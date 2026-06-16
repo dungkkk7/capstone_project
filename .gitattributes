@@ -1,0 +1,2 @@
+dependency/remill/bin/remill-clang-11 filter=lfs diff=lfs merge=lfs -text
+dependency/Simplifier/EqSat/target/release/deps/*.rlib filter=lfs diff=lfs merge=lfs -text
