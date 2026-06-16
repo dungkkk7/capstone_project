@@ -1,15 +1,2 @@
 result/
-**/build/
-**/target/
-dependency/remill/bin/
-dependency/remill/include/
-dependency/remill/lib/
-dependency/remill/share/
-dependency/mscema/bin/
-dependency/mscema/lib/
-*.so
-*.a
-*.o
-*.la
-*.d
-*.bin
+src/
