@@ -1,0 +1,9 @@
+binary_path
+data/obfuscated/cpu/obfuscated.bin
+data/obfuscated/command_io/obfuscated.bin
+data/obfuscated/crackme/obfuscated.bin
+data/obfuscated/hash/obfuscated.bin
+data/obfuscated/keybox/obfuscated.bin
+data/obfuscated/maze/obfuscated.bin
+data/obfuscated/md5/obfuscated.bin
+data/obfuscated/smart_shop/obfuscated.bin

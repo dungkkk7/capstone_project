@@ -41,6 +41,9 @@ OBFUSCATE_FLAGS=(
 
 mkdir -p "$OUTPUT_DIR"
 
+CSV_FILE="data/obfuscated_bin_list.csv"
+echo "binary_path" > "$CSV_FILE"
+
 echo "[*] Building dataset"
 
 for project_dir in "$INPUT_DIR"/*; do
@@ -154,6 +157,8 @@ for project_dir in "$INPUT_DIR"/*; do
     strip \
         --strip-all \
         "$out_dir/obfuscated.bin"
+
+    echo "data/obfuscated/$project/obfuscated.bin" >> "$CSV_FILE"
 
     rm -rf "$out_dir/obj"
 
