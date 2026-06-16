@@ -1,7 +1,7 @@
 CMakeFiles/BrightenRepairPass.dir/src/RuleSynthesizeMissingMain.cpp.o: \
- /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/src/RuleSynthesizeMissingMain.cpp \
+ /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/src/RuleSynthesizeMissingMain.cpp \
  /usr/include/stdc-predef.h \
- /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/src/BrightenRepairPass.h \
+ /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/src/BrightenRepairPass.h \
  /usr/include/c++/13/cstdint \
  /usr/include/x86_64-linux-gnu/c++/13/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/13/bits/os_defines.h \

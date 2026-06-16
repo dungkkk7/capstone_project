@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass
+CMAKE_SOURCE_DIR = /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build
+CMAKE_BINARY_DIR = /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build
 
 # Utility rule file for install-BrightenRepairPass-stripped.
 
@@ -67,7 +67,7 @@ include CMakeFiles/install-BrightenRepairPass-stripped.dir/compiler_depend.make
 include CMakeFiles/install-BrightenRepairPass-stripped.dir/progress.make
 
 CMakeFiles/install-BrightenRepairPass-stripped:
-	/usr/bin/cmake -DCMAKE_INSTALL_COMPONENT="BrightenRepairPass" -DCMAKE_INSTALL_DO_STRIP=1 -P /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/cmake_install.cmake
+	/usr/bin/cmake -DCMAKE_INSTALL_COMPONENT="BrightenRepairPass" -DCMAKE_INSTALL_DO_STRIP=1 -P /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/cmake_install.cmake
 
 install-BrightenRepairPass-stripped: CMakeFiles/install-BrightenRepairPass-stripped
 install-BrightenRepairPass-stripped: CMakeFiles/install-BrightenRepairPass-stripped.dir/build.make
@@ -82,6 +82,6 @@ CMakeFiles/install-BrightenRepairPass-stripped.dir/clean:
 .PHONY : CMakeFiles/install-BrightenRepairPass-stripped.dir/clean
 
 CMakeFiles/install-BrightenRepairPass-stripped.dir/depend:
-	cd /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/CMakeFiles/install-BrightenRepairPass-stripped.dir/DependInfo.cmake "--color=$(COLOR)"
+	cd /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/CMakeFiles/install-BrightenRepairPass-stripped.dir/DependInfo.cmake "--color=$(COLOR)"
 .PHONY : CMakeFiles/install-BrightenRepairPass-stripped.dir/depend
 

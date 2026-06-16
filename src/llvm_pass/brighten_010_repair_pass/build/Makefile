@@ -57,10 +57,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass
+CMAKE_SOURCE_DIR = /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build
+CMAKE_BINARY_DIR = /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -132,9 +132,9 @@ install/strip/fast: preinstall/fast
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/CMakeFiles /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/CMakeFiles /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -313,53 +313,29 @@ src/RuleAddRemillEntryDispatchers.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleAddRemillEntryDispatchers.cpp.s
 .PHONY : src/RuleAddRemillEntryDispatchers.cpp.s
 
-src/RuleAnnotateDataInitOrder.o: src/RuleAnnotateDataInitOrder.cpp.o
-.PHONY : src/RuleAnnotateDataInitOrder.o
+src/RuleCanonicalizeObfuscatedCompares.o: src/RuleCanonicalizeObfuscatedCompares.cpp.o
+.PHONY : src/RuleCanonicalizeObfuscatedCompares.o
 
 # target to build an object file
-src/RuleAnnotateDataInitOrder.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleAnnotateDataInitOrder.cpp.o
-.PHONY : src/RuleAnnotateDataInitOrder.cpp.o
+src/RuleCanonicalizeObfuscatedCompares.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleCanonicalizeObfuscatedCompares.cpp.o
+.PHONY : src/RuleCanonicalizeObfuscatedCompares.cpp.o
 
-src/RuleAnnotateDataInitOrder.i: src/RuleAnnotateDataInitOrder.cpp.i
-.PHONY : src/RuleAnnotateDataInitOrder.i
-
-# target to preprocess a source file
-src/RuleAnnotateDataInitOrder.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleAnnotateDataInitOrder.cpp.i
-.PHONY : src/RuleAnnotateDataInitOrder.cpp.i
-
-src/RuleAnnotateDataInitOrder.s: src/RuleAnnotateDataInitOrder.cpp.s
-.PHONY : src/RuleAnnotateDataInitOrder.s
-
-# target to generate assembly for a file
-src/RuleAnnotateDataInitOrder.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleAnnotateDataInitOrder.cpp.s
-.PHONY : src/RuleAnnotateDataInitOrder.cpp.s
-
-src/RuleConcretizeUndefPoisonValues.o: src/RuleConcretizeUndefPoisonValues.cpp.o
-.PHONY : src/RuleConcretizeUndefPoisonValues.o
-
-# target to build an object file
-src/RuleConcretizeUndefPoisonValues.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleConcretizeUndefPoisonValues.cpp.o
-.PHONY : src/RuleConcretizeUndefPoisonValues.cpp.o
-
-src/RuleConcretizeUndefPoisonValues.i: src/RuleConcretizeUndefPoisonValues.cpp.i
-.PHONY : src/RuleConcretizeUndefPoisonValues.i
+src/RuleCanonicalizeObfuscatedCompares.i: src/RuleCanonicalizeObfuscatedCompares.cpp.i
+.PHONY : src/RuleCanonicalizeObfuscatedCompares.i
 
 # target to preprocess a source file
-src/RuleConcretizeUndefPoisonValues.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleConcretizeUndefPoisonValues.cpp.i
-.PHONY : src/RuleConcretizeUndefPoisonValues.cpp.i
+src/RuleCanonicalizeObfuscatedCompares.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleCanonicalizeObfuscatedCompares.cpp.i
+.PHONY : src/RuleCanonicalizeObfuscatedCompares.cpp.i
 
-src/RuleConcretizeUndefPoisonValues.s: src/RuleConcretizeUndefPoisonValues.cpp.s
-.PHONY : src/RuleConcretizeUndefPoisonValues.s
+src/RuleCanonicalizeObfuscatedCompares.s: src/RuleCanonicalizeObfuscatedCompares.cpp.s
+.PHONY : src/RuleCanonicalizeObfuscatedCompares.s
 
 # target to generate assembly for a file
-src/RuleConcretizeUndefPoisonValues.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleConcretizeUndefPoisonValues.cpp.s
-.PHONY : src/RuleConcretizeUndefPoisonValues.cpp.s
+src/RuleCanonicalizeObfuscatedCompares.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleCanonicalizeObfuscatedCompares.cpp.s
+.PHONY : src/RuleCanonicalizeObfuscatedCompares.cpp.s
 
 src/RuleDefineRemillControlHelpers.o: src/RuleDefineRemillControlHelpers.cpp.o
 .PHONY : src/RuleDefineRemillControlHelpers.o
@@ -384,54 +360,6 @@ src/RuleDefineRemillControlHelpers.s: src/RuleDefineRemillControlHelpers.cpp.s
 src/RuleDefineRemillControlHelpers.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleDefineRemillControlHelpers.cpp.s
 .PHONY : src/RuleDefineRemillControlHelpers.cpp.s
-
-src/RuleExposeReadonlyDataAliases.o: src/RuleExposeReadonlyDataAliases.cpp.o
-.PHONY : src/RuleExposeReadonlyDataAliases.o
-
-# target to build an object file
-src/RuleExposeReadonlyDataAliases.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleExposeReadonlyDataAliases.cpp.o
-.PHONY : src/RuleExposeReadonlyDataAliases.cpp.o
-
-src/RuleExposeReadonlyDataAliases.i: src/RuleExposeReadonlyDataAliases.cpp.i
-.PHONY : src/RuleExposeReadonlyDataAliases.i
-
-# target to preprocess a source file
-src/RuleExposeReadonlyDataAliases.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleExposeReadonlyDataAliases.cpp.i
-.PHONY : src/RuleExposeReadonlyDataAliases.cpp.i
-
-src/RuleExposeReadonlyDataAliases.s: src/RuleExposeReadonlyDataAliases.cpp.s
-.PHONY : src/RuleExposeReadonlyDataAliases.s
-
-# target to generate assembly for a file
-src/RuleExposeReadonlyDataAliases.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleExposeReadonlyDataAliases.cpp.s
-.PHONY : src/RuleExposeReadonlyDataAliases.cpp.s
-
-src/RuleForwardExactGlobalLoads.o: src/RuleForwardExactGlobalLoads.cpp.o
-.PHONY : src/RuleForwardExactGlobalLoads.o
-
-# target to build an object file
-src/RuleForwardExactGlobalLoads.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleForwardExactGlobalLoads.cpp.o
-.PHONY : src/RuleForwardExactGlobalLoads.cpp.o
-
-src/RuleForwardExactGlobalLoads.i: src/RuleForwardExactGlobalLoads.cpp.i
-.PHONY : src/RuleForwardExactGlobalLoads.i
-
-# target to preprocess a source file
-src/RuleForwardExactGlobalLoads.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleForwardExactGlobalLoads.cpp.i
-.PHONY : src/RuleForwardExactGlobalLoads.cpp.i
-
-src/RuleForwardExactGlobalLoads.s: src/RuleForwardExactGlobalLoads.cpp.s
-.PHONY : src/RuleForwardExactGlobalLoads.s
-
-# target to generate assembly for a file
-src/RuleForwardExactGlobalLoads.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleForwardExactGlobalLoads.cpp.s
-.PHONY : src/RuleForwardExactGlobalLoads.cpp.s
 
 src/RuleForwardMcSemaFlagLoads.o: src/RuleForwardMcSemaFlagLoads.cpp.o
 .PHONY : src/RuleForwardMcSemaFlagLoads.o
@@ -649,30 +577,6 @@ src/RuleNormalizeRemillFunctionCalls.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleNormalizeRemillFunctionCalls.cpp.s
 .PHONY : src/RuleNormalizeRemillFunctionCalls.cpp.s
 
-src/RulePromoteSingleStoreDataConstants.o: src/RulePromoteSingleStoreDataConstants.cpp.o
-.PHONY : src/RulePromoteSingleStoreDataConstants.o
-
-# target to build an object file
-src/RulePromoteSingleStoreDataConstants.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RulePromoteSingleStoreDataConstants.cpp.o
-.PHONY : src/RulePromoteSingleStoreDataConstants.cpp.o
-
-src/RulePromoteSingleStoreDataConstants.i: src/RulePromoteSingleStoreDataConstants.cpp.i
-.PHONY : src/RulePromoteSingleStoreDataConstants.i
-
-# target to preprocess a source file
-src/RulePromoteSingleStoreDataConstants.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RulePromoteSingleStoreDataConstants.cpp.i
-.PHONY : src/RulePromoteSingleStoreDataConstants.cpp.i
-
-src/RulePromoteSingleStoreDataConstants.s: src/RulePromoteSingleStoreDataConstants.cpp.s
-.PHONY : src/RulePromoteSingleStoreDataConstants.s
-
-# target to generate assembly for a file
-src/RulePromoteSingleStoreDataConstants.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RulePromoteSingleStoreDataConstants.cpp.s
-.PHONY : src/RulePromoteSingleStoreDataConstants.cpp.s
-
 src/RulePruneDeadMcSemaFlagStores.o: src/RulePruneDeadMcSemaFlagStores.cpp.o
 .PHONY : src/RulePruneDeadMcSemaFlagStores.o
 
@@ -889,30 +793,6 @@ src/RuleRepairRemillX87LibCalls.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleRepairRemillX87LibCalls.cpp.s
 .PHONY : src/RuleRepairRemillX87LibCalls.cpp.s
 
-src/RuleResolveInitializedFunctionPointers.o: src/RuleResolveInitializedFunctionPointers.cpp.o
-.PHONY : src/RuleResolveInitializedFunctionPointers.o
-
-# target to build an object file
-src/RuleResolveInitializedFunctionPointers.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleResolveInitializedFunctionPointers.cpp.o
-.PHONY : src/RuleResolveInitializedFunctionPointers.cpp.o
-
-src/RuleResolveInitializedFunctionPointers.i: src/RuleResolveInitializedFunctionPointers.cpp.i
-.PHONY : src/RuleResolveInitializedFunctionPointers.i
-
-# target to preprocess a source file
-src/RuleResolveInitializedFunctionPointers.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleResolveInitializedFunctionPointers.cpp.i
-.PHONY : src/RuleResolveInitializedFunctionPointers.cpp.i
-
-src/RuleResolveInitializedFunctionPointers.s: src/RuleResolveInitializedFunctionPointers.cpp.s
-.PHONY : src/RuleResolveInitializedFunctionPointers.s
-
-# target to generate assembly for a file
-src/RuleResolveInitializedFunctionPointers.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/BrightenRepairPass.dir/build.make CMakeFiles/BrightenRepairPass.dir/src/RuleResolveInitializedFunctionPointers.cpp.s
-.PHONY : src/RuleResolveInitializedFunctionPointers.cpp.s
-
 src/RuleSanitizeDangerousStrlen.o: src/RuleSanitizeDangerousStrlen.cpp.o
 .PHONY : src/RuleSanitizeDangerousStrlen.o
 
@@ -1059,21 +939,12 @@ help:
 	@echo "... src/RuleAddRemillEntryDispatchers.o"
 	@echo "... src/RuleAddRemillEntryDispatchers.i"
 	@echo "... src/RuleAddRemillEntryDispatchers.s"
-	@echo "... src/RuleAnnotateDataInitOrder.o"
-	@echo "... src/RuleAnnotateDataInitOrder.i"
-	@echo "... src/RuleAnnotateDataInitOrder.s"
-	@echo "... src/RuleConcretizeUndefPoisonValues.o"
-	@echo "... src/RuleConcretizeUndefPoisonValues.i"
-	@echo "... src/RuleConcretizeUndefPoisonValues.s"
+	@echo "... src/RuleCanonicalizeObfuscatedCompares.o"
+	@echo "... src/RuleCanonicalizeObfuscatedCompares.i"
+	@echo "... src/RuleCanonicalizeObfuscatedCompares.s"
 	@echo "... src/RuleDefineRemillControlHelpers.o"
 	@echo "... src/RuleDefineRemillControlHelpers.i"
 	@echo "... src/RuleDefineRemillControlHelpers.s"
-	@echo "... src/RuleExposeReadonlyDataAliases.o"
-	@echo "... src/RuleExposeReadonlyDataAliases.i"
-	@echo "... src/RuleExposeReadonlyDataAliases.s"
-	@echo "... src/RuleForwardExactGlobalLoads.o"
-	@echo "... src/RuleForwardExactGlobalLoads.i"
-	@echo "... src/RuleForwardExactGlobalLoads.s"
 	@echo "... src/RuleForwardMcSemaFlagLoads.o"
 	@echo "... src/RuleForwardMcSemaFlagLoads.i"
 	@echo "... src/RuleForwardMcSemaFlagLoads.s"
@@ -1101,9 +972,6 @@ help:
 	@echo "... src/RuleNormalizeRemillFunctionCalls.o"
 	@echo "... src/RuleNormalizeRemillFunctionCalls.i"
 	@echo "... src/RuleNormalizeRemillFunctionCalls.s"
-	@echo "... src/RulePromoteSingleStoreDataConstants.o"
-	@echo "... src/RulePromoteSingleStoreDataConstants.i"
-	@echo "... src/RulePromoteSingleStoreDataConstants.s"
 	@echo "... src/RulePruneDeadMcSemaFlagStores.o"
 	@echo "... src/RulePruneDeadMcSemaFlagStores.i"
 	@echo "... src/RulePruneDeadMcSemaFlagStores.s"
@@ -1131,9 +999,6 @@ help:
 	@echo "... src/RuleRepairRemillX87LibCalls.o"
 	@echo "... src/RuleRepairRemillX87LibCalls.i"
 	@echo "... src/RuleRepairRemillX87LibCalls.s"
-	@echo "... src/RuleResolveInitializedFunctionPointers.o"
-	@echo "... src/RuleResolveInitializedFunctionPointers.i"
-	@echo "... src/RuleResolveInitializedFunctionPointers.s"
 	@echo "... src/RuleSanitizeDangerousStrlen.o"
 	@echo "... src/RuleSanitizeDangerousStrlen.i"
 	@echo "... src/RuleSanitizeDangerousStrlen.s"

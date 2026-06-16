@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass
+CMAKE_SOURCE_DIR = /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build
+CMAKE_BINARY_DIR = /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build
 
 # Utility rule file for intrinsics_gen.
 
@@ -78,6 +78,6 @@ CMakeFiles/intrinsics_gen.dir/clean:
 .PHONY : CMakeFiles/intrinsics_gen.dir/clean
 
 CMakeFiles/intrinsics_gen.dir/depend:
-	cd /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/CMakeFiles/intrinsics_gen.dir/DependInfo.cmake "--color=$(COLOR)"
+	cd /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/CMakeFiles/intrinsics_gen.dir/DependInfo.cmake "--color=$(COLOR)"
 .PHONY : CMakeFiles/intrinsics_gen.dir/depend
 

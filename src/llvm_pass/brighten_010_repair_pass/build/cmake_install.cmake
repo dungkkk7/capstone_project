@@ -1,4 +1,4 @@
-# Install script for directory: /home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass
+# Install script for directory: /home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -49,7 +49,7 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "BrightenRepairPass" OR NOT CMAKE_INSTALL_CO
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/BrightenRepairPass.so"
          RPATH "\$ORIGIN/../lib")
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE MODULE FILES "/home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/BrightenRepairPass.so")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib" TYPE MODULE FILES "/home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/BrightenRepairPass.so")
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/BrightenRepairPass.so" AND
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/BrightenRepairPass.so")
     file(RPATH_CHANGE
@@ -70,5 +70,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "/home/dungbv/WorkSpace/lifter/third_party/llvm_custome/brighten_010_repair_pass/build/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "/home/dungbv/capstone_project/src/llvm_pass/brighten_010_repair_pass/build/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
