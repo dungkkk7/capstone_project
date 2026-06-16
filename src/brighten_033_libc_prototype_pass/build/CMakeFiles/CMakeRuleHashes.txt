@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+7de9c52119dbef73f92d832a4b1eb967 CMakeFiles/install-BrightenLibcPrototypePass
+a17b93fccbb3d3da932134f1c6a8df08 CMakeFiles/install-BrightenLibcPrototypePass-stripped
