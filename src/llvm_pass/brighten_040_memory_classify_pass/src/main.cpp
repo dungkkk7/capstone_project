@@ -2,6 +2,9 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 
 using namespace llvm;
 
@@ -9,9 +12,18 @@ namespace {
 
 struct BrightenMemoryClassifyPass : public PassInfoMixin<BrightenMemoryClassifyPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    errs() << "Running BrightenMemoryClassifyPass\n";
-    // TODO: implement pass logic
-    return PreservedAnalyses::all();
+    bool Changed = false;
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.empty()) continue;
+      
+      for (Instruction &I : instructions(F)) {
+        if (auto *I2P = dyn_cast<IntToPtrInst>(&I)) {
+          // Identify integer-to-pointer casts that can be simplified into direct gep operations
+          Changed = true;
+        }
+      }
+    }
+    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 

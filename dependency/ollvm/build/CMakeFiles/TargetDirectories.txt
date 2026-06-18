@@ -1,9 +1,0 @@
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/intrinsics_gen.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/vt_gen.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/omp_gen.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/acc_gen.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/target_parser_gen.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/ollvm-obf.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/ollvm-plugin.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/edit_cache.dir
-/home/dungbv/WorkSpace/lifter/third_party/ollvm/build/CMakeFiles/rebuild_cache.dir

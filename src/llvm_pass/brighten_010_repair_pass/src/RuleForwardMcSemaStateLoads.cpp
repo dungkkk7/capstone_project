@@ -2,17 +2,15 @@
 // This is intentionally local and exact-alias only; it is a cleanup rule, not
 // a full memory-to-register recovery pass.
 #include "BrightenRepairPass.h"
-
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Instructions.h"
 
+
 namespace brighten_repair {
-
 using namespace llvm;
-
 namespace {
-
+  
 static GlobalValue *GetGlobalStorage(Value *Ptr) {
   Ptr = Ptr->stripPointerCasts();
   return dyn_cast<GlobalValue>(Ptr);

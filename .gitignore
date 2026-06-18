@@ -1,4 +1,14 @@
 result/
 __pycache__/
 *.pyc
+build/
+target/
+scratch/
+*.bin
+*.so
+*.bc
+data/clean_src/test/
+data/obfuscated/test/
+data/test.csv
+
 

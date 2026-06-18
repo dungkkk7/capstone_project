@@ -7,6 +7,8 @@ import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from binary_lifting.lifting import lift_binary
+from llvm_pass.britening_ir import brighten_ir
+from fuzzing_equi_check.fuzzing import SemanticFuzzer, TemplateEvaluator, make_bytes_generator, DEFAULT_TEMPLATES
 
 class Color:
     BLUE = '\033[94m'
@@ -116,7 +118,68 @@ def main(argv=None):
         success = lift_binary(binary_path=path, output=output_bc)
         if success:
             print(f"{Color.GREEN}[✓] Nâng mã (Lift) thành công cho: {path}{Color.END}")
-            success_count += 1
+            
+            # --- BƯỚC THÊM: LÀM ĐẸP MÃ IR (BRIGHTENING) ---
+            output_brightened_bc = os.path.join(case_output_dir, f"{base_name}_brightened.bc")
+            print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu làm đẹp mã IR (Brightening) cho: {path}...{Color.END}")
+            
+            try:
+                brighten_success = brighten_ir(output_bc, output_brightened_bc)
+                if brighten_success:
+                    print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
+                    success_count += 1
+                    
+                    # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
+                    print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu kiểm tra Semantic Equivalence cho: {path}...{Color.END}")
+                    try:
+                        # Tìm template phù hợp cho benchmark
+                        template_content = None
+                        for key in DEFAULT_TEMPLATES.keys():
+                            if key in path.lower():
+                                template_content = DEFAULT_TEMPLATES[key]
+                                print(f"{Color.YELLOW}      [!] Phát hiện benchmark '{key}', sử dụng cấu hình template.{Color.END}")
+                                break
+                        
+                        if template_content:
+                            generator = TemplateEvaluator(template_content)
+                        else:
+                            print(f"{Color.YELLOW}      [!] Không nhận diện được benchmark, sử dụng generator ngẫu nhiên (bytes).{Color.END}")
+                            generator = make_bytes_generator()
+                        
+                        fuzzer = SemanticFuzzer(output_brightened_bc, path)
+                        fuzzer.compile()
+                        
+                        # Chạy 100 iterations với 4 thread
+                        fuzz_report = fuzzer.run_differential_test(
+                            iterations=100,
+                            generator=generator,
+                            timeout=1.0,
+                            compare_stderr=False,
+                            num_workers=4
+                        )
+                        fuzzer.cleanup()
+                        
+                        ratio = fuzz_report["equivalence_ratio"]
+                        ratio_color = Color.GREEN if ratio == 100.0 else (Color.YELLOW if ratio >= 90.0 else Color.RED)
+                        
+                        print(f"      {Color.BOLD}Kết quả kiểm tra Semantic Equivalence:{Color.END}")
+                        print(f"      - Tổng số lần chạy: {fuzz_report['total_runs']}")
+                        print(f"      - Khớp hoàn toàn (Matches): {Color.GREEN}{fuzz_report['matches']}{Color.END}")
+                        print(f"      - Không khớp (Mismatches): {Color.RED if fuzz_report['mismatches'] > 0 else Color.GRAY}{fuzz_report['mismatches']}{Color.END}")
+                        print(f"      - Timeouts: F1: {fuzz_report['timeouts']['bin1']} | F2: {fuzz_report['timeouts']['bin2']} | Both: {fuzz_report['timeouts']['both']}")
+                        print(f"      - Tỉ lệ tương đương (Equivalence): {ratio_color}{ratio:.2f}%{Color.END}")
+                        
+                        if ratio == 100.0:
+                            print(f"      {Color.GREEN}[✓] XÁC NHẬN SEMANTIC EQUIVALENT.{Color.END}")
+                        else:
+                            print(f"      {Color.RED}[✗] CẢNH BÁO: PHÁT HIỆN SỰ KHÁC BIỆT SEMANTIC CHƯA ĐƯỢC GIẢI QUYẾT.{Color.END}")
+                            
+                    except Exception as fe:
+                        print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")
+                else:
+                    print(f"{Color.RED}[✗] Làm đẹp mã IR THẤT BẠI cho: {path}{Color.END}")
+            except Exception as e:
+                print(f"{Color.RED}[✗] Lỗi khi làm đẹp mã IR: {e}{Color.END}")
         else:
             print(f"{Color.RED}[✗] Nâng mã (Lift) THẤT BẠI cho: {path}{Color.END}")
 

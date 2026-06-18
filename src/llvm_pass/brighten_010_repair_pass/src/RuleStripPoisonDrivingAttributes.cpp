@@ -104,6 +104,16 @@ bool BrightenRepairPass::StripPoisonDrivingAttributes(Module &M) {
     }
   }
 
+  for (Function &Decl : M) {
+    if (Decl.isDeclaration()) {
+      StringRef Name = Decl.getName();
+      if (Name == "scanf" || Name == "__isoc99_scanf" || Name == "__isoc23_scanf" || Name.contains("scanf")) {
+        Decl.addFnAttr(Attribute::NoBuiltin);
+        Changed = true;
+      }
+    }
+  }
+
   return Changed;
 }
 

@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -shared  -o DeobfuscateBitwiseBMIPass.so CMakeFiles/DeobfuscateBitwiseBMIPass.dir/src/main.cpp.o 
