@@ -126,7 +126,10 @@ def main(argv=None):
             try:
                 brighten_success = brighten_ir(output_bc, output_brightened_bc)
                 if brighten_success:
+                    output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
                     print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
+                    print(f"{Color.GREEN}{Color.BOLD}    [✓] FILE NATIVE LLVM IR SẠCH (ĐÃ LÀM ĐẸP & ĐỂ XEM):{Color.END}")
+                    print(f"{Color.GREEN}{Color.BOLD}        {output_brightened_ll}{Color.END}")
                     success_count += 1
                     
                     # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---

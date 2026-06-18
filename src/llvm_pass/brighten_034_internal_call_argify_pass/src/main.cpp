@@ -271,21 +271,6 @@ struct BrightenInternalCallArgifyPass : public PassInfoMixin<BrightenInternalCal
         Value *LocalRegPtr = Builder.CreateConstGEP1_64(Builder.getInt8Ty(), StateAlloca, ABI.ParamOffsets[i]);
         Value *LocalStore = Builder.CreateStore(ArgVal, LocalRegPtr);
         errs() << "argify: created local store: " << *LocalStore << "\n";
-
-        // 2. Store to global register aliases / variables
-        Value *RegPtr = nullptr;
-        auto It = OffsetToGlobal.find(ABI.ParamOffsets[i]);
-        if (It != OffsetToGlobal.end()) {
-          RegPtr = It->second;
-        } else {
-          GlobalVariable *RegState = M.getGlobalVariable("__mcsema_reg_state");
-          if (RegState) {
-            RegPtr = Builder.CreateConstGEP1_64(Builder.getInt8Ty(), RegState, ABI.ParamOffsets[i]);
-          }
-        }
-        if (RegPtr) {
-          Builder.CreateStore(ArgVal, RegPtr);
-        }
       }
 
       // Prepare arguments for original lifted function
@@ -324,24 +309,11 @@ struct BrightenInternalCallArgifyPass : public PassInfoMixin<BrightenInternalCal
 
       Builder.CreateCall(F, CallArgs);
 
-      // Load return value directly from global RAX or return void
+      // Load return value directly from local StateAlloca or return void
       if (ABI.HasReturn) {
-        Value *RetPtr = nullptr;
-        auto It = OffsetToGlobal.find(RAX_OFFSET);
-        if (It != OffsetToGlobal.end()) {
-          RetPtr = It->second;
-        } else {
-          GlobalVariable *RegState = M.getGlobalVariable("__mcsema_reg_state");
-          if (RegState) {
-            RetPtr = Builder.CreateConstGEP1_64(Builder.getInt8Ty(), RegState, RAX_OFFSET);
-          }
-        }
-        if (RetPtr) {
-          Value *RetVal = Builder.CreateLoad(Type::getInt64Ty(Ctx), RetPtr, "retval");
-          Builder.CreateRet(RetVal);
-        } else {
-          Builder.CreateRet(ConstantInt::get(Type::getInt64Ty(Ctx), 0));
-        }
+        Value *RetPtr = Builder.CreateConstGEP1_64(Builder.getInt8Ty(), StateAlloca, RAX_OFFSET);
+        Value *RetVal = Builder.CreateLoad(Type::getInt64Ty(Ctx), RetPtr, "retval");
+        Builder.CreateRet(RetVal);
       } else {
         Builder.CreateRetVoid();
       }

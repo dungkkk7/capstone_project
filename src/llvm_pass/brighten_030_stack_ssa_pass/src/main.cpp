@@ -138,7 +138,7 @@ int64_t resolveStateOffset(Value *ptr, const DataLayout &DL) {
 bool IsRspOffset(Value *val, const DataLayout &DL) {
   if (!val) return false;
   int64_t Offset = resolveStateOffset(val, DL);
-  return Offset == 2312;
+  return Offset == 2312 || Offset == 2328;
 }
 
 bool IsRspLoad(Value *val, const DataLayout &DL) {

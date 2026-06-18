@@ -26,7 +26,8 @@ bool IsRspAlias(Value *val) {
     if (idx == StringRef::npos) {
       return false;
     }
-    return name.take_front(idx) == "RSP";
+    StringRef prefix = name.take_front(idx);
+    return prefix == "RSP" || prefix == "RBP";
   }
   return false;
 }

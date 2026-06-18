@@ -644,8 +644,28 @@ void CollectSlots(Function &F, const DataLayout &DL, DenseMap<SlotKey, SlotInfo>
 }
 
 bool PromoteFunction(Function &F) {
-  if (F.isDeclaration() || F.empty()) {
+  if (F.isDeclaration() || F.empty() || F.arg_size() == 0 || F.getName().ends_with("_native")) {
     return false;
+  }
+
+  // Rewrite first argument of state-passing calls to use the local StatePtr
+  Value *StatePtr = F.getArg(0);
+  for (Instruction &I : instructions(F)) {
+    if (auto *CB = dyn_cast<CallBase>(&I)) {
+      Value *CalledVal = CB->getCalledOperand()->stripPointerCasts();
+      if (Function *Callee = dyn_cast<Function>(CalledVal)) {
+        StringRef CalleeName = Callee->getName();
+        if ((CalleeName.starts_with("ext_") ||
+             CalleeName.starts_with("sub_") ||
+             CalleeName.starts_with("callback_") ||
+             CalleeName.starts_with("__remill_") ||
+             CalleeName.starts_with("__mcsema_")) &&
+            !CalleeName.ends_with("_native") &&
+            CB->arg_size() > 0) {
+          CB->setArgOperand(0, StatePtr);
+        }
+      }
+    }
   }
 
   const DataLayout &DL = F.getParent()->getDataLayout();
@@ -1056,7 +1076,7 @@ struct BrightenStateSSAPass : public PassInfoMixin<BrightenStateSSAPass> {
       Changed |= PromoteFunction(F);
       LowerConstantExprsInFunction(F);
       Changed |= SimplifyPointerArithmeticLoop(F);
-      Changed |= StripRemillCalls(F);
+      // Changed |= StripRemillCalls(F);
       CleanNames(F);
     }
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

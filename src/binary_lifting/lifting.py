@@ -210,7 +210,7 @@ def lift_binary(binary_path, disassembler="/opt/ida-pro-9.3/idat", ghidra=None, 
     
     if llvm_dis:
         if run_command([llvm_dis, output_bc, "-o", output_ll], "Bước 3: Chuyển đổi sang LLVM IR (.ll)"):
-            print(f"{Color.GREEN}[✓] Hoàn tất! File LLVM IR của bạn đã sẵn sàng tại: {output_ll}{Color.END}")
+            print(f"{Color.GREEN}[✓] Hoàn tất bước nâng mã thô (Raw Lift)! Tệp LLVM IR thô (chưa làm sạch) nằm tại: {output_ll}{Color.END}")
             return True
     else:
         print(f"{Color.YELLOW}[!] Gợi ý: Hãy chạy lệnh 'llvm-dis {output_bc}' (hoặc llvm-dis-21) để sinh mã IR dạng văn bản.{Color.END}")
