@@ -16,33 +16,27 @@ PreservedAnalyses BrightenRepairPass::run(Module &M, ModuleAnalysisManager &) {
   // tới sửa linkability, hardening, rồi chuẩn hoá control-flow/calls.
   bool Changed = false;
 
+  if (auto *F = M.getFunction("main_wrapper")) {
+    if (F->hasLocalLinkage()) {
+      F->setLinkage(GlobalValue::ExternalLinkage);
+      Changed = true;
+    }
+  }
+
   Changed |= StripPoisonDrivingFlags(M);
   Changed |= StripPoisonDrivingAttributes(M);
 
-  Changed |= ForwardMcSemaFlagLoads(M);
-  Changed |= PruneDeadMcSemaFlagStores(M);
-  Changed |= PruneDeadRipStores(M);
-  Changed |= ForwardMcSemaStateLoads(M);
-  Changed |= ForwardMcSemaGuestStackSlots(M);
-  Changed |= PruneUnusedMcSemaStateStores(M);
-  Changed |= InlineMcSemaExternalWrappers(M);
+  Changed |= RepairObfuscatedStackSubtractions(M);
 
+  // Quan trọng: chạy TRƯỚC khi optimizer xóa callback thunks
+  Changed |= FixCallbackFunctionPointerStores(M);
+
+  Changed |= ImplementExternCallBridge(M);
   Changed |= DefineRemillControlHelpers(M);
-  Changed |= GrowMcSemaSyntheticStack(M);
-  Changed |= HardenUnsafeScanf(M);
-  Changed |= CanonicalizeObfuscatedCompares(M);
-  Changed |= SanitizeDangerousStrlen(M);
-  Changed |= RepairRemillVarArgFPCalls(M);
-  Changed |= RepairRemillX87LibCalls(M);
-  Changed |= RepairMcSemaX87PseudoDoubleLoads(M);
-  Changed |= NormalizeJumpTableTargets(M);
-  Changed |= RecoverNoReturnFallthroughTargets(M);
-  Changed |= AddRemillEntryDispatchers(M);
+
   Changed |= SynthesizeMissingMain(M);
-  Changed |= NormalizeRemillFunctionCalls(M);
-  Changed |= RepairMcSemaRawIndirectCallStack(M);
-  Changed |= GuardRawIndirectCalls(M);
-  Changed |= PruneUnusedRemillMcSemaHelpers(M);
+  Changed |= ResolveAliases(M);
+  Changed |= PreserveCalleeSavedRegisters(M);
 
   // Có thay đổi IR thì invalidates tất cả; ngược lại giữ nguyên analyses.
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

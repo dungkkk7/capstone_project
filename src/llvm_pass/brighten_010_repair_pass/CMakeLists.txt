@@ -23,27 +23,10 @@ add_llvm_pass_plugin(BrightenRepairPass
   src/Helpers.cpp
   src/RuleStripPoisonDrivingFlags.cpp
   src/RuleStripPoisonDrivingAttributes.cpp
-  src/RuleForwardMcSemaFlagLoads.cpp
-  src/RulePruneDeadMcSemaFlagStores.cpp
-  src/RulePruneDeadRipStores.cpp
-  src/RuleForwardMcSemaStateLoads.cpp
-  src/RuleForwardMcSemaGuestStackSlots.cpp
-  src/RulePruneUnusedMcSemaStateStores.cpp
-  src/RuleInlineMcSemaExternalWrappers.cpp
   src/RuleDefineRemillControlHelpers.cpp
-  src/RuleGrowMcSemaSyntheticStack.cpp
-  src/RuleHardenUnsafeScanf.cpp
-  src/RuleCanonicalizeObfuscatedCompares.cpp
-  src/RuleSanitizeDangerousStrlen.cpp
-  src/RuleRepairRemillVarArgFPCalls.cpp
-  src/RuleRepairRemillX87LibCalls.cpp
-  src/RuleRepairMcSemaX87PseudoDoubleLoads.cpp
-  src/RuleNormalizeJumpTableTargets.cpp
-  src/RuleRecoverNoReturnFallthroughTargets.cpp
-  src/RuleAddRemillEntryDispatchers.cpp
   src/RuleSynthesizeMissingMain.cpp
-  src/RuleNormalizeRemillFunctionCalls.cpp
-  src/RuleRepairMcSemaRawIndirectCallStack.cpp
-  src/RuleGuardRawIndirectCalls.cpp
-  src/RulePruneUnusedRemillMcSemaHelpers.cpp
+  src/RuleResolveAliases.cpp
+  src/RuleImplementExternCallBridge.cpp
+  src/RuleFixCallbackFunctionPointerStores.cpp
+  src/RuleRepairObfuscatedStackSubtractions.cpp
 )

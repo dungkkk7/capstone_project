@@ -67,29 +67,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 
 # Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
 PLUGINS = [
-    "brighten_010_repair_pass/build/BrightenRepairPass.so",
-    "brighten_020_state_ssa_pass/build/BrightenStateSSAPass.so",
-    "brighten_030_stack_ssa_pass/build/BrightenStackSSAPass.so",
-    "brighten_031_state_forward_pass/build/BrightenStateForwardPass.so",
-    "brighten_032_host_frame_pass/build/BrightenHostFramePass.so",
-    "brighten_033_libc_prototype_pass/build/BrightenLibcPrototypePass.so",
-    "brighten_034_internal_call_argify_pass/build/BrightenInternalCallArgifyPass.so",
-    "brighten_040_memory_classify_pass/build/BrightenMemoryClassifyPass.so"
+    "brighten_010_repair_pass/build/BrightenRepairPass.so"
 ]
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-host-frame-pass,brighten-state-ssa-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,"
-    "gvn,instcombine<no-verify-fixpoint>,simplifycfg,brighten-stack-ssa-pass,brighten-state-forward-pass,"
-    "sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,instcombine<no-verify-fixpoint>,simplifycfg,"
-    "brighten-host-frame-pass,brighten-libc-prototype-pass,brighten-internal-call-argify-pass,always-inline,brighten-state-ssa-pass,"
-    "brighten-host-frame-pass,brighten-stack-ssa-pass,brighten-state-forward-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,"
-    "gvn,instcombine<no-verify-fixpoint>,simplifycfg,brighten-memory-classify-pass,brighten-host-frame-pass,dce,"
-    "brighten-memory-classify-pass,brighten-libc-prototype-pass,dce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,"
-    "gvn,instcombine<no-verify-fixpoint>,simplifycfg,brighten-stack-ssa-pass,brighten-state-forward-pass,"
-    "brighten-internal-call-argify-pass,always-inline,brighten-state-ssa-pass,brighten-host-frame-pass,brighten-stack-ssa-pass,brighten-state-forward-pass,sroa,early-cse,"
-    "instcombine<no-verify-fixpoint>,simplifycfg,gvn,instcombine<no-verify-fixpoint>,simplifycfg,"
-    "brighten-memory-classify-pass,brighten-host-frame-pass,dce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,"
-    "gvn,instcombine<no-verify-fixpoint>,simplifycfg,deadargelim,globaldce,brighten-state-ssa-pass"
+    "brighten-repair-pass,strip"
 )
 
 class Color:
@@ -102,29 +84,8 @@ class Color:
     END = '\033[0m'
 
 def clean_unused_types_and_globals(content):
-    # 1. Strip the dead startup/boilerplate functions first
-    lines = content.split('\n')
-    new_lines = []
-    in_strip = False
-    brace_count = 0
-    
-    dead_funcs_pat = r'^define\s+.*@(sub_1000|sub_1020|sub_1060|sub_1090|sub_10f8|sub_1100|sub_1140|sub_3f18|callback_sub_1100|callback_sub_1140)(?:_[a-zA-Z0-9_]+)?\b'
-    
-    for line in lines:
-        if not in_strip:
-            if re.match(dead_funcs_pat, line.strip()):
-                in_strip = True
-                brace_count = 0
-                if '{' in line:
-                    brace_count += line.count('{') - line.count('}')
-                continue
-            new_lines.append(line)
-        else:
-            brace_count += line.count('{') - line.count('}')
-            if brace_count <= 0 and '}' in line:
-                in_strip = False
-                
-    content = '\n'.join(new_lines)
+    # 1. Skip function stripping (keep all defined functions to avoid undefined reference errors)
+    new_lines = content.split('\n')
     
     # 2. Iterate to remove unused globals and aliases
     while True:
@@ -204,199 +165,92 @@ def clean_ir_file(ll_path):
     with open(ll_path, 'r') as f:
         content = f.read()
     
-    # Scan for constructors in init_array before we strip them
-    init_funcs = re.findall(r'@callback_sub_([0-9a-fA-F]+)\b', content)
-    seen = set()
-    unique_init_funcs = []
-    for addr_str in init_funcs:
-        if addr_str not in seen:
-            seen.add(addr_str)
-            unique_init_funcs.append(addr_str)
-            
-    init_array_calls = []
-    dead_init_addrs = {"1000", "1020", "1060", "1090", "10f8", "1100", "1140", "3f18"}
-    for addr_str in unique_init_funcs:
-        if addr_str in dead_init_addrs:
-            continue
-        native_name = f"sub_{addr_str}_native"
-        if f"@{native_name}" in content:
-            sig_match = re.search(r'define\s+([^\s@]+)\s+@' + re.escape(native_name) + r'\s*\(([^)]*)\)', content)
-            if sig_match:
-                ret_type = sig_match.group(1).strip()
-                params_str = sig_match.group(2).strip()
-                if params_str:
-                    args = [p.strip().split()[0] + " 0" for p in params_str.split(',') if p.strip()]
-                    args_str = ", ".join(args)
-                    init_array_calls.append(f"  call {ret_type} @{native_name}({args_str})")
-                else:
-                    init_array_calls.append(f"  call {ret_type} @{native_name}()")
-
-    # 1. Thay thế các con trỏ đến __mcsema_* trong static data segment bằng null
+    # 1. Thay thế các con trỏ đến __mcsema_* trong static data segment bằng null (loại trừ __mcsema_reg_state)
     # Để tránh việc clang/ld báo lỗi undefined reference
-    content = re.sub(r'ptr\s+@__mcsema_[a-zA-Z0-9_]+', 'ptr null', content)
+    content = re.sub(r'ptr\s+@__mcsema_(?!reg_state\b)[a-zA-Z0-9_]+', 'ptr null', content)
     
-    # Tìm hàm native đại diện cho main
-    main_native_name = None
-    wrapper_match = re.search(r'define internal ptr @main_wrapper\([^)]*\)[^{]*\{([\s\S]*?)\}', content)
-    if wrapper_match:
-        body = wrapper_match.group(1)
-        call_match = re.search(r'call \w+ @(sub_[0-9a-fA-F]+_main_native|sub_[0-9a-fA-F]+_native)', body)
-        if call_match:
-            main_native_name = call_match.group(1)
-        else:
-            call_match = re.search(r'call \w+ @(sub_[0-9a-fA-F]+)', body)
-            if call_match:
-                main_native_name = call_match.group(1)
-                
-    if not main_native_name:
-        func_names = re.findall(r'define \w+ @(sub_[0-9a-fA-F]+_main_native)', content)
-        if func_names:
-            main_native_name = func_names[0]
-            
+    # 2. Biến define của __remill_function_call và __remill_jump thành declare để tránh multiple definition (commented out because we compile standalone)
+    # content = re.sub(
+    #     r'define\s+(?:[a-zA-Z0-9_]+\s+)*ptr\s+@(__remill_function_call|__remill_jump)\([^)]*\)[^{]*\{[\s\S]*?\}',
+    #     r'declare ptr @\1(ptr, i64, ptr)',
+    #     content
+    # )
+        
+    # 3. Trích xuất entry point PC từ inline assembly của main cũ (tìm trong function @main)
+    main_match = re.search(r'define\s+[^@{]*@main\b[^{]*\{([\s\S]*?)\}', content)
+    if main_match:
+        main_body = main_match.group(1)
+        pc_match = re.search(r'pushq\s+\$\$0x([0-9a-fA-F]+)', main_body)
+        pc_val = int(pc_match.group(1), 16) if pc_match else 0
+    else:
+        pc_match = re.search(r'pushq\s+\$\$0x([0-9a-fA-F]+)', content)
+        pc_val = int(pc_match.group(1), 16) if pc_match else 0
+    
+    # 4. Quét và loại bỏ tất cả các hàm chứa inline assembly (gây crash clang-21)
     lines = content.split('\n')
     new_lines = []
-    in_function_to_strip = False
-    brace_count = 0
+    in_func = False
+    func_lines = []
+    func_name = None
     stripped_funcs = set()
     
-    strip_patterns = [
-        r'^(define|declare)\s+.*@__mcsema_',
-        r'^(define|declare)\s+.*@__remill_',
-        r'^(define|declare)\s+.*@callback_',
-        r'^(define|declare)\s+.*_wrapper\s*\(',
-        r'^(define|declare)\s+.*@main\s*\(',
-        r'^(define|declare)\s+.*@start\s*\(',
-        r'^(define|declare)\s+.*@\.init_proc\s*\('
-    ]
-    
-    # Pattern để khớp alias segment (kể cả có thread_local): @data_36060 = internal alias i8, getelementptr ... hoặc @data_3e000 = internal alias i32, ptr ...
-    alias_pattern = r'^@([a-zA-Z0-9_]+)\s*=\s*(.*?)\balias\s+([^,]+),\s*(.*)$'
-    
     for line in lines:
-        if not in_function_to_strip and re.match(r'^@[0-9]+\s*=\s*', line):
-            continue
-        if not in_function_to_strip:
-            is_strip = False
-            for pat in strip_patterns:
-                if re.match(pat, line):
-                    is_strip = True
-                    break
-            if is_strip:
+        if not in_func:
+            if line.startswith('define '):
+                in_func = True
+                func_lines = [line]
                 name_match = re.search(r'@([a-zA-Z0-9_.]+)', line)
-                if name_match:
-                    stripped_funcs.add(name_match.group(1))
-                    
-                if line.strip().startswith("declare"):
-                    # Nếu là declare, chỉ bỏ qua dòng này
-                    continue
+                func_name = name_match.group(1) if name_match else None
+            else:
+                new_lines.append(line)
+        else:
+            func_lines.append(line)
+            if line.startswith('}'):
+                in_func = False
+                has_asm = any('asm sideeffect' in l for l in func_lines)
+                if has_asm:
+                    if func_name:
+                        stripped_funcs.add(func_name)
                 else:
-                    # Nếu là define, bắt đầu bỏ qua block hàm
-                    in_function_to_strip = True
-                    brace_count = 0
-                    if '{' in line:
-                        brace_count += line.count('{') - line.count('}')
-                    continue
-        else:
-            brace_count += line.count('{') - line.count('}')
-            if brace_count <= 0 and '}' in line:
-                in_function_to_strip = False
-            continue
-            
-        # Dọn dẹp structs/unions CPU ảo của McSema - Giữ lại để đảm bảo compile không bị lỗi unsized type ở các pass trung gian
-        # if re.match(r'^%struct\.', line) or re.match(r'^%union\.', line):
-        #     continue
-            
-        # Xóa global register state
-        if re.match(r'^@__mcsema_reg_state\s*=', line):
-            continue
-            
-        new_lines.append(line)
-        
-    if main_native_name:
-        # Check signature of main_native_name
-        match = re.search(r'define\s+[^@]*@' + re.escape(main_native_name) + r'\s*\(([^)]*)\)', content)
-        num_params = 0
-        params_str = ""
-        if match:
-            params_str = match.group(1).strip()
-            if params_str:
-                num_params = len([p for p in params_str.split(',') if p.strip()])
-        
-        calls_str = "\n".join(init_array_calls)
-        if calls_str:
-            calls_str += "\n"
-            
-        if num_params == 0:
-            main_ir = f"""
-define dso_local i32 @main(i32 %argc, ptr %argv) {{
-entry:
-{calls_str}  %res = call i64 @{main_native_name}()
-  ret i32 0
-}}
-"""
-        else:
-            params = [p.strip().split() for p in params_str.split(',') if p.strip()]
-            arg1_type = params[0][0] if len(params) > 0 else "i64"
-            arg2_type = params[1][0] if len(params) > 1 else "i64"
-            
-            argc_val = "%argc.ext" if arg1_type == "i64" else "%argc"
-            argv_val = "%argv.int" if arg2_type == "i64" else "%argv"
-            
-            main_ir = f"""
-define dso_local i32 @main(i32 %argc, ptr %argv) {{
-entry:
-{calls_str}  %argc.ext = sext i32 %argc to i64
-  %argv.int = ptrtoint ptr %argv to i64
-  %res = call i64 @{main_native_name}({arg1_type} {argc_val}, {arg2_type} {argv_val})
-  ret i32 0
-}}
-"""
-        new_lines.append(main_ir)
-        if "main" in stripped_funcs:
-            stripped_funcs.remove("main")
-            
-    # Thêm declarations và stubs cho tất cả các hàm bị xóa
-    content_so_far = '\n'.join(new_lines)
-    stubs_list = []
-    
-    if re.search(r'@__remill_function_call\b', content_so_far):
-        stubs_list.append("""
-define ptr @__remill_function_call(ptr %0, i64 %1, ptr %2) {
-entry:
-  ret ptr %2
-}""")
-    if re.search(r'@__remill_jump\b', content_so_far):
-        stubs_list.append("""
-define ptr @__remill_jump(ptr %0, i64 %1, ptr %2) {
-entry:
-  ret ptr %2
-}""")
-
-    if "__remill_function_call" in stripped_funcs:
-        stripped_funcs.remove("__remill_function_call")
-    if "__remill_jump" in stripped_funcs:
-        stripped_funcs.remove("__remill_jump")
-        
-    for func in sorted(stripped_funcs):
-        # Không tạo stub cho __mcsema_ để giữ IR sạch 100%
-        if func.startswith("__mcsema_"):
-            continue
-        if re.search(rf'@{func}\b', content_so_far):
-            stubs_list.append(f"""
-define void @{func}() {{
-entry:
-  ret void
-}}""")
-        
-    if stubs_list:
-        stubs_ir = "\n".join(stubs_list)
-        new_lines.append(stubs_ir)
-        
-    cleaned_content = '\n'.join(new_lines)
+                    new_lines.extend(func_lines)
+    content = '\n'.join(new_lines)
+    print(f"DEBUG: Stripped functions: {sorted(list(stripped_funcs))}")
+    print(f"DEBUG: main_wrapper defined in content: {'@main_wrapper' in content}")
     for func in stripped_funcs:
-        cleaned_content = cleaned_content.replace(f"ptr @{func}", "ptr null")
-    cleaned_content = re.sub(r'\n{3,}', '\n\n', cleaned_content)
-    cleaned_content = clean_unused_types_and_globals(cleaned_content)
+        content = re.sub(rf'ptr @{re.escape(func)}\b', 'ptr null', content)
+    
+    # 5. Xác định kiểu dữ liệu thực tế của @__mcsema_reg_state (thường bị đổi tên thành %0)
+    state_type = "%struct.State"
+    state_type_match = re.search(r'@__mcsema_reg_state\s*=\s*(?:thread_local\([^)]*\)\s+)?global\s+([%a-zA-Z0-9_.]+)', content)
+    if state_type_match:
+        state_type = state_type_match.group(1)
+
+    # 6. Thêm hàm main mới sạch sẽ gọi main_wrapper và trả về RAX từ State
+    new_main_ir = f"""
+@__lifter_guest_stack = internal global [8388608 x i8] zeroinitializer, align 16
+
+define dso_local i32 @main(i32 %argc, ptr %argv) {{
+entry:
+  %fs_base = call i64 asm sideeffect "movq %fs:0, $0", "=r"()
+  %fs_base_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 5, i32 7
+  store i64 %fs_base, ptr %fs_base_ptr, align 8
+  %rsp_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 13, i32 0, i32 0
+  store i64 ptrtoint (ptr getelementptr inbounds ([8388608 x i8], ptr @__lifter_guest_stack, i64 0, i64 8388480) to i64), ptr %rsp_ptr, align 8
+  %edi_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 11, i32 0, i32 0
+  store i32 %argc, ptr %edi_ptr, align 4
+  %rsi_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 9, i32 0, i32 0
+  %argv_val = ptrtoint ptr %argv to i64
+  store i64 %argv_val, ptr %rsi_ptr, align 8
+  %res = call ptr @main_wrapper(ptr null, i64 {pc_val}, ptr null)
+  %rax_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 1, i32 0, i32 0
+  %rax_val = load i64, ptr %rax_ptr, align 8
+  %res_i32 = trunc i64 %rax_val to i32
+  ret i32 %res_i32
+}}
+"""
+    content += new_main_ir
+        
+    cleaned_content = clean_unused_types_and_globals(content)
     with open(ll_path, 'w') as f:
         f.write(cleaned_content)
     return True

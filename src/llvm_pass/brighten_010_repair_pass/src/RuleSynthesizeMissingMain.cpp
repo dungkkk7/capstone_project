@@ -56,7 +56,25 @@ static std::optional<uint64_t> ParseDataPCFromName(StringRef Name) {
 }
 
 static std::optional<uint64_t> ParseSubPCFromName(StringRef Name) {
-  return ParseHexSuffix(Name, "sub_");
+  if (auto PC = ParseHexSuffix(Name, "sub_")) {
+    return PC;
+  }
+  // Try to parse as purely numeric (hex) if it does not have a prefix, since strip renames sub_A5A0 to a5a0 or similar hex/decimal
+  uint64_t PC = 0;
+  if (!Name.empty() && std::isxdigit(static_cast<unsigned char>(Name[0]))) {
+    // If it's a valid hex number, try to parse it
+    bool all_hex = true;
+    for (char c : Name) {
+      if (!std::isxdigit(static_cast<unsigned char>(c))) {
+        all_hex = false;
+        break;
+      }
+    }
+    if (all_hex && !Name.getAsInteger(16, PC)) {
+      return PC;
+    }
+  }
+  return std::nullopt;
 }
 
 static std::optional<uint64_t> ParseEntryPCFromName(StringRef Name) {

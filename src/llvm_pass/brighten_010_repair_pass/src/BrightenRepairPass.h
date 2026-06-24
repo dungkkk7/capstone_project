@@ -31,38 +31,22 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
 
   // Bổ sung/chuẩn hoá luồng gọi Remill.
   static bool DefineRemillControlHelpers(llvm::Module &M);
-  static bool AddRemillEntryDispatchers(llvm::Module &M);
-  static bool NormalizeRemillFunctionCalls(llvm::Module &M);
   static bool SynthesizeMissingMain(llvm::Module &M);
-  static bool PruneUnusedRemillMcSemaHelpers(llvm::Module &M);
-
-  // Sửa/hardening runtime state do McSema sinh ra.
-  static bool GrowMcSemaSyntheticStack(llvm::Module &M);
-
-  // Cleanup conservative cho noise do McSema/Remill sinh ra.
-  static bool ForwardMcSemaFlagLoads(llvm::Module &M);
-  static bool PruneDeadMcSemaFlagStores(llvm::Module &M);
-  static bool PruneDeadRipStores(llvm::Module &M);
-  static bool ForwardMcSemaStateLoads(llvm::Module &M);
-  static bool ForwardMcSemaGuestStackSlots(llvm::Module &M);
-  static bool PruneUnusedMcSemaStateStores(llvm::Module &M);
-  static bool InlineMcSemaExternalWrappers(llvm::Module &M);
-
-  // Hardening cho các thư viện C dễ gây lỗi bộ nhớ.
-  static bool HardenUnsafeScanf(llvm::Module &M);
-  static bool CanonicalizeObfuscatedCompares(llvm::Module &M);
-  static bool SanitizeDangerousStrlen(llvm::Module &M);
-  static bool RepairRemillVarArgFPCalls(llvm::Module &M);
-  static bool RepairRemillX87LibCalls(llvm::Module &M);
-  static bool RepairMcSemaX87PseudoDoubleLoads(llvm::Module &M);
-
-  // Chuẩn hoá đích nhảy và khôi phục target fallthrough thiếu.
-  static bool NormalizeJumpTableTargets(llvm::Module &M);
-  static bool RecoverNoReturnFallthroughTargets(llvm::Module &M);
 
   // Chặn/guard các lời gọi gián tiếp thô (inttoptr call).
-  static bool RepairMcSemaRawIndirectCallStack(llvm::Module &M);
-  static bool GuardRawIndirectCalls(llvm::Module &M);
+  static bool ResolveAliases(llvm::Module &M);
+  static bool PreserveCalleeSavedRegisters(llvm::Module &M);
+
+  // Sửa chữa các phép toán trừ/cộng địa chỉ global vào RSP do OLLVM stack-randomize tạo ra
+  static bool RepairObfuscatedStackSubtractions(llvm::Module &M);
+
+  // Viết lại các stub gọi external libc qua __remill_function_call
+  // thành direct call với args đọc từ x86_64 State registers.
+  static bool ImplementExternCallBridge(llvm::Module &M);
+
+  // Thay thế ptrtoint(@callback_sub_N) bằng ConstantInt(N) trước khi optimizer
+  // xóa các naked callback thunks và khiến mọi function pointer thành null.
+  static bool FixCallbackFunctionPointerStores(llvm::Module &M);
 };
 
 // Tạo (hoặc lấy lại) helper fallback trả về memory không đổi.

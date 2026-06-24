@@ -18,8 +18,15 @@ static bool IsLiftedInternalFunction(const Function &F) {
     return false;
   }
   StringRef Name = F.getName();
-  return Name.starts_with("sub_") || Name.starts_with("callback_sub_") ||
-         Name.starts_with("__lifter_refine_");
+  if (Name.starts_with("sub_") || Name.starts_with("callback_sub_") ||
+      Name.starts_with("__lifter_refine_")) {
+    return true;
+  }
+  // Check if it starts with a digit (e.g. "12", "73" etc, renamed by strip)
+  if (!Name.empty() && std::isdigit(static_cast<unsigned char>(Name[0]))) {
+    return true;
+  }
+  return false;
 }
 
 static bool StripReturnAttrs(LLVMContext &Ctx, AttributeList &Attrs) {
