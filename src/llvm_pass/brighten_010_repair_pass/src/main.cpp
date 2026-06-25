@@ -28,10 +28,10 @@ PreservedAnalyses BrightenRepairPass::run(Module &M, ModuleAnalysisManager &) {
 
   Changed |= RepairObfuscatedStackSubtractions(M);
 
-  // Quan trọng: chạy TRƯỚC khi optimizer xóa callback thunks
   Changed |= FixCallbackFunctionPointerStores(M);
-
   Changed |= ImplementExternCallBridge(M);
+  Changed |= RepairExternalFunctionPointerDereferences(M);
+  Changed |= RepairIntToPtrDereferences(M);
   Changed |= DefineRemillControlHelpers(M);
 
   Changed |= SynthesizeMissingMain(M);

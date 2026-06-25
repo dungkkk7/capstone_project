@@ -213,5 +213,57 @@ std::optional<uint64_t> InferWritableBytesAtPointer(Value *Ptr, const DataLayout
   return Total - Offset;
 }
 
+uint64_t ResolveGuestAddress(GlobalValue *GV, Module &M) {
+  StringRef Name = GV->getName();
+  if (Name.starts_with("data_")) {
+    StringRef Hex = Name.drop_front(5);
+    uint64_t Val = 0;
+    if (!Hex.getAsInteger(16, Val)) {
+      return Val;
+    }
+  } else if (Name.starts_with("sub_")) {
+    StringRef Hex = Name.drop_front(4);
+    size_t Underscore = Hex.find('_');
+    if (Underscore != StringRef::npos) {
+      Hex = Hex.substr(0, Underscore);
+    }
+    uint64_t Val = 0;
+    if (!Hex.getAsInteger(16, Val)) {
+      return Val;
+    }
+  }
+
+  // Scan functions, global variables and aliases for ext_<hex>_<name>
+  std::string Suffix = (Twine("_") + Name).str();
+
+  for (Function &F : M) {
+    StringRef FName = F.getName();
+    if (FName.starts_with("ext_") && FName.ends_with(Suffix)) {
+      StringRef Hex = FName.drop_front(4).drop_back(Suffix.size());
+      uint64_t Val = 0;
+      if (!Hex.getAsInteger(16, Val)) return Val;
+    }
+  }
+  for (GlobalVariable &GVar : M.globals()) {
+    StringRef GName = GVar.getName();
+    if (GName.starts_with("ext_") && GName.ends_with(Suffix)) {
+      StringRef Hex = GName.drop_front(4).drop_back(Suffix.size());
+      uint64_t Val = 0;
+      if (!Hex.getAsInteger(16, Val)) return Val;
+    }
+  }
+  for (GlobalAlias &GA : M.aliases()) {
+    StringRef AName = GA.getName();
+    if (AName.starts_with("ext_") && AName.ends_with(Suffix)) {
+      StringRef Hex = AName.drop_front(4).drop_back(Suffix.size());
+      uint64_t Val = 0;
+      if (!Hex.getAsInteger(16, Val)) return Val;
+    }
+  }
+
+  return 0;
+}
+
 }  // namespace brighten_repair
+
 

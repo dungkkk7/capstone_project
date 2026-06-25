@@ -282,9 +282,9 @@ def evaluate_string_content(s: str, vars_dict: dict) -> str:
                 elif func_name == "repeat":
                     return str(gen_repeat(*eval_args, vars_dict=vars_dict))
                 else:
-                    raise ValueError(f"Unknown generator function: {func_name}")
+                    return match.group(0)
             next_str, count = pattern.subn(repl, current)
-            if count == 0:
+            if count == 0 or next_str == current:
                 break
             current = next_str
             

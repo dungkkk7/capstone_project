@@ -124,7 +124,7 @@ def main(argv=None):
             print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu làm đẹp mã IR (Brightening) cho: {path}...{Color.END}")
             
             try:
-                brighten_success = brighten_ir(output_bc, output_brightened_bc)
+                brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=path)
                 if brighten_success:
                     output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
                     print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
@@ -158,9 +158,9 @@ def main(argv=None):
                             generator=generator,
                             timeout=1.0,
                             compare_stderr=False,
-                            num_workers=4
+                            num_workers=1
                         )
-                        fuzzer.cleanup()
+                        # fuzzer.cleanup()
                         
                         ratio = fuzz_report["equivalence_ratio"]
                         ratio_color = Color.GREEN if ratio == 100.0 else (Color.YELLOW if ratio >= 90.0 else Color.RED)
@@ -176,6 +176,14 @@ def main(argv=None):
                             print(f"      {Color.GREEN}[✓] XÁC NHẬN SEMANTIC EQUIVALENT.{Color.END}")
                         else:
                             print(f"      {Color.RED}[✗] CẢNH BÁO: PHÁT HIỆN SỰ KHÁC BIỆT SEMANTIC CHƯA ĐƯỢC GIẢI QUYẾT.{Color.END}")
+                            if "mismatch_examples" in fuzz_report and fuzz_report["mismatch_examples"]:
+                                print(f"      {Color.YELLOW}--- Chi tiết mẫu không khớp (Mismatch Samples) ---{Color.END}")
+                                for sample in fuzz_report["mismatch_examples"]:
+                                    print(f"      * [Mẫu #{sample['index']}]: Lý do: {sample['reason']}")
+                                    print(f"        Arguments: {sample['args']}")
+                                    print(f"        Stdin: {repr(sample['stdin'])}")
+                                    print(f"        Prog1 (Brightened): status={sample['prog1']['status']}, code={sample['prog1']['returncode']}, stdout={repr(sample['prog1']['stdout'])}, stderr={repr(sample['prog1']['stderr'])}")
+                                    print(f"        Prog2 (Obfuscated): status={sample['prog2']['status']}, code={sample['prog2']['returncode']}, stdout={repr(sample['prog2']['stdout'])}, stderr={repr(sample['prog2']['stderr'])}")
                             
                     except Exception as fe:
                         print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")

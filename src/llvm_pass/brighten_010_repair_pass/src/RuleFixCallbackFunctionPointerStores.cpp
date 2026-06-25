@@ -30,6 +30,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/IRBuilder.h"
 
 namespace brighten_repair {
 
@@ -93,49 +94,68 @@ static std::optional<uint64_t> ExtractCallbackPC(Value *V) {
 bool BrightenRepairPass::FixCallbackFunctionPointerStores(Module &M) {
   bool Changed = false;
   LLVMContext &Ctx = M.getContext();
+  Type *Int64Ty = Type::getInt64Ty(Ctx);
 
-  // Scan tất cả instructions để tìm uses của ptrtoint(@callback_sub_*)
-  SmallVector<std::pair<Use *, uint64_t>, 32> Replacements;
-
+  // 1. Thao tác trên tất cả các hàm callback_sub_*
+  // Thay thế tất cả các references tới callback_sub_N bằng inttoptr(N)
+  SmallVector<Function *, 16> Callbacks;
   for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    StringRef Name = F.getName();
+    if (Name.starts_with("callback_sub_")) {
+      Callbacks.push_back(&F);
+    }
+  }
+
+  for (Function *F : Callbacks) {
+    auto PC = ParseCallbackPC(F->getName());
+    if (!PC.has_value()) continue;
+
+    Constant *IntVal = ConstantInt::get(Int64Ty, *PC);
+    Constant *Replacement = ConstantExpr::getIntToPtr(IntVal, F->getType());
+    F->replaceAllUsesWith(Replacement);
+    Changed = true;
+  }
+
+  // 2. Scan và dọn dẹp các PtrToIntInst thô đang chứa inttoptr
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
     for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        for (Use &U : I.operands()) {
-          auto PC = ExtractCallbackPC(U.get());
-          if (PC.has_value()) {
-            Replacements.push_back({&U, *PC});
+      for (auto InstIt = BB.begin(); InstIt != BB.end(); ) {
+        Instruction &I = *InstIt++;
+        if (auto *PTI = dyn_cast<PtrToIntInst>(&I)) {
+          Value *Op = PTI->getOperand(0);
+          if (auto *CE = dyn_cast<ConstantExpr>(Op)) {
+            if (CE->getOpcode() == Instruction::IntToPtr) {
+              Value *IntVal = CE->getOperand(0);
+              if (IntVal->getType() == PTI->getType()) {
+                PTI->replaceAllUsesWith(IntVal);
+                PTI->eraseFromParent();
+                Changed = true;
+              } else {
+                IRBuilder<> B(PTI);
+                Value *CastVal = B.CreateIntCast(IntVal, PTI->getType(), false);
+                PTI->replaceAllUsesWith(CastVal);
+                PTI->eraseFromParent();
+                Changed = true;
+              }
+            }
+          } else if (auto *GV = dyn_cast<GlobalValue>(Op->stripPointerCasts())) {
+            // Trường hợp PtrToIntInst trực tiếp trên sub_ hoặc callback_sub_ chưa bị thay thế
+            if (auto PC = ParseCallbackPC(GV->getName())) {
+              Value *ConstVal = ConstantInt::get(PTI->getType(), *PC);
+              PTI->replaceAllUsesWith(ConstVal);
+              PTI->eraseFromParent();
+              Changed = true;
+            }
           }
         }
       }
     }
   }
 
-  // Cũng scan constant initializers của global variables.
-  // (Ví dụ: @5 có thể chứa ptrtoint(@callback_sub_*))
-  // Global init không dễ patch trực tiếp — bỏ qua cho safety.
-
-  // Apply replacements
-  for (auto &[U, PC] : Replacements) {
-    // Xác định integer type của use
-    Type *UsedTy = U->get()->getType();
-    Type *IntTy = nullptr;
-    if (UsedTy->isIntegerTy()) {
-      IntTy = UsedTy;
-    } else if (auto *CE = dyn_cast<ConstantExpr>(U->get())) {
-      // ptrtoint result type
-      if (CE->getOpcode() == Instruction::PtrToInt) {
-        IntTy = CE->getType();
-      }
-    }
-    if (!IntTy) {
-      continue;
-    }
-    auto *NewVal = ConstantInt::get(cast<IntegerType>(IntTy), PC);
-    U->set(NewVal);
-    Changed = true;
-  }
-
   return Changed;
 }
 
 }  // namespace brighten_repair
+

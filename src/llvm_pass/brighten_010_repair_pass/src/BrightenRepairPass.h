@@ -47,12 +47,20 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
   // Thay thế ptrtoint(@callback_sub_N) bằng ConstantInt(N) trước khi optimizer
   // xóa các naked callback thunks và khiến mọi function pointer thành null.
   static bool FixCallbackFunctionPointerStores(llvm::Module &M);
+
+  // Sửa chữa các phép truy cập bộ nhớ gián tiếp/offset từ con trỏ hàm external.
+  static bool RepairExternalFunctionPointerDereferences(llvm::Module &M);
+
+  // Sửa chữa các phép chuyển đổi inttoptr chứa địa chỉ guest hoặc địa chỉ bị truncate.
+  static bool RepairIntToPtrDereferences(llvm::Module &M);
 };
 
 // Tạo (hoặc lấy lại) helper fallback trả về memory không đổi.
 llvm::Function *GetOrCreateNoopCallHelper(llvm::Module &M, llvm::FunctionType *FTy);
 // Tìm lifted subroutine theo PC dạng tên sub_<hex>.
 llvm::Function *FindLiftedSubroutineByPC(llvm::Module &M, uint64_t PC);
+// Giải quyết địa chỉ khách cho một GlobalValue.
+uint64_t ResolveGuestAddress(llvm::GlobalValue *GV, llvm::Module &M);
 
 // Các helper nhận diện mẫu IR nhỏ phục vụ rule canonicalization.
 bool IsConstInt(llvm::Value *V, int64_t SignedVal);

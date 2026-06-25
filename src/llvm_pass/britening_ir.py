@@ -71,7 +71,7 @@ PLUGINS = [
 ]
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,strip"
+    "brighten-repair-pass,always-inline"
 )
 
 class Color:
@@ -159,7 +159,7 @@ def clean_unused_types_and_globals(content):
         
     return content
 
-def clean_ir_file(ll_path):
+def clean_ir_file(ll_path, binary_path=None):
     if not os.path.exists(ll_path):
         return False
     with open(ll_path, 'r') as f:
@@ -255,7 +255,7 @@ entry:
         f.write(cleaned_content)
     return True
 
-def brighten_ir(input_path, output_path=None):
+def brighten_ir(input_path, output_path=None, binary_path=None):
     """
     Chạy llvm opt với các pass plugin làm đẹp IR (brightening) và dọn dẹp boilerplate
     """
@@ -310,7 +310,7 @@ def brighten_ir(input_path, output_path=None):
                     print(f"{Color.BLUE}[*] Đang tiến hành dọn dẹp boilerplate và struct rác trong: {output_ll}{Color.END}")
                     
                     # Gọi hàm dọn dẹp file .ll
-                    if clean_ir_file(output_ll):
+                    if clean_ir_file(output_ll, binary_path):
                         print(f"{Color.GREEN}[✓] Dọn dẹp IR thành công!{Color.END}")
                         
                         # Biên dịch ngược lại .ll đã dọn dẹp thành .bc
