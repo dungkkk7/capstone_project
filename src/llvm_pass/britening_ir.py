@@ -72,11 +72,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 PLUGINS = [
     "brighten_010_repair_pass/build/BrightenRepairPass.so",
     "brighten_020_devirt_pass/build/BrightenDevirtPass.so",
-    "brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so"
+    "brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so",
+    "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so"
 ]
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-devirt-pass,always-inline,brighten-stack-frame-pass,brighten-state-ssa-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
 )
 
 class Color:
