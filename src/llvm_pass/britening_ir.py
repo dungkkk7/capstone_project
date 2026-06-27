@@ -3,54 +3,57 @@
 
 
 """
-[ ĐẦU VÀO: obfuscated.bc ] (Mã máy dạng thô được nâng lên LLVM IR, chứa cấu trúc CPU State)
-         │  
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 1: Sửa chữa & Chuyển đổi trạng thái ban đầu                  │
-│ 1. brighten-repair-pass         ──> Sửa các lỗi cấu trúc IR khi nâng   │
-│ 2. brighten-state-ssa-pass      ──> Chuyển các thanh ghi thô thành SSA │
-│ 3. [LLVM Chuẩn]* (sroa, gvn...) ──> Tối ưu hóa, dọn dẹp biến cục bộ    │
-└────────────────────────────────────────────────────────────────────────┘
-         │  
-         ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 2: Khôi phục cấu trúc Ngăn xếp (Stack)                       │
-│ 1. brighten-stack-ssa-pass      ──> Phân tích toán học trên RSP        │
-│ 2. brighten-state-forward-pass  ──> Lan truyền giá trị thanh ghi       │
-│ 3. [LLVM Chuẩn]* (sroa, cse...) ──> Rút gọn các lệnh load/store bộ nhớ │
-└────────────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌────────────────────────────────────────────────────────────────────────---- ┐
-│ GIAI ĐOẠN 3: Khôi phục Giao diện Hàm (ABI) & Liên kết Hàm                   │
-│ 1. brighten-host-frame-pass      ──> Tái tạo lại 'alloca' cho Stack         │ 
-│ 2. brighten-libc-prototype-pass  ──> Khôi phục hàm hệ thống (printf...)     │
-│ 3. brighten-internal-call-argify ──> Biến thanh ghi truyền vào thành tham số│
-│ 4. Lặp lại (stack-ssa, forward..)──> Đưa các tham số vừa tạo vào SSA        │
-│ 5. [LLVM Chuẩn]* (gvn,cfg...)    ──> Ép cấu trúc hàm về dạng chuẩn          │
-└────────────────────────────────────────────────────────────────────────---- ┘
-         │
-         ▼
-┌────────────────────────────────────────────────────────────────────────  ┐
-│ GIAI ĐOẠN 4: Phân loại bộ nhớ & Loại bỏ mã chết (DCE)                    │
-│ 1. brighten-memory-classify-pass ──> Phân biệt vùng nhớ Stack/Heap/Global│
-│ 2. brighten-host-frame-pass      ──> Cập nhật lại khung bộ nhớ           │
-│ 3. dce (Dead Code Elimination)   ──> Xóa bỏ các lệnh giả lập thừa        │
-│ 4. brighten-libc-prototype-pass  ──> Đồng bộ lại với các hàm libc        │
-│ 5. [LLVM Chuẩn]* (Vòng lặp cuối)  ──> Thu gọn tối đa cấu trúc IR         │
-└────────────────────────────────────────────────────────────────────────  ┘
-         |
-         │ (Toàn bộ chuỗi trên được lặp lại một lần nữa ở cuối lệnh để đảm bảo sạch mã)
-         ▼
-┌────────────────────────────────────────────────────────────────────────  ┐
-│ VÒNG LẶP CUỐI (Clean-up Phase)                                           │
-│ Chạy lại toàn bộ chuỗi: stack-ssa -> forward -> argify -> sroa -> gvn    │
-│ Nhằm dọn dẹp các tàn dư phát sinh sau khi phân loại bộ nhớ ở GĐ 4.       │
-└────────────────────────────────────────────────────────────────────────  ┘
-         │
-         ▼
-[ ĐẦU RA: obfuscated_brightened.bc ] (Mã IR đã được khử một phần cấu trúc McSema)
+### Phân tích chi tiết và đề xuất bổ sung cho từng Phase:
+
+  #### PHASE 0 — Symbol Discovery
+
+  - Chi tiết: Nên thu thập thêm bảng ký hiệu từ ELF gốc (nếu có) hoặc xuất từ IDA Pro để ánh xạ địa chỉ PC (sub_XXXX) sang tên hàm gốc ngay từ đầu.
+  - Verify: Đảm bảo metadata được đính kèm dưới dạng LLVM Named Metadata (ví dụ: !brighten.symbols) để các pass sau truy vấn trực tiếp.
+
+  #### PHASE 1 — Structural Repair
+
+  - Chi tiết: Cần bổ sung việc loại bỏ các directive vô nghĩa của Assembly cũ được nhúng qua inline asm của McSema (gây crash compiler mới).
+
+  #### PHASE 2 — Call / Return Devirtualization
+
+  - Chi tiết:
+      - brighten-remill-return-lower: Chuyển đổi lệnh return thô (McSema lưu RAX vào State rồi RET void) thành lệnh ret trả về giá trị thực tế của RAX.
+      - Cần đảm bảo globaldce chạy ở cuối phase này để xóa bỏ các hàm thunk/dispatcher không còn ai gọi.
+
+  #### PHASE 3 — Register State SSA
+
+  - Chi tiết:
+      - brighten-flag-lower: Chuyển đổi toàn bộ các phép tính toán cờ CPU phức tạp (CF, ZF...) thành các biến logic i1 cục bộ. LLVM gvn và dce sau đó sẽ dễ dàng tối giản các lệnh so sánh nhảy.
+
+  #### PHASE 4 — Stack Frame Recovery
+
+  - Chi tiết:
+      - brighten-stack-model: Dựng lại bản đồ stack frame bằng cách tìm toán hạng RSP trong SSA.
+      - brighten-host-frame: Thay thế các truy cập offset bằng alloca. Chú ý: Cần xử lý trường hợp biến cục bộ bị truyền địa chỉ (passed by pointer/reference) sang hàm khác.
+
+  #### PHASE 5 — ABI Recovery / Function Signature Rewrite
+
+  - Chi tiết:
+      - brighten-livein-liveout: Phân tích thanh ghi nào là đầu vào (Live-in) và đầu ra (Live-out) của từng hàm để quyết định danh sách tham số.
+      - Chạy deadargelim ngay sau đó để xóa bỏ các tham số thừa (ví dụ hàm không dùng đến RDX nhưng ABI mặc định truyền vào).
+
+  #### PHASE 6 — Global/Data Recovery
+
+  - Chi tiết:
+      - brighten-string-recover: Cực kỳ quan trọng. Quét phân đoạn @seg_...__rodata để dựng lại @.str = private unnamed_addr constant ....
+      - brighten-jumptable-recover: Nhận diện cấu trúc Jump Table từ lệnh switch gián tiếp để khôi phục cấu trúc điều khiển chuẩn (chuỗi if-else hoặc switch-case sạch).
+
+  #### PHASE 7 — Type Reconstruction
+
+  - Chi tiết:
+      - Phân tích các lệnh getelementptr dựa trên kiểu dữ liệu của alloca ở Phase 4 để nhóm các biến đơn lẻ thành struct/array C gốc.
+
+  #### PHASE 8 — Final Native Cleanup
+
+  - Chi tiết:
+      - brighten-type-cleanup: Loại bỏ định nghĩa %struct.State và các type thừa ra khỏi IR.
+      - function-attrs: Tự động suy luận các thuộc tính hàm (readonly, readnone, nofree) để IR đầu ra chuẩn hóa tối đa.
+
 
 """
 import os
@@ -67,11 +70,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 
 # Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
 PLUGINS = [
-    "brighten_010_repair_pass/build/BrightenRepairPass.so"
+    "brighten_010_repair_pass/build/BrightenRepairPass.so",
+    "brighten_020_devirt_pass/build/BrightenDevirtPass.so"
 ]
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,always-inline"
+    "brighten-repair-pass,brighten-devirt-pass,always-inline"
 )
 
 class Color:
