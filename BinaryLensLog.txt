@@ -1,0 +1,1 @@
+[BinaryLens] WARNING: Failed to create Edit menu container

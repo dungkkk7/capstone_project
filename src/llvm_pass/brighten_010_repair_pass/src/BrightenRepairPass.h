@@ -40,6 +40,10 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
   // Sửa chữa các phép toán trừ/cộng địa chỉ global vào RSP do OLLVM stack-randomize tạo ra
   static bool RepairObfuscatedStackSubtractions(llvm::Module &M);
 
+  // McSema sometimes materializes guest immediates as ptrtoint(GEP @seg_...)
+  // constants. Canonicalize those to guest virtual addresses before host codegen.
+  static bool CanonicalizeGuestAddressConstants(llvm::Module &M);
+
   // Viết lại các stub gọi external libc qua __remill_function_call
   // thành direct call với args đọc từ x86_64 State registers.
   static bool ImplementExternCallBridge(llvm::Module &M);

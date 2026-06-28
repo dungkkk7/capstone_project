@@ -221,6 +221,16 @@ uint64_t ResolveGuestAddress(GlobalValue *GV, Module &M) {
     if (!Hex.getAsInteger(16, Val)) {
       return Val;
     }
+  } else if (Name.starts_with("seg_")) {
+    StringRef Hex = Name.drop_front(4);
+    size_t End = Hex.find('_');
+    if (End != StringRef::npos) {
+      Hex = Hex.substr(0, End);
+    }
+    uint64_t Val = 0;
+    if (!Hex.getAsInteger(16, Val)) {
+      return Val;
+    }
   } else if (Name.starts_with("sub_")) {
     StringRef Hex = Name.drop_front(4);
     size_t Underscore = Hex.find('_');
@@ -265,5 +275,4 @@ uint64_t ResolveGuestAddress(GlobalValue *GV, Module &M) {
 }
 
 }  // namespace brighten_repair
-
 

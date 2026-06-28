@@ -5,14 +5,17 @@
 //   2) Dynamic PC (load từ stack) → indirect call tới lifted sub_<pc>
 //
 // Thay vì noop đơn giản, ta tạo một dispatcher switch() trên tất cả
-// lifted subroutines (sub_<hex>) để handle dynamic indirect calls đúng cách.
+// lifted subroutines (sub_<hex>) và external stubs (ext_<hex>_*) để handle
+// dynamic indirect calls đúng cách.
 //
-// Các helpers còn lại (__remill_jump, __remill_function_return, ...) vẫn là noop.
+// __remill_jump cũng phải dispatch theo PC; noop làm rơi control-flow động.
+// Các helpers còn lại (__remill_function_return, ...) vẫn là noop.
 
 #include "BrightenRepairPass.h"
 
 #include <cctype>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,7 +35,6 @@ namespace {
 static bool IsSimpleNoop(StringRef Name) {
   // Các helpers này không cần dispatch — chỉ return memory.
   return Name == "__remill_function_return" ||
-         Name == "__remill_jump" ||
          Name == "__remill_missing_block" ||
          Name == "__remill_async_hyper_call";
 }
@@ -62,12 +64,15 @@ static bool DefineReturnMemory(Function &F) {
   return true;
 }
 
-// Parse tên sub_<hex> để lấy PC.
-static std::optional<uint64_t> ParseSubroutinePC(StringRef Name) {
-  if (!Name.starts_with("sub_")) {
+// Parse tên sub_<hex> hoặc ext_<hex>_* để lấy PC.
+static std::optional<uint64_t> ParseDispatchPC(StringRef Name) {
+  if (Name.starts_with("sub_")) {
+    Name = Name.drop_front(4);
+  } else if (Name.starts_with("ext_")) {
+    Name = Name.drop_front(4);
+  } else {
     return std::nullopt;
   }
-  Name = Name.drop_front(4);
   if (Name.empty()) {
     return std::nullopt;
   }
@@ -87,36 +92,37 @@ static std::optional<uint64_t> ParseSubroutinePC(StringRef Name) {
   return PC;
 }
 
-// Tạo __remill_function_call với body là switch dispatch trên tất cả sub_<pc>.
+// Tạo helper PC-dispatch với body là switch dispatch trên tất cả sub_<pc>.
 // Nếu PC match một lifted subroutine → gọi trực tiếp.
 // Default → return memory (noop fallback).
-static bool DefineRemillFunctionCallDispatcher(Function &RemillCall,
-                                               Module &M) {
-  if (!RemillCall.isDeclaration() ||
-      !HasMemoryThreadingSignature(RemillCall)) {
+static bool DefineRemillPCDispatcher(Function &Helper, Module &M) {
+  if (!Helper.isDeclaration() ||
+      !HasMemoryThreadingSignature(Helper)) {
     return false;
   }
 
   LLVMContext &Ctx = M.getContext();
-  FunctionType *FTy = RemillCall.getFunctionType();
+  FunctionType *FTy = Helper.getFunctionType();
 
-  // Thu thập tất cả lifted subroutines sub_<hex>
-  std::vector<std::pair<uint64_t, Function *>> Subroutines;
+  // Thu thập lifted subroutines và external stubs cùng signature.
+  std::vector<std::pair<uint64_t, Function *>> Targets;
+  std::set<uint64_t> SeenPCs;
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
-    auto PC = ParseSubroutinePC(F.getName());
+    auto PC = ParseDispatchPC(F.getName());
     if (!PC.has_value()) continue;
     // Chỉ chấp nhận functions với cùng signature (ptr, i64, ptr) -> ptr
     if (F.getFunctionType() != FTy) continue;
-    Subroutines.push_back({*PC, &F});
+    if (!SeenPCs.insert(*PC).second) continue;
+    Targets.push_back({*PC, &F});
   }
 
   // Tạo body
-  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", &RemillCall);
-  BasicBlock *DefaultBB = BasicBlock::Create(Ctx, "noop", &RemillCall);
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", &Helper);
+  BasicBlock *DefaultBB = BasicBlock::Create(Ctx, "noop", &Helper);
 
   // Args
-  auto ArgIt = RemillCall.arg_begin();
+  auto ArgIt = Helper.arg_begin();
   Value *StateArg = &*ArgIt++;
   Value *PCArg = &*ArgIt++;
   Value *MemArg = &*ArgIt++;
@@ -131,16 +137,16 @@ static bool DefineRemillFunctionCallDispatcher(Function &RemillCall,
   {
     IRBuilder<> B(EntryBB);
     auto *Switch = B.CreateSwitch(PCArg, DefaultBB,
-                                  static_cast<unsigned>(Subroutines.size()));
-    for (auto &[PC, Sub] : Subroutines) {
+                                  static_cast<unsigned>(Targets.size()));
+    for (auto &[PC, Target] : Targets) {
       auto *CaseVal = ConstantInt::get(
           cast<IntegerType>(PCArg->getType()), PC);
       BasicBlock *CaseBB =
-          BasicBlock::Create(Ctx, "case_" + Sub->getName(), &RemillCall);
+          BasicBlock::Create(Ctx, "case_" + Target->getName(), &Helper);
       Switch->addCase(CaseVal, CaseBB);
 
       IRBuilder<> CB(CaseBB);
-      auto *Call = CB.CreateCall(FTy, Sub, {StateArg, PCArg, MemArg});
+      auto *Call = CB.CreateCall(FTy, Target, {StateArg, PCArg, MemArg});
       CB.CreateRet(Call);
     }
   }
@@ -156,9 +162,9 @@ bool BrightenRepairPass::DefineRemillControlHelpers(Module &M) {
   for (Function &F : M) {
     StringRef Name = F.getName();
 
-    if (Name == "__remill_function_call") {
-      // Tạo dispatcher switch để handle cả static và dynamic PC.
-      Changed |= DefineRemillFunctionCallDispatcher(F, M);
+    if (Name == "__remill_function_call" || Name == "__remill_jump") {
+      // Tạo dispatcher switch để handle static/dynamic PC.
+      Changed |= DefineRemillPCDispatcher(F, M);
     } else if (IsSimpleNoop(Name)) {
       Changed |= DefineReturnMemory(F);
     }

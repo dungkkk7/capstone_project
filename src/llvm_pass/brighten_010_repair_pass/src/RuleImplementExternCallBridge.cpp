@@ -25,6 +25,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 namespace brighten_repair {
 
@@ -40,6 +41,16 @@ static constexpr uint64_t kOffRDX = 2264;
 static constexpr uint64_t kOffRCX = 2248;
 static constexpr uint64_t kOffR8  = 2344;
 static constexpr uint64_t kOffR9  = 2360;
+
+static bool IsSetjmpName(StringRef Name) {
+  return Name == "_setjmp" || Name == "setjmp" ||
+         Name == "sigsetjmp" || Name == "__sigsetjmp";
+}
+
+static bool IsLongjmpName(StringRef Name) {
+  return Name == "longjmp" || Name == "_longjmp" ||
+         Name == "siglongjmp";
+}
 
 // Load một thanh ghi i64 từ State tại byte offset đã biết.
 static Value *LoadReg(IRBuilder<> &B, Value *StatePtr, uint64_t Offset,
@@ -380,7 +391,14 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
   Value *Ret = nullptr;
 
 
-  if (Name == "_setjmp" || Name == "setjmp" || Name == "sigsetjmp" || Name == "__sigsetjmp") {
+  if (IsLongjmpName(Name)) {
+    ExtFn->addFnAttr(Attribute::NoReturn);
+    ExtFn->removeFnAttr(Attribute::ReturnsTwice);
+  }
+
+  if (IsSetjmpName(Name)) {
+    ExtFn->addFnAttr(Attribute::ReturnsTwice);
+    ExtFn->removeFnAttr(Attribute::NoReturn);
 
     // 1. Allocate space on the host stack to save guest GPRs (17 * 8 = 136 bytes)
     auto *SavedGPRs = B.CreateAlloca(ArrayType::get(B.getInt64Ty(), 17), nullptr, "saved_gprs");
@@ -414,16 +432,65 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
       SaveRegToBuf(kGPRs[idx], idx);
     }
 
-    // Call _setjmp
+    // Call setjmp-family with the original McSema declaration type.
+    // LLVM must see this as returns_twice; otherwise later SSA/cleanup passes
+    // can legally miscompile the non-local return edge.
     Value *Env = LoadReg(B, StatePtr, 2296/*RDI*/, "env_val");
     Function *TranslateFn = GetOrCreateTranslateGuestPointer(*M);
     Value *EnvPtr = B.CreateCall(TranslateFn, {Env, B.getTrue()});
-    
-    FunctionCallee SetjmpFn = M->getOrInsertFunction(Name, B.getInt64Ty(), B.getPtrTy());
-    Ret = B.CreateCall(SetjmpFn, {EnvPtr});
+
+    auto CoerceArg = [&](Value *RawI64, Type *ParamTy,
+                         bool ForcePointer) -> Value * {
+      if (ParamTy->isPointerTy()) {
+        if (ForcePointer) {
+          return B.CreateBitCast(EnvPtr, ParamTy);
+        }
+        Value *Translated = B.CreateCall(TranslateFn, {RawI64, B.getTrue()});
+        return B.CreateBitCast(Translated, ParamTy);
+      }
+      if (ParamTy->isIntegerTy()) {
+        Value *V = RawI64;
+        if (ForcePointer) {
+          V = B.CreatePtrToInt(EnvPtr, B.getInt64Ty());
+        }
+        unsigned Bits = ParamTy->getIntegerBitWidth();
+        if (Bits < 64) {
+          return B.CreateTrunc(V, ParamTy);
+        }
+        if (Bits > 64) {
+          return B.CreateZExt(V, ParamTy);
+        }
+        return V;
+      }
+      return UndefValue::get(ParamTy);
+    };
+
+    SmallVector<Value *, 4> SetjmpArgs;
+    for (unsigned i = 0; i < NumParams; ++i) {
+      Type *ParamTy = ExtFTy->getParamType(i);
+      if (i == 0) {
+        SetjmpArgs.push_back(CoerceArg(Env, ParamTy, true));
+      } else if (i < 6) {
+        Value *RawI64 = LoadReg(B, StatePtr, kArgRegs[i], "setjmp_arg_reg");
+        SetjmpArgs.push_back(CoerceArg(RawI64, ParamTy, false));
+      } else {
+        SetjmpArgs.push_back(UndefValue::get(ParamTy));
+      }
+    }
+
+    auto *SetjmpCall = B.CreateCall(ExtFTy, ExtFn, SetjmpArgs);
+    SetjmpCall->setCallingConv(ExtFn->getCallingConv());
+    SetjmpCall->addFnAttr(Attribute::ReturnsTwice);
+    Ret = SetjmpCall;
 
     // Check return value
-    Value *IsZero = B.CreateICmpEQ(Ret, B.getInt64(0));
+    Value *RetI64 = Ret;
+    if (Ret->getType()->isIntegerTy() && !Ret->getType()->isIntegerTy(64)) {
+      RetI64 = B.CreateZExt(Ret, B.getInt64Ty());
+    } else if (Ret->getType()->isPointerTy()) {
+      RetI64 = B.CreatePtrToInt(Ret, B.getInt64Ty());
+    }
+    Value *IsZero = B.CreateICmpEQ(RetI64, B.getInt64(0));
     
     BasicBlock *NormalBB = BasicBlock::Create(Ctx, "setjmp.normal", &Stub);
     BasicBlock *RestoreBB = BasicBlock::Create(Ctx, "setjmp.restore", &Stub);
@@ -607,7 +674,12 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
       }
       Args.push_back(Arg);
     }
-    Ret = B.CreateCall(ExtFTy, ExtFn, Args);
+    auto *DirectCall = B.CreateCall(ExtFTy, ExtFn, Args);
+    DirectCall->setCallingConv(ExtFn->getCallingConv());
+    if (IsLongjmpName(Name)) {
+      DirectCall->addFnAttr(Attribute::NoReturn);
+    }
+    Ret = DirectCall;
   }
 
   // Store return value vào RAX nếu cần
@@ -622,6 +694,30 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
   } else {
     B.CreateRetVoid();
   }
+}
+
+static bool InlineDirectCallsTo(Function &F) {
+  SmallVector<CallBase *, 8> Calls;
+  for (User *U : F.users()) {
+    auto *CB = dyn_cast<CallBase>(U);
+    if (!CB || CB->getCalledFunction() != &F) {
+      continue;
+    }
+    Calls.push_back(CB);
+  }
+
+  bool Changed = false;
+  for (CallBase *CB : Calls) {
+    InlineFunctionInfo IFI;
+    InlineResult Res = InlineFunction(*CB, IFI);
+    if (Res.isSuccess()) {
+      Changed = true;
+    } else {
+      llvm::errs() << "BrightenRepair: failed to inline setjmp stub "
+                   << F.getName() << ": " << Res.getFailureReason() << "\n";
+    }
+  }
+  return Changed;
 }
 
 bool BrightenRepairPass::ImplementExternCallBridge(Module &M) {
@@ -647,7 +743,7 @@ bool BrightenRepairPass::ImplementExternCallBridge(Module &M) {
     if (Function *ExtFn = MatchExternCallStub(F, RemillCall)) {
       Worklist.push_back({&F, ExtFn});
       StringRef Name = ExtFn->getName();
-      if (Name == "_setjmp" || Name == "setjmp" || Name == "sigsetjmp" || Name == "__sigsetjmp") {
+      if (IsSetjmpName(Name)) {
         SetjmpStubs.push_back(&F);
       }
     }
@@ -662,6 +758,8 @@ bool BrightenRepairPass::ImplementExternCallBridge(Module &M) {
     for (Function *Stub : SetjmpStubs) {
       Stub->removeFnAttr(Attribute::NoInline);
       Stub->addFnAttr(Attribute::AlwaysInline);
+      Stub->addFnAttr(Attribute::ReturnsTwice);
+      Changed |= InlineDirectCallsTo(*Stub);
     }
   }
 

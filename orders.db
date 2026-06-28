@@ -1,2 +1,0 @@
-# ORDER|id|customer|itemCount|subtotal|discount|tax|total|status|createdAt
-# ITEM|productId|productName|qty|unitPrice|lineTotal
