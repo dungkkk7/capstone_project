@@ -23,19 +23,49 @@ PreservedAnalyses BrightenRepairPass::run(Module &M, ModuleAnalysisManager &) {
     }
   }
 
+  Changed |= DiscoverSymbols(M);
+  Changed |= StripOptimizationBlockers(M);
+  Changed |= StripInvalidInlineAsm(M);
+  Changed |= ProtectSetjmpCallers(M);
   Changed |= StripPoisonDrivingFlags(M);
   Changed |= StripPoisonDrivingAttributes(M);
+  Changed |= SimplifyObfuscatedMBA(M);
+
+  Changed |= ForwardFlagLoads(M);
+  Changed |= ForwardLocalFlagState(M);
+  Changed |= ForwardMcSemaFlagLoads(M);
+  Changed |= PruneDeadMcSemaFlagStores(M);
+  Changed |= PruneDeadRipStores(M);
+  Changed |= ForwardMcSemaStateLoads(M);
+  Changed |= ForwardMcSemaGuestStackSlots(M);
+  Changed |= PruneUnusedMcSemaStateStores(M);
+  Changed |= InlineMcSemaExternalWrappers(M);
 
   Changed |= CanonicalizeGuestAddressConstants(M);
   Changed |= RepairObfuscatedStackSubtractions(M);
 
+  Changed |= RepairMcSemaRawIndirectCallStack(M);
+  Changed |= GuardRawIndirectCalls(M);
   Changed |= FixCallbackFunctionPointerStores(M);
   Changed |= ImplementExternCallBridge(M);
   Changed |= RepairExternalFunctionPointerDereferences(M);
   Changed |= RepairIntToPtrDereferences(M);
   Changed |= DefineRemillControlHelpers(M);
 
+  Changed |= GrowMcSemaSyntheticStack(M);
+  Changed |= HardenUnsafeScanf(M);
+  Changed |= CanonicalizeObfuscatedCompares(M);
+  Changed |= SanitizeDangerousStrlen(M);
+  Changed |= RepairRemillVarArgFPCalls(M);
+  Changed |= RepairRemillX87LibCalls(M);
+  Changed |= RepairMcSemaX87PseudoDoubleLoads(M);
+  Changed |= NormalizeJumpTableTargets(M);
+  Changed |= RecoverNoReturnFallthroughTargets(M);
+  Changed |= AddRemillEntryDispatchers(M);
   Changed |= SynthesizeMissingMain(M);
+  Changed |= NormalizeRemillFunctionCalls(M);
+  Changed |= PruneUnusedRemillMcSemaHelpers(M);
+
   Changed |= ResolveAliases(M);
   Changed |= PreserveCalleeSavedRegisters(M);
 

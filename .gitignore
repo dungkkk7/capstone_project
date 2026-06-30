@@ -10,5 +10,7 @@ scratch/
 data/clean_src/test/
 data/obfuscated/test/
 data/test.csv
+dependency/AFLplusplus/
+
 
 

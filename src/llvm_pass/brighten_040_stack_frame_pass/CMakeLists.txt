@@ -11,6 +11,7 @@ message(STATUS "Using LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "LLVMConfig.cmake: ${LLVM_DIR}")
 
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_definitions(${LLVM_DEFINITIONS})
 
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
@@ -19,4 +20,5 @@ include(AddLLVM)
 add_llvm_pass_plugin(BrightenStackFramePass
   src/main.cpp
   src/RuleRecoverStackFrame.cpp
+  src/RuleGlobalData.cpp
 )

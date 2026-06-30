@@ -77,6 +77,46 @@ bool BrightenDevirtPass::LowerRemillReturn(Module &M) {
   bool Changed = false;
   LLVMContext &Ctx = M.getContext();
 
+  if (Function *RemillRet = M.getFunction("__remill_function_return")) {
+    SmallVector<CallInst *, 16> RetCalls;
+    for (User *U : RemillRet->users()) {
+      if (auto *CI = dyn_cast<CallInst>(U)) {
+        RetCalls.push_back(CI);
+      }
+    }
+
+    for (CallInst *CI : RetCalls) {
+      Value *MemArg = CI->getArgOperand(2);
+      Function *F = CI->getFunction();
+      
+      CI->replaceAllUsesWith(MemArg);
+      
+      Value *OldRetVal = nullptr;
+      ReturnInst *TheRet = nullptr;
+      for (BasicBlock &BB : *F) {
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+          OldRetVal = RI->getReturnValue();
+          TheRet = RI;
+          break;
+        }
+      }
+
+      if (TheRet) {
+        TheRet->setOperand(0, MemArg);
+        if (OldRetVal && OldRetVal != MemArg) {
+          if (auto *OldI = dyn_cast<Instruction>(OldRetVal)) {
+            if (OldI->use_empty()) {
+              OldI->eraseFromParent();
+            }
+          }
+        }
+      }
+
+      CI->eraseFromParent();
+      Changed = true;
+    }
+  }
+
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
     
@@ -84,7 +124,6 @@ bool BrightenDevirtPass::LowerRemillReturn(Module &M) {
       Instruction *Term = BB.getTerminator();
       if (auto *RI = dyn_cast<ReturnInst>(Term)) {
         if (Value *RAXVal = FindRAXValueBeforeRet(RI)) {
-          // Attach metadata to ReturnInst containing the RAX return value
           Metadata *MDs[] = { ValueAsMetadata::get(RAXVal) };
           MDNode *Node = MDNode::get(Ctx, MDs);
           RI->setMetadata("brighten.return_rax", Node);

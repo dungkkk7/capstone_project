@@ -1,3 +1,5 @@
+; RUN: opt-21 -load-pass-plugin %plugin -passes=brighten-repair-pass -S %s | FileCheck-21 %s
+
 @__mcsema_reg_state = global [64 x i8] zeroinitializer
 @RAX_0_i = private alias i64, ptr @__mcsema_reg_state
 @RBX_0_i = private alias i64, ptr @__mcsema_reg_state
@@ -39,24 +41,24 @@ entry:
 }
 
 ; CHECK-LABEL: define i64 @state_load_forward
-; CHECK: store i64 %x, ptr @RBX_0_i
-; CHECK-NOT: load i64, ptr @RBX_0_i
+; CHECK: store i64 %x, ptr {{@RBX_0_i|@__mcsema_reg_state}}
+; CHECK-NOT: load i64, ptr {{@RBX_0_i|@__mcsema_reg_state}}
 ; CHECK: %y = add i64 %x, 7
 ; CHECK: ret i64 %y
 
 ; CHECK-LABEL: define i64 @state_load_keep_across_unknown_store
-; CHECK: store i64 %x, ptr @RBX_0_i
+; CHECK: store i64 %x, ptr {{@RBX_0_i|@__mcsema_reg_state}}
 ; CHECK: store i64 123, ptr %p
-; CHECK: %rbx = load i64, ptr @RBX_0_i
+; CHECK: %rbx = load i64, ptr {{@RBX_0_i|@__mcsema_reg_state}}
 ; CHECK: ret i64 %rbx
 
 ; CHECK-LABEL: define i64 @state_load_keep_across_guest_stack_store
-; CHECK: store i64 %x, ptr @RBX_0_i
-; CHECK: store i64 123, ptr %slot
-; CHECK: %rbx = load i64, ptr @RBX_0_i
+; CHECK: store i64 %x, ptr {{@RBX_0_i|@__mcsema_reg_state}}
+; CHECK: store i64 123, ptr {{%slot|%translated_ptr}}
+; CHECK: %rbx = load i64, ptr {{@RBX_0_i|@__mcsema_reg_state}}
 ; CHECK: ret i64 %rbx
 
 ; CHECK-LABEL: define i64 @state_load_keep_rax
-; CHECK: store i64 %x, ptr @RAX_0_i
-; CHECK: %rax = load i64, ptr @RAX_0_i
+; CHECK: store i64 %x, ptr {{@RAX_0_i|@__mcsema_reg_state}}
+; CHECK: %rax = load i64, ptr {{@RAX_0_i|@__mcsema_reg_state}}
 ; CHECK: %y = add i64 %rax, 7

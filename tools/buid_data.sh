@@ -15,9 +15,9 @@ COMPILE_FLAGS=(
     -O0
     -fno-vectorize
     -fno-slp-vectorize
-   # -mno-sse
-   # -mno-sse2
-   # -mno-mmx
+    -mno-sse
+    -mno-sse2
+    -mno-mmx
 )
 
 OBFUSCATE_FLAGS=(

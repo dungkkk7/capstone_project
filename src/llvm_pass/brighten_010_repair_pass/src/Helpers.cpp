@@ -43,11 +43,16 @@ Function *GetOrCreateNoopCallHelper(Module &M, FunctionType *FTy) {
 }
 
 Function *FindLiftedSubroutineByPC(Module &M, uint64_t PC) {
-  // Quy ước hàm lifted: sub_<hex_pc>.
-  std::string Name = (Twine("sub_") + Twine::utohexstr(PC)).str();
-  auto *F = M.getFunction(Name);
-  if (F && !F->isDeclaration()) {
-    return F;
+  std::string Prefix = (Twine("sub_") + Twine::utohexstr(PC)).str();
+  if (auto *F = M.getFunction(Prefix)) {
+    if (!F->isDeclaration()) return F;
+  }
+  std::string PrefixWithUnderscore = Prefix + "_";
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    if (F.getName().starts_with(PrefixWithUnderscore)) {
+      return &F;
+    }
   }
   return nullptr;
 }

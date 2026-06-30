@@ -44,8 +44,15 @@ static int64_t resolveStateOffset(Value *ptr, const DataLayout &DL) {
     }
   }
   if (auto *Arg = dyn_cast<Argument>(base)) {
-    if (Arg->getArgNo() == 0 && Arg->getParent()->getName() != "main") {
-      return total_offset;
+    if (Arg->getParent()->getName() != "main") {
+      if (Arg->getType()->isPointerTy()) {
+        StringRef Name = Arg->getName();
+        if (Name.contains_insensitive("memory") || Name.contains_insensitive("mem")) {
+          // skip memory pointer
+        } else if (Name.contains_insensitive("state") || Arg->getArgNo() == 0) {
+          return total_offset;
+        }
+      }
     }
   }
   return -1;
@@ -66,7 +73,22 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
     if (F.isDeclaration()) continue;
     if (F.getName() == "main") continue;
 
-    Value *StatePtr = (F.arg_size() > 0) ? cast<Value>(F.getArg(0)) : cast<Value>(StateGV);
+    Value *StatePtr = nullptr;
+    for (Argument &Arg : F.args()) {
+      if (Arg.getType()->isPointerTy()) {
+        StringRef Name = Arg.getName();
+        if (Name.contains_insensitive("memory") || Name.contains_insensitive("mem")) {
+          continue;
+        }
+        if (Name.contains_insensitive("state") || Arg.getArgNo() == 0) {
+          StatePtr = &Arg;
+          break;
+        }
+      }
+    }
+    if (!StatePtr) {
+      StatePtr = StateGV;
+    }
     if (!StatePtr) continue;
 
     struct FieldInfo {
@@ -193,9 +215,8 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
         } else {
           // Sub-register write (masking)
           Value *Curr = B.CreateLoad(info.type, Alloca);
-          uint64_t mask_val = ~((1ULL << val_bits) - 1);
-          if (val_bits == 64) mask_val = 0; // Avoid shift overflow if 64 bits
-          Value *Mask = ConstantInt::get(info.type, mask_val);
+          APInt MaskAP = APInt::getHighBitsSet(alloca_bits, alloca_bits - val_bits);
+          Value *Mask = ConstantInt::get(info.type, MaskAP);
           Value *Cleared = B.CreateAnd(Curr, Mask);
           Value *ZextVal = B.CreateZExt(IntStoredVal, info.type);
           Value *NewVal = B.CreateOr(Cleared, ZextVal);
@@ -227,7 +248,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
 
         if (CI->arg_size() < 1) continue;
         Value *CallStatePtr = CI->getArgOperand(0);
-        if (!CallStatePtr->getType()->isPointerTy()) continue;
+        if (CallStatePtr != StatePtr && CallStatePtr != StateGV) continue;
 
         // Flush before call
         {

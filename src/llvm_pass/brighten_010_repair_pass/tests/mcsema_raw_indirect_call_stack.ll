@@ -1,4 +1,4 @@
-; RUN: opt-16 -load-pass-plugin %plugin -passes=refine-semantic-pass -S %s | FileCheck-16 %s
+; RUN: opt-21 -load-pass-plugin %plugin -passes=brighten-repair-pass -S %s | FileCheck-21 %s
 
 @__mcsema_reg_state = global [64 x i8] zeroinitializer
 @RSP_0_i = private alias i64, ptr @__mcsema_reg_state
@@ -18,11 +18,11 @@ entry:
 }
 
 ; CHECK-LABEL: define internal ptr @sub_raw_indirect
-; CHECK: [[OLD:%[A-Za-z0-9_.]+]] = load i64, ptr @RSP_0_i
+; CHECK: [[OLD:%[A-Za-z0-9_.]+]] = load i64, ptr {{@RSP_0_i|@__mcsema_reg_state}}
 ; CHECK: [[NEW:%[A-Za-z0-9_.]+]] = add i64 [[OLD]], -8
 ; CHECK: store i64 4660, ptr
 ; CHECK: [[TARGET:%[A-Za-z0-9_.]+]] = load i64, ptr @callee_bits
-; CHECK: [[CALLEE:%[A-Za-z0-9_.]+]] = inttoptr i64 [[TARGET]] to ptr
-; CHECK: store i64 [[NEW]], ptr @RSP_0_i
-; CHECK: call i64 [[CALLEE]]
-; CHECK: store i64 [[OLD]], ptr @RSP_0_i
+; CHECK: [[CALLEE:%[A-Za-z0-9_.]+]] = call ptr @__translate_guest_pointer(i64 [[TARGET]], i1 false)
+; CHECK: store i64 [[NEW]], ptr {{@RSP_0_i|@__mcsema_reg_state}}
+; CHECK: call i64 {{.*}}[[CALLEE]]
+; CHECK: store i64 [[OLD]], ptr {{@RSP_0_i|@__mcsema_reg_state}}

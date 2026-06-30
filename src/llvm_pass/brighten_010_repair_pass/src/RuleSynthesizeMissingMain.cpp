@@ -89,6 +89,9 @@ static std::optional<uint64_t> ParseEntryPCFromName(StringRef Name) {
 
 static std::optional<uint64_t> ParseEntryPCFromValue(Value *V) {
   V = V->stripPointerCasts();
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    return CI->getZExtValue();
+  }
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     if (CE->getOpcode() == Instruction::PtrToInt && CE->getNumOperands() == 1) {
       V = CE->getOperand(0)->stripPointerCasts();

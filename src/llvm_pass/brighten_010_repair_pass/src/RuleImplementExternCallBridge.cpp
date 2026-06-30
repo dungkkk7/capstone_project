@@ -546,8 +546,14 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     };
 
     // Helper load, translate and store register
+    bool IsScanfLike = Name.contains("scanf");
     auto StoreTranslatedReg = [&](uint64_t Offset, unsigned idx, const char *name) {
       Value *Val = LoadReg(B, StatePtr, Offset, name);
+      if (IsScanfLike && idx >= 1 && idx <= 5) {
+        auto *TranslateFn = GetOrCreateTranslateGuestPointer(*M);
+        Value *HostPtr = B.CreateCall(TranslateFn, {Val, B.getFalse()}, "host_ptr");
+        Val = B.CreatePtrToInt(HostPtr, B.getInt64Ty());
+      }
       B.CreateStore(Val, GetSlot(idx));
     };
 

@@ -67,34 +67,34 @@ entry:
 }
 
 ; CHECK-LABEL: define i32 @guest_stack_forward
-; CHECK: %sp = load i64, ptr @RSP_0_i
+; CHECK: %sp = load i64, ptr {{@RSP_0_i|@__mcsema_reg_state}}
 ; CHECK: %slot_i = add i64 %sp, -4
-; CHECK: %slot = inttoptr i64 %slot_i to ptr
-; CHECK: store i32 %x, ptr %slot
-; CHECK-NOT: load i32, ptr %slot
+; CHECK: {{%slot|%translated_ptr}} = {{inttoptr i64 %slot_i to ptr|call ptr @__translate_guest_pointer\(i64 %slot_i, i1 false\)}}
+; CHECK: store i32 %x, ptr {{%slot|%translated_ptr}}
+; CHECK-NOT: load i32, ptr {{%slot|%translated_ptr}}
 ; CHECK: %y = add i32 %x, 7
 ; CHECK: ret i32 %y
 
 ; CHECK-LABEL: define i32 @guest_stack_forward_across_non_alias
-; CHECK: store i32 %x, ptr %slot0
+; CHECK: store i32 %x, ptr {{%slot0|%translated_ptr}}
 ; CHECK: store i32 %other, ptr @global_sink
-; CHECK: store i32 %other, ptr %slot1
-; CHECK-NOT: load i32, ptr %slot0
+; CHECK: store i32 %other, ptr {{%slot1|%translated_ptr1}}
+; CHECK-NOT: load i32, ptr {{%slot0|%translated_ptr}}
 ; CHECK: %y = add i32 %x, 3
 ; CHECK: ret i32 %y
 
 ; CHECK-LABEL: define i32 @guest_stack_keep_overlap
-; CHECK: store i64 %wide, ptr %slot
-; CHECK: %narrow = load i32, ptr %slot
+; CHECK: store i64 %wide, ptr {{%slot|%translated_ptr}}
+; CHECK: %narrow = load i32, ptr {{%slot|%translated_ptr}}
 ; CHECK: ret i32 %narrow
 
 ; CHECK-LABEL: define i32 @guest_stack_forward_across_reloaded_rsp
-; CHECK: store i32 %x, ptr %slot0
-; CHECK-NOT: load i32, ptr %slot1
+; CHECK: store i32 %x, ptr {{%slot0|%translated_ptr}}
+; CHECK-NOT: load i32, ptr {{%slot1|%translated_ptr1}}
 ; CHECK: ret i32 %x
 
 ; CHECK-LABEL: define i32 @guest_stack_block_changed_rsp
-; CHECK: store i32 %x, ptr %slot0
-; CHECK: store i64 %new_sp, ptr @RSP_0_i
-; CHECK: %loaded = load i32, ptr %slot1
+; CHECK: store i32 %x, ptr {{%slot0|%translated_ptr}}
+; CHECK: store i64 %new_sp, ptr {{@RSP_0_i|@__mcsema_reg_state}}
+; CHECK: %loaded = load i32, ptr {{%slot1|%translated_ptr1}}
 ; CHECK: ret i32 %loaded

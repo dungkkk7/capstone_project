@@ -27,7 +27,36 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
  private:
   // Nhóm rule xử lý cờ/attribute có thể dẫn tới poison hoặc UB giả.
   static bool StripPoisonDrivingFlags(llvm::Module &M);
+  static bool StripOptimizationBlockers(llvm::Module &M);
+  static bool DiscoverSymbols(llvm::Module &M);
+  static bool StripInvalidInlineAsm(llvm::Module &M);
+  static bool ProtectSetjmpCallers(llvm::Module &M);
+  static bool ForwardFlagLoads(llvm::Module &M);
+  static bool ForwardLocalFlagState(llvm::Module &M);
   static bool StripPoisonDrivingAttributes(llvm::Module &M);
+  static bool SimplifyObfuscatedMBA(llvm::Module &M);
+
+  static bool AddRemillEntryDispatchers(llvm::Module &M);
+  static bool NormalizeRemillFunctionCalls(llvm::Module &M);
+  static bool PruneUnusedRemillMcSemaHelpers(llvm::Module &M);
+  static bool GrowMcSemaSyntheticStack(llvm::Module &M);
+  static bool ForwardMcSemaFlagLoads(llvm::Module &M);
+  static bool PruneDeadMcSemaFlagStores(llvm::Module &M);
+  static bool PruneDeadRipStores(llvm::Module &M);
+  static bool ForwardMcSemaStateLoads(llvm::Module &M);
+  static bool ForwardMcSemaGuestStackSlots(llvm::Module &M);
+  static bool PruneUnusedMcSemaStateStores(llvm::Module &M);
+  static bool InlineMcSemaExternalWrappers(llvm::Module &M);
+  static bool HardenUnsafeScanf(llvm::Module &M);
+  static bool CanonicalizeObfuscatedCompares(llvm::Module &M);
+  static bool SanitizeDangerousStrlen(llvm::Module &M);
+  static bool RepairRemillVarArgFPCalls(llvm::Module &M);
+  static bool RepairRemillX87LibCalls(llvm::Module &M);
+  static bool RepairMcSemaX87PseudoDoubleLoads(llvm::Module &M);
+  static bool NormalizeJumpTableTargets(llvm::Module &M);
+  static bool RecoverNoReturnFallthroughTargets(llvm::Module &M);
+  static bool RepairMcSemaRawIndirectCallStack(llvm::Module &M);
+  static bool GuardRawIndirectCalls(llvm::Module &M);
 
   // Bổ sung/chuẩn hoá luồng gọi Remill.
   static bool DefineRemillControlHelpers(llvm::Module &M);

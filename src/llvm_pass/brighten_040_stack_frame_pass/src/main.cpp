@@ -10,6 +10,9 @@ PreservedAnalyses BrightenStackFramePass::run(Module &M, ModuleAnalysisManager &
   bool Changed = false;
 
   Changed |= RecoverStackFrame(M);
+  Changed |= RecoverStrings(M);
+
+
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

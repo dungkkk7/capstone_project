@@ -11,7 +11,5 @@ entry:
 
 ; CHECK-LABEL: define internal ptr @ext_1000_malloc
 ; CHECK-SAME: #[[EXT_ATTR:[0-9]+]]
-; CHECK-LABEL: define internal ptr @sub_2000
-; CHECK-SAME: #[[SUB_ATTR:[0-9]+]]
+; CHECK-LABEL: define internal ptr @sub_2000(ptr %state, i64 %pc, ptr %memory) {
 ; CHECK: attributes #[[EXT_ATTR]] = { alwaysinline
-; CHECK: attributes #[[SUB_ATTR]] = { noinline

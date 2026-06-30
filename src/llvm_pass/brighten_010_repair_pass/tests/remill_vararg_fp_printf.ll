@@ -1,4 +1,4 @@
-; RUN: opt-16 -load-pass-plugin %plugin -passes=refine-semantic-pass -S %s | FileCheck-16 %s
+; RUN: opt-21 -load-pass-plugin %plugin -passes=brighten-repair-pass -S %s | FileCheck-21 %s
 
 %struct.State = type { [64 x i8] }
 
@@ -29,6 +29,6 @@ entry:
 }
 
 ; CHECK-LABEL: define ptr @sub_1000
-; CHECK: [[FP:%[0-9]+]] = load double, ptr @XMM0_0_d
-; CHECK: call i32 (ptr, ...) @printf(ptr @fmt, double [[FP]])
+; CHECK: [[FP:%[0-9]+]] = load double, ptr {{@XMM0_0_d|@__mcsema_reg_state}}
+; CHECK: call i32 (ptr, ...) @printf(ptr @fmt_obj, double [[FP]])
 ; CHECK-NOT: call ptr @ext_4010_printf

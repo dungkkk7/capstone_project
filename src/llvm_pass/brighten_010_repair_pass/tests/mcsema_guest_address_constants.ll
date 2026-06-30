@@ -1,5 +1,7 @@
 ; RUN: opt-21 -load-pass-plugin %plugin -passes=brighten-repair-pass -S %s | FileCheck-21 %s
 
+@__mcsema_reg_state = global [4096 x i8] zeroinitializer
+
 @seg_1000__init_1b = internal constant [65536 x i8] zeroinitializer
 @seg_2000__data = internal global [32 x i8] zeroinitializer
 @data_2008 = internal alias i8, getelementptr inbounds ([32 x i8], ptr @seg_2000__data, i64 0, i64 8)
@@ -33,7 +35,7 @@ entry:
 
 define i8 @guest_load_keeps_native_pointer() {
 ; CHECK-LABEL: @guest_load_keeps_native_pointer
-; CHECK: load i8, ptr @data_2008
+; CHECK: load i8, ptr {{getelementptr|@data_2008}}
 entry:
   %v = load i8, ptr @data_2008
   ret i8 %v

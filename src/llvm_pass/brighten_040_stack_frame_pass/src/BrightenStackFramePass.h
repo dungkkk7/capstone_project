@@ -12,6 +12,7 @@ public:
 
   // Phase 4 Rules
   static bool RecoverStackFrame(llvm::Module &M);
+  static bool RecoverStrings(llvm::Module &M);
 };
 
 } // namespace brighten_stack_frame

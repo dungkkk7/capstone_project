@@ -71,14 +71,18 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 # Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
 PLUGINS = [
     "brighten_010_repair_pass/build/BrightenRepairPass.so",
-   "brighten_020_devirt_pass/build/BrightenDevirtPass.so",
+    "brighten_020_devirt_pass/build/BrightenDevirtPass.so",
     "brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so",
-    "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so"
+    "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so",
+    "brighten_050_abi_recovery_pass/build/BrightenABIRecoveryPass.so",
+    "brighten_060_global_data_pass/build/BrightenGlobalDataPass.so",
+    "brighten_070_type_reconstruct_pass/build/BrightenTypeReconstructPass.so",
+    "brighten_080_native_cleanup_pass/build/BrightenNativeCleanupPass.so"
 ]
 
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-devirt-pass,always-inline,brighten-stack-frame-pass,brighten-state-ssa-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-devirt-pass,globaldce,always-inline,brighten-stack-frame-pass,brighten-state-ssa-pass,brighten-global-data-pass,brighten-abi-recovery-pass,deadargelim,always-inline,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,brighten-type-reconstruct-pass,gvn,dce,brighten-native-cleanup-pass,deadargelim,globaldce"
 )
 
 class Color:
@@ -166,6 +170,26 @@ def clean_unused_types_and_globals(content):
         
     return content
 
+
+def find_direct_main_target(content):
+    match = re.search(
+        r'define\s+[^@{]*@main_wrapper\b[^{]*\{[\s\S]*?(?:tail\s+)?call\s+ptr\s+@'
+        r'(?P<target>sub_[A-Za-z0-9_.]+)\(ptr\s+(?:nonnull\s+)?@__mcsema_reg_state,\s*i64\s+[^,]+,\s*ptr\s+%[A-Za-z0-9_.]+\)',
+        content,
+    )
+    if not match:
+        return None
+    return match.group('target')
+
+
+def can_synthesize_mcsema_main(content, state_type):
+    if '@__mcsema_reg_state' not in content:
+        return False
+    if not state_type.startswith('%'):
+        return False
+    type_pattern = rf'^{re.escape(state_type)}\s*=\s*type\b'
+    return re.search(type_pattern, content, re.MULTILINE) is not None
+
 def clean_ir_file(ll_path, binary_path=None):
     if not os.path.exists(ll_path):
         return False
@@ -215,7 +239,8 @@ def clean_ir_file(ll_path, binary_path=None):
             if line.startswith('}'):
                 in_func = False
                 has_asm = any('asm sideeffect' in l for l in func_lines)
-                if has_asm:
+                should_strip = has_asm and func_name in {"main", "start"}
+                if should_strip:
                     if func_name:
                         stripped_funcs.add(func_name)
                 else:
@@ -232,8 +257,52 @@ def clean_ir_file(ll_path, binary_path=None):
     if state_type_match:
         state_type = state_type_match.group(1)
 
-    # 6. Thêm hàm main mới sạch sẽ gọi main_wrapper và trả về RAX từ State
-    new_main_ir = f"""
+    direct_main_target = find_direct_main_target(content)
+    can_synth_main = can_synthesize_mcsema_main(content, state_type)
+    target_pc_val = pc_val
+    if direct_main_target:
+        target_pc_match = re.match(r'sub_([0-9a-fA-F]+)(?:_|$)', direct_main_target)
+        if target_pc_match:
+            target_pc_val = int(target_pc_match.group(1), 16)
+
+    # 6. Thêm hàm main mới sạch sẽ nếu module thực sự còn McSema state khả dụng.
+    if can_synth_main and direct_main_target:
+        early_init = "  call void @__mcsema_early_init()\n" if "@__mcsema_early_init" in content else ""
+        new_main_ir = f"""
+@__lifter_guest_stack = internal global [8388608 x i8] zeroinitializer, align 16
+
+define dso_local i32 @main(i32 %argc, ptr %argv) {{
+entry:
+{early_init}  %state_alloca = alloca [4096 x i8], align 1
+  call void @llvm.memset.p0.i64(ptr align 16 %state_alloca, i8 0, i64 4096, i1 false)
+  %fs_base = call i64 asm sideeffect "movq %fs:0, $0", "=r"()
+  %local_fs_base_ptr = getelementptr {state_type}, ptr %state_alloca, i32 0, i32 5, i32 7
+  store i64 %fs_base, ptr %local_fs_base_ptr, align 8
+  %fs_base_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 5, i32 7
+  store i64 %fs_base, ptr %fs_base_ptr, align 8
+  %local_rsp_ptr = getelementptr {state_type}, ptr %state_alloca, i32 0, i32 6, i32 13, i32 0, i32 0
+  store i64 ptrtoint (ptr getelementptr inbounds ([8388608 x i8], ptr @__lifter_guest_stack, i64 0, i64 8388480) to i64), ptr %local_rsp_ptr, align 8
+  %rsp_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 13, i32 0, i32 0
+  store i64 ptrtoint (ptr getelementptr inbounds ([8388608 x i8], ptr @__lifter_guest_stack, i64 0, i64 8388480) to i64), ptr %rsp_ptr, align 8
+  %local_edi_ptr = getelementptr {state_type}, ptr %state_alloca, i32 0, i32 6, i32 11, i32 0, i32 0
+  store i32 %argc, ptr %local_edi_ptr, align 4
+  %edi_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 11, i32 0, i32 0
+  store i32 %argc, ptr %edi_ptr, align 4
+  %local_rsi_ptr = getelementptr {state_type}, ptr %state_alloca, i32 0, i32 6, i32 9, i32 0, i32 0
+  %argv_val = ptrtoint ptr %argv to i64
+  store i64 %argv_val, ptr %local_rsi_ptr, align 8
+  %rsi_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 9, i32 0, i32 0
+  store i64 %argv_val, ptr %rsi_ptr, align 8
+  call ptr @{direct_main_target}(ptr %state_alloca, i64 {target_pc_val}, ptr null)
+  %rax_ptr = getelementptr {state_type}, ptr %state_alloca, i32 0, i32 6, i32 1, i32 0, i32 0
+  %rax_val = load i64, ptr %rax_ptr, align 8
+  %res_i32 = trunc i64 %rax_val to i32
+  ret i32 %res_i32
+}}
+"""
+        content += new_main_ir
+    elif can_synth_main:
+        new_main_ir = f"""
 @__lifter_guest_stack = internal global [8388608 x i8] zeroinitializer, align 16
 
 define dso_local i32 @main(i32 %argc, ptr %argv) {{
@@ -255,7 +324,9 @@ entry:
   ret i32 %res_i32
 }}
 """
-    content += new_main_ir
+        content += new_main_ir
+    else:
+        print("DEBUG: Skip synthetic main (no usable McSema state struct)")
         
     cleaned_content = clean_unused_types_and_globals(content)
     with open(ll_path, 'w') as f:
