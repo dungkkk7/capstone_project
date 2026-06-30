@@ -1,6 +1,6 @@
 # Binary lifting with revng
 
-Pipeline hiện tại dùng revng thay cho MC-Sema.
+Pipeline hiện tại dùng revng.
 
 Luồng xử lý:
 
