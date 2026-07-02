@@ -183,6 +183,9 @@ def main(argv=None):
                         ratio_color = Color.GREEN if ratio == 100.0 else (Color.YELLOW if ratio >= 90.0 else Color.RED)
                         
                         print(f"      {Color.BOLD}Kết quả kiểm tra Semantic Equivalence:{Color.END}")
+                        if "afl_stats" in fuzz_report:
+                            stats = fuzz_report["afl_stats"]
+                            print(f"      - AFL++ Coverage: {stats['bitmap_cvg']} bitmap | {stats['paths_total']} paths | {stats['execs_done']} execs ({stats['execs_per_sec']} execs/s)")
                         print(f"      - Tổng số lần chạy: {fuzz_report['total_runs']}")
                         print(f"      - Khớp hoàn toàn (Matches): {Color.GREEN}{fuzz_report['matches']}{Color.END}")
                         print(f"      - Không khớp (Mismatches): {Color.RED if fuzz_report['mismatches'] > 0 else Color.GRAY}{fuzz_report['mismatches']}{Color.END}")
