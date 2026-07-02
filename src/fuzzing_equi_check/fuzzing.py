@@ -484,22 +484,24 @@ class SemanticFuzzer:
         self.bin2: Optional[str] = None
         
         # AFL++ path setup:
-        # Ưu tiên 1: AFL++ cài sẵn trên hệ thống (PATH) — /usr/local/bin/afl-cc, afl-fuzz
-        # Ưu tiên 2: AFL++ build local trong dependency/AFLplusplus/
-        _sys_afl_cc   = shutil.which("afl-cc")
-        _sys_afl_fuzz = shutil.which("afl-fuzz")
-        _local_afl_dir = os.path.join(self.project_root, "dependency", "AFLplusplus")
+        # Ưu tiên 1: Local dependency/AFLplusplus/ (prebuilt, đảm bảo reproducible)
+        # Ưu tiên 2: AFL++ cài sẵn trên hệ thống (PATH) — /usr/local/bin/afl-cc
+        _local_afl_dir  = os.path.join(self.project_root, "dependency", "AFLplusplus")
+        _local_afl_cc   = os.path.join(_local_afl_dir, "afl-cc")
+        _local_afl_fuzz = os.path.join(_local_afl_dir, "afl-fuzz")
 
-        if _sys_afl_cc and _sys_afl_fuzz:
-            # Dùng system-installed AFL++ (ví dụ: /usr/local/bin)
-            self.afl_path  = os.path.dirname(_sys_afl_cc)
-            self.afl_cc    = _sys_afl_cc
-            self.afl_fuzz  = _sys_afl_fuzz
+        if os.path.exists(_local_afl_cc) and os.path.exists(_local_afl_fuzz):
+            # Dùng local prebuilt AFL++ trong dependency/AFLplusplus/
+            self.afl_path = _local_afl_dir
+            self.afl_cc   = _local_afl_cc
+            self.afl_fuzz = _local_afl_fuzz
         else:
-            # Fallback: local dependency/AFLplusplus/
-            self.afl_path  = _local_afl_dir
-            self.afl_cc    = os.path.join(_local_afl_dir, "afl-cc")
-            self.afl_fuzz  = os.path.join(_local_afl_dir, "afl-fuzz")
+            # Fallback: system-installed AFL++ (e.g. /usr/local/bin)
+            _sys_afl_cc   = shutil.which("afl-cc")
+            _sys_afl_fuzz = shutil.which("afl-fuzz")
+            self.afl_path = os.path.dirname(_sys_afl_cc) if _sys_afl_cc else _local_afl_dir
+            self.afl_cc   = _sys_afl_cc   or _local_afl_cc
+            self.afl_fuzz = _sys_afl_fuzz or _local_afl_fuzz
 
     def compile(self) -> Tuple[str, str]:
         """Compiles the target files into the local temporary directory."""
