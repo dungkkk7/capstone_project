@@ -28,12 +28,27 @@ def main(argv=None):
 
     # Kiểm tra tham số
     if len(argv) < 1:
-        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv>{Color.END}")
+        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv> [--no-cache] [--force-relift]{Color.END}")
+        return 1
+
+    # Phân tích tham số cache từ command line
+    use_cache = "--no-cache" not in argv
+    force_relift = "--force-relift" in argv
+    # Lọc ra các flag để lấy đường dẫn CSV
+    positional_args = [a for a in argv if not a.startswith("--")]
+    if not positional_args:
+        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv> [--no-cache] [--force-relift]{Color.END}")
         return 1
 
     # CSV chứa danh sách binary bị obfuscate
-    list_obfuscated_bin = argv[0]
+    list_obfuscated_bin = positional_args[0]
     print(f"{Color.BLUE}[*] Danh sách tệp binary cần lift: {list_obfuscated_bin}{Color.END}")
+    if not use_cache:
+        print(f"{Color.YELLOW}[!] Lifting cache: TẮT (--no-cache){Color.END}")
+    elif force_relift:
+        print(f"{Color.YELLOW}[!] Lifting cache: BẮT BUỘC LIFT LẠI (--force-relift){Color.END}")
+    else:
+        print(f"{Color.GREEN}[✓] Lifting cache: BẬT — Các binary đã lift sẽ được tái sử dụng.{Color.END}")
 
     # Đọc danh sách các tệp binary từ tệp CSV
     if not os.path.exists(list_obfuscated_bin):
@@ -115,7 +130,9 @@ def main(argv=None):
         output_bc = os.path.join(case_output_dir, f"{base_name}.bc")
 
         # Gọi hàm lift_binary từ module binary_lifting.lifting, truyền output_bc chỉ định thư mục pipeline con
-        success = lift_binary(binary_path=path, output=output_bc)
+        # use_cache và force_relift được truyền từ tham số dòng lệnh
+        success = lift_binary(binary_path=path, output=output_bc,
+                              use_cache=use_cache, force_relift=force_relift)
         if success:
             print(f"{Color.GREEN}[✓] Nâng mã (Lift) thành công cho: {path}{Color.END}")
             
