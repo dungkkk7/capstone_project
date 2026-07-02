@@ -483,10 +483,23 @@ class SemanticFuzzer:
         self.bin1: Optional[str] = None
         self.bin2: Optional[str] = None
         
-        # AFL++ path setup
-        self.afl_path = os.path.join(self.project_root, "dependency", "AFLplusplus")
-        self.afl_cc = os.path.join(self.afl_path, "afl-cc")
-        self.afl_fuzz = os.path.join(self.afl_path, "afl-fuzz")
+        # AFL++ path setup:
+        # Ưu tiên 1: AFL++ cài sẵn trên hệ thống (PATH) — /usr/local/bin/afl-cc, afl-fuzz
+        # Ưu tiên 2: AFL++ build local trong dependency/AFLplusplus/
+        _sys_afl_cc   = shutil.which("afl-cc")
+        _sys_afl_fuzz = shutil.which("afl-fuzz")
+        _local_afl_dir = os.path.join(self.project_root, "dependency", "AFLplusplus")
+
+        if _sys_afl_cc and _sys_afl_fuzz:
+            # Dùng system-installed AFL++ (ví dụ: /usr/local/bin)
+            self.afl_path  = os.path.dirname(_sys_afl_cc)
+            self.afl_cc    = _sys_afl_cc
+            self.afl_fuzz  = _sys_afl_fuzz
+        else:
+            # Fallback: local dependency/AFLplusplus/
+            self.afl_path  = _local_afl_dir
+            self.afl_cc    = os.path.join(_local_afl_dir, "afl-cc")
+            self.afl_fuzz  = os.path.join(_local_afl_dir, "afl-fuzz")
 
     def compile(self) -> Tuple[str, str]:
         """Compiles the target files into the local temporary directory."""
