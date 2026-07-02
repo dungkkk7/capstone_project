@@ -11,7 +11,7 @@ PreservedAnalyses BrightenDevirtPass::run(Module &M, ModuleAnalysisManager &) {
 
   Changed |= DevirtualizeRemillCalls(M);
   Changed |= LowerRemillReturn(M);
-  Changed |= LowerLibcCalls(M);
+  // Changed |= LowerLibcCalls(M);
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

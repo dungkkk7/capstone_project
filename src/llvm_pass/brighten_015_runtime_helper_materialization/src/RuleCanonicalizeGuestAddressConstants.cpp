@@ -1,4 +1,5 @@
-#include "BrightenRepairPass.h"
+#include "BrightenRuntimeHelperPass.h"
+#include "Helpers.h"
 
 #include <limits>
 #include <optional>
@@ -10,7 +11,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
 
-namespace brighten_repair {
+namespace brighten_runtime {
 
 using namespace llvm;
 
@@ -48,7 +49,7 @@ std::optional<uint64_t> ResolveGuestPointerConstant(Value *Ptr, Module &M,
   Value *DirectBase = Ptr->stripPointerCasts();
   if (auto *GV = dyn_cast<GlobalValue>(DirectBase)) {
     if (IsGuestNamedAddress(GV) || AllowExternal) {
-      uint64_t GuestAddr = ResolveGuestAddress(GV, M);
+      uint64_t GuestAddr = ResolveGuestAddress(GV);
       if (GuestAddr != 0) {
         return GuestAddr;
       }
@@ -73,7 +74,7 @@ std::optional<uint64_t> ResolveGuestPointerConstant(Value *Ptr, Module &M,
     return std::nullopt;
   }
 
-  uint64_t GuestBase = ResolveGuestAddress(GV, M);
+  uint64_t GuestBase = ResolveGuestAddress(GV);
   if (GuestBase == 0) {
     return std::nullopt;
   }
@@ -238,7 +239,7 @@ Constant *FoldGuestAddressConstant(Constant *C, Module &M, bool &Changed,
 
 }  // namespace
 
-bool BrightenRepairPass::CanonicalizeGuestAddressConstants(Module &M) {
+bool BrightenRuntimeHelperPass::CanonicalizeGuestAddressConstants(Module &M) {
   bool Changed = false;
 
   for (GlobalVariable &GV : M.globals()) {
@@ -284,4 +285,4 @@ bool BrightenRepairPass::CanonicalizeGuestAddressConstants(Module &M) {
   return Changed;
 }
 
-}  // namespace brighten_repair
+}  // namespace brighten_runtime

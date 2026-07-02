@@ -28,10 +28,7 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
   // Nhóm rule xử lý cờ/attribute có thể dẫn tới poison hoặc UB giả.
   static bool StripPoisonDrivingFlags(llvm::Module &M);
   static bool StripPoisonDrivingAttributes(llvm::Module &M);
-
-  // Bổ sung/chuẩn hoá luồng gọi Remill.
-  static bool DefineRemillControlHelpers(llvm::Module &M);
-  static bool SynthesizeMissingMain(llvm::Module &M);
+  static bool StripMcSemaInlineAsmDirectives(llvm::Module &M);
 
   // Chặn/guard các lời gọi gián tiếp thô (inttoptr call).
   static bool ResolveAliases(llvm::Module &M);
@@ -40,23 +37,9 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
   // Sửa chữa các phép toán trừ/cộng địa chỉ global vào RSP do OLLVM stack-randomize tạo ra
   static bool RepairObfuscatedStackSubtractions(llvm::Module &M);
 
-  // McSema sometimes materializes guest immediates as ptrtoint(GEP @seg_...)
-  // constants. Canonicalize those to guest virtual addresses before host codegen.
-  static bool CanonicalizeGuestAddressConstants(llvm::Module &M);
-
-  // Viết lại các stub gọi external libc qua __remill_function_call
-  // thành direct call với args đọc từ x86_64 State registers.
-  static bool ImplementExternCallBridge(llvm::Module &M);
-
   // Thay thế ptrtoint(@callback_sub_N) bằng ConstantInt(N) trước khi optimizer
   // xóa các naked callback thunks và khiến mọi function pointer thành null.
   static bool FixCallbackFunctionPointerStores(llvm::Module &M);
-
-  // Sửa chữa các phép truy cập bộ nhớ gián tiếp/offset từ con trỏ hàm external.
-  static bool RepairExternalFunctionPointerDereferences(llvm::Module &M);
-
-  // Sửa chữa các phép chuyển đổi inttoptr chứa địa chỉ guest hoặc địa chỉ bị truncate.
-  static bool RepairIntToPtrDereferences(llvm::Module &M);
 };
 
 // Tạo (hoặc lấy lại) helper fallback trả về memory không đổi.

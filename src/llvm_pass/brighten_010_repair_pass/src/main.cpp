@@ -12,8 +12,7 @@ namespace brighten_repair {
 using namespace llvm;
 
 PreservedAnalyses BrightenRepairPass::run(Module &M, ModuleAnalysisManager &) {
-  // Chạy rule theo thứ tự cố định: từ vệ sinh metadata/flags,
-  // tới sửa linkability, hardening, rồi chuẩn hoá control-flow/calls.
+  // Phase 1 chỉ strip/repair/normalize. Runtime emulation/bridges chạy ở phase sau.
   bool Changed = false;
 
   if (auto *F = M.getFunction("main_wrapper")) {
@@ -23,21 +22,14 @@ PreservedAnalyses BrightenRepairPass::run(Module &M, ModuleAnalysisManager &) {
     }
   }
 
+  Changed |= StripMcSemaInlineAsmDirectives(M);
+  Changed |= ResolveAliases(M);
+
   Changed |= StripPoisonDrivingFlags(M);
   Changed |= StripPoisonDrivingAttributes(M);
 
-  Changed |= CanonicalizeGuestAddressConstants(M);
   Changed |= RepairObfuscatedStackSubtractions(M);
-
   Changed |= FixCallbackFunctionPointerStores(M);
-  Changed |= ImplementExternCallBridge(M);
-  Changed |= RepairExternalFunctionPointerDereferences(M);
-  Changed |= RepairIntToPtrDereferences(M);
-  Changed |= DefineRemillControlHelpers(M);
-
-  Changed |= SynthesizeMissingMain(M);
-  Changed |= ResolveAliases(M);
-  Changed |= PreserveCalleeSavedRegisters(M);
 
   // Có thay đổi IR thì invalidates tất cả; ngược lại giữ nguyên analyses.
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

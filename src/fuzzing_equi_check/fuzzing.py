@@ -667,7 +667,7 @@ class SemanticFuzzer:
                     with open(ll_path, 'r', encoding='utf-8') as f:
                         content = f.read()
                     
-                    content = re.sub(r'define\s+([a-zA-Z0-9_\s\*]+)@main\s*\(', r'define \1@target_main(', content)
+                    content = re.sub(r'@main\b', '@target_main', content)
                     
                     modified_file1 = os.path.join(self.tmp_dir, "modified_file1.ll")
                     with open(modified_file1, 'w', encoding='utf-8') as f:

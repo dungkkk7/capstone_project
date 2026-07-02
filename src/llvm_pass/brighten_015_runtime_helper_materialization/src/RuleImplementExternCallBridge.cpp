@@ -15,7 +15,8 @@
 // Approach này đúng vì McSema luôn marshal args vào register slots
 // trước khi gọi external stub.
 
-#include "BrightenRepairPass.h"
+#include "BrightenRuntimeHelperPass.h"
+#include "Helpers.h"
 
 #include <vector>
 #include <map>
@@ -27,7 +28,7 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
-namespace brighten_repair {
+namespace brighten_runtime {
 
 using namespace llvm;
 
@@ -111,7 +112,7 @@ static Function *MatchExternCallStub(Function &F, Function *RemillCall) {
         uint64_t Addr = ConstInt->getZExtValue();
         Module *M = F.getParent();
         for (Function &Fn : *M) {
-          if (Fn.isDeclaration() && ResolveGuestAddress(&Fn, *M) == Addr) {
+          if (Fn.isDeclaration() && ResolveGuestAddress(&Fn) == Addr) {
             ExtFn = &Fn;
             break;
           }
@@ -136,7 +137,7 @@ static Function *MatchExternCallStub(Function &F, Function *RemillCall) {
     uint64_t Addr = ConstInt->getZExtValue();
     Module *M = F.getParent();
     for (Function &Fn : *M) {
-      if (Fn.isDeclaration() && ResolveGuestAddress(&Fn, *M) == Addr) {
+      if (Fn.isDeclaration() && ResolveGuestAddress(&Fn) == Addr) {
         return &Fn;
       }
     }
@@ -145,164 +146,7 @@ static Function *MatchExternCallStub(Function &F, Function *RemillCall) {
   return nullptr;
 }
 
-static Function *GetOrCreateTranslateGuestPointer(Module &M) {
-  if (auto *F = M.getFunction("__translate_guest_pointer")) {
-    return F;
-  }
 
-  LLVMContext &Ctx = M.getContext();
-  Type *Int64Ty = Type::getInt64Ty(Ctx);
-  Type *Int1Ty = Type::getInt1Ty(Ctx);
-  Type *PtrTy = PointerType::get(Ctx, 0);
-
-  FunctionType *FTy = FunctionType::get(PtrTy, {Int64Ty, Int1Ty}, false);
-  Function *F = Function::Create(FTy, GlobalValue::InternalLinkage, "__translate_guest_pointer", M);
-
-  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", F);
-  IRBuilder<> B(EntryBB);
-  Value *GuestAddr = F->getArg(0);
-  Value *IsKnownPointer = F->getArg(1);
-  AllocaInst *DummyStack = B.CreateAlloca(B.getInt32Ty(), nullptr, "dummy_stack");
-
-  const DataLayout &DL = M.getDataLayout();
-
-  std::map<GlobalValue *, uint64_t> BaseAddresses;
-
-  for (GlobalVariable &GV : M.globals()) {
-    if (GV.isDeclaration()) continue;
-    uint64_t Addr = ResolveGuestAddress(&GV, M);
-    if (Addr > 0) {
-      BaseAddresses[&GV] = Addr;
-    }
-  }
-
-  for (GlobalAlias &GA : M.aliases()) {
-    uint64_t Addr = ResolveGuestAddress(&GA, M);
-    if (Addr > 0) {
-      APInt ByteOffset(DL.getPointerSizeInBits(0), 0, true);
-      Value *Base = GA.getAliasee()->stripAndAccumulateConstantOffsets(DL, ByteOffset, true);
-      if (auto *GV = dyn_cast<GlobalValue>(Base)) {
-        BaseAddresses[GV] = Addr - ByteOffset.getZExtValue();
-      }
-    }
-  }
-
-  for (Function &Fn : M) {
-    if (Fn.isDeclaration()) continue;
-    uint64_t Addr = ResolveGuestAddress(&Fn, M);
-    if (Addr > 0) {
-      BaseAddresses[&Fn] = Addr;
-    }
-  }
-
-  struct GuestRange {
-    uint64_t Start;
-    uint64_t End;
-    GlobalValue *GV;
-  };
-  std::vector<GuestRange> Ranges;
-
-  for (auto &Pair : BaseAddresses) {
-    GlobalValue *GV = Pair.first;
-    uint64_t Addr = Pair.second;
-    uint64_t Size = 1;
-    if (auto *GVar = dyn_cast<GlobalVariable>(GV)) {
-      Size = DL.getTypeAllocSize(GVar->getValueType());
-    }
-
-    GuestRange Range = {Addr, Addr + Size, GV};
-    Ranges.push_back(Range);
-  }
-
-  BasicBlock *CurrentBB = EntryBB;
-  for (const auto &Range : Ranges) {
-    BasicBlock *MatchBB = BasicBlock::Create(Ctx, "match", F);
-    BasicBlock *NextBB = BasicBlock::Create(Ctx, "next", F);
-
-    B.SetInsertPoint(CurrentBB);
-    Value *Cond1 = B.CreateICmpUGE(GuestAddr, B.getInt64(Range.Start));
-    Value *Cond2 = B.CreateICmpULT(GuestAddr, B.getInt64(Range.End));
-    Value *Cond = B.CreateAnd(Cond1, Cond2);
-    B.CreateCondBr(Cond, MatchBB, NextBB);
-
-    B.SetInsertPoint(MatchBB);
-    Value *Offset = B.CreateSub(GuestAddr, B.getInt64(Range.Start));
-    Value *BasePtr = B.CreateBitCast(Range.GV, PtrTy);
-    Value *ResPtr = B.CreateGEP(Type::getInt8Ty(Ctx), BasePtr, Offset);
-    B.CreateRet(ResPtr);
-
-    CurrentBB = NextBB;
-  }
-
-  B.SetInsertPoint(CurrentBB);
-
-  GlobalVariable *StateGV = M.getGlobalVariable("__mcsema_reg_state");
-  Value *FinalAddr = GuestAddr;
-
-  if (StateGV) {
-    Value *GuestAddr32 = B.CreateAnd(GuestAddr, B.getInt64(0xffffffffULL));
-    
-    // Check if GuestAddr32 >= 0x1000
-    Value *InNonTrivialRange = B.CreateICmpUGE(GuestAddr32, B.getInt64(0x1000ULL));
-
-    Value *UpperBits = B.CreateAnd(GuestAddr, B.getInt64(0xffffffff00000000ULL));
-    Value *IsZeroUpper = B.CreateICmpEQ(UpperBits, B.getInt64(0));
-    Value *IsSignExtended = B.CreateICmpEQ(UpperBits, B.getInt64(0xffffffff00000000ULL));
-    Value *IsTruncatedPtr = B.CreateOr(IsZeroUpper, IsSignExtended);
-
-    Value *StatePtrVal = B.CreatePtrToInt(StateGV, B.getInt64Ty());
-    Value *StateLower = B.CreateAnd(StatePtrVal, B.getInt64(0xffffffffULL));
-    Value *StackPtrVal = B.CreatePtrToInt(DummyStack, B.getInt64Ty());
-    Value *StackLower = B.CreateAnd(StackPtrVal, B.getInt64(0xffffffffULL));
-
-    // AbsDiffGlobal
-    Value *DiffGlobal = B.CreateSub(GuestAddr32, StateLower);
-    Value *IsNegGlobal = B.CreateICmpSLT(DiffGlobal, B.getInt64(0));
-    Value *NegDiffGlobal = B.CreateNeg(DiffGlobal);
-    Value *AbsDiffGlobal = B.CreateSelect(IsNegGlobal, NegDiffGlobal, DiffGlobal);
-
-    // AbsDiffStack
-    Value *DiffStack = B.CreateSub(GuestAddr32, StackLower);
-    Value *IsNegStack = B.CreateICmpSLT(DiffStack, B.getInt64(0));
-    Value *NegDiffStack = B.CreateNeg(DiffStack);
-    Value *AbsDiffStack = B.CreateSelect(IsNegStack, NegDiffStack, DiffStack);
-
-    // Check if distance to Global < 32MB or distance to Stack < 32MB
-    Value *CloseToGlobal = B.CreateICmpULT(AbsDiffGlobal, B.getInt64(0x2000000ULL));
-    Value *CloseToStack = B.CreateICmpULT(AbsDiffStack, B.getInt64(0x2000000ULL));
-    Value *CloseToEither = B.CreateOr(CloseToGlobal, CloseToStack);
-
-    Value *IsTruncatedHostPtr = B.CreateAnd(IsTruncatedPtr, B.CreateAnd(InNonTrivialRange, CloseToEither));
-    Value *IsKnownPtrAndNonZero = B.CreateAnd(IsKnownPointer, B.CreateAnd(IsTruncatedPtr, B.CreateICmpNE(GuestAddr, B.getInt64(0))));
-    Value *ShouldReconstruct = B.CreateOr(IsKnownPtrAndNonZero, IsTruncatedHostPtr);
-
-    BasicBlock *ReconstructBB = BasicBlock::Create(Ctx, "reconstruct", F);
-    BasicBlock *FinalBB = BasicBlock::Create(Ctx, "final", F);
-
-    B.CreateCondBr(ShouldReconstruct, ReconstructBB, FinalBB);
-
-    B.SetInsertPoint(ReconstructBB);
-    Value *UseGlobalUpper = B.CreateICmpULT(AbsDiffGlobal, AbsDiffStack);
-    Value *SelectedLower = B.CreateSelect(UseGlobalUpper, StateLower, StackLower);
-    Value *SelectedPtrVal = B.CreateSelect(UseGlobalUpper, StatePtrVal, StackPtrVal);
-
-    Value *Diff32 = B.CreateTrunc(B.CreateSub(GuestAddr32, SelectedLower), B.getInt32Ty());
-    Value *Offset64 = B.CreateSExt(Diff32, B.getInt64Ty());
-    Value *ReconstructedAddr = B.CreateAdd(SelectedPtrVal, Offset64);
-    B.CreateBr(FinalBB);
-
-    B.SetInsertPoint(FinalBB);
-    PHINode *PHIRec = B.CreatePHI(B.getInt64Ty(), 2);
-    PHIRec->addIncoming(GuestAddr, CurrentBB);
-    PHIRec->addIncoming(ReconstructedAddr, ReconstructBB);
-    FinalAddr = PHIRec;
-  }
-
-  Value *FallbackPtr = B.CreateIntToPtr(FinalAddr, PtrTy);
-  B.CreateRet(FallbackPtr);
-
-  return F;
-}
 
 static bool IsExternalParamPointer(StringRef FuncName, unsigned ParamIdx) {
   if (FuncName == "malloc" || FuncName == "calloc") {
@@ -414,9 +258,6 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     auto RestoreRegFromBuf = [&](uint64_t Offset, unsigned idx) {
       Value *Slot = B.CreateConstGEP2_64(ArrayType::get(B.getInt64Ty(), 17), SavedGPRs, 0, idx);
       Value *Val = B.CreateLoad(B.getInt64Ty(), Slot);
-      if (Offset == 2312/*RSP*/) {
-        Val = B.CreateAdd(Val, B.getInt64(8));
-      }
       auto *GEP = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, Offset);
       B.CreateAlignedStore(Val, GEP, Align(8));
     };
@@ -581,8 +422,24 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     // 3. Cấp phát và khởi tạo struct va_list
     auto *VAList = B.CreateAlloca(VaListType, nullptr, "valist");
     
-    B.CreateStore(B.getInt32(ActualNumParams * 8), B.CreateStructGEP(VaListType, VAList, 0));
-    B.CreateStore(B.getInt32(48),            B.CreateStructGEP(VaListType, VAList, 1));
+    unsigned GPCount = 0;
+    unsigned FPCount = 0;
+    for (unsigned i = 0; i < ActualNumParams; ++i) {
+      if (i < ExtFTy->getNumParams()) {
+        Type *ParamTy = ExtFTy->getParamType(i);
+        if (ParamTy->isFloatingPointTy()) {
+          FPCount++;
+        } else {
+          GPCount++;
+        }
+      } else {
+        GPCount++;
+      }
+    }
+    unsigned GPOffsetVal = GPCount * 8;
+    unsigned FPOffsetVal = 48 + FPCount * 16;
+    B.CreateStore(B.getInt32(GPOffsetVal), B.CreateStructGEP(VaListType, VAList, 0));
+    B.CreateStore(B.getInt32(FPOffsetVal), B.CreateStructGEP(VaListType, VAList, 1));
     B.CreateStore(OverflowArgArea,           B.CreateStructGEP(VaListType, VAList, 2));
     B.CreateStore(B.CreateBitCast(RegSaveArea, B.getPtrTy()), B.CreateStructGEP(VaListType, VAList, 3));
 
@@ -687,6 +544,12 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     StoreRAX(B, StatePtr, Ret);
   }
 
+  // Simulating the pop of the return address from guest stack (add guest RSP by 8)
+  Value *GuestRSP = LoadReg(B, StatePtr, 2312, "guest_rsp");
+  Value *NewRSP = B.CreateAdd(GuestRSP, B.getInt64(8), "new_rsp");
+  auto *RSPGEP = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, 2312, "rsp_ptr");
+  B.CreateAlignedStore(NewRSP, RSPGEP, Align(8));
+
   // Return memory arg
   Type *RetTy = Stub.getReturnType();
   if (RetTy->isPointerTy()) {
@@ -708,6 +571,9 @@ static bool InlineDirectCallsTo(Function &F) {
 
   bool Changed = false;
   for (CallBase *CB : Calls) {
+    if (Function *Caller = CB->getFunction()) {
+      Caller->addFnAttr(Attribute::ReturnsTwice);
+    }
     InlineFunctionInfo IFI;
     InlineResult Res = InlineFunction(*CB, IFI);
     if (Res.isSuccess()) {
@@ -720,7 +586,7 @@ static bool InlineDirectCallsTo(Function &F) {
   return Changed;
 }
 
-bool BrightenRepairPass::ImplementExternCallBridge(Module &M) {
+bool BrightenRuntimeHelperPass::ImplementExternCallBridge(Module &M) {
   // Tìm @__remill_function_call
   Function *RemillCall = M.getFunction("__remill_function_call");
   if (!RemillCall) {
@@ -766,7 +632,7 @@ bool BrightenRepairPass::ImplementExternCallBridge(Module &M) {
   return Changed;
 }
 
-bool BrightenRepairPass::RepairExternalFunctionPointerDereferences(Module &M) {
+bool BrightenRuntimeHelperPass::RepairExternalFunctionPointerDereferences(Module &M) {
   bool Changed = false;
   LLVMContext &Ctx = M.getContext();
   Type *PtrTy = PointerType::get(Ctx, 0);
@@ -782,7 +648,7 @@ bool BrightenRepairPass::RepairExternalFunctionPointerDereferences(Module &M) {
           Value *PtrOp = GEP->getPointerOperand()->stripPointerCasts();
           if (auto *GV = dyn_cast<GlobalValue>(PtrOp)) {
             if (GV->isDeclaration()) {
-              uint64_t Addr = ResolveGuestAddress(GV, M);
+              uint64_t Addr = ResolveGuestAddress(GV);
               if (Addr > 0) {
                 GEPs.push_back(GEP);
               }
@@ -803,7 +669,7 @@ bool BrightenRepairPass::RepairExternalFunctionPointerDereferences(Module &M) {
     IRBuilder<> B(GEP);
     Value *PtrOp = GEP->getPointerOperand()->stripPointerCasts();
     auto *GV = cast<GlobalValue>(PtrOp);
-    uint64_t BaseAddr = ResolveGuestAddress(GV, M);
+    uint64_t BaseAddr = ResolveGuestAddress(GV);
 
     // 1. Calculate offset at runtime by applying the GEP to a null pointer of the same type.
     Value *BaseNull = ConstantPointerNull::get(cast<PointerType>(GEP->getPointerOperand()->getType()));
@@ -835,7 +701,7 @@ bool BrightenRepairPass::RepairExternalFunctionPointerDereferences(Module &M) {
   return Changed;
 }
 
-bool BrightenRepairPass::RepairIntToPtrDereferences(Module &M) {
+bool BrightenRuntimeHelperPass::RepairIntToPtrDereferences(Module &M) {
   bool Changed = false;
   LLVMContext &Ctx = M.getContext();
 
@@ -848,7 +714,16 @@ bool BrightenRepairPass::RepairIntToPtrDereferences(Module &M) {
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (auto *I2P = dyn_cast<IntToPtrInst>(&I)) {
-          IntToPtrs.push_back(I2P);
+          Value *Src = I2P->getOperand(0);
+          if (auto *CI = dyn_cast<ConstantInt>(Src)) {
+            // Chỉ translate nếu hằng số địa chỉ guest nằm trong dải memory guest hợp lý
+            if (CI->getZExtValue() < 0x800000000000ULL) {
+              IntToPtrs.push_back(I2P);
+            }
+          } else {
+            // Đối với các chỉ thị động, chúng ta vẫn chèn translate
+            IntToPtrs.push_back(I2P);
+          }
         }
       }
     }
@@ -878,4 +753,4 @@ bool BrightenRepairPass::RepairIntToPtrDereferences(Module &M) {
   return Changed;
 }
 
-}  // namespace brighten_repair
+}  // namespace brighten_runtime

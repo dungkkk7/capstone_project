@@ -71,16 +71,24 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 # Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
 PLUGINS = [
     "brighten_010_repair_pass/build/BrightenRepairPass.so",
-   "brighten_020_devirt_pass/build/BrightenDevirtPass.so",
+    "brighten_015_runtime_helper_materialization/build/BrightenRuntimeHelperPass.so",
+    "brighten_020_devirt_pass/build/BrightenDevirtPass.so"
+]
+# Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
+PLUGINS1 = [
+    "brighten_010_repair_pass/build/BrightenRepairPass.so",
+    "brighten_015_runtime_helper_materialization/build/BrightenRuntimeHelperPass.so",
+    "brighten_020_devirt_pass/build/BrightenDevirtPass.so",
     "brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so",
     "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so"
 ]
 
-
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-devirt-pass,always-inline,brighten-stack-frame-pass,brighten-state-ssa-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
 )
-
+PASS_PIPELINE1 = (
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-stack-frame-pass,brighten-state-ssa-pass,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+)
 class Color:
     BLUE = '\033[94m'
     GREEN = '\033[92m'
@@ -215,7 +223,7 @@ def clean_ir_file(ll_path, binary_path=None):
             if line.startswith('}'):
                 in_func = False
                 has_asm = any('asm sideeffect' in l for l in func_lines)
-                if has_asm:
+                if has_asm and func_name not in ['main', 'start', 'main_wrapper', 'start_wrapper']:
                     if func_name:
                         stripped_funcs.add(func_name)
                 else:
@@ -233,9 +241,13 @@ def clean_ir_file(ll_path, binary_path=None):
         state_type = state_type_match.group(1)
 
     # 6. Thêm hàm main mới sạch sẽ gọi main_wrapper và trả về RAX từ State
-    new_main_ir = f"""
-@__lifter_guest_stack = internal global [8388608 x i8] zeroinitializer, align 16
+    # Chỉ thêm guest stack nếu chưa được định nghĩa
+    if not re.search(r'@__lifter_guest_stack\s*=\s*', content):
+        content = "@__lifter_guest_stack = internal global [8388608 x i8] zeroinitializer, align 16\n" + content
 
+    # Chỉ thêm nếu chưa có định nghĩa @main trong content (để tránh trùng với định nghĩa do pass 015 tự sinh)
+    if not re.search(r'define\s+(?:[a-zA-Z0-9_]+\s+)*@main\b', content):
+        new_main_ir = f"""
 define dso_local i32 @main(i32 %argc, ptr %argv) {{
 entry:
   %fs_base = call i64 asm sideeffect "movq %fs:0, $0", "=r"()
@@ -255,7 +267,7 @@ entry:
   ret i32 %res_i32
 }}
 """
-    content += new_main_ir
+        content += new_main_ir
         
     cleaned_content = clean_unused_types_and_globals(content)
     with open(ll_path, 'w') as f:

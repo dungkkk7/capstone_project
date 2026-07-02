@@ -14,6 +14,9 @@ bool BrightenDevirtPass::LowerLibcCalls(Module &M) {
 
     StringRef Name = F.getName();
     if (Name.starts_with("ext_")) {
+      if (F.hasFnAttribute(Attribute::NoInline)) {
+        F.removeFnAttr(Attribute::NoInline);
+      }
       if (!F.hasFnAttribute(Attribute::AlwaysInline)) {
         F.addFnAttr(Attribute::AlwaysInline);
         Changed = true;
