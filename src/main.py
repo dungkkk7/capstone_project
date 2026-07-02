@@ -187,13 +187,30 @@ def main(argv=None):
                             stats = fuzz_report["afl_stats"]
                             print(f"      - AFL++ Coverage: {stats['bitmap_cvg']} bitmap | {stats['paths_total']} paths | {stats['execs_done']} execs ({stats['execs_per_sec']} execs/s)")
                         print(f"      - Tổng số lần chạy: {fuzz_report['total_runs']}")
+                        print(f"      - Số lần chạy có kết luận (Confirmed): {fuzz_report.get('confirmed_runs', fuzz_report['matches'] + fuzz_report['mismatches'])}")
                         print(f"      - Khớp hoàn toàn (Matches): {Color.GREEN}{fuzz_report['matches']}{Color.END}")
                         print(f"      - Không khớp (Mismatches): {Color.RED if fuzz_report['mismatches'] > 0 else Color.GRAY}{fuzz_report['mismatches']}{Color.END}")
                         print(f"      - Timeouts: F1: {fuzz_report['timeouts']['bin1']} | F2: {fuzz_report['timeouts']['bin2']} | Both: {fuzz_report['timeouts']['both']}")
-                        print(f"      - Tỉ lệ tương đương (Equivalence): {ratio_color}{ratio:.2f}%{Color.END}")
+                        print(f"      - Crashes: F1: {fuzz_report['crashes']['bin1']} | F2: {fuzz_report['crashes']['bin2']} | Both: {fuzz_report['crashes']['both']}")
+                        print(f"      - Không kết luận (Inconclusive): {Color.YELLOW if fuzz_report.get('inconclusive', 0) > 0 else Color.GRAY}{fuzz_report.get('inconclusive', 0)}{Color.END}")
+                        confirmed_ratio = fuzz_report.get('confirmed_equivalence_ratio', ratio)
+                        print(f"      - Tỉ lệ tương đương nghiêm ngặt (Strict Equivalence): {ratio_color}{ratio:.2f}%{Color.END}")
+                        print(f"      - Tỉ lệ trên ca có kết luận (Confirmed Subset): {confirmed_ratio:.2f}%")
                         
-                        if ratio == 100.0:
+                        if fuzz_report.get("is_fully_equivalent", ratio == 100.0):
                             print(f"      {Color.GREEN}[✓] XÁC NHẬN SEMANTIC EQUIVALENT.{Color.END}")
+                        elif fuzz_report.get("inconclusive", 0) > 0 and fuzz_report["mismatches"] == 0:
+                            both_timeouts = fuzz_report["timeouts"]["both"]
+                            both_crashes = fuzz_report["crashes"]["both"]
+                            if both_timeouts and both_crashes:
+                                reason = "timeout/crash cả hai bên"
+                            elif both_timeouts:
+                                reason = "timeout cả hai bên"
+                            elif both_crashes:
+                                reason = "crash cả hai bên"
+                            else:
+                                reason = "trạng thái không kết luận"
+                            print(f"      {Color.YELLOW}[!] CHƯA THỂ XÁC NHẬN ĐẦY ĐỦ: còn input {reason}.{Color.END}")
                         else:
                             print(f"      {Color.RED}[✗] CẢNH BÁO: PHÁT HIỆN SỰ KHÁC BIỆT SEMANTIC CHƯA ĐƯỢC GIẢI QUYẾT.{Color.END}")
                             if "mismatch_examples" in fuzz_report and fuzz_report["mismatch_examples"]:

@@ -19,7 +19,12 @@ include(AddLLVM)
 add_llvm_pass_plugin(BrightenDevirtPass
   src/main.cpp
   src/Helpers.cpp
-  src/RuleDevirtualizeRemillCalls.cpp
-  src/RuleLowerRemillReturn.cpp
-  src/RuleLowerLibcCalls.cpp
+  src/RuleLowerExternalCalls.cpp
+  src/RuleLowerFiniteRemillPCSwitch.cpp
+  src/RuleDevirtualizeRemillFunctionCalls.cpp
+  src/RuleDevirtualizeRemillJumps.cpp
+  src/RuleAnnotateRemillReturns.cpp
+  src/RuleCleanupCallbackThunks.cpp
+  src/RuleCleanupUnusedRemillDispatchers.cpp
+  src/RuleVerifyDevirtualization.cpp
 )

@@ -451,8 +451,7 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
         return False, f"Execution status mismatch: {res1['status']} vs {res2['status']}"
         
     if res1["status"] in ("timeout", "crash"):
-        # If both hit system limits or timed out, they are temporarily matched behaviorally
-        return True, ""
+        return False, f"Inconclusive shared {res1['status']}"
         
     if res1["returncode"] != res2["returncode"]:
         return False, f"Exit code mismatch: {res1['returncode']} vs {res2['returncode']}"
@@ -464,6 +463,30 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
         return False, "Stderr stream mismatch"
         
     return True, ""
+
+def is_inconclusive_pair(res1: Dict[str, Any], res2: Dict[str, Any]) -> bool:
+    """Both-side infrastructure limits do not prove semantic equivalence."""
+    return (
+        (res1["status"] == "timeout" and res2["status"] == "timeout") or
+        (res1["status"] == "crash" and res2["status"] == "crash")
+    )
+
+def finalize_equivalence_report(report: Dict[str, Any]) -> None:
+    """Compute confirmed equivalence over non-inconclusive runs only."""
+    report["confirmed_runs"] = report["matches"] + report["mismatches"]
+    confirmed = report["confirmed_runs"]
+    report["confirmed_equivalence_ratio"] = (
+        (report["matches"] / confirmed) * 100.0 if confirmed > 0 else 0.0
+    )
+    total = report.get("total_runs", 0)
+    report["equivalence_ratio"] = (
+        (report["matches"] / total) * 100.0 if total > 0 else 0.0
+    )
+    report["is_fully_equivalent"] = (
+        confirmed > 0 and
+        report["mismatches"] == 0 and
+        report.get("inconclusive", 0) == 0
+    )
 
 # -----------------------------------------------------------------------------
 # Fuzzer Core Pipeline Manager (AFL++ Integration)
@@ -538,7 +561,10 @@ class SemanticFuzzer:
             "mismatches": 0,
             "timeouts": {"bin1": 0, "bin2": 0, "both": 0},
             "crashes": {"bin1": 0, "bin2": 0, "both": 0},
+            "inconclusive": 0,
+            "confirmed_runs": 0,
             "equivalence_ratio": 0.0,
+            "is_fully_equivalent": False,
             "mismatch_examples": []
         }
         
@@ -591,7 +617,9 @@ class SemanticFuzzer:
                     elif res2["status"] == "crash":
                         report["crashes"]["bin2"] += 1
 
-                    if result["is_equivalent"]:
+                    if is_inconclusive_pair(res1, res2):
+                        report["inconclusive"] += 1
+                    elif result["is_equivalent"]:
                         report["matches"] += 1
                     else:
                         report["mismatches"] += 1
@@ -622,7 +650,7 @@ class SemanticFuzzer:
                 except Exception as ex:
                     print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
                     
-        report["equivalence_ratio"] = (report["matches"] / iterations) * 100.0 if iterations > 0 else 0.0
+        finalize_equivalence_report(report)
         return report
 
     def run_differential_test(
@@ -836,7 +864,10 @@ int main(int argc, char** argv) {
                 "mismatches": 0,
                 "timeouts": {"bin1": 0, "bin2": 0, "both": 0},
                 "crashes": {"bin1": 0, "bin2": 0, "both": 0},
+                "inconclusive": 0,
+                "confirmed_runs": 0,
                 "equivalence_ratio": 0.0,
+                "is_fully_equivalent": False,
                 "mismatch_examples": []
             }
             if afl_stats:
@@ -907,7 +938,9 @@ int main(int argc, char** argv) {
                         elif res2["status"] == "crash":
                             report["crashes"]["bin2"] += 1
 
-                        if result["is_equivalent"]:
+                        if is_inconclusive_pair(res1, res2):
+                            report["inconclusive"] += 1
+                        elif result["is_equivalent"]:
                             report["matches"] += 1
                         else:
                             report["mismatches"] += 1
@@ -938,7 +971,7 @@ int main(int argc, char** argv) {
                     except Exception as ex:
                         print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
                         
-            report["equivalence_ratio"] = (report["matches"] / len(run_inputs)) * 100.0 if len(run_inputs) > 0 else 0.0
+            finalize_equivalence_report(report)
             return report
             
         except Exception as e:
@@ -1067,11 +1100,14 @@ def main():
     if "afl_stats" in report:
         print(f"AFL++ Coverage: {report['afl_stats']['bitmap_cvg']} bitmap | {report['afl_stats']['paths_total']} paths | {report['afl_stats']['execs_done']} execs ({report['afl_stats']['execs_per_sec']} execs/s)")
     print(f"Total Iter:     {report['total_runs']}")
+    print(f"Confirmed Runs: {report.get('confirmed_runs', report['matches'] + report['mismatches'])}")
     print(f"Matches:        {Color.GREEN}{report['matches']}{Color.END}")
     print(f"Mismatches:     {Color.RED if report['mismatches'] > 0 else Color.GRAY}{report['mismatches']}{Color.END}")
     print(f"Timeouts (F1):  {report['timeouts']['bin1']} | F2: {report['timeouts']['bin2']} | Both: {report['timeouts']['both']}")
     print(f"Crashes  (F1):  {report['crashes']['bin1']} | F2: {report['crashes']['bin2']} | Both: {report['crashes']['both']}")
-    print(f"Equivalence:    {ratio_color}{ratio:.2f}%{Color.END}")
+    print(f"Inconclusive:   {Color.YELLOW if report.get('inconclusive', 0) > 0 else Color.GRAY}{report.get('inconclusive', 0)}{Color.END}")
+    print(f"Strict Equivalence:    {ratio_color}{ratio:.2f}%{Color.END}")
+    print(f"Confirmed Subset:      {report.get('confirmed_equivalence_ratio', ratio):.2f}%")
     
     if report["mismatches"] > 0:
         print("\n" + f"{Color.BOLD}{Color.RED}--- MISMATCH SAMPLES ---{Color.END}")

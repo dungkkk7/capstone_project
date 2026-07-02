@@ -9,9 +9,14 @@ using namespace llvm;
 PreservedAnalyses BrightenDevirtPass::run(Module &M, ModuleAnalysisManager &) {
   bool Changed = false;
 
-  Changed |= DevirtualizeRemillCalls(M);
-  Changed |= LowerRemillReturn(M);
-  // Changed |= LowerLibcCalls(M);
+  Changed |= LowerExternalCalls(M);
+  Changed |= DevirtualizeRemillFunctionCalls(M);
+  Changed |= DevirtualizeRemillJumps(M);
+  Changed |= AnnotateRemillReturns(M);
+  Changed |= CleanupCallbackThunks(M);
+  Changed |= CleanupUnusedRemillDispatchers(M);
+
+  VerifyDevirtualization(M);
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
