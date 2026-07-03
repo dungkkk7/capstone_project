@@ -424,6 +424,7 @@ def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float
             "returncode": proc.returncode,
             "stdout": proc.stdout,
             "stderr": proc.stderr,
+            "bin_path": bin_path,
             "elapsed": elapsed
         }
     except subprocess.TimeoutExpired as e:
@@ -433,6 +434,7 @@ def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float
             "returncode": -1,
             "stdout": e.stdout or b"",
             "stderr": e.stderr or b"",
+            "bin_path": bin_path,
             "elapsed": elapsed
         }
     except Exception as e:
@@ -442,8 +444,21 @@ def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float
             "returncode": -2,
             "stdout": b"",
             "stderr": str(e).encode('utf-8'),
+            "bin_path": bin_path,
             "elapsed": elapsed
         }
+
+def normalize_process_stream(data: bytes, res: Dict[str, Any]) -> bytes:
+    """Normalize per-binary argv[0] text before comparing outputs."""
+    bin_path = res.get("bin_path")
+    if not data or not bin_path:
+        return data
+    normalized = data
+    for path in {bin_path, os.path.abspath(bin_path)}:
+        path_bytes = path.encode("utf-8", errors="ignore")
+        if path_bytes:
+            normalized = normalized.replace(path_bytes, b"<argv0>")
+    return normalized
 
 def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr: bool = False) -> Tuple[bool, str]:
     """Checks differential equivalence based on status, exit codes, and output streams."""
@@ -456,10 +471,14 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
     if res1["returncode"] != res2["returncode"]:
         return False, f"Exit code mismatch: {res1['returncode']} vs {res2['returncode']}"
         
-    if res1["stdout"] != res2["stdout"]:
+    stdout1 = normalize_process_stream(res1["stdout"], res1)
+    stdout2 = normalize_process_stream(res2["stdout"], res2)
+    if stdout1 != stdout2:
         return False, "Stdout stream mismatch"
         
-    if compare_stderr and res1["stderr"] != res2["stderr"]:
+    stderr1 = normalize_process_stream(res1["stderr"], res1)
+    stderr2 = normalize_process_stream(res2["stderr"], res2)
+    if compare_stderr and stderr1 != stderr2:
         return False, "Stderr stream mismatch"
         
     return True, ""
