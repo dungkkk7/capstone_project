@@ -7,6 +7,8 @@ import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from binary_lifting.lifting import lift_binary
+from llvm_pass.britening_ir import brighten_ir
+from fuzzing_equi_check.fuzzing import SemanticFuzzer, TemplateEvaluator, make_bytes_generator, DEFAULT_TEMPLATES
 
 class Color:
     BLUE = '\033[94m'
@@ -26,12 +28,27 @@ def main(argv=None):
 
     # Kiểm tra tham số
     if len(argv) < 1:
-        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv>{Color.END}")
+        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv> [--no-cache] [--force-relift]{Color.END}")
+        return 1
+
+    # Phân tích tham số cache từ command line
+    use_cache = "--no-cache" not in argv
+    force_relift = "--force-relift" in argv
+    # Lọc ra các flag để lấy đường dẫn CSV
+    positional_args = [a for a in argv if not a.startswith("--")]
+    if not positional_args:
+        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv> [--no-cache] [--force-relift]{Color.END}")
         return 1
 
     # CSV chứa danh sách binary bị obfuscate
-    list_obfuscated_bin = argv[0]
+    list_obfuscated_bin = positional_args[0]
     print(f"{Color.BLUE}[*] Danh sách tệp binary cần lift: {list_obfuscated_bin}{Color.END}")
+    if not use_cache:
+        print(f"{Color.YELLOW}[!] Lifting cache: TẮT (--no-cache){Color.END}")
+    elif force_relift:
+        print(f"{Color.YELLOW}[!] Lifting cache: BẮT BUỘC LIFT LẠI (--force-relift){Color.END}")
+    else:
+        print(f"{Color.GREEN}[✓] Lifting cache: BẬT — Các binary đã lift sẽ được tái sử dụng.{Color.END}")
 
     # Đọc danh sách các tệp binary từ tệp CSV
     if not os.path.exists(list_obfuscated_bin):
@@ -113,10 +130,104 @@ def main(argv=None):
         output_bc = os.path.join(case_output_dir, f"{base_name}.bc")
 
         # Gọi hàm lift_binary từ module binary_lifting.lifting, truyền output_bc chỉ định thư mục pipeline con
-        success = lift_binary(binary_path=path, output=output_bc)
+        # use_cache và force_relift được truyền từ tham số dòng lệnh
+        success = lift_binary(binary_path=path, output=output_bc,
+                              use_cache=use_cache, force_relift=force_relift)
         if success:
             print(f"{Color.GREEN}[✓] Nâng mã (Lift) thành công cho: {path}{Color.END}")
-            success_count += 1
+            
+            # --- BƯỚC THÊM: LÀM ĐẸP MÃ IR (BRIGHTENING) ---
+            output_brightened_bc = os.path.join(case_output_dir, f"{base_name}_brightened.bc")
+            print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu làm đẹp mã IR (Brightening) cho: {path}...{Color.END}")
+            
+            try:
+                brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=path)
+                if brighten_success:
+                    output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
+                    print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
+                    print(f"{Color.GREEN}{Color.BOLD}    [✓] FILE NATIVE LLVM IR SẠCH (ĐÃ LÀM ĐẸP & ĐỂ XEM):{Color.END}")
+                    print(f"{Color.GREEN}{Color.BOLD}        {output_brightened_ll}{Color.END}")
+                    success_count += 1
+                    
+                    # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
+                    print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu kiểm tra Semantic Equivalence cho: {path}...{Color.END}")
+                    try:
+                        # Tìm template phù hợp cho benchmark
+                        template_content = None
+                        for key in DEFAULT_TEMPLATES.keys():
+                            if key in path.lower():
+                                template_content = DEFAULT_TEMPLATES[key]
+                                print(f"{Color.YELLOW}      [!] Phát hiện benchmark '{key}', sử dụng cấu hình template.{Color.END}")
+                                break
+                        
+                        if template_content:
+                            generator = TemplateEvaluator(template_content)
+                        else:
+                            print(f"{Color.YELLOW}      [!] Không nhận diện được benchmark, sử dụng generator ngẫu nhiên (bytes).{Color.END}")
+                            generator = make_bytes_generator()
+                        
+                        fuzzer = SemanticFuzzer(output_brightened_bc, path)
+                        fuzzer.compile()
+                        
+                        # Chạy 100 iterations với 4 thread
+                        fuzz_report = fuzzer.run_differential_test(
+                            iterations=100,
+                            generator=generator,
+                            timeout=1.0,
+                            compare_stderr=False,
+                            num_workers=1
+                        )
+                        # fuzzer.cleanup()
+                        
+                        ratio = fuzz_report["equivalence_ratio"]
+                        ratio_color = Color.GREEN if ratio == 100.0 else (Color.YELLOW if ratio >= 90.0 else Color.RED)
+                        
+                        print(f"      {Color.BOLD}Kết quả kiểm tra Semantic Equivalence:{Color.END}")
+                        if "afl_stats" in fuzz_report:
+                            stats = fuzz_report["afl_stats"]
+                            print(f"      - AFL++ Coverage: {stats['bitmap_cvg']} bitmap | {stats['paths_total']} paths | {stats['execs_done']} execs ({stats['execs_per_sec']} execs/s)")
+                        print(f"      - Tổng số lần chạy: {fuzz_report['total_runs']}")
+                        print(f"      - Số lần chạy có kết luận (Confirmed): {fuzz_report.get('confirmed_runs', fuzz_report['matches'] + fuzz_report['mismatches'])}")
+                        print(f"      - Khớp hoàn toàn (Matches): {Color.GREEN}{fuzz_report['matches']}{Color.END}")
+                        print(f"      - Không khớp (Mismatches): {Color.RED if fuzz_report['mismatches'] > 0 else Color.GRAY}{fuzz_report['mismatches']}{Color.END}")
+                        print(f"      - Timeouts: F1: {fuzz_report['timeouts']['bin1']} | F2: {fuzz_report['timeouts']['bin2']} | Both: {fuzz_report['timeouts']['both']}")
+                        print(f"      - Crashes: F1: {fuzz_report['crashes']['bin1']} | F2: {fuzz_report['crashes']['bin2']} | Both: {fuzz_report['crashes']['both']}")
+                        print(f"      - Không kết luận (Inconclusive): {Color.YELLOW if fuzz_report.get('inconclusive', 0) > 0 else Color.GRAY}{fuzz_report.get('inconclusive', 0)}{Color.END}")
+                        confirmed_ratio = fuzz_report.get('confirmed_equivalence_ratio', ratio)
+                        print(f"      - Tỉ lệ tương đương nghiêm ngặt (Strict Equivalence): {ratio_color}{ratio:.2f}%{Color.END}")
+                        print(f"      - Tỉ lệ trên ca có kết luận (Confirmed Subset): {confirmed_ratio:.2f}%")
+                        
+                        if fuzz_report.get("is_fully_equivalent", ratio == 100.0):
+                            print(f"      {Color.GREEN}[✓] XÁC NHẬN SEMANTIC EQUIVALENT.{Color.END}")
+                        elif fuzz_report.get("inconclusive", 0) > 0 and fuzz_report["mismatches"] == 0:
+                            both_timeouts = fuzz_report["timeouts"]["both"]
+                            both_crashes = fuzz_report["crashes"]["both"]
+                            if both_timeouts and both_crashes:
+                                reason = "timeout/crash cả hai bên"
+                            elif both_timeouts:
+                                reason = "timeout cả hai bên"
+                            elif both_crashes:
+                                reason = "crash cả hai bên"
+                            else:
+                                reason = "trạng thái không kết luận"
+                            print(f"      {Color.YELLOW}[!] CHƯA THỂ XÁC NHẬN ĐẦY ĐỦ: còn input {reason}.{Color.END}")
+                        else:
+                            print(f"      {Color.RED}[✗] CẢNH BÁO: PHÁT HIỆN SỰ KHÁC BIỆT SEMANTIC CHƯA ĐƯỢC GIẢI QUYẾT.{Color.END}")
+                            if "mismatch_examples" in fuzz_report and fuzz_report["mismatch_examples"]:
+                                print(f"      {Color.YELLOW}--- Chi tiết mẫu không khớp (Mismatch Samples) ---{Color.END}")
+                                for sample in fuzz_report["mismatch_examples"]:
+                                    print(f"      * [Mẫu #{sample['index']}]: Lý do: {sample['reason']}")
+                                    print(f"        Arguments: {sample['args']}")
+                                    print(f"        Stdin: {repr(sample['stdin'])}")
+                                    print(f"        Prog1 (Brightened): status={sample['prog1']['status']}, code={sample['prog1']['returncode']}, stdout={repr(sample['prog1']['stdout'])}, stderr={repr(sample['prog1']['stderr'])}")
+                                    print(f"        Prog2 (Obfuscated): status={sample['prog2']['status']}, code={sample['prog2']['returncode']}, stdout={repr(sample['prog2']['stdout'])}, stderr={repr(sample['prog2']['stderr'])}")
+                            
+                    except Exception as fe:
+                        print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")
+                else:
+                    print(f"{Color.RED}[✗] Làm đẹp mã IR THẤT BẠI cho: {path}{Color.END}")
+            except Exception as e:
+                print(f"{Color.RED}[✗] Lỗi khi làm đẹp mã IR: {e}{Color.END}")
         else:
             print(f"{Color.RED}[✗] Nâng mã (Lift) THẤT BẠI cho: {path}{Color.END}")
 

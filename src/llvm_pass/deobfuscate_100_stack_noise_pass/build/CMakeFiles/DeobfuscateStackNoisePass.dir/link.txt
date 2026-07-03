@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -shared  -o DeobfuscateStackNoisePass.so CMakeFiles/DeobfuscateStackNoisePass.dir/src/main.cpp.o 

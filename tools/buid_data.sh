@@ -21,20 +21,20 @@ COMPILE_FLAGS=(
 )
 
 OBFUSCATE_FLAGS=(
-    --code-clone
+   # --code-clone
     --substitute
-    --if-convert
+    #--if-convert
     --flatten
-    --opaque-predicates
+ #   --opaque-predicates
     --bogus-control-flow
-    --const-unfold
-    --schedule-instructions
-    --outline-functions
-    --arith-encode
-    --stack-randomize
-    --verify-each
-    --reg-pressure
-    --loop-to-recursion
+   # --const-unfold
+   # --schedule-instructions
+  #  --outline-functions
+   #--arith-encode
+    #--stack-randomize
+   # --verify-each
+   # --reg-pressure
+   # --loop-to-recursion
     --seed=2976579765
     --transform-percent=100
 )
