@@ -83,7 +83,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
       for (Instruction &I : BB) {
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
           int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
-          if (off >= 0) {
+          if (off >= 2065) {
             unsigned u_off = static_cast<unsigned>(off);
             auto &info = fields[u_off];
             info.offset = u_off;
@@ -96,7 +96,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
           }
         } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
           int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
-          if (off >= 0) {
+          if (off >= 2065) {
             unsigned u_off = static_cast<unsigned>(off);
             auto &info = fields[u_off];
             info.offset = u_off;

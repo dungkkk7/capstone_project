@@ -2,6 +2,10 @@
 #include "Helpers.h"
 
 #include <vector>
+#include <algorithm>
+#include "llvm/ADT/DenseSet.h"
+#include <algorithm>
+#include "llvm/ADT/DenseSet.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -64,13 +68,28 @@ static bool DefinePCDispatcher(Function &Helper, Module &M) {
     IRBuilder<> B(DefaultBB);
     B.CreateRet(Mem);
   }
+  std::sort(Targets.begin(), Targets.end(), [](const auto &A, const auto &B) {
+    if (A.first != B.first) {
+      return A.first < B.first;
+    }
+    bool A_is_sub = A.second->getName().starts_with("sub_");
+    bool B_is_sub = B.second->getName().starts_with("sub_");
+    if (A_is_sub != B_is_sub) {
+      return A_is_sub;
+    }
+    return A.second->getName() < B.second->getName();
+  });
+
   IRBuilder<> B(Entry);
   auto *Switch = B.CreateSwitch(PC, DefaultBB, Targets.size());
+  DenseSet<uint64_t> AddedPCs;
   for (auto &[TargetPC, Target] : Targets) {
-    BasicBlock *CaseBB = BasicBlock::Create(Ctx, "case_" + Target->getName(), &Helper);
-    Switch->addCase(ConstantInt::get(cast<IntegerType>(PC->getType()), TargetPC), CaseBB);
-    IRBuilder<> CB(CaseBB);
-    CB.CreateRet(CB.CreateCall(FTy, Target, {State, PC, Mem}));
+    if (AddedPCs.insert(TargetPC).second) {
+      BasicBlock *CaseBB = BasicBlock::Create(Ctx, "case_" + Target->getName(), &Helper);
+      Switch->addCase(ConstantInt::get(cast<IntegerType>(PC->getType()), TargetPC), CaseBB);
+      IRBuilder<> CB(CaseBB);
+      CB.CreateRet(CB.CreateCall(FTy, Target, {State, PC, Mem}));
+    }
   }
   return true;
 }

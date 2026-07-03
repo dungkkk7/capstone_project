@@ -13,6 +13,8 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
 
 namespace brighten_runtime {
 
@@ -116,6 +118,29 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
     IRBuilder<> B(Entry);
 
+    if (RegState) {
+      // 1. Setup Guest Stack (RSP)
+      GlobalVariable *GuestStack = M.getGlobalVariable("__lifter_guest_stack");
+      if (!GuestStack) {
+        Type *StackTy = ArrayType::get(I8, 8388608);
+        GuestStack = new GlobalVariable(
+            M, StackTy, false, GlobalValue::InternalLinkage,
+            ConstantAggregateZero::get(StackTy), "__lifter_guest_stack");
+        GuestStack->setAlignment(Align(16));
+      }
+      Value *StackGEP = B.CreateConstInBoundsGEP2_64(GuestStack->getValueType(), GuestStack, 0, 8388480);
+      Value *StackVal = B.CreatePtrToInt(StackGEP, I64);
+      Value *RSPPtr = B.CreateConstGEP1_64(I8, RegState, 2312);
+      B.CreateAlignedStore(StackVal, RSPPtr, Align(8));
+
+      // 2. Setup fs_base
+      FunctionType *FsAsmFTy = FunctionType::get(I64, {}, false);
+      InlineAsm *GetFsAsm = InlineAsm::get(FsAsmFTy, "movq %fs:0, $0", "=r", false);
+      Value *FsVal = B.CreateCall(GetFsAsm, {});
+      Value *FsPtr = B.CreateConstGEP1_64(I8, RegState, 2168);
+      B.CreateAlignedStore(FsVal, FsPtr, Align(8));
+    }
+
     if (Name == "main") {
       // setup args in State
       if (RegState) {
@@ -203,9 +228,9 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     }
   }
   for (Function *F : DeadCallbacks) {
+    errs() << "[brighten-mcsema-lower] Erased unused callback thunk: " << F->getName() << "\n";
     F->eraseFromParent();
     Changed = true;
-    errs() << "[brighten-mcsema-lower] Erased unused callback thunk: " << F->getName() << "\n";
   }
 
   // 4. Xoá declaration của __mcsema_attach_call
