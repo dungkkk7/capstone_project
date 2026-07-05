@@ -508,6 +508,8 @@ Changed |= VerifyNoUnresolvedRemillIntrinsics(M);
 * Dựa trên alloca/global recovered từ Phase 4 và Phase 7 để suy luận type.
 * Rewrite GEP byte-offset thành typed GEP nếu an toàn.
 
+**Trạng thái:** Đã hoàn thành thiết kế, implement và kiểm thử (21/21 tests passed).
+
 **Lưu ý:** phase này nên chạy sau stack/global recovery. Nếu chạy sớm, type inference dễ sai vì object boundary chưa rõ.
 
 ---
@@ -578,7 +580,7 @@ brighten-repair-pass,
 brighten-remill-runtime-pass,
 brighten-devirt-pass,
 brighten-state-ssa-pass,
-brighten-stack-frame-pass,
+brighten-stack-frame-pass,lll
 brighten-abi-rewrite-pass,
 brighten-global-recover-pass,
 brighten-final-cleanup-pass

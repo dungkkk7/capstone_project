@@ -77,7 +77,8 @@ PLUGINS = [
     "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so",
     "brighten_050_abi_recovery/build/BrightenABIRecoveryPass.so",
     "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
-    "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so"
+    "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
+    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so"
 ]
 # Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
 PLUGINS1 = [
@@ -88,7 +89,8 @@ PLUGINS1 = [
     "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so",
     "brighten_050_abi_recovery/build/BrightenABIRecoveryPass.so",
     "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
-    "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so"
+    "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
+    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so"
 ]
 
 PASS_PIPELINE = (

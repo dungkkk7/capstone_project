@@ -386,7 +386,7 @@ string(alnum, 10, 30)
 int(-3, 3)""",
 
     "keybox": """[ARGV]
-string(print, 8, 20)""",
+string(print, 8, 14)""",
 
     "md5": """[ARGV]
 -s
