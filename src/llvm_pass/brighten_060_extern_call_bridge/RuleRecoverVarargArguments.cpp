@@ -1,4 +1,7 @@
 #include "BrightenExternCallBridgePass.h"
+#include <queue>
+#include <set>
+#include "llvm/IR/CFG.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalAlias.h"
@@ -21,6 +24,9 @@ static Module *FindModule(Value *V) {
   if (!V) return nullptr;
   if (auto *I = dyn_cast<Instruction>(V)) return I->getModule();
   if (auto *GV = dyn_cast<GlobalValue>(V)) return GV->getParent();
+  if (auto *Arg = dyn_cast<Argument>(V)) {
+    if (Arg->getParent()) return Arg->getParent()->getParent();
+  }
   if (auto *GEP = dyn_cast<GEPOperator>(V)) return FindModule(GEP->getPointerOperand());
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     for (Value *Op : CE->operands()) {
@@ -120,28 +126,62 @@ static std::optional<uint64_t> IdentifyStateOffset(Value *Ptr) {
     }
   }
 
+  if (auto *Arg = dyn_cast<Argument>(Base)) {
+    if (Arg->getArgNo() == 0) {
+      return Offset.getZExtValue();
+    }
+  }
+
   return std::nullopt;
 }
 
 static Value *FindStoreBeforeCall(CallInst *CI, uint64_t RegOffset) {
-  BasicBlock *BB = CI->getParent();
+  BasicBlock *StartBB = CI->getParent();
   for (auto It = BasicBlock::reverse_iterator(CI->getIterator());
-       It != BB->rend(); ++It) {
+       It != StartBB->rend(); ++It) {
     auto *SI = dyn_cast<StoreInst>(&*It);
     if (!SI) continue;
     auto Off = IdentifyStateOffset(SI->getPointerOperand());
     if (Off && *Off == RegOffset) return SI->getValueOperand();
   }
+
+  std::queue<BasicBlock *> Worklist;
+  std::set<BasicBlock *> Visited;
+  for (BasicBlock *Pred : predecessors(StartBB)) {
+    Worklist.push(Pred);
+    Visited.insert(Pred);
+  }
+
+  unsigned BlocksVisited = 0;
+  while (!Worklist.empty() && BlocksVisited < 32) {
+    BasicBlock *BB = Worklist.front();
+    Worklist.pop();
+    BlocksVisited++;
+
+    for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
+      auto *SI = dyn_cast<StoreInst>(&*It);
+      if (!SI) continue;
+      auto Off = IdentifyStateOffset(SI->getPointerOperand());
+      if (Off && *Off == RegOffset) return SI->getValueOperand();
+    }
+
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (Visited.insert(Pred).second) {
+        Worklist.push(Pred);
+      }
+    }
+  }
+
   return nullptr;
 }
 
 static Value *FindStoreToStackOffset(AllocaInst *AI, uint64_t Offset, Instruction *Before, unsigned Depth) {
   if (Depth > 4 || !Before) return nullptr;
-  BasicBlock *BB = Before->getParent();
-  const DataLayout &DL = BB->getModule()->getDataLayout();
+  BasicBlock *StartBB = Before->getParent();
+  const DataLayout &DL = StartBB->getModule()->getDataLayout();
 
   for (auto It = BasicBlock::reverse_iterator(Before->getIterator());
-       It != BB->rend(); ++It) {
+       It != StartBB->rend(); ++It) {
     auto *SI = dyn_cast<StoreInst>(&*It);
     if (!SI) continue;
 
@@ -158,6 +198,45 @@ static Value *FindStoreToStackOffset(AllocaInst *AI, uint64_t Offset, Instructio
       return SI->getValueOperand();
     }
   }
+
+  std::queue<BasicBlock *> Worklist;
+  std::set<BasicBlock *> Visited;
+  for (BasicBlock *Pred : predecessors(StartBB)) {
+    Worklist.push(Pred);
+    Visited.insert(Pred);
+  }
+
+  unsigned BlocksVisited = 0;
+  while (!Worklist.empty() && BlocksVisited < 32) {
+    BasicBlock *BB = Worklist.front();
+    Worklist.pop();
+    BlocksVisited++;
+
+    for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
+      auto *SI = dyn_cast<StoreInst>(&*It);
+      if (!SI) continue;
+
+      Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
+      if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+        if (GEP->getPointerOperand()->stripPointerCasts() == AI) {
+          APInt Off(DL.getPointerSizeInBits(), 0, true);
+          if (GEP->accumulateConstantOffset(DL, Off) && !Off.isNegative() &&
+              Off.getZExtValue() == Offset) {
+            return SI->getValueOperand();
+          }
+        }
+      } else if (Ptr == AI && Offset == 0) {
+        return SI->getValueOperand();
+      }
+    }
+
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (Visited.insert(Pred).second) {
+        Worklist.push(Pred);
+      }
+    }
+  }
+
   return nullptr;
 }
 
@@ -196,10 +275,34 @@ static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
     return ClassifyPointerProvenance(ITP->getOperand(0), Depth + 1);
   }
   if (auto *CE = dyn_cast<ConstantExpr>(Stripped)) {
+    if (CE->getOpcode() == Instruction::PtrToInt) {
+      return ClassifyPointerProvenance(CE->getOperand(0), Depth + 1);
+    }
     if (CE->getOpcode() == Instruction::IntToPtr) {
       if (isa<ConstantInt>(CE->getOperand(0)))
         return PointerProvenance::GuestAddressConstant;
       return PointerProvenance::GuestAddressDynamic;
+    }
+  }
+  if (auto *LI = dyn_cast<LoadInst>(Stripped)) {
+    Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
+    if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+      Value *Base = GEP->getPointerOperand()->stripPointerCasts();
+      if (auto *AI = dyn_cast<AllocaInst>(Base)) {
+        const DataLayout &DL = LI->getModule()->getDataLayout();
+        APInt Offset(DL.getPointerSizeInBits(), 0, true);
+        if (GEP->accumulateConstantOffset(DL, Offset) && !Offset.isNegative()) {
+          Value *Stored = FindStoreToStackOffset(AI, Offset.getZExtValue(), LI, Depth + 1);
+          if (Stored) {
+            return ClassifyPointerProvenance(Stored, Depth + 1);
+          }
+        }
+      }
+    } else if (auto *AI = dyn_cast<AllocaInst>(Ptr)) {
+      Value *Stored = FindStoreToStackOffset(AI, 0, LI, Depth + 1);
+      if (Stored) {
+        return ClassifyPointerProvenance(Stored, Depth + 1);
+      }
     }
   }
   if (auto *PTI = dyn_cast<PtrToIntInst>(Stripped))
@@ -344,6 +447,36 @@ static std::string ResolveFormatString(Value *V, unsigned Depth = 0) {
     return ResolveFormatString(ITP->getOperand(0), Depth + 1);
   if (auto *PTI = dyn_cast<PtrToIntInst>(V))
     return ResolveFormatString(PTI->getOperand(0), Depth + 1);
+
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->getOpcode() == Instruction::PtrToInt ||
+        CE->getOpcode() == Instruction::IntToPtr) {
+      return ResolveFormatString(CE->getOperand(0), Depth + 1);
+    }
+  }
+
+  // Trace through stack loads
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
+    if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+      Value *Base = GEP->getPointerOperand()->stripPointerCasts();
+      if (auto *AI = dyn_cast<AllocaInst>(Base)) {
+        const DataLayout &DL = LI->getModule()->getDataLayout();
+        APInt Offset(DL.getPointerSizeInBits(), 0, true);
+        if (GEP->accumulateConstantOffset(DL, Offset) && !Offset.isNegative()) {
+          Value *Stored = FindStoreToStackOffset(AI, Offset.getZExtValue(), LI, Depth + 1);
+          if (Stored) {
+            return ResolveFormatString(Stored, Depth + 1);
+          }
+        }
+      }
+    } else if (auto *AI = dyn_cast<AllocaInst>(Ptr)) {
+      Value *Stored = FindStoreToStackOffset(AI, 0, LI, Depth + 1);
+      if (Stored) {
+        return ResolveFormatString(Stored, Depth + 1);
+      }
+    }
+  }
 
   if (auto *Alias = dyn_cast<GlobalAlias>(V))
     if (Constant *Aliasee = Alias->getAliasee())

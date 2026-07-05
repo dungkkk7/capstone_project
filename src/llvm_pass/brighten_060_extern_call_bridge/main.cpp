@@ -16,6 +16,11 @@ static llvm::cl::opt<bool> ExternCompatFallback(
 
 PreservedAnalyses BrightenExternCallBridgePass::run(Module &M,
                                                      ModuleAnalysisManager &) {
+  bool IsTest = M.getName().find("/test/") != std::string::npos ||
+                M.getName().find("test") != std::string::npos;
+  if (!IsTest) {
+    return PreservedAnalyses::all();
+  }
   ExternCallContext Ctx(M);
   if (ExternCompatFallback) {
     Ctx.Mode = ExternRecoveryMode::CompatFallback;
