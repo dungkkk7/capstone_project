@@ -94,10 +94,10 @@ PLUGINS1 = [
 ]
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,deadargelim,function-attrs,ipsccp,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
 )
 PASS_PIPELINE1 = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,deadargelim,function-attrs,ipsccp,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
 )
 class Color:
     BLUE = '\033[94m'
