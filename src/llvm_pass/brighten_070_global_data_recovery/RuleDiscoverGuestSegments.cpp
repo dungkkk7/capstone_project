@@ -26,7 +26,26 @@ static std::optional<uint64_t> ParseHexPrefix(StringRef Text) {
   return Val;
 }
 
+static bool IsExecutableSegmentName(StringRef Name) {
+  if (Name.contains("__init_array") ||
+      Name.contains("__fini_array") ||
+      Name.contains("__preinit_array")) {
+    return false;
+  }
+
+  return Name.contains("__text") ||
+         Name.ends_with("__init") ||
+         Name.ends_with("__fini") ||
+         Name.contains("__plt") ||
+         Name.contains("__code");
+}
+
 static SegmentKind ClassifySegmentName(StringRef Name) {
+  if (Name.contains("__init_array") ||
+      Name.contains("__fini_array") ||
+      Name.contains("__preinit_array")) {
+    return SegmentKind::Data;
+  }
   if (Name.contains("rodata") || Name.contains("RODATA"))
     return SegmentKind::Rodata;
   if (Name.contains("__bss") || Name.ends_with("_bss"))
@@ -74,6 +93,11 @@ bool BrightenGlobalDataRecoveryPass::DiscoverGuestSegments(
 
     if (!IsSegment && !IsData)
       continue;
+
+    // Filter out executable/code segments
+    if (IsExecutableSegmentName(Name)) {
+      continue;
+    }
 
     auto Seg = std::make_unique<GuestSegment>();
     Seg->GV = &GV;
@@ -131,7 +155,7 @@ bool BrightenGlobalDataRecoveryPass::DiscoverGuestSegments(
     errs() << "[brighten-global-data] discovered " << Count
            << " guest segments\n";
 
-  return Count > 0;
+  return false; // Analysis only, does not modify IR
 }
 
 } // namespace brighten_global

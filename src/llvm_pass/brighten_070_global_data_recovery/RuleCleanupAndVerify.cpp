@@ -9,12 +9,26 @@ namespace brighten_global {
 
 using namespace llvm;
 
+bool BrightenGlobalDataRecoveryPass::RemoveDeadSegmentConstantUsers(
+    GlobalDataContext &Ctx) {
+  bool Changed = false;
+  for (auto &Seg : Ctx.Segments) {
+    if (Seg->GV) {
+      Seg->GV->removeDeadConstantUsers();
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     GlobalDataContext &Ctx) {
   unsigned Removed = 0;
 
   for (auto &Seg : Ctx.Segments) {
     if (!Seg->GV)
+      continue;
+    if (!Seg->BaseResolved)
       continue;
 
     bool AllUsesRewritten = true;
@@ -55,6 +69,47 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
 bool BrightenGlobalDataRecoveryPass::VerifyGlobalDataRecovery(
     GlobalDataContext &Ctx) {
   bool HasError = false;
+
+  // Live segment check: in strict mode, no data/rodata/bss segment should still have uses.
+  for (auto &Seg : Ctx.Segments) {
+    if (!Seg->GV)
+      continue;
+    if (!Seg->BaseResolved)
+      continue;
+    if (Ctx.Mode == DataRecoveryMode::NativeStrict) {
+      if (Seg->Kind == SegmentKind::Rodata || Seg->Kind == SegmentKind::Data || Seg->Kind == SegmentKind::Bss) {
+        bool AllowedToBeLive = false;
+        for (auto &Ref : Ctx.AddressRefs) {
+          if (Ref->Segment == Seg.get() && !Ref->Rewritten) {
+            AllowedToBeLive = true;
+            break;
+          }
+        }
+        if (!AllowedToBeLive) {
+          Function *TranslateFn = Ctx.M.getFunction("__translate_guest_pointer");
+          if (TranslateFn && !TranslateFn->use_empty()) {
+            for (User *U : Seg->GV->users()) {
+              if (auto *I = dyn_cast<Instruction>(U)) {
+                if (I->getFunction() == TranslateFn) {
+                  AllowedToBeLive = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (!AllowedToBeLive && !Seg->GV->use_empty()) {
+          errs() << "[brighten-global-data] VERIFY ERROR: segment " << Seg->GV->getName() << " still live without preserved uses:\n";
+          for (User *U : Seg->GV->users()) {
+            U->print(errs());
+            errs() << "\n";
+          }
+          HasError = true;
+          ++Ctx.Report.VerifierErrors;
+        }
+      }
+    }
+  }
 
   // 1. No recovered object overlaps another incompatible object
   RecoveredObject *Prev = nullptr;

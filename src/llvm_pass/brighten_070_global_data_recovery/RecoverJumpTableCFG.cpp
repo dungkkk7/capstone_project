@@ -1,3 +1,4 @@
+#include "llvm/ADT/SmallPtrSet.h"
 #include "BrightenGlobalDataRecoveryPass.h"
 
 #include "llvm/IR/Constants.h"
@@ -28,16 +29,18 @@ static Function *FindFnByGuestAddr(Module &M, uint64_t Addr) {
   return nullptr;
 }
 
-static bool TraceToValue(Value *Source, Value *Target) {
+static bool TraceToValue(Value *Source, Value *Target, SmallPtrSetImpl<Value *> &Visited) {
   if (Source == Target)
     return true;
+  if (!Visited.insert(Source).second)
+    return false;
   for (User *U : Source->users()) {
     if (U == Target)
       return true;
     if (isa<PtrToIntInst>(U) || isa<IntToPtrInst>(U) ||
         isa<ZExtInst>(U) || isa<SExtInst>(U) || isa<TruncInst>(U) ||
         isa<BitCastInst>(U)) {
-      if (TraceToValue(U, Target))
+      if (TraceToValue(U, Target, Visited))
         return true;
     }
   }
@@ -101,7 +104,8 @@ static bool IsJumpTableLoad(Instruction *I, GlobalDataContext &Ctx,
     if (auto *CI = dyn_cast<CallInst>(&Inst)) {
       Function *Callee = CI->getCalledFunction();
       if (Callee && Callee->getName() == "__remill_jump") {
-        if (TraceToValue(LI, CI->getArgOperand(1))) {
+        SmallPtrSet<Value *, 8> Visited;
+        if (TraceToValue(LI, CI->getArgOperand(1), Visited)) {
           TraceOk = true;
           OutJumpCall = CI;
           break;
@@ -242,12 +246,30 @@ bool BrightenGlobalDataRecoveryPass::RecoverJumpTableCFG(
           Value *PCParam = ConstantInt::get(Type::getInt64Ty(LCtx), Entry.GuestTarget);
 
           SmallVector<Value *, 3> Args;
-          if (Entry.TargetFn->arg_size() >= 1)
-            Args.push_back(StateParam);
-          if (Entry.TargetFn->arg_size() >= 2)
-            Args.push_back(PCParam);
-          if (Entry.TargetFn->arg_size() >= 3)
-            Args.push_back(MemParam);
+          if (Entry.TargetFn->arg_size() >= 1) {
+            Value *Arg0 = StateParam;
+            Type *ParamTy = Entry.TargetFn->getFunctionType()->getParamType(0);
+            if (Arg0->getType() != ParamTy) {
+              Arg0 = CaseBuilder.CreateBitCast(Arg0, ParamTy);
+            }
+            Args.push_back(Arg0);
+          }
+          if (Entry.TargetFn->arg_size() >= 2) {
+            Value *Arg1 = PCParam;
+            Type *ParamTy = Entry.TargetFn->getFunctionType()->getParamType(1);
+            if (Arg1->getType() != ParamTy) {
+              Arg1 = CaseBuilder.CreateZExtOrTrunc(Arg1, ParamTy);
+            }
+            Args.push_back(Arg1);
+          }
+          if (Entry.TargetFn->arg_size() >= 3) {
+            Value *Arg2 = MemParam;
+            Type *ParamTy = Entry.TargetFn->getFunctionType()->getParamType(2);
+            if (Arg2->getType() != ParamTy) {
+              Arg2 = CaseBuilder.CreateBitCast(Arg2, ParamTy);
+            }
+            Args.push_back(Arg2);
+          }
 
           CallInst *Call = CaseBuilder.CreateCall(Entry.TargetFn, Args);
 
@@ -265,7 +287,16 @@ bool BrightenGlobalDataRecoveryPass::RecoverJumpTableCFG(
             CaseBuilder.CreateRet(RetVal);
           }
 
-          SI->addCase(Builder.getInt64(CaseId), CaseBB);
+unsigned GEP_ElemSize = 1;
+          if (auto *GEPInst = dyn_cast<GetElementPtrInst>(cast<LoadInst>(&I)->getPointerOperand())) {
+            GEP_ElemSize = Ctx.DL.getTypeAllocSize(GEPInst->getSourceElementType());
+          }
+          uint64_t CaseVal = CaseId;
+          if (GEP_ElemSize == 1) {
+            CaseVal = (uint64_t)CaseId * JT->EntrySize;
+          }
+          auto *IndexTy = cast<IntegerType>(IndexVal->getType());
+          SI->addCase(ConstantInt::get(IndexTy, CaseVal), CaseBB);
           ++CaseId;
         }
 
@@ -274,6 +305,15 @@ bool BrightenGlobalDataRecoveryPass::RecoverJumpTableCFG(
           Instruction *ToErase = Next;
           Next = Next->getNextNode();
           ToErase->eraseFromParent();
+        }
+
+        Value *Ptr = cast<LoadInst>(&I)->getPointerOperand();
+        I.replaceAllUsesWith(UndefValue::get(I.getType()));
+        I.eraseFromParent();
+        if (auto *GEPInst = dyn_cast<GetElementPtrInst>(Ptr)) {
+          if (GEPInst->use_empty()) {
+            GEPInst->eraseFromParent();
+          }
         }
 
         Changed = true;

@@ -73,81 +73,12 @@ bool BrightenGlobalDataRecoveryPass::ResolveObjectConflicts(
               return A->Begin < B->Begin;
             });
 
-  // Now, for each segment, find all gaps not covered by the resolved proven candidates,
-  // and fill them with ObjectKind::RawBytes candidates so 100% of segment bytes are mapped.
-  std::vector<std::unique_ptr<ObjectCandidate>> Filled;
-
-  for (auto &Seg : Ctx.Segments) {
-    if (!Seg->BaseResolved)
-      continue;
-
-    uint64_t SegBegin = Seg->GuestBase;
-    uint64_t SegEnd = SegBegin + Seg->Size;
-    uint64_t Current = SegBegin;
-
-    // Collect resolved candidates belonging to this segment
-    std::vector<ObjectCandidate *> SegCands;
-    for (const auto &Cand : Resolved) {
-      if (Cand->SourceSegment == Seg.get()) {
-        SegCands.push_back(Cand.get());
-      }
-    }
-
-    // Sort ascending
-    std::sort(SegCands.begin(), SegCands.end(),
-              [](const ObjectCandidate *A, const ObjectCandidate *B) {
-                return A->Begin < B->Begin;
-              });
-
-    for (const auto *Cand : SegCands) {
-      if (Cand->Begin > Current) {
-        // Gap detected! Create RawBytes candidate for the gap [Current, Cand->Begin)
-        auto Gap = std::make_unique<ObjectCandidate>();
-        Gap->Begin = Current;
-        Gap->End = Cand->Begin;
-        Gap->Kind = ObjectKind::RawBytes;
-        Gap->Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), Cand->Begin - Current);
-        Gap->Confidence = 0;
-        Gap->SourceSegment = Seg.get();
-        Gap->Name = "g_raw_" + Twine::utohexstr(Current).str();
-        Filled.push_back(std::move(Gap));
-      }
-      Current = Cand->End;
-    }
-
-    if (Current < SegEnd) {
-      // Gap at end of segment
-      auto Gap = std::make_unique<ObjectCandidate>();
-      Gap->Begin = Current;
-      Gap->End = SegEnd;
-      Gap->Kind = ObjectKind::RawBytes;
-      Gap->Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), SegEnd - Current);
-      Gap->Confidence = 0;
-      Gap->SourceSegment = Seg.get();
-      Gap->Name = "g_raw_" + Twine::utohexstr(Current).str();
-      Filled.push_back(std::move(Gap));
-    }
-  }
-
-  // Merge the gap candidates back into Resolved
-  for (auto &Gap : Filled) {
-    Resolved.push_back(std::move(Gap));
-  }
-
-  // Sort again by Begin address ascending
-  std::sort(Resolved.begin(), Resolved.end(),
-            [](const std::unique_ptr<ObjectCandidate> &A,
-               const std::unique_ptr<ObjectCandidate> &B) {
-              return A->Begin < B->Begin;
-            });
-
   Ctx.Candidates = std::move(Resolved);
 
   if (Ctx.Debug)
-    errs() << "[brighten-global-data] resolved conflicts & filled gaps, total candidates: "
+    errs() << "[brighten-global-data] resolved conflicts, total candidates: "
            << Ctx.Candidates.size() << "\n";
 
-  return Changed;
+  return false; // Analysis only
 }
-
 } // namespace brighten_global

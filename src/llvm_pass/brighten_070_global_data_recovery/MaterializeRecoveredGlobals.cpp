@@ -79,141 +79,166 @@ static Function *FindFnByGuestAddr(Module &M, uint64_t Addr) {
   return nullptr;
 }
 
+static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataContext &Ctx);
+
+static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataContext &Ctx) {
+  if (!Cand)
+    return nullptr;
+
+  if (const RecoveredObject *Obj = Ctx.findObjectAt(Cand->Begin)) {
+    return Obj->GV;
+  }
+
+  GuestSegment *Seg = Cand->SourceSegment;
+  if (!Seg)
+    return nullptr;
+
+  uint64_t Off = Cand->Begin - Seg->GuestBase;
+  Constant *Init = nullptr;
+
+  if (Seg->Kind == SegmentKind::Bss) {
+    Init = Constant::getNullValue(Cand->Ty);
+  } else {
+    if (Cand->Kind == ObjectKind::StringLiteral) {
+      std::vector<uint8_t> Bytes(Seg->FlatBytes.begin() + Off,
+                                 Seg->FlatBytes.begin() + Off + (Cand->End - Cand->Begin));
+      StringRef BytesRef(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+      Init = ConstantDataArray::getString(Ctx.M.getContext(), BytesRef, false);
+    } else if (Cand->Kind == ObjectKind::Array || Cand->Kind == ObjectKind::RawBytes) {
+      auto *ArrTy = cast<ArrayType>(Cand->Ty);
+      Type *ElemTy = ArrTy->getElementType();
+      unsigned ElemSize = Ctx.DL.getTypeStoreSize(ElemTy);
+      unsigned NumElems = ArrTy->getNumElements();
+
+      if (ElemTy->isIntegerTy(8)) {
+        std::vector<uint8_t> Bytes(Seg->FlatBytes.begin() + Off,
+                                   Seg->FlatBytes.begin() + Off + NumElems);
+        Init = ConstantDataArray::get(Ctx.M.getContext(), Bytes);
+      } else {
+        SmallVector<Constant *, 64> Elems;
+        for (unsigned I = 0; I < NumElems; ++I) {
+          Constant *E = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Off + I * ElemSize, ElemTy);
+          if (!E)
+            E = Constant::getNullValue(ElemTy);
+          Elems.push_back(E);
+        }
+        Init = ConstantArray::get(ArrTy, Elems);
+      }
+    } else if (Cand->Kind == ObjectKind::PointerTable) {
+      auto *ArrTy = cast<ArrayType>(Cand->Ty);
+      unsigned PtrSize = Ctx.DL.getPointerSize();
+      unsigned NumElems = ArrTy->getNumElements();
+      PointerType *PtrTy = PointerType::get(Ctx.M.getContext(), 0);
+
+      SmallVector<Constant *, 32> Elems;
+      for (unsigned I = 0; I < NumElems; ++I) {
+        uint64_t EntryVal = 0;
+        for (unsigned B = 0; B < PtrSize; ++B)
+          EntryVal |= (uint64_t)Seg->FlatBytes[Off + I * PtrSize + B] << (B * 8);
+
+        Constant *Target = nullptr;
+
+        auto RelIt = Seg->Relocations.find(Off + I * PtrSize);
+        if (RelIt != Seg->Relocations.end()) {
+          Target = RelIt->second;
+        } else {
+          Function *Fn = FindFnByGuestAddr(Ctx.M, EntryVal);
+          if (Fn) {
+            Target = Fn;
+          } else {
+            const RecoveredObject *TargetObj = Ctx.findObjectAt(EntryVal);
+            if (TargetObj && TargetObj->GV) {
+              Target = TargetObj->GV;
+            } else {
+              ObjectCandidate *TargetCand = nullptr;
+              for (auto &C : Ctx.Candidates) {
+                if (EntryVal >= C->Begin && EntryVal < C->End) {
+                  TargetCand = C.get();
+                  break;
+                }
+              }
+              if (TargetCand && TargetCand != Cand) {
+                Target = MaterializeCandidate(TargetCand, Ctx);
+              }
+            }
+          }
+        }
+
+        if (Target) {
+          Constant *CastVal = ConstantExpr::getPointerCast(Target, PtrTy);
+          Elems.push_back(CastVal);
+        } else {
+          Elems.push_back(Constant::getNullValue(PtrTy));
+        }
+      }
+      Init = ConstantArray::get(ArrTy, Elems);
+    } else {
+      Init = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Off, Cand->Ty);
+    }
+  }
+
+  if (!Init)
+    return nullptr;
+
+  std::string Name = Cand->Name;
+  bool IsReadOnly = Seg->ReadOnly;
+  GlobalValue::LinkageTypes Linkage = GlobalValue::InternalLinkage;
+
+  if (Cand->Kind == ObjectKind::StringLiteral) {
+    Name = ".str." + std::to_string(Ctx.NextStringId++);
+    Linkage = GlobalValue::PrivateLinkage;
+    IsReadOnly = true;
+  } else if (Cand->Kind == ObjectKind::Scalar) {
+    Name = "g_scalar_" + std::to_string(Ctx.NextScalarId++);
+  } else if (Cand->Kind == ObjectKind::Array) {
+    Name = "g_arr_" + std::to_string(Ctx.NextArrayId++);
+  } else if (Cand->Kind == ObjectKind::PointerTable) {
+    Name = "g_ptrtable_" + std::to_string(Ctx.NextPtrTableId++);
+  }
+
+  auto *GV = new GlobalVariable(Ctx.M, Init->getType(), IsReadOnly,
+                                Linkage, Init, Name);
+  GV->setAlignment(Align(Ctx.DL.getABITypeAlign(Init->getType())));
+
+  if (Cand->Kind == ObjectKind::StringLiteral) {
+    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  }
+
+  auto Obj = std::make_unique<RecoveredObject>();
+  Obj->Begin = Cand->Begin;
+  Obj->End = Cand->End;
+  Obj->Kind = Cand->Kind;
+  Obj->Ty = Init->getType();
+  Obj->GV = GV;
+  Obj->SourceSegment = Seg;
+  Obj->ReadOnly = IsReadOnly;
+  Obj->Name = Name;
+  Obj->Action = "recovered-" + Name;
+
+  if (Cand->Kind == ObjectKind::StringLiteral)
+    ++Ctx.Report.StringsRecovered;
+  else if (Cand->Kind == ObjectKind::Scalar)
+    ++Ctx.Report.GlobalScalarsRecovered;
+  else if (Cand->Kind == ObjectKind::Array)
+    ++Ctx.Report.GlobalArraysRecovered;
+  else if (Cand->Kind == ObjectKind::PointerTable)
+    ++Ctx.Report.PointerTablesRecovered;
+
+  auto *RetGV = GV;
+  Ctx.RecoveredObjects[Cand->Begin] = std::move(Obj);
+  return RetGV;
+}
+
 bool BrightenGlobalDataRecoveryPass::MaterializeRecoveredGlobals(
     GlobalDataContext &Ctx) {
   bool Changed = false;
-
   for (auto &Cand : Ctx.Candidates) {
     if (Ctx.findObjectAt(Cand->Begin))
       continue;
-
-    GuestSegment *Seg = Cand->SourceSegment;
-    if (!Seg)
-      continue;
-
-    uint64_t Off = Cand->Begin - Seg->GuestBase;
-    Constant *Init = nullptr;
-
-    if (Seg->Kind == SegmentKind::Bss) {
-      Init = Constant::getNullValue(Cand->Ty);
-    } else {
-      if (Cand->Kind == ObjectKind::StringLiteral) {
-        std::vector<uint8_t> Bytes(Seg->FlatBytes.begin() + Off,
-                                   Seg->FlatBytes.begin() + Off + (Cand->End - Cand->Begin));
-        StringRef BytesRef(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
-        Init = ConstantDataArray::getString(Ctx.M.getContext(), BytesRef, false);
-      } else if (Cand->Kind == ObjectKind::Array || Cand->Kind == ObjectKind::RawBytes) {
-        auto *ArrTy = cast<ArrayType>(Cand->Ty);
-        Type *ElemTy = ArrTy->getElementType();
-        unsigned ElemSize = Ctx.DL.getTypeStoreSize(ElemTy);
-        unsigned NumElems = ArrTy->getNumElements();
-
-        if (ElemTy->isIntegerTy(8)) {
-          std::vector<uint8_t> Bytes(Seg->FlatBytes.begin() + Off,
-                                     Seg->FlatBytes.begin() + Off + NumElems);
-          Init = ConstantDataArray::get(Ctx.M.getContext(), Bytes);
-        } else {
-          SmallVector<Constant *, 64> Elems;
-          for (unsigned I = 0; I < NumElems; ++I) {
-            Constant *E = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Off + I * ElemSize, ElemTy);
-            if (!E)
-              E = Constant::getNullValue(ElemTy);
-            Elems.push_back(E);
-          }
-          Init = ConstantArray::get(ArrTy, Elems);
-        }
-      } else if (Cand->Kind == ObjectKind::PointerTable) {
-        auto *ArrTy = cast<ArrayType>(Cand->Ty);
-        unsigned PtrSize = Ctx.DL.getPointerSize();
-        unsigned NumElems = ArrTy->getNumElements();
-        PointerType *PtrTy = PointerType::get(Ctx.M.getContext(), 0);
-
-        SmallVector<Constant *, 32> Elems;
-        for (unsigned I = 0; I < NumElems; ++I) {
-          uint64_t EntryVal = 0;
-          for (unsigned B = 0; B < PtrSize; ++B)
-            EntryVal |= (uint64_t)Seg->FlatBytes[Off + I * PtrSize + B] << (B * 8);
-
-          Constant *Target = nullptr;
-
-          auto RelIt = Seg->Relocations.find(Off + I * PtrSize);
-          if (RelIt != Seg->Relocations.end()) {
-            Target = RelIt->second;
-          } else {
-            Function *Fn = FindFnByGuestAddr(Ctx.M, EntryVal);
-            if (Fn) {
-              Target = Fn;
-            } else {
-              const RecoveredObject *Obj = Ctx.findObjectAt(EntryVal);
-              if (Obj && Obj->GV)
-                Target = Obj->GV;
-            }
-          }
-
-          if (Target) {
-            Constant *CastVal = ConstantExpr::getPointerCast(Target, PtrTy);
-            Elems.push_back(CastVal);
-          } else {
-            Elems.push_back(Constant::getNullValue(PtrTy));
-          }
-        }
-        Init = ConstantArray::get(ArrTy, Elems);
-      } else {
-        Init = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Off, Cand->Ty);
-      }
+    if (MaterializeCandidate(Cand.get(), Ctx)) {
+      Changed = true;
     }
-
-    if (!Init)
-      continue;
-
-    std::string Name = Cand->Name;
-    bool IsReadOnly = Seg->ReadOnly;
-    GlobalValue::LinkageTypes Linkage = GlobalValue::InternalLinkage;
-
-    if (Cand->Kind == ObjectKind::StringLiteral) {
-      Name = ".str." + std::to_string(Ctx.NextStringId++);
-      Linkage = GlobalValue::PrivateLinkage;
-      IsReadOnly = true;
-    } else if (Cand->Kind == ObjectKind::Scalar) {
-      Name = "g_scalar_" + std::to_string(Ctx.NextScalarId++);
-    } else if (Cand->Kind == ObjectKind::Array) {
-      Name = "g_arr_" + std::to_string(Ctx.NextArrayId++);
-    } else if (Cand->Kind == ObjectKind::PointerTable) {
-      Name = "g_ptrtable_" + std::to_string(Ctx.NextPtrTableId++);
-    }
-
-    auto *GV = new GlobalVariable(Ctx.M, Init->getType(), IsReadOnly,
-                                  Linkage, Init, Name);
-    GV->setAlignment(Align(Ctx.DL.getABITypeAlign(Init->getType())));
-
-    if (Cand->Kind == ObjectKind::StringLiteral) {
-      GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    }
-
-    auto Obj = std::make_unique<RecoveredObject>();
-    Obj->Begin = Cand->Begin;
-    Obj->End = Cand->End;
-    Obj->Kind = Cand->Kind;
-    Obj->Ty = Init->getType();
-    Obj->GV = GV;
-    Obj->SourceSegment = Seg;
-    Obj->ReadOnly = IsReadOnly;
-    Obj->Name = Name;
-    Obj->Action = "recovered-" + Name;
-
-    if (Cand->Kind == ObjectKind::StringLiteral)
-      ++Ctx.Report.StringsRecovered;
-    else if (Cand->Kind == ObjectKind::Scalar)
-      ++Ctx.Report.GlobalScalarsRecovered;
-    else if (Cand->Kind == ObjectKind::Array)
-      ++Ctx.Report.GlobalArraysRecovered;
-    else if (Cand->Kind == ObjectKind::PointerTable)
-      ++Ctx.Report.PointerTablesRecovered;
-
-    Ctx.RecoveredObjects[Cand->Begin] = std::move(Obj);
-    Changed = true;
   }
-
   return Changed;
 }
 

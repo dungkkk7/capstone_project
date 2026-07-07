@@ -21,7 +21,9 @@ public:
   static bool ResolveObjectConflicts(GlobalDataContext &Ctx);
   static bool MaterializeRecoveredGlobals(GlobalDataContext &Ctx);
   static bool RewriteGuestDataReferences(GlobalDataContext &Ctx);
+  static bool RewriteGuestPointerTranslatorCalls(GlobalDataContext &Ctx);
   static bool RecoverJumpTableCFG(GlobalDataContext &Ctx);
+  static bool RemoveDeadSegmentConstantUsers(GlobalDataContext &Ctx);
   static bool CleanupDeadSegmentArtifacts(GlobalDataContext &Ctx);
   static bool VerifyGlobalDataRecovery(GlobalDataContext &Ctx);
   static bool PrintGlobalDataRecoveryReport(GlobalDataContext &Ctx);

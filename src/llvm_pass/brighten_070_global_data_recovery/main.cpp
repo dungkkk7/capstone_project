@@ -1,3 +1,4 @@
+#include "llvm/Support/ErrorHandling.h"
 #include "BrightenGlobalDataRecoveryPass.h"
 
 #include "llvm/Passes/PassBuilder.h"
@@ -12,16 +13,25 @@ PreservedAnalyses BrightenGlobalDataRecoveryPass::run(Module &M,
   GlobalDataContext Ctx(M);
   bool Changed = false;
 
-  Changed |= DiscoverGuestSegments(Ctx);
-  Changed |= FlattenSegmentBytes(Ctx);
-  Changed |= BuildGuestAddressMap(Ctx);
-  Changed |= GenerateObjectCandidates(Ctx);
-  Changed |= ResolveObjectConflicts(Ctx);
+  // Analysis / helper passes (do not modify IR)
+  DiscoverGuestSegments(Ctx);
+  FlattenSegmentBytes(Ctx);
+  BuildGuestAddressMap(Ctx);
+  GenerateObjectCandidates(Ctx);
+  ResolveObjectConflicts(Ctx);
+
+  // Transformation passes
   Changed |= MaterializeRecoveredGlobals(Ctx);
-  Changed |= RewriteGuestDataReferences(Ctx);
   Changed |= RecoverJumpTableCFG(Ctx);
+  Changed |= RewriteGuestDataReferences(Ctx);
+  Changed |= RewriteGuestPointerTranslatorCalls(Ctx);
+  Changed |= RemoveDeadSegmentConstantUsers(Ctx);
   Changed |= CleanupDeadSegmentArtifacts(Ctx);
-  VerifyGlobalDataRecovery(Ctx);
+
+  bool HasVerifierError = VerifyGlobalDataRecovery(Ctx);
+  if (Ctx.Mode == DataRecoveryMode::NativeStrict && HasVerifierError) {
+    report_fatal_error("global data recovery validation failed in strict mode");
+  }
   PrintGlobalDataRecoveryReport(Ctx);
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

@@ -132,15 +132,20 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
   for (auto &Ref : Ctx.AddressRefs) {
     if (Ref->Rewritten)
       continue;
-    if (Ref->SkipReason.size() > 0)
+    if (Ref->SkipReason.size() > 0) {
+      ++Ctx.Report.PreservedRefs;
       continue;
-    if (!Ref->Segment || !Ref->Segment->BaseResolved)
+    }
+    if (!Ref->Segment || !Ref->Segment->BaseResolved) {
+      ++Ctx.Report.PreservedRefs;
       continue;
+    }
 
     // Address identity sensitive check in NativeStrict mode
     if (Ctx.Mode == DataRecoveryMode::NativeStrict &&
         IsAddressIdentitySensitive(Ref.get())) {
       Ref->SkipReason = "address-identity-observable";
+      ++Ctx.Report.PreservedRefs;
       continue;
     }
 
@@ -153,45 +158,61 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
         Obj = It->second.get();
     }
 
-    if (!Obj)
+    if (!Obj) {
+      ++Ctx.Report.PreservedRefs;
       continue;
+    }
 
     Instruction *UserInst = Ref->UserInst;
-    if (!UserInst)
+    if (!UserInst) {
+      ++Ctx.Report.PreservedRefs;
       continue;
+    }
 
     Value *OrigVal = Ref->OriginalValue;
-    if (!OrigVal)
+    if (!OrigVal) {
+      ++Ctx.Report.PreservedRefs;
       continue;
+    }
 
+    bool LocalRewritten = false;
     if (auto *CE = dyn_cast<ConstantExpr>(OrigVal)) {
       Constant *NewConst = CreateConstantGEPToObject(Obj, Ref->GuestAddr, CE->getType());
       if (NewConst) {
         UserInst->replaceUsesOfWith(CE, NewConst);
         Ref->Rewritten = true;
+        LocalRewritten = true;
         ++Count;
-        continue;
       }
     }
 
-    IRBuilder<> Builder(UserInst);
-    Value *NewPtr = CreateGEPToObject(Builder, Obj, Ref->GuestAddr);
-    if (!NewPtr)
-      continue;
+    if (!LocalRewritten) {
+      IRBuilder<> Builder(UserInst);
+      Value *NewPtr = CreateGEPToObject(Builder, Obj, Ref->GuestAddr);
+      if (NewPtr) {
+        Type *ExpectedTy = OrigVal->getType();
+        bool TypeOk = true;
+        if (NewPtr->getType() != ExpectedTy) {
+          if (ExpectedTy->isPointerTy())
+            NewPtr = Builder.CreateBitCast(NewPtr, ExpectedTy);
+          else if (ExpectedTy->isIntegerTy())
+            NewPtr = Builder.CreatePtrToInt(NewPtr, ExpectedTy);
+          else
+            TypeOk = false;
+        }
 
-    Type *ExpectedTy = OrigVal->getType();
-    if (NewPtr->getType() != ExpectedTy) {
-      if (ExpectedTy->isPointerTy())
-        NewPtr = Builder.CreateBitCast(NewPtr, ExpectedTy);
-      else if (ExpectedTy->isIntegerTy())
-        NewPtr = Builder.CreatePtrToInt(NewPtr, ExpectedTy);
-      else
-        continue;
+        if (TypeOk) {
+          UserInst->replaceUsesOfWith(OrigVal, NewPtr);
+          Ref->Rewritten = true;
+          LocalRewritten = true;
+          ++Count;
+        }
+      }
     }
 
-    UserInst->replaceUsesOfWith(OrigVal, NewPtr);
-    Ref->Rewritten = true;
-    ++Count;
+    if (!Ref->Rewritten) {
+      ++Ctx.Report.PreservedRefs;
+    }
   }
 
   // 2. Rewrite dynamic users of segment globals to point to appropriate recovered or raw-byte objects
@@ -199,7 +220,6 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     if (!Seg->GV || !Seg->BaseResolved)
       continue;
 
-    // Find recovered object at the start of segment
     const RecoveredObject *Obj = Ctx.findObjectAt(Seg->GuestBase);
     if (!Obj || !Obj->GV)
       continue;
@@ -207,24 +227,28 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     SmallVector<User *, 8> Users(Seg->GV->users());
     for (User *U : Users) {
       if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-        if (GEP->getNumIndices() >= 2) {
-          Value *Idx = GEP->getOperand(2);
-          if (!isa<ConstantInt>(Idx)) {
-            uint64_t BaseOffset = 0;
-            if (auto *ConstFirst = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
-              // Usually 0
+        Value *Idx = nullptr;
+        uint64_t BaseOffset = 0;
+        if (GEP->getNumIndices() == 1) {
+          Idx = GEP->getOperand(1);
+        } else if (GEP->getNumIndices() >= 2) {
+          Idx = GEP->getOperand(2);
+          if (auto *ConstFirst = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
+            // usually 0
+          }
+        }
+
+        if (Idx && !isa<ConstantInt>(Idx)) {
+          uint64_t GuestAddr = Seg->GuestBase + BaseOffset;
+          const RecoveredObject *Obj = Ctx.findObjectAt(GuestAddr);
+          if (Obj && Obj->GV && (Obj->End - Obj->Begin == Seg->Size)) {
+            IRBuilder<> Builder(GEP);
+            Value *NewBase = Obj->GV;
+            if (NewBase->getType() != GEP->getPointerOperand()->getType()) {
+              NewBase = Builder.CreateBitCast(NewBase, GEP->getPointerOperand()->getType());
             }
-            uint64_t GuestAddr = Seg->GuestBase + BaseOffset;
-            const RecoveredObject *Obj = Ctx.findObjectAt(GuestAddr);
-            if (Obj && Obj->GV) {
-              IRBuilder<> Builder(GEP);
-              Value *NewBase = Obj->GV;
-              if (NewBase->getType() != GEP->getPointerOperand()->getType()) {
-                NewBase = Builder.CreateBitCast(NewBase, GEP->getPointerOperand()->getType());
-              }
-              GEP->setOperand(0, NewBase);
-              ++Count;
-            }
+            GEP->setOperand(0, NewBase);
+            ++Count;
           }
         }
       }
@@ -237,6 +261,59 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
            << " data references\n";
 
   return Count > 0;
+}
+
+
+
+bool BrightenGlobalDataRecoveryPass::RewriteGuestPointerTranslatorCalls(
+    GlobalDataContext &Ctx) {
+  Module &M = Ctx.M;
+  Function *TranslateFn = M.getFunction("__translate_guest_pointer");
+  if (!TranslateFn)
+    return false;
+
+  bool Changed = false;
+  unsigned TranslatorCount = 0;
+  SmallVector<CallInst *, 64> Calls;
+  for (User *U : TranslateFn->users()) {
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+      if (CI->getCalledFunction() == TranslateFn) {
+        Calls.push_back(CI);
+      }
+    }
+  }
+
+  for (CallInst *CI : Calls) {
+    Value *AddrVal = CI->getArgOperand(0);
+
+    // Case 1: Constant address
+    if (auto *CI_Addr = dyn_cast<ConstantInt>(AddrVal)) {
+      uint64_t Addr = CI_Addr->getZExtValue();
+      const RecoveredObject *Obj = Ctx.findObjectAt(Addr);
+      if (Obj && Obj->GV) {
+        IRBuilder<> Builder(CI);
+        Value *NewPtr = CreateGEPToObject(Builder, const_cast<RecoveredObject *>(Obj), Addr);
+        if (NewPtr) {
+          if (NewPtr->getType() != CI->getType()) {
+            NewPtr = Builder.CreateBitCast(NewPtr, CI->getType());
+          }
+          CI->replaceAllUsesWith(NewPtr);
+          CI->eraseFromParent();
+          Changed = true;
+          ++TranslatorCount;
+          continue;
+        }
+      }
+    }
+  }
+
+  if (TranslatorCount > 0) {
+    Ctx.Report.DataRefsRewritten += TranslatorCount;
+  }
+
+
+
+  return Changed;
 }
 
 } // namespace brighten_global

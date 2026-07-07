@@ -71,7 +71,7 @@ static void GenerateStringCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) 
     bool HasStrongEvidence = false;
 
     for (auto &Ref : Ctx.AddressRefs) {
-      if (Ref->GuestAddr == Addr) {
+      if (Ref->GuestAddr >= Addr && Ref->GuestAddr < Addr + Len) {
         for (auto &Ev : Ref->EvidenceList) {
           EvList.push_back(Ev);
           Confidence += Ev.Confidence;
@@ -178,9 +178,7 @@ static void GenerateArrayCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) {
         HasWrite = true;
     }
 
-    // Strict array requirements: must have dynamic indexed stride expression
-    if (!HasIndexedUse)
-      continue;
+
 
     size_t ClusterStart = 0;
     while (ClusterStart < UniqueAddrs.size()) {

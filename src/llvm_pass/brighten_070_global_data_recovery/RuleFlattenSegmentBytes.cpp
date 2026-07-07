@@ -96,9 +96,10 @@ static bool FlattenConstant(Constant *C, const DataLayout &DL,
     return true;
   }
 
-  uint64_t Size = DL.getTypeAllocSize(C->getType());
-  Bytes.insert(Bytes.end(), Size, 0);
-  return true;
+  errs() << "unsupported initializer constant: ";
+  C->print(errs());
+  errs() << "\n";
+  return false;
 }
 
 bool BrightenGlobalDataRecoveryPass::FlattenSegmentBytes(
@@ -110,7 +111,12 @@ bool BrightenGlobalDataRecoveryPass::FlattenSegmentBytes(
     Seg->FlatBytes.clear();
     Seg->Relocations.clear();
     if (Seg->GV->hasInitializer()) {
-      FlattenConstant(Seg->GV->getInitializer(), Ctx.DL, Seg->FlatBytes, Seg->Relocations, 0);
+      if (!FlattenConstant(Seg->GV->getInitializer(), Ctx.DL, Seg->FlatBytes, Seg->Relocations, 0)) {
+        Seg->SkipReason = "initializer-flatten-unsupported";
+        Seg->FlatBytes.clear();
+        Seg->Relocations.clear();
+        continue;
+      }
       if (Seg->FlatBytes.size() < Seg->Size) {
         Seg->FlatBytes.insert(Seg->FlatBytes.end(), Seg->Size - Seg->FlatBytes.size(), 0);
       }

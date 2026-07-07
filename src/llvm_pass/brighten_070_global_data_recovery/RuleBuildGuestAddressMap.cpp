@@ -33,11 +33,12 @@ static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
     return CI->getZExtValue();
 
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    auto *U = cast<User>(CE);
     if (CE->getOpcode() == Instruction::IntToPtr &&
-        isa<ConstantInt>(CE->getOperand(0)))
-      return cast<ConstantInt>(CE->getOperand(0))->getZExtValue();
+        isa<ConstantInt>(U->getOperand(0)))
+      return cast<ConstantInt>(U->getOperand(0))->getZExtValue();
     if (CE->getOpcode() == Instruction::PtrToInt)
-      return TryExtractGuestAddr(CE->getOperand(0), Ctx);
+      return TryExtractGuestAddr(U->getOperand(0), Ctx);
     if (CE->getOpcode() == Instruction::GetElementPtr) {
       auto *GEP = cast<GEPOperator>(CE);
       Value *Base = GEP->getPointerOperand();
@@ -51,15 +52,15 @@ static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
       return *BaseAddr + Offset.getZExtValue();
     }
     if (CE->getOpcode() == Instruction::Add) {
-      auto LHS = TryExtractGuestAddr(CE->getOperand(0), Ctx);
-      auto RHS = TryExtractGuestAddr(CE->getOperand(1), Ctx);
+      auto LHS = TryExtractGuestAddr(U->getOperand(0), Ctx);
+      auto RHS = TryExtractGuestAddr(U->getOperand(1), Ctx);
       if (LHS && RHS)
         return *LHS + *RHS;
       return std::nullopt;
     }
     if (CE->getOpcode() == Instruction::Sub) {
-      auto LHS = TryExtractGuestAddr(CE->getOperand(0), Ctx);
-      auto RHS = TryExtractGuestAddr(CE->getOperand(1), Ctx);
+      auto LHS = TryExtractGuestAddr(U->getOperand(0), Ctx);
+      auto RHS = TryExtractGuestAddr(U->getOperand(1), Ctx);
       if (LHS && RHS)
         return *LHS - *RHS;
       return std::nullopt;
@@ -107,6 +108,88 @@ static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
   return std::nullopt;
 }
 
+static bool IsExternalStringWrapper(StringRef Name, std::string &LibcName) {
+  if (!Name.starts_with("ext_"))
+    return false;
+  size_t FirstUnderscore = Name.find("_");
+  if (FirstUnderscore == StringRef::npos)
+    return false;
+  size_t SecondUnderscore = Name.find("_", FirstUnderscore + 1);
+  if (SecondUnderscore == StringRef::npos)
+    return false;
+  StringRef Func = Name.substr(SecondUnderscore + 1);
+  size_t Dot = Func.find(".");
+  if (Dot != StringRef::npos)
+    Func = Func.substr(0, Dot);
+
+  if (Func == "puts" || Func == "strlen" || Func == "strdup" ||
+      Func == "atoi" || Func == "atol" || Func == "strtol" ||
+      Func == "strtoul" || Func == "strcmp" || Func == "strncmp" ||
+      Func == "strcpy" || Func == "strncpy" || Func == "strcat" ||
+      Func == "strchr" || Func == "strstr" || Func == "printf" ||
+      Func == "scanf" || Func == "fprintf" || Func == "sprintf" ||
+      Func == "sscanf" || Func == "snprintf") {
+    LibcName = Func.str();
+    return true;
+  }
+  return false;
+}
+
+static int64_t GetStateOffset(Value *V) {
+  if (!V) return -1;
+  V = V->stripPointerCasts();
+  if (auto *GA = dyn_cast<GlobalAlias>(V)) {
+    V = GA->getAliasee()->stripPointerCasts();
+  }
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    if (auto *GV = dyn_cast<GlobalValue>(GEP->getPointerOperand())) {
+      if (GV->getName().contains("State") || GV->getName().contains("reg_state")) {
+        const DataLayout &DL = GV->getParent()->getDataLayout();
+        APInt Offset(DL.getPointerSizeInBits(), 0);
+        if (GEP->accumulateConstantOffset(DL, Offset)) {
+          return Offset.getSExtValue();
+        }
+      }
+    }
+  }
+  if (auto *GV = dyn_cast<GlobalValue>(V)) {
+    StringRef Name = GV->getName();
+    if (Name.contains("RDI")) return 2296;
+    if (Name.contains("RSI")) return 2280;
+    if (Name.contains("RDX")) return 2264;
+    if (Name.contains("RCX")) return 2248;
+    if (Name.contains("R8"))  return 2344;
+    if (Name.contains("R9"))  return 2360;
+  }
+  return -1;
+}
+
+static bool StateRegisterMatchesLibcArg(int64_t Offset, StringRef LibcName) {
+  if (Offset == -1)
+    return false;
+
+  if (LibcName == "puts" || LibcName == "strlen" || LibcName == "strdup" ||
+      LibcName == "atoi" || LibcName == "atol" || LibcName == "strtol" || LibcName == "strtoul") {
+    return Offset == 2296;
+  }
+  if (LibcName == "strcmp" || LibcName == "strncmp" || LibcName == "strchr" || LibcName == "strstr") {
+    return Offset == 2296 || Offset == 2280;
+  }
+  if (LibcName == "strcpy" || LibcName == "strncpy" || LibcName == "strcat") {
+    return Offset == 2280;
+  }
+  if (LibcName == "printf" || LibcName == "scanf") {
+    return Offset == 2296;
+  }
+  if (LibcName == "fprintf" || LibcName == "sprintf" || LibcName == "sscanf") {
+    return Offset == 2280;
+  }
+  if (LibcName == "snprintf") {
+    return Offset == 2264;
+  }
+  return false;
+}
+
 static std::pair<DataConsumerKind, EvidenceKind> ClassifyConsumerAndEvidence(
     Instruction *User, Value *AddrVal, unsigned &Confidence) {
   Confidence = 1;
@@ -121,6 +204,38 @@ static std::pair<DataConsumerKind, EvidenceKind> ClassifyConsumerAndEvidence(
     if (SI->getPointerOperand() == AddrVal) {
       Confidence = 20;
       return {DataConsumerKind::LoadStorePointer, EvidenceKind::LoadStoreWidth};
+    }
+    
+    Value *Dest = SI->getPointerOperand();
+    int64_t Offset = GetStateOffset(Dest);
+    if (Offset != -1) {
+      BasicBlock *BB = SI->getParent();
+      Instruction *Next = SI->getNextNode();
+      unsigned Limit = 10;
+      while (Next && Limit > 0) {
+        if (auto *CI = dyn_cast<CallInst>(Next)) {
+          Function *Callee = CI->getCalledFunction();
+          if (Callee) {
+            std::string LibcName;
+            if (IsExternalStringWrapper(Callee->getName(), LibcName)) {
+              if (StateRegisterMatchesLibcArg(Offset, LibcName)) {
+                if (LibcName == "printf" || LibcName == "scanf" ||
+                    LibcName == "fprintf" || LibcName == "sprintf" ||
+                    LibcName == "sscanf" || LibcName == "snprintf") {
+                  Confidence = 120;
+                  return {DataConsumerKind::LibcStringArg, EvidenceKind::FormatStringArg};
+                } else {
+                  Confidence = 100;
+                  return {DataConsumerKind::LibcStringArg, EvidenceKind::LibcStringArg};
+                }
+              }
+            }
+          }
+          break;
+        }
+        Next = Next->getNextNode();
+        --Limit;
+      }
     }
     return {DataConsumerKind::IntegerAddressConsumer, EvidenceKind::LoadStoreWidth};
   }
@@ -201,22 +316,27 @@ static std::pair<DataConsumerKind, EvidenceKind> ClassifyConsumerAndEvidence(
 static GlobalVariable *FindReferencedGlobal(Value *V) {
   if (!V)
     return nullptr;
+  V = V->stripPointerCasts();
   if (auto *GV = dyn_cast<GlobalVariable>(V))
     return GV;
-  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
-    for (unsigned I = 0; I < CE->getNumOperands(); ++I) {
-      if (auto *GV = FindReferencedGlobal(CE->getOperand(I)))
+  if (auto *GA = dyn_cast<GlobalAlias>(V)) {
+    return FindReferencedGlobal(GA->getAliasee());
+  }
+  if (auto *U = dyn_cast<User>(V)) {
+    for (unsigned I = 0; I < U->getNumOperands(); ++I) {
+      if (auto *GV = FindReferencedGlobal(U->getOperand(I)))
         return GV;
     }
-  }
-  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
-    return FindReferencedGlobal(GEP->getPointerOperand());
   }
   return nullptr;
 }
 
 static void AddAddressRef(Value *V, Instruction *Inst, const GlobalDataContext &Ctx,
                           SmallVectorImpl<std::unique_ptr<GuestAddressRef>> &Refs) {
+  for (auto &Existing : Refs) {
+    if (Existing->OriginalValue == V && Existing->UserInst == Inst)
+      return;
+  }
   auto Addr = TryExtractGuestAddr(V, Ctx);
   if (!Addr)
     return;
@@ -270,12 +390,82 @@ static void FindConstantExprRefs(Value *V, Instruction *Inst, const GlobalDataCo
                                  SmallVectorImpl<std::unique_ptr<GuestAddressRef>> &Refs) {
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     AddAddressRef(CE, Inst, Ctx, Refs);
-    for (unsigned I = 0; I < CE->getNumOperands(); ++I) {
-      FindConstantExprRefs(CE->getOperand(I), Inst, Ctx, Refs);
+    auto *U = cast<User>(CE);
+    for (unsigned I = 0; I < U->getNumOperands(); ++I) {
+      FindConstantExprRefs(U->getOperand(I), Inst, Ctx, Refs);
     }
   } else if (auto *GV = dyn_cast<GlobalValue>(V)) {
     AddAddressRef(GV, Inst, Ctx, Refs);
   }
+}
+
+static bool IsStackPointer(Value *V) {
+  if (!V) return false;
+  V = V->stripPointerCasts();
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
+    if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+      if (auto *GV = dyn_cast<GlobalValue>(GEP->getPointerOperand())) {
+        if (GV->getName().contains("State") || GV->getName().contains("reg_state")) {
+          const DataLayout &DL = GV->getParent()->getDataLayout();
+          APInt Offset(DL.getPointerSizeInBits(), 0);
+          if (GEP->accumulateConstantOffset(DL, Offset)) {
+            int64_t Off = Offset.getSExtValue();
+            if (Off == 2312 || Off == 2328) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+    if (auto *GV = dyn_cast<GlobalValue>(Ptr)) {
+      if (GV->getName().contains("RSP") || GV->getName().contains("RBP") ||
+          GV->getName().contains("rsp") || GV->getName().contains("rbp")) {
+        return true;
+      }
+    }
+  }
+  if (V->hasName()) {
+    StringRef Name = V->getName();
+    if (Name.contains("RSP") || Name.contains("RBP") ||
+        Name.contains("rsp") || Name.contains("rbp") ||
+        Name.contains("state_2312") || Name.contains("state_2328")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsLikelyGuestAddress(Value *V, Instruction *Inst, unsigned OpIdx) {
+  if (!Inst)
+    return true;
+
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(Inst)) {
+    if (OpIdx > 0)
+      return false;
+  }
+
+  if (auto *BO = dyn_cast<BinaryOperator>(Inst)) {
+    if (BO->getOpcode() == Instruction::Shl ||
+        BO->getOpcode() == Instruction::LShr ||
+        BO->getOpcode() == Instruction::AShr) {
+      if (OpIdx == 1)
+        return false;
+    }
+    if (BO->getOpcode() == Instruction::Add ||
+        BO->getOpcode() == Instruction::Sub) {
+      Value *OtherOp = BO->getOperand(1 - OpIdx);
+      if (IsStackPointer(OtherOp))
+        return false;
+    }
+  }
+
+  if (auto *SI = dyn_cast<SwitchInst>(Inst)) {
+    if (OpIdx > 0)
+      return false;
+  }
+
+  return true;
 }
 
 bool BrightenGlobalDataRecoveryPass::BuildGuestAddressMap(
@@ -290,7 +480,14 @@ bool BrightenGlobalDataRecoveryPass::BuildGuestAddressMap(
       for (Instruction &I : BB) {
         for (unsigned OpIdx = 0; OpIdx < I.getNumOperands(); ++OpIdx) {
           Value *Op = I.getOperand(OpIdx);
-          FindConstantExprRefs(Op, &I, Ctx, Ctx.AddressRefs);
+          if (IsLikelyGuestAddress(Op, &I, OpIdx)) {
+            if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<CallInst>(I)) {
+              if (TryExtractGuestAddr(Op, Ctx)) {
+                AddAddressRef(Op, &I, Ctx, Ctx.AddressRefs);
+              }
+            }
+            FindConstantExprRefs(Op, &I, Ctx, Ctx.AddressRefs);
+          }
         }
       }
     }
@@ -302,7 +499,7 @@ bool BrightenGlobalDataRecoveryPass::BuildGuestAddressMap(
     errs() << "[brighten-global-data] discovered " << Count
            << " guest address refs\n";
 
-  return Count > 0;
+  return false; // Analysis only, does not modify IR
 }
 
 } // namespace brighten_global
