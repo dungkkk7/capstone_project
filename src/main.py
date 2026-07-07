@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from binary_lifting.lifting import lift_binary
 from llvm_pass.britening_ir import brighten_ir
+from llm_recovery.recovery_loop import run_recovery_loop
 from fuzzing_equi_check.fuzzing import SemanticFuzzer, TemplateEvaluator, make_bytes_generator, DEFAULT_TEMPLATES
 
 class Color:
@@ -224,6 +225,26 @@ def main(argv=None):
                             
                     except Exception as fe:
                         print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")
+                    
+                    # --- BƯỚC THÊM: LLM RECOVERY LOOP TO RECOVER SOURCE CODE ---
+                    print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu khôi phục mã nguồn C gốc bằng LLM cho: {path}...{Color.END}")
+                    output_recovered_c = os.path.join(case_output_dir, f"{base_name}_recovered.c")
+                    max_iters = int(os.environ.get("LLM_RECOVERY_MAX_ITERS", "5"))
+                    try:
+                        recovery_success = run_recovery_loop(
+                            obfuscated_binary_path=path,
+                            brightened_bc_path=output_brightened_bc,
+                            output_recovered_c_path=output_recovered_c,
+                            case_output_dir=case_output_dir,
+                            max_iters=max_iters
+                        )
+                        if recovery_success:
+                            print(f"{Color.GREEN}{Color.BOLD}    [✓] KHÔI PHỤC MÃ NGUỒN CÀNH CÔNG CHO: {path}{Color.END}")
+                            print(f"{Color.GREEN}{Color.BOLD}        Mã nguồn C khôi phục sạch nằm tại: {output_recovered_c}{Color.END}")
+                        else:
+                            print(f"{Color.RED}    [✗] Khôi phục mã nguồn C thất bại hoặc chưa tương đương cho: {path}{Color.END}")
+                    except Exception as re:
+                        print(f"{Color.RED}    [✗] Lỗi xảy ra trong LLM Recovery Loop: {re}{Color.END}")
                 else:
                     print(f"{Color.RED}[✗] Làm đẹp mã IR THẤT BẠI cho: {path}{Color.END}")
             except Exception as e:
