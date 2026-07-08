@@ -76,16 +76,9 @@ static bool FlattenConstant(Constant *C, const DataLayout &DL,
   }
 
   // Pointer/relocation constant expressions (e.g. ptrtoint, getelementptr)
-  if (auto *CE = dyn_cast<ConstantExpr>(C)) {
-    uint64_t Size = DL.getTypeStoreSize(CE->getType());
-    Relocs[CurrentOffset] = CE;
-    Bytes.insert(Bytes.end(), Size, 0);
-    return true;
-  }
-
-  if (auto *GV = dyn_cast<GlobalValue>(C)) {
-    uint64_t Size = DL.getTypeStoreSize(GV->getType());
-    Relocs[CurrentOffset] = GV;
+  if (C->getType()->isPointerTy()) {
+    uint64_t Size = DL.getTypeStoreSize(C->getType());
+    Relocs[CurrentOffset] = C;
     Bytes.insert(Bytes.end(), Size, 0);
     return true;
   }

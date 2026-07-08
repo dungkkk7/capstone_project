@@ -176,10 +176,10 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     }
 
     bool LocalRewritten = false;
-    if (auto *CE = dyn_cast<ConstantExpr>(OrigVal)) {
-      Constant *NewConst = CreateConstantGEPToObject(Obj, Ref->GuestAddr, CE->getType());
+    if (auto *C = dyn_cast<Constant>(OrigVal)) {
+      Constant *NewConst = CreateConstantGEPToObject(Obj, Ref->GuestAddr, C->getType());
       if (NewConst) {
-        UserInst->replaceUsesOfWith(CE, NewConst);
+        UserInst->replaceUsesOfWith(C, NewConst);
         Ref->Rewritten = true;
         LocalRewritten = true;
         ++Count;

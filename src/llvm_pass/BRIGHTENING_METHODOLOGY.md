@@ -90,7 +90,6 @@ Trong quá trình hoàn thiện pipeline làm đẹp mã IR cho các tệp nhị
   2. Loại bỏ các hằng số nằm ở vị trí toán hạng lượng dịch (shift amount) của các lệnh dịch bit `shl`, `lshr`, `ashr` (`OpIdx == 1`).
   3. Loại bỏ các hằng số là trường hợp so sánh case của chỉ thị `SwitchInst` (`OpIdx > 0`).
   4. Loại bỏ các hằng số toán học (`add`/`sub`) nếu toán hạng còn lại được xác định là con trỏ stack (`RSP` hoặc `RBP`), dựa trên việc kiểm tra offset thanh ghi đặc trưng (`2312` cho RSP và `2328` cho RBP) hoặc tên biến được gán.
-
 ---
 
 ## 4. Tiêu chuẩn mục tiêu (Target Standards)
@@ -101,9 +100,7 @@ Một tệp LLVM IR được coi là làm đẹp thành công và đạt chất 
 2. **Khử hoàn toàn CPU-state:** Vùng nhớ của struct `State` phải được giải phóng hoàn toàn khỏi các hàm native chính. Không còn các lệnh load/store gián tiếp vào các offset thanh ghi.
 3. **Chữ ký hàm sạch:** Các hàm nội bộ sử dụng kiểu dữ liệu C tiêu chuẩn làm tham số và kiểu trả về thay vì truyền con trỏ `State*`.
 4. **Tương đương ngữ nghĩa tuyệt đối (Semantic Equivalence):** Khi biên dịch lại thành tệp nhị phân host và chạy kiểm thử vi sai bằng AFL++ fuzzer so với tệp nhị phân obfuscated ban đầu, tỉ lệ tương đương ngữ nghĩa phải đạt **100.00%** trên toàn bộ các ca kiểm thử đầu vào ngẫu nhiên và biên (không xảy ra crash hoặc lệch kết quả đầu ra).
-
 ---
-
 ## 5. Hạn chế tồn đọng & Hướng phát triển tương lai
 
 Dù phương pháp luận hiện tại đã giúp khôi phục thành công các hàm obfuscated cơ bản và sửa chữa các lỗi crash compiler nghiêm trọng, vẫn còn một số thách thức kỹ thuật lớn cần giải quyết:

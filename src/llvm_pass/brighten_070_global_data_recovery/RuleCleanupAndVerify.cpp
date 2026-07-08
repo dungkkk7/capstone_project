@@ -21,6 +21,22 @@ bool BrightenGlobalDataRecoveryPass::RemoveDeadSegmentConstantUsers(
   return Changed;
 }
 
+static bool HasLiveInstructionUsers(Value *V) {
+  for (User *U : V->users()) {
+    if (auto *Inst = dyn_cast<Instruction>(U)) {
+      if (Inst->getParent()) {
+        return true;
+      }
+    } else if (isa<Constant>(U)) {
+      if (HasLiveInstructionUsers(U))
+        return true;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     GlobalDataContext &Ctx) {
   unsigned Removed = 0;
@@ -31,25 +47,10 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     if (!Seg->BaseResolved)
       continue;
 
-    bool AllUsesRewritten = true;
-    for (User *U : Seg->GV->users()) {
-      if (auto *Inst = dyn_cast<Instruction>(U)) {
-        if (Inst->getParent())
-          AllUsesRewritten = false;
-      } else if (auto *CE = dyn_cast<ConstantExpr>(U)) {
-        for (User *CEU : CE->users()) {
-          if (auto *Inst = dyn_cast<Instruction>(CEU)) {
-            if (Inst->getParent())
-              AllUsesRewritten = false;
-          }
-        }
-      } else {
-        AllUsesRewritten = false;
-      }
-    }
-
-    if (!AllUsesRewritten)
+    if (HasLiveInstructionUsers(Seg->GV))
       continue;
+
+    Seg->GV->removeDeadConstantUsers();
 
     if (Seg->GV->use_empty()) {
       Seg->GV->eraseFromParent();
