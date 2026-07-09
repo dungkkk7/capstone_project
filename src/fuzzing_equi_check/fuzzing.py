@@ -18,6 +18,7 @@ import subprocess
 import time
 import argparse
 import json
+import stat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Any, Optional, Dict, List, Tuple
 
@@ -45,6 +46,20 @@ def find_clang() -> str:
             return path
     return "clang"
 
+
+def ensure_executable(file_path: str) -> str:
+    """Ensure a generated/copied executable has execute permission."""
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Executable does not exist: {file_path}")
+    mode = os.stat(file_path).st_mode
+    os.chmod(file_path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if not os.access(file_path, os.X_OK):
+        raise PermissionError(
+            f"File is not executable: {file_path}. Check ACL/noexec mount options."
+        )
+    return file_path
+
 def is_binary(file_path: str) -> bool:
     """Heuristically checks if a file is already a compiled binary executable."""
     if not os.path.exists(file_path):
@@ -60,24 +75,82 @@ def is_binary(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
     return ext not in ['.c', '.ll', '.bc', '.cpp', '.cc']
 
-def compile_to_binary(file_path: str, output_path: str, extra_flags: Optional[List[str]] = None) -> str:
+def compile_to_binary(file_path: str, output_path: str, extra_flags: Optional[List[str]] = None, binary_path: Optional[str] = None) -> str:
     """
-    Compiles C source or LLVM IR to a binary executable using clang.
+    Compiles C source or LLVM IR to a binary executable.
     If the file is already a binary, it copies it directly.
+    For LLVM IR from revng, compiles it using the revng pipeline wrapper if binary_path is provided.
     """
     file_path = os.path.abspath(file_path)
     output_path = os.path.abspath(output_path)
     
     if is_binary(file_path):
         shutil.copy2(file_path, output_path)
-        os.chmod(output_path, 0o755)
-        return output_path
+        return ensure_executable(output_path)
+
+    ext = os.path.splitext(file_path)[1].lower()
+    is_ir = ext in ['.bc', '.ll']
+
+    if is_ir and binary_path:
+        # Recompile using revng pipeline to link the QEMU/TCG runtime helpers correctly
+        print(f"[AFL++ Compile] Recompiling revng IR using revng pipeline...")
+        # 1. Ensure zstd compression for revng pipeline input
+        zstd_path = file_path + ".zstd"
+        
+        # If it is not .bc, assemble it first
+        bc_path = file_path
+        if ext == ".ll":
+            llvm_as = shutil.which("llvm-as-21") or shutil.which("llvm-as") or "/home/dungbv/.cache/deobf_framework/revng/revng/root/lib64/llvm/llvm/bin/llvm-as"
+            bc_path = file_path.replace(".ll", ".bc")
+            subprocess.run([llvm_as, file_path, "-o", bc_path], check=True)
+
+        # Compress to zstd
+        try:
+            import zstandard as zstd
+            with open(bc_path, "rb") as f_in, open(zstd_path, "wb") as f_out:
+                zstd.ZstdCompressor().copy_stream(f_in, f_out)
+            compressed_ok = True
+        except Exception:
+            compressed_ok = False
+        
+        if not compressed_ok:
+            zstd_bin = shutil.which("zstd")
+            if zstd_bin:
+                res = subprocess.run([zstd_bin, "-z", bc_path, "-o", zstd_path, "--force"], capture_output=True)
+                compressed_ok = (res.returncode == 0)
+
+        if not compressed_ok:
+            raise RuntimeError(f"Failed to compress {bc_path} to zstd format for revng pipeline.")
+
+        revng = shutil.which("revng") or "/usr/local/bin/revng"
+        cmd = [
+            revng, "pipeline",
+            "--analyze=initial/import-binary/input/:binary",
+            "--analyze=lift/detect-abi/root.bc.zstd/:root",
+            "--produce=recompile/output/:translated",
+            "-i", f"{binary_path}:begin/input",
+            "-i", f"{zstd_path}:recompile/root.bc.zstd",
+            "-o", f"{output_path}:recompile/output",
+            "--compile-opt-level=0"
+        ]
+        
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if os.path.exists(zstd_path):
+                os.remove(zstd_path)
+            if ext == ".ll" and os.path.exists(bc_path):
+                os.remove(bc_path)
+            return ensure_executable(output_path)
+        except subprocess.CalledProcessError as e:
+            if os.path.exists(zstd_path):
+                os.remove(zstd_path)
+            if ext == ".ll" and os.path.exists(bc_path):
+                os.remove(bc_path)
+            error_msg = f"revng pipeline compilation failed for: {file_path}\nCommand: {' '.join(cmd)}\nStderr: {e.stderr}\nStdout: {e.stdout}"
+            raise RuntimeError(error_msg) from e
         
     clang = find_clang()
     cmd = [clang]
-    
-    ext = os.path.splitext(file_path)[1].lower()
-    is_ir = ext in ['.bc', '.ll']
     
     if extra_flags:
         cmd.extend(extra_flags)
@@ -89,7 +162,7 @@ def compile_to_binary(file_path: str, output_path: str, extra_flags: Optional[Li
     
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return output_path
+        return ensure_executable(output_path)
     except subprocess.CalledProcessError as e:
         error_msg = f"Compilation failed for: {file_path}\nCommand: {' '.join(cmd)}\nStderr: {e.stderr}\nStdout: {e.stdout}"
         raise RuntimeError(error_msg) from e
@@ -386,7 +459,7 @@ string(alnum, 10, 30)
 int(-3, 3)""",
 
     "keybox": """[ARGV]
-string(print, 8, 20)""",
+string(print, 8, 14)""",
 
     "md5": """[ARGV]
 -s
@@ -557,7 +630,7 @@ class SemanticFuzzer:
         self.bin2 = os.path.join(self.tmp_dir, f"{ext2}_f2.bin")
         
         print(f"{Color.BLUE}[*] Compiling Program 1 (Clean/Recovered): {self.file1} -> {self.bin1}...{Color.END}")
-        compile_to_binary(self.file1, self.bin1, self.compiler_flags)
+        compile_to_binary(self.file1, self.bin1, self.compiler_flags, binary_path=self.file2)
         
         print(f"{Color.BLUE}[*] Compiling Program 2 (Obfuscated): {self.file2} -> {self.bin2}...{Color.END}")
         compile_to_binary(self.file2, self.bin2, self.compiler_flags)
@@ -673,211 +746,192 @@ class SemanticFuzzer:
         return report
 
     def run_differential_test(
-        self, 
-        iterations: int, 
-        generator: Callable[[], Tuple[List[str], bytes]], 
-        timeout: float = 1.0, 
+        self,
+        iterations: int,
+        generator: Callable[[], Tuple[List[str], bytes]],
+        timeout: float = 1.0,
         compare_stderr: bool = False,
-        num_workers: int = 1
+        num_workers: int = 1,
     ) -> Dict[str, Any]:
-        """Runs the differential testing loops using AFL++ if available, else falls back to default fuzzer."""
-        has_afl = os.path.exists(self.afl_cc) and os.path.exists(self.afl_fuzz)
-        
+        '''
+        Generate a coverage-guided corpus with AFL++ QEMU mode, then execute
+        the exact same payloads against both binaries.
+
+        This deliberately does not try to link/instrument rev.ng cleanup/native
+        IR: those modules may be object-compilable but not standalone-linkable.
+        '''
+        if not self.bin1 or not self.bin2:
+            self.compile()
+
+        ensure_executable(self.bin1)
+        ensure_executable(self.bin2)
+
+        has_afl = os.path.isfile(self.afl_fuzz) and os.access(self.afl_fuzz, os.X_OK)
         if not has_afl:
-            print(f"{Color.YELLOW}[!] AFL++ binaries not found at dependency/AFLplusplus/. Falling back to random generator.{Color.END}")
-            return self.run_differential_test_fallback(iterations, generator, timeout, compare_stderr, num_workers)
-            
+            print(
+                f"{Color.YELLOW}[!] AFL++ afl-fuzz not found; "
+                f"falling back to template/random differential testing.{Color.END}"
+            )
+            return self.run_differential_test_fallback(
+                iterations, generator, timeout, compare_stderr, num_workers
+            )
+
         try:
-            # 1. Determine if target uses argv or stdin
-            test_args, test_stdin = generator()
-            uses_argv = len(test_args) > 0
-            
-            # 2. Compile Program 1 with AFL++ instrumentation
-            bin1_afl = os.path.join(self.tmp_dir, "bin1_afl.bin")
-            print(f"{Color.BLUE}[*] Compiling Program 1 with AFL++ instrumentation...{Color.END}")
-            
-            env = os.environ.copy()
-            env["AFL_PATH"] = self.afl_path
-            
-            ext = os.path.splitext(self.file1)[1].lower()
-            if uses_argv:
-                # Rename main to target_main in Program 1
-                if ext in ['.bc', '.ll']:
-                    if ext == '.bc':
-                        llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis") or "llvm-dis"
-                        temp_ll = os.path.join(self.tmp_dir, "temp_file1.ll")
-                        subprocess.run([llvm_dis, self.file1, "-o", temp_ll], check=True, capture_output=True)
-                        ll_path = temp_ll
-                    else:
-                        ll_path = self.file1
-                        
-                    with open(ll_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    content = re.sub(r'@main\b', '@target_main', content)
-                    
-                    modified_file1 = os.path.join(self.tmp_dir, "modified_file1.ll")
-                    with open(modified_file1, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    compile_srcs = [modified_file1]
-                else:
-                    compile_srcs = [self.file1]
-                    
-                # Write harness.c
-                harness_c = os.path.join(self.tmp_dir, "harness.c")
-                harness_code = """
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+            test_args, _ = generator()
+            uses_argv = bool(test_args)
 
-int target_main(int argc, char** argv);
-
-int main(int argc, char** argv) {
-    char buf[16384];
-    memset(buf, 0, sizeof(buf));
-    int n = read(0, buf, sizeof(buf) - 1);
-    if (n < 0) n = 0;
-    buf[n] = '\\0';
-
-    char* new_argv[128];
-    int new_argc = 0;
-    new_argv[new_argc++] = argv[0];
-
-    char* line = strtok(buf, "\\n");
-    while (line != NULL && new_argc < 127) {
-        int len = strlen(line);
-        while (len > 0 && (line[len-1] == '\\r' || line[len-1] == ' ')) {
-            line[len-1] = '\\0';
-            len--;
-        }
-        new_argv[new_argc++] = line;
-        line = strtok(NULL, "\\n");
-    }
-    new_argv[new_argc] = NULL;
-
-    return target_main(new_argc, new_argv);
-}
-"""
-                with open(harness_c, 'w', encoding='utf-8') as f:
-                    f.write(harness_code)
-                    
-                cmd = [self.afl_cc] + compile_srcs + [harness_c]
-                if ext not in ['.bc', '.ll']:
-                    cmd.append("-Dmain=target_main")
-                if self.compiler_flags:
-                    cmd.extend(self.compiler_flags)
-                else:
-                    cmd.extend(["-O2", "-lm"])
-                cmd.extend(["-o", bin1_afl])
-            else:
-                cmd = [self.afl_cc, self.file1]
-                if self.compiler_flags:
-                    cmd.extend(self.compiler_flags)
-                else:
-                    cmd.extend(["-O2", "-lm"])
-                cmd.extend(["-o", bin1_afl])
-                
-            subprocess.run(cmd, env=env, check=True, capture_output=True)
-            
-            # 3. Create Seed Corpus
             seeds_dir = os.path.join(self.tmp_dir, "seeds")
+            out_dir = os.path.join(self.tmp_dir, "afl-out")
             os.makedirs(seeds_dir, exist_ok=True)
-            
-            for i in range(20):
+            if os.path.isdir(out_dir):
+                shutil.rmtree(out_dir)
+
+            # Use the original/obfuscated side as the coverage target.  AFL++
+            # mutates payloads; the oracle later runs both sides independently.
+            coverage_target = self.bin2
+            afl_target = coverage_target
+            afl_mode = "qemu-stdin"
+
+            if uses_argv:
+                # AFL testcase bytes encode argv as one argument per line.  The
+                # small native wrapper converts stdin into argv and execs the
+                # coverage target.  Running the wrapper with -Q keeps this path
+                # usable for closed-source binaries.
+                wrapper_c = os.path.join(self.tmp_dir, "afl_argv_exec_wrapper.c")
+                wrapper_bin = os.path.join(self.tmp_dir, "afl_argv_exec_wrapper")
+                escaped_target = coverage_target.replace("\\", "\\\\").replace('"', '\\"')
+                wrapper_source = f'''\n#include <errno.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n\nint main(void) {{\n    static char buffer[1 << 20];\n    static char *argv_out[256];\n    size_t used = fread(buffer, 1, sizeof(buffer) - 1, stdin);\n    buffer[used] = '\\0';\n\n    int argc_out = 0;\n    argv_out[argc_out++] = (char *)"{escaped_target}";\n    char *save = NULL;\n    for (char *line = strtok_r(buffer, "\\n", &save);\n         line != NULL && argc_out < 255;\n         line = strtok_r(NULL, "\\n", &save)) {{\n        size_t n = strlen(line);\n        while (n > 0 && (line[n - 1] == '\\r' || line[n - 1] == ' '))\n            line[--n] = '\\0';\n        if (n > 0)\n            argv_out[argc_out++] = line;\n    }}\n    argv_out[argc_out] = NULL;\n    execv(argv_out[0], argv_out);\n    fprintf(stderr, "execv failed: %s\\n", strerror(errno));\n    return 127;\n}}\n'''
+                with open(wrapper_c, "w", encoding="utf-8") as stream:
+                    stream.write(wrapper_source)
+                clang = find_clang()
+                proc = subprocess.run(
+                    [clang, "-O2", wrapper_c, "-o", wrapper_bin],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        "Cannot compile AFL argv wrapper:\n" + proc.stderr
+                    )
+                afl_target = ensure_executable(wrapper_bin)
+                afl_mode = "qemu-argv-wrapper"
+
+            # Seed corpus uses the same payload encoding consumed later by the
+            # differential oracle.
+            for index in range(20):
                 args, stdin_data = generator()
-                if uses_argv:
-                    payload = "\n".join(args).encode('utf-8')
-                else:
-                    payload = stdin_data
+                payload = (
+                    "\n".join(args).encode("utf-8", errors="replace")
+                    if uses_argv
+                    else stdin_data
+                )
                 if not payload:
                     payload = b"0"
-                with open(os.path.join(seeds_dir, f"seed_{i}"), "wb") as sf:
-                    sf.write(payload)
-                    
-            # 4. Run AFL++ Input Generator
-            out_dir = os.path.join(self.tmp_dir, "out")
-            fuzz_time = 5
-            cmd_fuzz = [self.afl_fuzz, "-i", seeds_dir, "-o", out_dir, "-V", str(fuzz_time), "--", bin1_afl]
-            
-            fuzz_env = os.environ.copy()
-            fuzz_env["AFL_SKIP_CPUFREQ"] = "1"
-            fuzz_env["AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"] = "1"
-            fuzz_env["AFL_PATH"] = self.afl_path
-            
-            print(f"{Color.BLUE}[*] Running AFL++ for {fuzz_time} seconds to generate inputs...{Color.END}")
-            subprocess.run(cmd_fuzz, env=fuzz_env, capture_output=True)
-            
-            # 5. Gather generated inputs
-            generated_inputs = []
-            queue_dir = os.path.join(out_dir, "default/queue")
-            crashes_dir = os.path.join(out_dir, "default/crashes")
-            
-            for d in [queue_dir, crashes_dir]:
-                if os.path.exists(d):
-                    for filename in os.listdir(d):
-                        filepath = os.path.join(d, filename)
-                        if os.path.isfile(filepath) and not filename.startswith("."):
-                            try:
-                                with open(filepath, "rb") as f:
-                                    generated_inputs.append(f.read())
-                            except Exception:
-                                pass
-                                
-            if not generated_inputs:
-                print(f"{Color.YELLOW}[!] AFL++ did not generate inputs. Using seeds.{Color.END}")
-                for filename in os.listdir(seeds_dir):
-                    filepath = os.path.join(seeds_dir, filename)
-                    if os.path.isfile(filepath):
-                        try:
-                            with open(filepath, "rb") as f:
-                                generated_inputs.append(f.read())
-                        except Exception:
-                            pass
-                            
-            # Deduplicate inputs
-            unique_inputs = []
-            seen = set()
-            for inp in generated_inputs:
-                if inp not in seen:
-                    seen.add(inp)
-                    unique_inputs.append(inp)
-            generated_inputs = unique_inputs
-            
-            # Supplement with random generator inputs if AFL++ generated fewer than requested iterations
-            if len(generated_inputs) < iterations:
-                needed = iterations - len(generated_inputs)
-                for _ in range(needed):
-                    args, stdin_data = generator()
-                    if uses_argv:
-                        payload = "\n".join(args).encode('utf-8')
-                    else:
-                        payload = stdin_data
-                    if not payload:
-                        payload = b"0"
-                    if payload not in seen:
-                        seen.add(payload)
-                        generated_inputs.append(payload)
-            
-            total_inputs = len(generated_inputs)
-            max_runs = min(total_inputs, 500)
-            run_inputs = generated_inputs[:max_runs]
-            
-            # Try to read AFL++ fuzzer stats
-            afl_stats = {}
-            stats_file = os.path.join(out_dir, "default/fuzzer_stats")
-            if os.path.exists(stats_file):
-                try:
-                    with open(stats_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if ":" in line:
-                                k, v = line.split(":", 1)
-                                afl_stats[k.strip()] = v.strip()
-                except Exception:
-                    pass
+                with open(os.path.join(seeds_dir, f"seed_{index:03d}"), "wb") as stream:
+                    stream.write(payload)
 
-            # 6. Differential Execution & Oracle Comparison
-            report = {
+            fuzz_seconds = max(5, min(30, max(1, iterations // 20)))
+            timeout_ms = max(20, int(timeout * 1000))
+            fuzz_cmd = [
+                self.afl_fuzz,
+                "-Q",
+                "-i", seeds_dir,
+                "-o", out_dir,
+                "-V", str(fuzz_seconds),
+                "-t", f"{timeout_ms}+",
+                "-m", "none",
+                "--",
+                afl_target,
+            ]
+            fuzz_env = os.environ.copy()
+            fuzz_env.update({
+                "AFL_SKIP_CPUFREQ": "1",
+                "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES": "1",
+                "AFL_NO_UI": "1",
+                "AFL_PATH": self.afl_path,
+            })
+
+            print(
+                f"{Color.BLUE}[*] AFL++ coverage generation "
+                f"({afl_mode}, {fuzz_seconds}s): {' '.join(fuzz_cmd)}{Color.END}"
+            )
+            fuzz_proc = subprocess.run(
+                fuzz_cmd,
+                env=fuzz_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            generated_inputs: List[bytes] = []
+            for directory in (
+                os.path.join(out_dir, "default", "queue"),
+                os.path.join(out_dir, "default", "crashes"),
+                os.path.join(out_dir, "default", "hangs"),
+            ):
+                if not os.path.isdir(directory):
+                    continue
+                for filename in sorted(os.listdir(directory)):
+                    path = os.path.join(directory, filename)
+                    if os.path.isfile(path) and not filename.startswith("."):
+                        try:
+                            with open(path, "rb") as stream:
+                                generated_inputs.append(stream.read())
+                        except OSError:
+                            pass
+
+            if fuzz_proc.returncode != 0 and not generated_inputs:
+                stderr = (fuzz_proc.stderr or "").strip()
+                stdout = (fuzz_proc.stdout or "").strip()
+                raise RuntimeError(
+                    "AFL++ QEMU mode failed.\n"
+                    f"Command: {' '.join(fuzz_cmd)}\n"
+                    f"stdout: {stdout[-4000:]}\n"
+                    f"stderr: {stderr[-4000:]}"
+                )
+
+            if not generated_inputs:
+                print(
+                    f"{Color.YELLOW}[!] AFL++ produced no queue entries; "
+                    f"using the seed corpus.{Color.END}"
+                )
+                for filename in sorted(os.listdir(seeds_dir)):
+                    with open(os.path.join(seeds_dir, filename), "rb") as stream:
+                        generated_inputs.append(stream.read())
+
+            seen: set[bytes] = set()
+            unique_inputs: List[bytes] = []
+            for payload in generated_inputs:
+                if payload not in seen:
+                    seen.add(payload)
+                    unique_inputs.append(payload)
+
+            while len(unique_inputs) < iterations:
+                args, stdin_data = generator()
+                payload = (
+                    "\n".join(args).encode("utf-8", errors="replace")
+                    if uses_argv
+                    else stdin_data
+                )
+                if not payload:
+                    payload = b"0"
+                if payload not in seen:
+                    seen.add(payload)
+                    unique_inputs.append(payload)
+
+            run_inputs = unique_inputs[: min(max(iterations, 1), 500)]
+
+            afl_stats: Dict[str, str] = {}
+            stats_file = os.path.join(out_dir, "default", "fuzzer_stats")
+            if os.path.isfile(stats_file):
+                with open(stats_file, "r", encoding="utf-8", errors="replace") as stream:
+                    for line in stream:
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            afl_stats[key.strip()] = value.strip()
+
+            report: Dict[str, Any] = {
                 "total_runs": len(run_inputs),
                 "matches": 0,
                 "mismatches": 0,
@@ -887,115 +941,132 @@ int main(int argc, char** argv) {
                 "confirmed_runs": 0,
                 "equivalence_ratio": 0.0,
                 "is_fully_equivalent": False,
-                "mismatch_examples": []
+                "mismatch_examples": [],
+                "afl_mode": afl_mode,
+                "afl_target": coverage_target,
+                "afl_returncode": fuzz_proc.returncode,
             }
             if afl_stats:
                 report["afl_stats"] = {
-                    "paths_total": afl_stats.get("paths_total", "N/A"),
+                    "paths_total": afl_stats.get(
+                        "corpus_count", afl_stats.get("paths_total", "N/A")
+                    ),
                     "bitmap_cvg": afl_stats.get("bitmap_cvg", "N/A"),
                     "execs_done": afl_stats.get("execs_done", "N/A"),
-                    "execs_per_sec": afl_stats.get("execs_per_sec", "N/A")
+                    "execs_per_sec": afl_stats.get("execs_per_sec", "N/A"),
                 }
-            
-            print(f"{Color.BLUE}[*] Running differential execution on {len(run_inputs)} inputs generated by AFL++...{Color.END}")
-            
-            def run_iteration(idx: int, payload: bytes) -> Dict[str, Any]:
+
+            print(
+                f"{Color.BLUE}[*] Differential execution on "
+                f"{len(run_inputs)} AFL++/seed payloads...{Color.END}"
+            )
+
+            def run_iteration(index: int, payload: bytes) -> Dict[str, Any]:
                 if uses_argv:
-                    lines = payload.split(b"\n")
-                    args = []
-                    for line in lines:
-                        try:
-                            line_str = line.decode('utf-8', errors='replace').strip()
-                            if line_str:
-                                args.append(line_str)
-                        except Exception:
-                            pass
+                    args = [
+                        line.decode("utf-8", errors="replace").strip()
+                        for line in payload.split(b"\n")
+                        if line.decode("utf-8", errors="replace").strip()
+                    ]
                     stdin_data = b""
                 else:
                     args = []
                     stdin_data = payload
-                    
                 res1 = run_binary(self.bin1, args, stdin_data, timeout)
                 res2 = run_binary(self.bin2, args, stdin_data, timeout)
-                is_eq, reason = check_equivalence(res1, res2, compare_stderr)
+                equivalent, reason = check_equivalence(
+                    res1, res2, compare_stderr
+                )
                 return {
-                    "index": idx,
+                    "index": index,
                     "args": args,
                     "stdin": stdin_data,
                     "res1": res1,
                     "res2": res2,
-                    "is_equivalent": is_eq,
-                    "reason": reason
+                    "is_equivalent": equivalent,
+                    "reason": reason,
                 }
 
-            completed = 0
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(run_iteration, idx, payload) for idx, payload in enumerate(run_inputs)]
-                
-                for fut in as_completed(futures):
-                    try:
-                        result = fut.result()
-                        completed += 1
-                        
-                        res1 = result["res1"]
-                        res2 = result["res2"]
-                        
-                        if completed % max(1, len(run_inputs) // 10) == 0 or completed == len(run_inputs):
-                            print(f"{Color.GRAY}  - Progress: {completed}/{len(run_inputs)} completed...{Color.END}")
-                        
-                        if res1["status"] == "timeout" and res2["status"] == "timeout":
-                            report["timeouts"]["both"] += 1
-                        elif res1["status"] == "timeout":
-                            report["timeouts"]["bin1"] += 1
-                        elif res2["status"] == "timeout":
-                            report["timeouts"]["bin2"] += 1
-                            
-                        if res1["status"] == "crash" and res2["status"] == "crash":
-                            report["crashes"]["both"] += 1
-                        elif res1["status"] == "crash":
-                            report["crashes"]["bin1"] += 1
-                        elif res2["status"] == "crash":
-                            report["crashes"]["bin2"] += 1
+            with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
+                futures = [
+                    executor.submit(run_iteration, index, payload)
+                    for index, payload in enumerate(run_inputs)
+                ]
+                completed = 0
+                for future in as_completed(futures):
+                    result = future.result()
+                    completed += 1
+                    res1 = result["res1"]
+                    res2 = result["res2"]
 
-                        if is_inconclusive_pair(res1, res2):
-                            report["inconclusive"] += 1
-                        elif result["is_equivalent"]:
-                            report["matches"] += 1
-                        else:
-                            report["mismatches"] += 1
-                            if len(report["mismatch_examples"]) < 5:
-                                try:
-                                    decoded_stdin = result["stdin"].decode('utf-8', errors='replace')
-                                except Exception:
-                                    decoded_stdin = repr(result["stdin"])
-                                    
-                                report["mismatch_examples"].append({
-                                    "index": result["index"],
-                                    "args": result["args"],
-                                    "stdin": decoded_stdin,
-                                    "reason": result["reason"],
-                                    "prog1": {
-                                        "status": res1["status"],
-                                        "returncode": res1["returncode"],
-                                        "stdout": res1["stdout"].decode('utf-8', errors='replace'),
-                                        "stderr": res1["stderr"].decode('utf-8', errors='replace')
-                                    },
-                                    "prog2": {
-                                        "status": res2["status"],
-                                        "returncode": res2["returncode"],
-                                        "stdout": res2["stdout"].decode('utf-8', errors='replace'),
-                                        "stderr": res2["stderr"].decode('utf-8', errors='replace')
-                                    }
-                                })
-                    except Exception as ex:
-                        print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
-                        
+                    if completed % max(1, len(run_inputs) // 10) == 0:
+                        print(
+                            f"{Color.GRAY}  - Progress: {completed}/"
+                            f"{len(run_inputs)} completed...{Color.END}"
+                        )
+
+                    if res1["status"] == "timeout" and res2["status"] == "timeout":
+                        report["timeouts"]["both"] += 1
+                    elif res1["status"] == "timeout":
+                        report["timeouts"]["bin1"] += 1
+                    elif res2["status"] == "timeout":
+                        report["timeouts"]["bin2"] += 1
+
+                    if res1["status"] == "crash" and res2["status"] == "crash":
+                        report["crashes"]["both"] += 1
+                    elif res1["status"] == "crash":
+                        report["crashes"]["bin1"] += 1
+                    elif res2["status"] == "crash":
+                        report["crashes"]["bin2"] += 1
+
+                    if is_inconclusive_pair(res1, res2):
+                        report["inconclusive"] += 1
+                    elif result["is_equivalent"]:
+                        report["matches"] += 1
+                    else:
+                        report["mismatches"] += 1
+                        if len(report["mismatch_examples"]) < 5:
+                            report["mismatch_examples"].append({
+                                "index": result["index"],
+                                "args": result["args"],
+                                "stdin": result["stdin"].decode(
+                                    "utf-8", errors="replace"
+                                ),
+                                "reason": result["reason"],
+                                "prog1": {
+                                    "status": res1["status"],
+                                    "returncode": res1["returncode"],
+                                    "stdout": res1["stdout"].decode(
+                                        "utf-8", errors="replace"
+                                    ),
+                                    "stderr": res1["stderr"].decode(
+                                        "utf-8", errors="replace"
+                                    ),
+                                },
+                                "prog2": {
+                                    "status": res2["status"],
+                                    "returncode": res2["returncode"],
+                                    "stdout": res2["stdout"].decode(
+                                        "utf-8", errors="replace"
+                                    ),
+                                    "stderr": res2["stderr"].decode(
+                                        "utf-8", errors="replace"
+                                    ),
+                                },
+                            })
+
             finalize_equivalence_report(report)
             return report
-            
-        except Exception as e:
-            print(f"{Color.RED}[!] AFL++ pipeline failed: {e}. Falling back to default fuzzer.{Color.END}")
-            return self.run_differential_test_fallback(iterations, generator, timeout, compare_stderr, num_workers)
+
+        except Exception as error:
+            print(
+                f"{Color.RED}[!] AFL++ pipeline failed: {error}{Color.END}\n"
+                f"{Color.YELLOW}[!] Falling back to template/random "
+                f"differential testing.{Color.END}"
+            )
+            return self.run_differential_test_fallback(
+                iterations, generator, timeout, compare_stderr, num_workers
+            )
 
     def cleanup(self):
         """Cleans up the local temporary workspaces."""
