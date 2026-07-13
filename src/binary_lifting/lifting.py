@@ -20,6 +20,14 @@ MCSEMA_LIB = os.path.join(SCRIPT_DIR, "../../dependency/mcsema/mcsema/lib")
 REMILL_BIN = os.path.join(SCRIPT_DIR, "../../dependency/mcsema/remill/bin")
 MCSEMA_DISASS = os.path.join(MCSEMA_BIN, "mcsema-disass")
 MCSEMA_LIFT = os.path.join(MCSEMA_BIN, "mcsema-lift-10.0")
+MCSEMA_DISASS_MAIN = os.path.join(
+    MCSEMA_LIB,
+    "python3",
+    "site-packages",
+    "mcsema_disass-3.1.3.8-py3.8.egg",
+    "mcsema_disass",
+    "__main__.py",
+)
 
 # --- THƯ MỤC CACHE LIFTING ---
 # Cache nằm tại: result/.lifting_cache/
@@ -221,6 +229,8 @@ def setup_python_path():
             os.environ["PYTHONPATH"] = f"{new_pythonpath}{os.pathsep}{existing_pythonpath}"
         else:
             os.environ["PYTHONPATH"] = new_pythonpath
+        # Gán protobuf pure-python mode để tương thích với plugin mcsema trên IDA (tránh lỗi protobuf API mới)
+        os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
         # Chỉ in log cấu hình này ở màu xám mờ để đỡ rối mắt
         print(f"{Color.GRAY}[*] Đã cấu hình PYTHONPATH cho các thư viện đi kèm của McSema.{Color.END}")
     else:
@@ -384,9 +394,16 @@ def lift_binary(binary_path, disassembler="/opt/ida-pro-9.3/idat", ghidra=None, 
     # -------------------------------------------------------------------------
     # BƯỚC 1: DISASSEMBLY (Phân tích sinh file .cfg)
     # -------------------------------------------------------------------------
+    # Ưu tiên gọi trực tiếp module mcsema_disass __main__ trong egg để tránh lỗi
+    # entry-point (pkg_resources) khi chạy bằng Python 3.12 trong môi trường hiện tại.
+    if os.path.exists(MCSEMA_DISASS_MAIN):
+        disass_target = MCSEMA_DISASS_MAIN
+    else:
+        disass_target = MCSEMA_DISASS
+
     disass_cmd = [
         sys.executable,
-        MCSEMA_DISASS,
+        disass_target,
         "--disassembler", disass_bin,
         "--binary", binary_path,
         "--output", cfg_file,

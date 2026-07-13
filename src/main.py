@@ -19,6 +19,45 @@ class Color:
     BOLD = '\033[1m'
     END = '\033[0m'
 
+
+def _resolve_seed_paths(project_root, binary_path):
+    """Resolve seed sources for one binary from `data/seeds/<case>/`.
+
+    Returns:
+        (seed_paths, seed_dir)
+        - seed_paths: list of exact per-binary seed files if available.
+        - seed_dir: directory containing .seed files to use as AFL corpus.
+    """
+    binary_abs = os.path.abspath(binary_path)
+    seed_root = os.path.join(project_root, "data", "seeds")
+    candidate_case = None
+
+    data_obfuscated_root = os.path.join(project_root, "data", "obfuscated")
+    data_clean_root = os.path.join(project_root, "data", "clean_src")
+
+    if binary_abs.startswith(data_obfuscated_root + os.sep):
+        rel_path = os.path.relpath(binary_abs, data_obfuscated_root)
+        candidate_case = rel_path.split(os.sep)[0]
+    elif binary_abs.startswith(data_clean_root + os.sep):
+        rel_path = os.path.relpath(binary_abs, data_clean_root)
+        candidate_case = rel_path.split(os.sep)[0]
+    else:
+        for part in reversed(binary_abs.split(os.sep)):
+            if part.startswith("p000"):
+                candidate_case = part
+                break
+
+    if not candidate_case:
+        return ([], None)
+
+    seed_dir = os.path.join(seed_root, candidate_case)
+    if not os.path.isdir(seed_dir):
+        return ([], None)
+
+    exact_seed_file = os.path.join(seed_dir, f"{os.path.basename(binary_abs)}.seed")
+    seed_paths = [exact_seed_file] if os.path.isfile(exact_seed_file) else []
+    return (seed_paths, seed_dir)
+
 def main(argv=None):
     print(f"{Color.BLUE}{Color.BOLD}==== Binary Deobfuscation based on LLVM and LLMs ===={Color.END}")
 
@@ -166,7 +205,18 @@ def main(argv=None):
                             print(f"{Color.YELLOW}      [!] Không nhận diện được benchmark, sử dụng generator ngẫu nhiên (bytes).{Color.END}")
                             generator = make_bytes_generator()
                         
-                        fuzzer = SemanticFuzzer(output_brightened_bc, path)
+                        seed_paths, seed_dir = _resolve_seed_paths(project_root, path)
+                        if seed_paths:
+                            print(f"{Color.BLUE}    [*] Tìm thấy seed corpus riêng cho binary: {seed_paths[0]}{Color.END}")
+                        elif seed_dir:
+                            print(f"{Color.BLUE}    [*] Tìm thấy seed directory cho case: {seed_dir}{Color.END}")
+
+                        fuzzer = SemanticFuzzer(
+                            output_brightened_bc,
+                            path,
+                            seed_paths=seed_paths,
+                            seed_dir=seed_dir,
+                        )
                         fuzzer.compile()
                         
                         # Chạy 100 iterations với 4 thread

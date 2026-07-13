@@ -37,6 +37,22 @@ class Color:
 # -----------------------------------------------------------------------------
 # Helper Utilities
 # -----------------------------------------------------------------------------
+def _dedupe_bytes(items: List[bytes]) -> List[bytes]:
+    """Deduplicate bytes payloads while keeping order."""
+    seen = set()
+    output = []
+    for item in items:
+        if item is None:
+            continue
+        if not isinstance(item, (bytes, bytearray)):
+            item = str(item).encode("utf-8")
+        payload = bytes(item)
+        if payload in seen:
+            continue
+        seen.add(payload)
+        output.append(payload)
+    return output
+
 def find_clang() -> str:
     """Finds the clang compiler dynamically, preferring clang-21 if available."""
     for name in ["clang-21", "clang-20", "clang-19", "clang-18", "clang-17", "clang-16", "clang-15", "clang"]:
@@ -512,10 +528,21 @@ def finalize_equivalence_report(report: Dict[str, Any]) -> None:
 # -----------------------------------------------------------------------------
 class SemanticFuzzer:
     """Main differential fuzzer that orchestrates compiling and fuzz testing binaries using AFL++."""
-    def __init__(self, file1: str, file2: str, compiler_flags: Optional[List[str]] = None):
+    def __init__(
+        self,
+        file1: str,
+        file2: str,
+        compiler_flags: Optional[List[str]] = None,
+        seed_inputs: Optional[List[bytes]] = None,
+        seed_dir: Optional[str] = None,
+        seed_paths: Optional[List[str]] = None,
+    ):
         self.file1 = file1
         self.file2 = file2
         self.compiler_flags = compiler_flags
+        self.seed_inputs = _dedupe_bytes(
+            self._load_seed_inputs(seed_inputs=seed_inputs, seed_dir=seed_dir, seed_paths=seed_paths)
+        )
         
         # Paths inside the project root for execution
         src_dir = os.path.dirname(os.path.abspath(__file__))
@@ -545,6 +572,46 @@ class SemanticFuzzer:
             self.afl_cc   = _sys_afl_cc   or _local_afl_cc
             self.afl_fuzz = _sys_afl_fuzz or _local_afl_fuzz
 
+    @staticmethod
+    def _read_seed_file(path: str) -> Optional[bytes]:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                data = b"0"
+            return data
+        except Exception as e:
+            print(f"{Color.YELLOW}[!] Không đọc được file seed '{path}': {e}{Color.END}")
+            return None
+
+    def _load_seed_inputs(
+        self,
+        seed_inputs: Optional[List[bytes]] = None,
+        seed_dir: Optional[str] = None,
+        seed_paths: Optional[List[str]] = None,
+    ) -> List[bytes]:
+        collected: List[bytes] = []
+        if seed_inputs:
+            collected.extend(seed_inputs)
+        if seed_paths:
+            for seed_path in seed_paths:
+                if os.path.isfile(seed_path):
+                    loaded = self._read_seed_file(seed_path)
+                    if loaded is not None:
+                        collected.append(loaded)
+        if seed_dir and os.path.isdir(seed_dir):
+            try:
+                for filename in sorted(os.listdir(seed_dir)):
+                    if not filename.endswith(".seed"):
+                        continue
+                    seed_path = os.path.join(seed_dir, filename)
+                    loaded = self._read_seed_file(seed_path)
+                    if loaded is not None:
+                        collected.append(loaded)
+            except Exception as e:
+                print(f"{Color.YELLOW}[!] Không đọc được seed corpus từ '{seed_dir}': {e}{Color.END}")
+        return collected
+
     def compile(self) -> Tuple[str, str]:
         """Compiles the target files into the local temporary directory."""
         os.makedirs(self.tmp_dir, exist_ok=True)
@@ -571,7 +638,8 @@ class SemanticFuzzer:
         generator: Callable[[], Tuple[List[str], bytes]], 
         timeout: float = 1.0, 
         compare_stderr: bool = False,
-        num_workers: int = 1
+        num_workers: int = 1,
+        seed_inputs: Optional[List[bytes]] = None
     ) -> Dict[str, Any]:
         """Fallback differential testing loop using the default random/template generator."""
         report = {
@@ -590,7 +658,21 @@ class SemanticFuzzer:
         print(f"{Color.BLUE}[*] Fuzzing {iterations} iterations (timeout={timeout}s, workers={num_workers}) using fallback random generator...{Color.END}")
         
         # Prepare all inputs beforehand
-        test_inputs = [generator() for _ in range(iterations)]
+        seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
+        test_inputs = []
+        if seed_inputs:
+            for payload in seed_inputs[:iterations]:
+                if not payload:
+                    payload = b"0"
+                test_inputs.append(([], payload))
+        while len(test_inputs) < iterations:
+            args, stdin_data = generator()
+            if not stdin_data:
+                stdin_data = b"0"
+            if not args:
+                test_inputs.append((args, stdin_data))
+            else:
+                test_inputs.append((args, stdin_data))
         
         def run_iteration(idx: int, args: List[str], stdin_data: bytes) -> Dict[str, Any]:
             res1 = run_binary(self.bin1, args, stdin_data, timeout)
@@ -678,14 +760,22 @@ class SemanticFuzzer:
         generator: Callable[[], Tuple[List[str], bytes]], 
         timeout: float = 1.0, 
         compare_stderr: bool = False,
-        num_workers: int = 1
+        num_workers: int = 1,
+        seed_inputs: Optional[List[bytes]] = None
     ) -> Dict[str, Any]:
         """Runs the differential testing loops using AFL++ if available, else falls back to default fuzzer."""
         has_afl = os.path.exists(self.afl_cc) and os.path.exists(self.afl_fuzz)
         
         if not has_afl:
             print(f"{Color.YELLOW}[!] AFL++ binaries not found at dependency/AFLplusplus/. Falling back to random generator.{Color.END}")
-            return self.run_differential_test_fallback(iterations, generator, timeout, compare_stderr, num_workers)
+            return self.run_differential_test_fallback(
+                iterations,
+                generator,
+                timeout,
+                compare_stderr,
+                num_workers,
+                seed_inputs=seed_inputs,
+            )
             
         try:
             # 1. Determine if target uses argv or stdin
@@ -783,17 +873,26 @@ int main(int argc, char** argv) {
             # 3. Create Seed Corpus
             seeds_dir = os.path.join(self.tmp_dir, "seeds")
             os.makedirs(seeds_dir, exist_ok=True)
-            
-            for i in range(20):
-                args, stdin_data = generator()
-                if uses_argv:
-                    payload = "\n".join(args).encode('utf-8')
-                else:
-                    payload = stdin_data
-                if not payload:
-                    payload = b"0"
-                with open(os.path.join(seeds_dir, f"seed_{i}"), "wb") as sf:
-                    sf.write(payload)
+
+            afl_seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
+            if afl_seed_inputs:
+                print(f"{Color.BLUE}[*] Sử dụng seed ngoại lệ ({len(afl_seed_inputs)} mẫu).{Color.END}")
+                for i, payload in enumerate(afl_seed_inputs):
+                    if not payload:
+                        payload = b"0"
+                    with open(os.path.join(seeds_dir, f"seed_{i}"), "wb") as sf:
+                        sf.write(payload)
+            else:
+                for i in range(20):
+                    args, stdin_data = generator()
+                    if uses_argv:
+                        payload = "\n".join(args).encode('utf-8')
+                    else:
+                        payload = stdin_data
+                    if not payload:
+                        payload = b"0"
+                    with open(os.path.join(seeds_dir, f"seed_{i}"), "wb") as sf:
+                        sf.write(payload)
                     
             # 4. Run AFL++ Input Generator
             out_dir = os.path.join(self.tmp_dir, "out")
@@ -995,7 +1094,14 @@ int main(int argc, char** argv) {
             
         except Exception as e:
             print(f"{Color.RED}[!] AFL++ pipeline failed: {e}. Falling back to default fuzzer.{Color.END}")
-            return self.run_differential_test_fallback(iterations, generator, timeout, compare_stderr, num_workers)
+            return self.run_differential_test_fallback(
+                iterations,
+                generator,
+                timeout,
+                compare_stderr,
+                num_workers,
+                seed_inputs=seed_inputs,
+            )
 
     def cleanup(self):
         """Cleans up the local temporary workspaces."""
@@ -1040,6 +1146,8 @@ def main():
                         help="Fuzz input generator type. Select 'template' for structured benchmark tests.")
     parser.add_argument("--template-file", help="Path to custom structured generator template file")
     parser.add_argument("--template-str", help="Inline string representing a structured generator template")
+    parser.add_argument("--seed-file", action="append", help="Seed file(s) to include in AFL corpus")
+    parser.add_argument("--seed-dir", help="Directory containing .seed files to include in AFL corpus")
     parser.add_argument("-o", "--output-report", help="JSON report path to save final outputs")
     parser.add_argument("--compare-stderr", action="store_true", help="Include stderr streams in differential evaluation")
     parser.add_argument("--compiler-flags", help="Comma-separated compilation flags (e.g. -O3,-lm)")
@@ -1052,7 +1160,13 @@ def main():
     if args.compiler_flags:
         flags = args.compiler_flags.split(",")
         
-    fuzzer = SemanticFuzzer(args.file1, args.file2, compiler_flags=flags)
+    fuzzer = SemanticFuzzer(
+        args.file1,
+        args.file2,
+        compiler_flags=flags,
+        seed_paths=args.seed_file,
+        seed_dir=args.seed_dir,
+    )
     
     try:
         fuzzer.compile()
