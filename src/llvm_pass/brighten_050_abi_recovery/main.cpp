@@ -19,6 +19,9 @@ PreservedAnalyses BrightenABIRecoveryPass::run(Module &M,
   Changed |= InferFunctionABISignatures(Ctx);
   Changed |= CloneNativeFunctions(Ctx);
   Changed |= RewriteNativeFunctionBodies(Ctx);
+  // Rewrite while Remill functions still have their original identity.  The
+  // wrapper pass below is only a compatibility boundary for genuinely
+  // unresolved dynamic users; it must not hide direct calls from ABI recovery.
   Changed |= RewriteKnownCallsites(Ctx);
   Changed |= CreateRemillWrappers(Ctx);
   Changed |= RewriteMainWrapper(Ctx);
@@ -44,4 +47,3 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
-

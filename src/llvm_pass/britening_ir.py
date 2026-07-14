@@ -78,7 +78,8 @@ PLUGINS = [
     "brighten_050_abi_recovery/build/BrightenABIRecoveryPass.so",
     "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
     "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
-    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so"
+    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so",
+    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
 ]
 # Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
 PLUGINS1 = [
@@ -90,14 +91,15 @@ PLUGINS1 = [
     "brighten_050_abi_recovery/build/BrightenABIRecoveryPass.so",
     "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
     "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
-    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so"
+    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so",
+    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
 ]
 
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass"
 )
 PASS_PIPELINE1 = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,globaldce,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass"
 )
 class Color:
     BLUE = '\033[94m'
@@ -185,104 +187,14 @@ def clean_unused_types_and_globals(content):
     return content
 
 def clean_ir_file(ll_path, binary_path=None):
-    if not os.path.exists(ll_path):
-        return False
-    with open(ll_path, 'r') as f:
-        content = f.read()
-    
-    # 1. Thay thế các con trỏ đến __mcsema_* trong static data segment bằng null (loại trừ __mcsema_reg_state)
-    # Để tránh việc clang/ld báo lỗi undefined reference
-    content = re.sub(r'ptr\s+@__mcsema_(?!reg_state\b)[a-zA-Z0-9_]+', 'ptr null', content)
-    
-    # 2. Biến define của __remill_function_call và __remill_jump thành declare để tránh multiple definition (commented out because we compile standalone)
-    # content = re.sub(
-    #     r'define\s+(?:[a-zA-Z0-9_]+\s+)*ptr\s+@(__remill_function_call|__remill_jump)\([^)]*\)[^{]*\{[\s\S]*?\}',
-    #     r'declare ptr @\1(ptr, i64, ptr)',
-    #     content
-    # )
-        
-    # 3. Trích xuất entry point PC từ inline assembly của main cũ (tìm trong function @main)
-    main_match = re.search(r'define\s+[^@{]*@main\b[^{]*\{([\s\S]*?)\}', content)
-    if main_match:
-        main_body = main_match.group(1)
-        pc_match = re.search(r'pushq\s+\$\$0x([0-9a-fA-F]+)', main_body)
-        pc_val = int(pc_match.group(1), 16) if pc_match else 0
-    else:
-        pc_match = re.search(r'pushq\s+\$\$0x([0-9a-fA-F]+)', content)
-        pc_val = int(pc_match.group(1), 16) if pc_match else 0
-    
-    # 4. Quét và loại bỏ tất cả các hàm chứa inline assembly (gây crash clang-21)
-    lines = content.split('\n')
-    new_lines = []
-    in_func = False
-    func_lines = []
-    func_name = None
-    stripped_funcs = set()
-    
-    for line in lines:
-        if not in_func:
-            if line.startswith('define '):
-                in_func = True
-                func_lines = [line]
-                name_match = re.search(r'@([a-zA-Z0-9_.]+)', line)
-                func_name = name_match.group(1) if name_match else None
-            else:
-                new_lines.append(line)
-        else:
-            func_lines.append(line)
-            if line.startswith('}'):
-                in_func = False
-                has_asm = any('asm sideeffect' in l for l in func_lines)
-                if has_asm and func_name not in ['main', 'start', 'main_wrapper', 'start_wrapper']:
-                    if func_name:
-                        stripped_funcs.add(func_name)
-                else:
-                    new_lines.extend(func_lines)
-    content = '\n'.join(new_lines)
-    print(f"DEBUG: Stripped functions: {sorted(list(stripped_funcs))}")
-    print(f"DEBUG: main_wrapper defined in content: {'@main_wrapper' in content}")
-    for func in stripped_funcs:
-        content = re.sub(rf'ptr @{re.escape(func)}\b', 'ptr null', content)
-    
-    # 5. Xác định kiểu dữ liệu thực tế của @__mcsema_reg_state (thường bị đổi tên thành %0)
-    state_type = "%struct.State"
-    state_type_match = re.search(r'@__mcsema_reg_state\s*=\s*(?:thread_local\([^)]*\)\s+)?global\s+([%a-zA-Z0-9_.]+)', content)
-    if state_type_match:
-        state_type = state_type_match.group(1)
+    """Compatibility shim retained for callers of the old API.
 
-    # 6. Thêm hàm main mới sạch sẽ gọi main_wrapper và trả về RAX từ State
-    # Chỉ thêm guest stack nếu chưa được định nghĩa
-    if not re.search(r'@__lifter_guest_stack\s*=\s*', content):
-        content = "@__lifter_guest_stack = internal global [8388608 x i8] zeroinitializer, align 16\n" + content
-
-    # Chỉ thêm nếu chưa có định nghĩa @main trong content (để tránh trùng với định nghĩa do pass 015 tự sinh)
-    if not re.search(r'define\s+(?:[a-zA-Z0-9_]+\s+)*@main\b', content):
-        new_main_ir = f"""
-define dso_local i32 @main(i32 %argc, ptr %argv) {{
-entry:
-  %fs_base = call i64 asm sideeffect "movq %fs:0, $0", "=r"()
-  %fs_base_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 5, i32 7
-  store i64 %fs_base, ptr %fs_base_ptr, align 8
-  %rsp_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 13, i32 0, i32 0
-  store i64 ptrtoint (ptr getelementptr inbounds ([8388608 x i8], ptr @__lifter_guest_stack, i64 0, i64 8388480) to i64), ptr %rsp_ptr, align 8
-  %edi_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 11, i32 0, i32 0
-  store i32 %argc, ptr %edi_ptr, align 4
-  %rsi_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 9, i32 0, i32 0
-  %argv_val = ptrtoint ptr %argv to i64
-  store i64 %argv_val, ptr %rsi_ptr, align 8
-  %res = call ptr @main_wrapper(ptr null, i64 {pc_val}, ptr null)
-  %rax_ptr = getelementptr {state_type}, ptr @__mcsema_reg_state, i32 0, i32 6, i32 1, i32 0, i32 0
-  %rax_val = load i64, ptr %rax_ptr, align 8
-  %res_i32 = trunc i64 %rax_val to i32
-  ret i32 %res_i32
-}}
-"""
-        content += new_main_ir
-        
-    cleaned_content = clean_unused_types_and_globals(content)
-    with open(ll_path, 'w') as f:
-        f.write(cleaned_content)
-    return True
+    IR cleanup is deliberately implemented in LLVM passes.  Textual edits
+    cannot safely recover types, replace unresolved pointers, or synthesize an
+    entrypoint without changing semantics, so this function only verifies that
+    the disassembled file exists and never rewrites it.
+    """
+    return os.path.exists(ll_path)
 
 def brighten_ir(input_path, output_path=None, binary_path=None):
     """
@@ -313,21 +225,50 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
             return False
         cmd.extend(["-load-pass-plugin", plugin_path])
 
+    if os.environ.get("BRIGHTEN_NATIVE_STRICT", "0") == "1":
+        # The plugin must be loaded before opt parses its pass-specific flag.
+        cmd.append("-brighten-native-strict")
+    # Native ABI lowering is part of the production pipeline.  Keep an
+    # explicit opt-out for debugging old lifted IR, but do not make the
+    # dataset path depend on a hidden environment variable.
+    if os.environ.get("BRIGHTEN_NATIVE_STATE_SSA", "1").lower() not in {
+        "0", "false", "off", "no"
+    }:
+        cmd.append("-brighten-native-state-ssa")
+
     # Thiết lập pipeline pass và file input/output
     cmd.extend([
         "-passes", PASS_PIPELINE,
         input_path,
         "-o", output_path
     ])
-
     print(f"{Color.BLUE}[*] Đang thực thi brightening với: {opt_bin}{Color.END}")
     print(f"{Color.GRAY}    Lệnh: {' '.join(cmd)}{Color.END}")
 
     try:
         env = os.environ.copy()
         env["REMILL_STACK_SSA_ALLOW_BOUNDARY"] = "1"
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        opt_timeout = float(os.environ.get("BRIGHTEN_OPT_TIMEOUT", "180"))
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 env=env, timeout=opt_timeout)
+        except subprocess.TimeoutExpired as exc:
+            print(f"{Color.RED}[✗] opt timeout sau {opt_timeout:.1f}s; bỏ qua module để tránh treo batch.{Color.END}")
+            if exc.stderr:
+                print(f"{Color.RED}    Stderr trước timeout: {exc.stderr}{Color.END}")
+            return False
         if res.returncode == 0:
+            report_lines = []
+            in_native_report = False
+            for stderr_line in (res.stderr or "").splitlines():
+                if stderr_line.startswith("brighten-native-cleanup report:"):
+                    in_native_report = True
+                if in_native_report:
+                    report_lines.append(stderr_line)
+                    if stderr_line.startswith("  native contract violations:"):
+                        break
+            if report_lines:
+                print("\n".join(report_lines))
             print(f"{Color.GREEN}[✓] Brightening hoàn tất! Kết quả đã ghi ra: {output_path}{Color.END}")
             
             # Chạy llvm-dis để sinh file .ll cho dễ đọc nếu file output là .bc
@@ -336,22 +277,7 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                 if llvm_dis:
                     output_ll = f"{os.path.splitext(output_path)[0]}.ll"
                     subprocess.run([llvm_dis, output_path, "-o", output_ll])
-                    print(f"{Color.BLUE}[*] Đang tiến hành dọn dẹp boilerplate và struct rác trong: {output_ll}{Color.END}")
-                    
-                    # Gọi hàm dọn dẹp file .ll
-                    if clean_ir_file(output_ll, binary_path):
-                        print(f"{Color.GREEN}[✓] Dọn dẹp IR thành công!{Color.END}")
-                        
-                        # Biên dịch ngược lại .ll đã dọn dẹp thành .bc
-                        llvm_as = shutil.which("llvm-as-21") or shutil.which("llvm-as")
-                        if llvm_as:
-                            as_res = subprocess.run([llvm_as, output_ll, "-o", output_path], capture_output=True, text=True)
-                            if as_res.returncode == 0:
-                                print(f"{Color.GREEN}[✓] Đã cập nhật tệp Bitcode sạch: {output_path}{Color.END}")
-                            else:
-                                print(f"{Color.RED}[✗] Lỗi khi chạy llvm-as (Mã lỗi: {as_res.returncode}){Color.END}")
-                                print(f"{Color.RED}    Stderr: {as_res.stderr}{Color.END}")
-                                return False
+                    print(f"{Color.BLUE}[*] Đã disassemble kết quả LLVM; không sửa textual IR hậu kỳ: {output_ll}{Color.END}")
             return True
         else:
             print(f"{Color.RED}[✗] Lỗi khi chạy opt (Mã lỗi: {res.returncode}){Color.END}")

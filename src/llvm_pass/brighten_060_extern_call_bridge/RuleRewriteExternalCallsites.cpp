@@ -363,12 +363,12 @@ bool BrightenExternCallBridgePass::RewriteExternalCallsites(
       if (!OldCI->use_empty()) {
         Value *Mem = OldCI->arg_size() >= 3 ? OldCI->getArgOperand(2) : nullptr;
         if (Mem) OldCI->replaceAllUsesWith(Mem);
-        else OldCI->replaceAllUsesWith(UndefValue::get(OldCI->getType()));
+        else OldCI->replaceAllUsesWith(Constant::getNullValue(OldCI->getType()));
       }
       OldCI->eraseFromParent();
       for (auto It = ToErase.rbegin(); It != ToErase.rend(); ++It) {
         if (!(*It)->use_empty()) {
-          (*It)->replaceAllUsesWith(UndefValue::get((*It)->getType()));
+          (*It)->replaceAllUsesWith(Constant::getNullValue((*It)->getType()));
         }
         (*It)->eraseFromParent();
       }
@@ -379,7 +379,7 @@ bool BrightenExternCallBridgePass::RewriteExternalCallsites(
       if (!OldCI->use_empty()) {
         Value *Mem = OldCI->arg_size() >= 3 ? OldCI->getArgOperand(2) : nullptr;
         if (Mem) OldCI->replaceAllUsesWith(Mem);
-        else OldCI->replaceAllUsesWith(UndefValue::get(OldCI->getType()));
+        else OldCI->replaceAllUsesWith(Constant::getNullValue(OldCI->getType()));
       }
       OldCI->eraseFromParent();
     }

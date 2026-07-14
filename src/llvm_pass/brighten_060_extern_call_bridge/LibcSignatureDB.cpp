@@ -71,8 +71,9 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
              {PK::SizeT, "n", false}},
             false, false, true, false, false, false, false, SK::None});
 
-  // Allocators disabled for safety against pointer truncation bugs
-  /*
+  // Allocators use native pointer signatures.  Keeping the return type as ptr
+  // is essential: routing these through the lifted i64 RAX slot would lose
+  // provenance and make a later free/realloc unsound.
   addEntry({"malloc", PK::Pointer,
             {{PK::SizeT, "size", false}},
             false, false, false, true, false, true, false, SK::Allocator});
@@ -85,7 +86,6 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
   addEntry({"free", PK::Integer,
             {{PK::VoidStar, "ptr", false}},
             false, false, false, false, true, false, false, SK::Deallocator});
-  */
 
   addEntry({"exit", PK::Integer,
             {{PK::Integer, "status", false}},
@@ -93,6 +93,9 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
   addEntry({"abort", PK::Integer,
             {},
             false, false, false, false, false, false, false, SK::NoReturn});
+  addEntry({"__cxa_finalize", PK::Integer,
+            {{PK::VoidStar, "d", false}},
+            false, false, false, false, false, false, false, SK::None});
   addEntry({"atoi", PK::Integer,
             {{PK::ConstPointer, "nptr", false}},
             false, false, true, false, false, false, false, SK::None});

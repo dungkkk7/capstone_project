@@ -1,6 +1,7 @@
 #include "BrightenABIRecoveryPass.h"
 
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace brighten_abi {
@@ -110,6 +111,41 @@ static bool CanRewrite(CallInst &CI, FunctionABISummary &S,
   return true;
 }
 
+static bool IsMemoryTokenUse(Value *V, SmallPtrSetImpl<Value *> &Visited,
+                             unsigned Depth) {
+  if (!V || Depth > 16 || !Visited.insert(V).second)
+    return true;
+
+  for (User *U : V->users()) {
+    if (auto *CB = dyn_cast<CallBase>(U)) {
+      if (CB->arg_size() >= 3 && CB->getArgOperand(2) == V)
+        continue;
+      return false;
+    }
+    if (isa<ReturnInst>(U))
+      continue;
+    if (auto *PN = dyn_cast<PHINode>(U)) {
+      if (!IsMemoryTokenUse(PN, Visited, Depth + 1))
+        return false;
+      continue;
+    }
+    if (auto *SI = dyn_cast<SelectInst>(U)) {
+      if (!IsMemoryTokenUse(SI, Visited, Depth + 1))
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool IsMemoryOnlyResult(CallInst &CI) {
+  if (CI.use_empty())
+    return true;
+  SmallPtrSet<Value *, 16> Visited;
+  return IsMemoryTokenUse(&CI, Visited, 0);
+}
+
 static bool RewriteOne(FunctionABISummary &S, CallsiteABIInfo &Info) {
   CallInst *Old = Info.Call;
   if (!Old || !Old->getParent()) {
@@ -163,12 +199,53 @@ static bool RewriteOne(FunctionABISummary &S, CallsiteABIInfo &Info) {
 
 bool BrightenABIRecoveryPass::RewriteKnownCallsites(ABIRecoveryContext &Ctx) {
   bool Changed = false;
+
+  // AnalyzeCallsiteABI runs before cloning.  Cloning creates additional
+  // direct calls in the native bodies, so do not rely solely on the stale
+  // per-summary callsite list.  Collect every current call to the original
+  // Remill function before any rewrite mutates the module.
   for (FunctionABISummary *S : Ctx.Summaries) {
     if (!S->Cloned || !S->NativeBodyRewritten) {
       continue;
     }
-    for (CallsiteABIInfo &Info : S->Calls) {
-      Changed |= RewriteOne(*S, Info);
+
+    SmallVector<CallInst *, 32> Calls;
+    for (Function &Caller : Ctx.M) {
+      if (Caller.isDeclaration())
+        continue;
+      for (BasicBlock &BB : Caller) {
+        for (Instruction &I : BB) {
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI || ResolveCalledFunction(CI->getCalledOperand()) != S->RemillFn)
+            continue;
+          Calls.push_back(CI);
+        }
+      }
+    }
+
+    if (Ctx.Debug && !Calls.empty()) {
+      errs() << "[brighten-abi] scan direct callsites: " << S->OriginalName
+             << " count=" << Calls.size() << "\n";
+    }
+
+    for (CallInst *CI : Calls) {
+      CallsiteABIInfo Info;
+      Info.Call = CI;
+      Info.Caller = CI->getFunction();
+      Info.Target = S->RemillFn;
+      // The lifted return is a memory token by contract.  Calls with no
+      // users are also safe to rewrite.  Calls whose result is observed as a
+      // register value remain for the explicit callsite analysis path.
+      Info.RewritableMemoryResult = IsMemoryOnlyResult(*CI) ||
+                                    S->ReturnsOriginalMemoryArg;
+      bool Rewritten = RewriteOne(*S, Info);
+      if (!Rewritten && Ctx.Debug && Info.RewritableMemoryResult) {
+        errs() << "[brighten-abi] callsite preserved: caller="
+               << CI->getFunction()->getName() << " target="
+               << S->OriginalName << " memory-result="
+               << (Info.RewritableMemoryResult ? "yes" : "no") << "\n";
+      }
+      Changed |= Rewritten;
     }
   }
   return Changed;

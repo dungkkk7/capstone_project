@@ -303,7 +303,7 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
         }
         return V;
       }
-      return UndefValue::get(ParamTy);
+      return ZeroValue(ParamTy);
     };
 
     SmallVector<Value *, 4> SetjmpArgs;
@@ -315,7 +315,7 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
         Value *RawI64 = LoadReg(B, StatePtr, kArgRegs[i], "setjmp_arg_reg");
         SetjmpArgs.push_back(CoerceArg(RawI64, ParamTy, false));
       } else {
-        SetjmpArgs.push_back(UndefValue::get(ParamTy));
+        SetjmpArgs.push_back(ZeroValue(ParamTy));
       }
     }
 
@@ -490,7 +490,7 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
       } else if (ParamTy->isIntegerTy()) {
         Arg = B.CreateTrunc(RawI64, ParamTy);
       } else {
-        Arg = UndefValue::get(ParamTy);
+        Arg = ZeroValue(ParamTy);
       }
       VArgs.push_back(Arg);
     }
@@ -505,7 +505,7 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
       uint64_t RegOff = (i < 6) ? kArgRegs[i] : 0;
 
       if (RegOff == 0) {
-        Args.push_back(UndefValue::get(ParamTy));
+        Args.push_back(ZeroValue(ParamTy));
         continue;
       }
 
@@ -527,7 +527,7 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
       } else if (ParamTy->isIntegerTy()) {
         Arg = B.CreateTrunc(RawI64, ParamTy);
       } else {
-        Arg = UndefValue::get(ParamTy);
+        Arg = ZeroValue(ParamTy);
       }
       Args.push_back(Arg);
     }

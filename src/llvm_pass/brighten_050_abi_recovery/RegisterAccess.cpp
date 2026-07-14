@@ -20,6 +20,9 @@ static Module *FindModule(Value *V) {
   if (auto *I = dyn_cast<Instruction>(V)) {
     return I->getModule();
   }
+  if (auto *Arg = dyn_cast<Argument>(V)) {
+    return Arg->getParent()->getParent();
+  }
   if (auto *GV = dyn_cast<GlobalValue>(V)) {
     return GV->getParent();
   }
@@ -54,6 +57,28 @@ static Value *StripAlias(Value *V) {
     }
   }
   return V;
+}
+
+static bool IsLiftedStateArgument(Argument *Arg) {
+  if (!Arg || Arg->getArgNo() != 0) {
+    return false;
+  }
+  Function *F = Arg->getParent();
+  if (!F || F->isDeclaration()) {
+    return false;
+  }
+  if (F->getName().ends_with(".native")) {
+    return Arg->getType()->isPointerTy();
+  }
+  if (F->arg_size() != 3 || !F->getReturnType()->isPointerTy()) {
+    return false;
+  }
+  auto It = F->arg_begin();
+  Type *StateTy = (It++)->getType();
+  Type *PCTy = (It++)->getType();
+  Type *MemoryTy = (It++)->getType();
+  return StateTy->isPointerTy() && PCTy->isIntegerTy(64) &&
+         MemoryTy->isPointerTy();
 }
 
 static std::optional<ABIReg> RegisterFromGlobalName(Value *V) {
@@ -100,10 +125,21 @@ std::optional<uint64_t> IdentifyStateOffset(Value *Ptr) {
 
   Base = StripAlias(Base);
   auto *GV = dyn_cast<GlobalValue>(Base);
-  if (!GV || GV->getName() != "__mcsema_reg_state") {
-    return std::nullopt;
+  if (GV && GV->getName() == "__mcsema_reg_state") {
+    return Offset.getZExtValue();
   }
-  return Offset.getZExtValue();
+
+  // After state SSA and ABI preparation, the same guest state is often
+  // addressed through the function's first lifted argument (%state) rather
+  // than the global.  Treat that argument as a state base only for the
+  // canonical McSema three-argument function shape; arbitrary user pointers
+  // must not be misclassified as register state.
+  if (auto *Arg = dyn_cast<Argument>(Base)) {
+    if (IsLiftedStateArgument(Arg)) {
+      return Offset.getZExtValue();
+    }
+  }
+  return std::nullopt;
 }
 
 std::optional<ABIReg> IdentifyStateRegisterPointer(Value *Ptr) {
@@ -168,4 +204,3 @@ Value *BuildStateRegisterPointer(IRBuilder<> &B, Value *StateBase, ABIReg Reg) {
 }
 
 } // namespace brighten_abi
-

@@ -58,7 +58,7 @@ static void PruneDispatcherCases(Module &M, Function *Dispatcher) {
     for (auto It = BB->begin(); It != BB->end(); ) {
       Instruction &I = *It++;
       if (!I.use_empty()) {
-        I.replaceAllUsesWith(PoisonValue::get(I.getType()));
+        I.replaceAllUsesWith(Constant::getNullValue(I.getType()));
       }
       I.eraseFromParent();
     }

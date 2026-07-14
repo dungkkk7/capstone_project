@@ -31,6 +31,7 @@ static bool IsGenericSafeExternalName(StringRef Name) {
          Name == "strncpy" || Name == "strcat" || Name == "memcpy" ||
          Name == "memmove" || Name == "memset" || Name == "malloc" ||
          Name == "calloc" || Name == "realloc" || Name == "free" ||
+         Name == "__cxa_finalize" || Name == "__gmon_start__" ||
          Name == "fopen" || Name == "fclose" || Name == "fread" ||
          Name == "fwrite" || Name == "fgets" || Name == "fputs" ||
          Name == "time" || Name == "localtime";
@@ -96,7 +97,7 @@ static Value *CoerceArg(IRBuilder<> &B, Value *Raw, Type *Ty,
   if (Ty->isDoubleTy()) {
     return B.CreateBitCast(Raw, Ty);
   }
-  return UndefValue::get(Ty);
+  return Constant::getNullValue(Ty);
 }
 
 static bool IsWritePointerArg(StringRef Name, unsigned Index) {

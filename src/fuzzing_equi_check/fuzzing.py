@@ -764,7 +764,13 @@ class SemanticFuzzer:
         seed_inputs: Optional[List[bytes]] = None
     ) -> Dict[str, Any]:
         """Runs the differential testing loops using AFL++ if available, else falls back to default fuzzer."""
-        has_afl = os.path.exists(self.afl_cc) and os.path.exists(self.afl_fuzz)
+        # AFL++ is enabled for coverage-guided fuzzing by default.  Set
+        # BRIGHTEN_USE_AFL=0 to use only the bounded differential runner when
+        # debugging a case or when AFL++ is unavailable.
+        use_afl = os.environ.get("BRIGHTEN_USE_AFL", "1").lower() in {
+            "1", "true", "yes", "on"
+        }
+        has_afl = use_afl and os.path.exists(self.afl_cc) and os.path.exists(self.afl_fuzz)
         
         if not has_afl:
             print(f"{Color.YELLOW}[!] AFL++ binaries not found at dependency/AFLplusplus/. Falling back to random generator.{Color.END}")

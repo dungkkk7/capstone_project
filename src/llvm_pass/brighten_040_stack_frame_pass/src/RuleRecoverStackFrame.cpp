@@ -461,7 +461,6 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
     if (!brighten_state_ssa::IsLiftedFunction(F)) continue;
     VisitedFunctions++;
 
-    unsigned NextRSPEpoch = 1;
     DenseMap<Value *, StackExpr> ExprMap;
     DenseMap<BasicBlock *, BlockState> BlockEntryState;
     DenseMap<BasicBlock *, BlockState> BlockExitState;
@@ -486,7 +485,22 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       InWorklist.insert(&BB);
     }
 
+    // The data-flow state must converge even for malformed/obfuscated CFGs.
+    // In particular, assigning a fresh epoch every time an unresolved RSP
+    // load is revisited makes loop headers appear changed forever.  Keep a
+    // deterministic per-function work budget as a second line of defence.
+    uint64_t WorkItems = 0;
+    const uint64_t MaxWorkItems =
+        std::max<uint64_t>(1024, static_cast<uint64_t>(F.size()) * 128);
+    bool AnalysisAborted = false;
+
     while (!Worklist.empty()) {
+      if (++WorkItems > MaxWorkItems) {
+        errs() << "brighten-stack-frame-pass: aborting non-convergent dataflow in "
+               << F.getName() << " after " << MaxWorkItems << " work items\n";
+        AnalysisAborted = true;
+        break;
+      }
       BasicBlock *BB = Worklist.front();
       Worklist.pop();
       InWorklist.erase(BB);
@@ -519,7 +533,10 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
               Expr.K = StackExpr::Kind::StackConst;
               Expr.Base.V = LI;
               Expr.Base.Kind = StackBaseKind::RSP;
-              Expr.Base.Epoch = NextRSPEpoch++;
+              // The load instruction is the identity of this unresolved
+              // stack base.  Do not allocate a new epoch on every revisit;
+              // that prevents looped CFGs from converging.
+              Expr.Base.Epoch = 0;
               Expr.Base.Stable = true;
               Expr.Offset = 0;
             }
@@ -681,6 +698,12 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
           }
         }
       }
+    }
+
+    if (AnalysisAborted) {
+      // Never rewrite from a partially solved data-flow graph.  Preserve this
+      // function unchanged and continue with the remaining module functions.
+      continue;
     }
 
     std::map<BaseKey, unsigned> BaseReasons;

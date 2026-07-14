@@ -105,8 +105,21 @@ static Constant *ConstantAtOffset(Constant *C, Type *LoadTy, uint64_t Offset,
     return nullptr;
   }
 
-  if (Offset == 0 && C->getType() == LoadTy) {
-    return C;
+  if (Offset == 0) {
+    if (C->getType() == LoadTy) {
+      return C;
+    }
+    // Recovered pointer tables are typed as [N x ptr], while the lifted
+    // code often reads one entry through an i64 load before handing it to a
+    // Remill dispatcher.  Preserve the relocation as a pointer constant so
+    // later devirtualization can recover the actual Function instead of
+    // treating the entry as an opaque integer.
+    if (C->getType()->isPointerTy() && LoadTy->isIntegerTy()) {
+      return ConstantExpr::getPtrToInt(C, LoadTy);
+    }
+    if (C->getType()->isIntegerTy() && LoadTy->isPointerTy()) {
+      return ConstantExpr::getIntToPtr(C, LoadTy);
+    }
   }
 
   if (isa<ConstantAggregateZero>(C)) {
@@ -189,6 +202,23 @@ static Constant *ConstantAtOffset(Constant *C, Type *LoadTy, uint64_t Offset,
   return nullptr;
 }
 
+static bool IsProvenReadOnly(GlobalVariable &GV) {
+  for (User *U : GV.users()) {
+    if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getPointerOperand() == &GV) {
+        return false;
+      }
+    }
+    if (auto *CB = dyn_cast<CallBase>(U)) {
+      // A global passed to an unknown call may be mutated through an alias.
+      // Keep the proof conservative; direct constant loads are the only
+      // safe case for dispatcher resolution.
+      return false;
+    }
+  }
+  return true;
+}
+
 static std::optional<uint64_t> ExtractConstantLoadPC(LoadInst *LI,
                                                      const DataLayout &DL) {
   if (!LI || LI->isVolatile()) {
@@ -205,7 +235,8 @@ static std::optional<uint64_t> ExtractConstantLoadPC(LoadInst *LI,
 
   Base = StripAlias(Base);
   auto *GV = dyn_cast<GlobalVariable>(Base);
-  if (!GV || !GV->hasInitializer() || !GV->isConstant()) {
+  if (!GV || !GV->hasInitializer() ||
+      (!GV->isConstant() && !IsProvenReadOnly(*GV))) {
     return std::nullopt;
   }
 
@@ -217,6 +248,36 @@ static std::optional<uint64_t> ExtractConstantLoadPC(LoadInst *LI,
   }
 
   return ExtractConstantPC(Loaded, DL);
+}
+
+static Function *ResolveFunctionFromConstantLoad(Value *V,
+                                                 const DataLayout &DL) {
+  auto *LI = dyn_cast<LoadInst>(V);
+  if (!LI || LI->isVolatile()) {
+    return nullptr;
+  }
+
+  APInt Offset(DL.getPointerSizeInBits(0), 0, true);
+  Value *Base = LI->getPointerOperand()->stripAndAccumulateConstantOffsets(
+      DL, Offset, true);
+  if (!Base || Offset.isNegative()) {
+    return nullptr;
+  }
+  Base = StripAlias(Base);
+  auto *GV = dyn_cast<GlobalVariable>(Base);
+  if (!GV || !GV->hasInitializer() ||
+      (!GV->isConstant() && !IsProvenReadOnly(*GV))) {
+    return nullptr;
+  }
+
+  PointerType *PtrTy = PointerType::getUnqual(GV->getContext());
+  Constant *Loaded = ConstantAtOffset(GV->getInitializer(), PtrTy,
+                                      Offset.getZExtValue(), DL);
+  if (!Loaded) {
+    return nullptr;
+  }
+  Value *Stripped = Loaded->stripPointerCasts();
+  return dyn_cast<Function>(Stripped);
 }
 
 std::optional<uint64_t> ExtractConstantPC(Value *V, const DataLayout &DL) {
@@ -341,6 +402,13 @@ static Function *FindExternalByName(Module &M, StringRef Name) {
   return nullptr;
 }
 
+static bool IsKnownExternalTarget(StringRef Name) {
+  return Name == "__gmon_start__" || Name == "__cxa_finalize" ||
+         Name == "__libc_start_main" || Name == "free" ||
+         Name == "printf" || Name == "memset" || Name == "calloc" ||
+         Name == "realloc" || Name == "__isoc99_scanf";
+}
+
 Function *FindExternalFunctionByPC(Module &M, uint64_t PC) {
   for (Function &F : M) {
     auto Parsed = ParseAddressName(F.getName());
@@ -384,6 +452,21 @@ Function *FindExternalFunctionByPC(Module &M, uint64_t PC) {
 Function *ResolveExternalFunction(Module &M, Value *PCVal, const DataLayout &DL) {
   if (!PCVal) {
     return nullptr;
+  }
+
+  // This is the post-global-recovery form of a dispatcher target:
+  //   %pc = load i64, ptr getelementptr (... @g_ptrtable, ...)
+  // The table is accepted only after proving that no instruction can mutate
+  // it, so resolving it does not invent a target from arbitrary data.
+  if (Function *F = ResolveFunctionFromConstantLoad(PCVal, DL)) {
+    if (auto ExtName = ExternalNameFromExtStub(F->getName())) {
+      if (Function *Ext = FindExternalByName(M, *ExtName)) {
+        return Ext;
+      }
+    }
+    if (F->isDeclaration() || IsKnownExternalTarget(F->getName())) {
+      return F;
+    }
   }
 
   Value *Ptr = nullptr;

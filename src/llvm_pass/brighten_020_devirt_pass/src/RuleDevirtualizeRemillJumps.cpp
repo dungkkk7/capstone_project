@@ -109,6 +109,20 @@ bool BrightenDevirtPass::DevirtualizeRemillJumps(Module &M) {
 
     Function *Target = FindLiftedSubroutineByPC(M, *PC);
     if (!Target) {
+      // The ABI recovery dispatcher uses its default arm as the Remill
+      // fallback: an unknown jump target returns the incoming memory token.
+      // A proven zero PC therefore has an exact native lowering, rather than
+      // being a reason to retain the dispatcher.  Do not apply this to an
+      // unknown SSA PC; only the constant case is covered here.
+      if (*PC == 0 && CI->arg_size() >= 3) {
+        Value *Memory = CI->getArgOperand(2);
+        if (!CI->use_empty())
+          CI->replaceAllUsesWith(Memory);
+        CI->eraseFromParent();
+        Changed = true;
+        errs() << "[devirt] lowered remill jump PC 0x0 -> dispatcher fallback\n";
+        continue;
+      }
       errs() << "[devirt] WARNING: unresolved constant __remill_jump PC = 0x"
              << Twine::utohexstr(*PC) << "\n";
       continue;

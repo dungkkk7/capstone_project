@@ -1,7 +1,5 @@
 #include "ABIAnalysis.h"
 #include "llvm/ADT/SmallPtrSet.h"
-
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -10,6 +8,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <functional>
 
 namespace brighten_abi {
 
@@ -355,42 +354,34 @@ bool ReturnOperandIsOriginalMemoryArg(Function &F, ReturnInst &RI) {
   Value *MemArg = F.getArg(2);
 
   SmallPtrSet<Value *, 8> Visited;
-  while (V && Visited.insert(V).second) {
-    if (V == MemArg) {
+  std::function<bool(Value *)> IsOriginalMemory = [&](Value *Candidate) {
+    if (!Candidate || !Visited.insert(Candidate).second)
+      return true;
+    if (Candidate == MemArg)
+      return true;
+
+    if (auto *CB = dyn_cast<CallBase>(Candidate)) {
+      if (CB->arg_size() >= 3)
+        return IsOriginalMemory(CB->getArgOperand(2));
+      if (CB->arg_size() > 0)
+        return IsOriginalMemory(CB->getArgOperand(CB->arg_size() - 1));
+      return false;
+    }
+    if (auto *PN = dyn_cast<PHINode>(Candidate)) {
+      for (Value *Incoming : PN->incoming_values()) {
+        if (!IsOriginalMemory(Incoming))
+          return false;
+      }
       return true;
     }
-    if (auto *CB = dyn_cast<CallBase>(V)) {
-      if (CB->arg_size() >= 3) {
-        V = CB->getArgOperand(2);
-        continue;
-      }
-      if (CB->arg_size() > 0) {
-        V = CB->getArgOperand(CB->arg_size() - 1);
-        continue;
-      }
+    if (auto *SI = dyn_cast<SelectInst>(Candidate)) {
+      return IsOriginalMemory(SI->getTrueValue()) &&
+             IsOriginalMemory(SI->getFalseValue());
     }
-    if (auto *PN = dyn_cast<PHINode>(V)) {
-      bool AllMatch = true;
-      for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
-        Value *Inc = PN->getIncomingValue(i);
-        if (Inc != MemArg) {
-          if (auto *IncCB = dyn_cast<CallBase>(Inc)) {
-            if (IncCB->arg_size() >= 3 && IncCB->getArgOperand(2) == MemArg) {
-              continue;
-            }
-          }
-          AllMatch = false;
-          break;
-        }
-      }
-      if (AllMatch) {
-        return true;
-      }
-    }
-    break;
-  }
+    return false;
+  };
 
-  return false;
+  return IsOriginalMemory(V);
 }
 
 void DebugCandidate(FunctionABISummary &S) {

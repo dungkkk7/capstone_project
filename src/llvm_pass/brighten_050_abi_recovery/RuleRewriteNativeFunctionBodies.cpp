@@ -1,6 +1,8 @@
 #include "BrightenABIRecoveryPass.h"
 
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -31,6 +33,106 @@ static Value *NativeArgForReg(FunctionABISummary &S, ABIReg Reg) {
     ++Index;
   }
   return nullptr;
+}
+
+static bool IsMcsemaStateBase(Value *V) {
+  if (!V) {
+    return false;
+  }
+  V = V->stripPointerCasts();
+  if (auto *GV = dyn_cast<GlobalVariable>(V)) {
+    return GV->getName() == "__mcsema_reg_state";
+  }
+  if (auto *Alias = dyn_cast<GlobalAlias>(V)) {
+    if (Alias->getName() == "__mcsema_reg_state") {
+      return true;
+    }
+    if (Constant *Aliasee = Alias->getAliasee()) {
+      return IsMcsemaStateBase(Aliasee);
+    }
+  }
+  return false;
+}
+
+static Value *NativeStatePointer(IRBuilder<> &B, Value *State,
+                                 uint64_t Offset) {
+  if (!State) {
+    return nullptr;
+  }
+  return B.CreateConstGEP1_64(B.getInt8Ty(), State, Offset,
+                              "native.state.ptr");
+}
+
+static bool IsNativeStateConsumer(Function *F) {
+  if (!F || F->arg_size() == 0 || !F->getArg(0)->getType()->isPointerTy()) {
+    return false;
+  }
+  if (F->getName().ends_with(".native")) {
+    return true;
+  }
+  return LooksLikeRemillFunction(*F);
+}
+
+// State-SSA deliberately runs before ABI cloning.  The clone can therefore
+// still contain a mixture of the lifted global state and its explicit state
+// argument.  Inside a native body those are the same logical object; keeping
+// both forms makes it impossible for later ABI lowering to prove that the
+// state argument is the only state source.  Canonicalize register accesses and
+// native-to-native calls to the clone's state argument.
+static bool CanonicalizeStatePointers(Function &F) {
+  if (F.arg_size() == 0 ||
+      !F.getArg(0)->getType()->isPointerTy()) {
+    return false;
+  }
+
+  Value *State = F.getArg(0);
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto RA = IdentifyRegAccess(I)) {
+        Value *OldPtr = nullptr;
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          OldPtr = LI->getPointerOperand();
+        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          OldPtr = SI->getPointerOperand();
+        }
+        if (OldPtr) {
+          IRBuilder<> B(&I);
+          if (Value *NewPtr = NativeStatePointer(B, State, RA->Offset)) {
+            if (auto *LI = dyn_cast<LoadInst>(&I)) {
+              LI->setOperand(0, NewPtr);
+            } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+              SI->setOperand(1, NewPtr);
+            }
+            Changed = true;
+          }
+        }
+      }
+
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI) {
+        continue;
+      }
+      Function *Callee = ResolveCalledFunction(CI->getCalledOperand());
+      if (!IsNativeStateConsumer(Callee) || CI->arg_size() == 0) {
+        continue;
+      }
+      Value *Arg0 = CI->getArgOperand(0);
+      if (!IsMcsemaStateBase(Arg0)) {
+        continue;
+      }
+      CI->setArgOperand(0, State);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+static bool CanonicalizeNativeState(FunctionABISummary &S) {
+  if (!S.HiddenState) {
+    return false;
+  }
+  return CanonicalizeStatePointers(*S.NativeFn);
 }
 
 static RegSet IntersectPredOuts(BasicBlock &BB,
@@ -175,12 +277,24 @@ bool BrightenABIRecoveryPass::RewriteNativeFunctionBodies(
     if (!S->Cloned || !S->NativeFn) {
       continue;
     }
+    Changed |= CanonicalizeNativeState(*S);
     Changed |= ReplaceLiveInLoads(*S);
     Changed |= RewriteReturns(*S);
     S->NativeBodyRewritten = true;
+  }
+
+  // External bridges and unresolved lifted wrappers have the same canonical
+  // state ABI but are not represented by a native-function summary.  Apply
+  // the same normalization to them so the global state is not reintroduced at
+  // wrapper boundaries.
+  for (Function &F : Ctx.M) {
+    if (F.isDeclaration() || F.getName().ends_with(".native") ||
+        !LooksLikeRemillFunction(F)) {
+      continue;
+    }
+    Changed |= CanonicalizeStatePointers(F);
   }
   return Changed;
 }
 
 } // namespace brighten_abi
-

@@ -308,7 +308,7 @@ unsigned GEP_ElemSize = 1;
         }
 
         Value *Ptr = cast<LoadInst>(&I)->getPointerOperand();
-        I.replaceAllUsesWith(UndefValue::get(I.getType()));
+        I.replaceAllUsesWith(Constant::getNullValue(I.getType()));
         I.eraseFromParent();
         if (auto *GEPInst = dyn_cast<GetElementPtrInst>(Ptr)) {
           if (GEPInst->use_empty()) {

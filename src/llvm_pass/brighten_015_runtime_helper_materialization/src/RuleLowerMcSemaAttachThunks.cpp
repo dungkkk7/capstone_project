@@ -119,16 +119,19 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     IRBuilder<> B(Entry);
 
     if (RegState) {
-      // 1. Setup Guest Stack (RSP)
-      GlobalVariable *GuestStack = M.getGlobalVariable("__lifter_guest_stack");
-      if (!GuestStack) {
-        Type *StackTy = ArrayType::get(I8, 8388608);
-        GuestStack = new GlobalVariable(
-            M, StackTy, false, GlobalValue::InternalLinkage,
-            ConstantAggregateZero::get(StackTy), "__lifter_guest_stack");
-        GuestStack->setAlignment(Align(16));
-      }
-      Value *StackGEP = B.CreateConstInBoundsGEP2_64(GuestStack->getValueType(), GuestStack, 0, 8388480);
+      // 1. Setup RSP from a native stack allocation.  The old implementation
+      // used a module-global 8 MiB guest-stack blob, which kept the lifted
+      // address-space model alive in otherwise native functions.  An alloca
+      // has the required lifetime (the target call is made from this frame)
+      // while preserving the guest stack layout expected by the recovered
+      // code.
+      constexpr uint64_t NativeStackBytes = 8 * 1024 * 1024;
+      AllocaInst *NativeStack = B.CreateAlloca(
+          I8, B.getInt64(NativeStackBytes), "native_stack");
+      NativeStack->setAlignment(Align(16));
+      Value *StackGEP = B.CreateInBoundsGEP(
+          I8, NativeStack, B.getInt64(NativeStackBytes - 128),
+          "native_stack_top");
       Value *StackVal = B.CreatePtrToInt(StackGEP, I64);
       Value *RSPPtr = B.CreateConstGEP1_64(I8, RegState, 2312);
       B.CreateAlignedStore(StackVal, RSPPtr, Align(8));
@@ -235,7 +238,9 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
 
   // 4. Xoá declaration của __mcsema_attach_call
   if (Function *AttachCall = M.getFunction("__mcsema_attach_call")) {
-    AttachCall->replaceAllUsesWith(UndefValue::get(AttachCall->getType()));
+    if (!AttachCall->use_empty()) {
+      AttachCall->replaceAllUsesWith(Constant::getNullValue(AttachCall->getType()));
+    }
     AttachCall->eraseFromParent();
     Changed = true;
     errs() << "[brighten-mcsema-lower] Erased __mcsema_attach_call declaration\n";

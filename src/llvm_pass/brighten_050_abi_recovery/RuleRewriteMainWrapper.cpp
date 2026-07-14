@@ -2,6 +2,8 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <functional>
+
 namespace brighten_abi {
 
 using namespace llvm;
@@ -14,6 +16,145 @@ static Value *BuildArgLoad(IRBuilder<> &B, Value *State, ABIArgInfo &Arg) {
   Type *LoadTy = Arg.Ty->isPointerTy() ? B.getInt64Ty() : Arg.Ty;
   Value *V = B.CreateLoad(LoadTy, Ptr, (GetRegisterName(Arg.Reg) + ".mw").str());
   return CoerceValue(B, V, Arg.Ty, GetRegisterName(Arg.Reg));
+}
+
+static Value *BuildEntrypointRegisterArg(IRBuilder<> &B, Function &Main,
+                                         Value *State, ABIReg Reg) {
+  if (Reg == ABIReg::RDI && Main.arg_size() > 0)
+    return CoerceValue(B, Main.getArg(0), B.getInt64Ty(), "main.argc");
+  if (Reg == ABIReg::RSI && Main.arg_size() > 1)
+    return CoerceValue(B, B.CreatePtrToInt(Main.getArg(1), B.getInt64Ty()),
+                       B.getInt64Ty(), "main.argv");
+  if (Reg == ABIReg::RDX && Main.arg_size() > 2)
+    return CoerceValue(B, B.CreatePtrToInt(Main.getArg(2), B.getInt64Ty()),
+                       B.getInt64Ty(), "main.envp");
+
+  ABIArgInfo Arg;
+  Arg.Reg = Reg;
+  Arg.Ty = B.getInt64Ty();
+  return BuildArgLoad(B, State, Arg);
+}
+
+static Value *MaterializeLocalState(ABIRecoveryContext &Ctx, Function &Main,
+                                    GlobalVariable *State) {
+  if (!State || Main.empty()) {
+    return nullptr;
+  }
+
+  uint64_t StateBytes =
+      Ctx.DL.getTypeAllocSize(State->getValueType()).getFixedValue();
+  if (StateBytes == 0) {
+    return nullptr;
+  }
+
+  IRBuilder<> B(&Main.getEntryBlock(), Main.getEntryBlock().begin());
+  AllocaInst *Local =
+      B.CreateAlloca(B.getInt8Ty(), B.getInt64(StateBytes), "native_state");
+  Local->setAlignment(Align(16));
+  B.CreateMemSet(Local, B.getInt8(0), B.getInt64(StateBytes), Align(1));
+
+  std::function<Value *(Value *, Instruction *)> Materialize =
+      [&](Value *V, Instruction *Before) -> Value * {
+    if (V == State) {
+      return Local;
+    }
+    auto *CE = dyn_cast<ConstantExpr>(V);
+    if (!CE) {
+      return V;
+    }
+
+    Instruction *Clone = CE->getAsInstruction();
+    bool Changed = false;
+    for (unsigned I = 0; I < Clone->getNumOperands(); ++I) {
+      Value *OldOp = Clone->getOperand(I);
+      Value *NewOp = Materialize(OldOp, Before);
+      if (NewOp != OldOp) {
+        Clone->setOperand(I, NewOp);
+        Changed = true;
+      }
+    }
+    if (!Changed) {
+      Clone->deleteValue();
+      return V;
+    }
+    Clone->insertBefore(Before);
+    return Clone;
+  };
+
+  for (BasicBlock &BB : Main) {
+    for (Instruction &I : BB) {
+      for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
+        Value *OldOp = I.getOperand(Op);
+        Value *NewOp = Materialize(OldOp, &I);
+        if (NewOp != OldOp) {
+          I.setOperand(Op, NewOp);
+        }
+      }
+    }
+  }
+  return Local;
+}
+
+// Replace the McSema-generated main -> main_wrapper edge with a direct call
+// to the recovered native function.  Keeping the wrapper alive as the only
+// entry edge would preserve the State ABI even when its body is native.
+static bool RewriteNativeMainEntrypoint(ABIRecoveryContext &Ctx,
+                                        FunctionABISummary &S) {
+  Function *Main = Ctx.M.getFunction("main");
+  GlobalVariable *State = Ctx.M.getGlobalVariable("__mcsema_reg_state");
+  if (!Main || !S.NativeFn || !State)
+    return false;
+
+  CallInst *WrapperCall = nullptr;
+  for (BasicBlock &BB : *Main) {
+    for (Instruction &I : BB) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (CI && ResolveCalledFunction(CI->getCalledOperand()) ==
+                    Ctx.M.getFunction("main_wrapper")) {
+        WrapperCall = CI;
+        break;
+      }
+    }
+    if (WrapperCall)
+      break;
+  }
+  if (!WrapperCall)
+    return false;
+
+  Value *LocalState = MaterializeLocalState(Ctx, *Main, State);
+  if (!LocalState)
+    return false;
+
+  IRBuilder<> B(WrapperCall);
+  SmallVector<Value *, 12> Args;
+  if (S.HiddenState)
+    Args.push_back(LocalState);
+  if (S.HiddenPC)
+    Args.push_back(B.getInt64(0));
+  if (S.HiddenMemory)
+    Args.push_back(ConstantPointerNull::get(B.getPtrTy()));
+  for (const ABIArgInfo &Arg : S.Args) {
+    Value *V = BuildEntrypointRegisterArg(B, *Main, LocalState, Arg.Reg);
+    if (!V)
+      return false;
+    Args.push_back(CoerceValue(B, V, Arg.Ty, GetRegisterName(Arg.Reg)));
+  }
+
+  CallInst *NativeCall = B.CreateCall(S.NativeFn, Args, "main.native");
+  NativeCall->setCallingConv(S.NativeFn->getCallingConv());
+  if (S.RetKind != ReturnKind::Void) {
+    Value *RAX = BuildStateRegisterPointer(B, LocalState, ABIReg::RAX);
+    Value *Ret = CoerceValue(B, NativeCall, B.getInt64Ty(), "main.ret.i64");
+    if (RAX && Ret)
+      B.CreateStore(Ret, RAX);
+  }
+
+  if (!WrapperCall->use_empty())
+    WrapperCall->replaceAllUsesWith(ConstantPointerNull::get(B.getPtrTy()));
+  WrapperCall->eraseFromParent();
+  errs() << "[brighten-abi] entrypoint rewritten: main -> "
+         << S.NativeFn->getName() << "\n";
+  return true;
 }
 
 bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
@@ -32,7 +173,10 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
       if (!Target) continue;
 
       MainS = FindSummary(Ctx, Target);
-      if (MainS && MainS->NativeFn) {
+      // RewriteKnownCallsites runs before this compatibility-specific pass.
+      // Do not reinterpret the already-native call as a Remill call and add
+      // the ABI arguments a second time.
+      if (MainS && MainS->NativeFn && Target == MainS->RemillFn) {
         MainCall = CI;
         break;
       }
@@ -40,21 +184,27 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
     if (MainCall) break;
   }
 
-  if (!MainCall || !MainS || !MainS->NativeFn) {
-    return false;
-  }
+  if (!MainS)
+    MainS = FindSummaryByOriginalName(Ctx, "sub_1190_main");
+
+  bool EntrypointChanged =
+      MainS && MainS->NativeFn && RewriteNativeMainEntrypoint(Ctx, *MainS);
+  if (!MainCall || !MainS || !MainS->NativeFn)
+    return EntrypointChanged;
 
   bool Changed = false;
   IRBuilder<> B(MainCall);
   SmallVector<Value *, 12> Args;
   if (MainS->HiddenState) {
-    Args.push_back(MainCall->arg_size() > 0 ? MainCall->getArgOperand(0) : UndefValue::get(B.getPtrTy()));
+    Args.push_back(MainCall->arg_size() > 0 ? MainCall->getArgOperand(0) :
+                   Constant::getNullValue(B.getPtrTy()));
   }
   if (MainS->HiddenPC) {
     Args.push_back(MainCall->arg_size() > 1 ? MainCall->getArgOperand(1) : B.getInt64(0));
   }
   if (MainS->HiddenMemory) {
-    Args.push_back(MainCall->arg_size() > 2 ? MainCall->getArgOperand(2) : UndefValue::get(B.getPtrTy()));
+    Args.push_back(MainCall->arg_size() > 2 ? MainCall->getArgOperand(2) :
+                   Constant::getNullValue(B.getPtrTy()));
   }
   for (ABIArgInfo &Arg : MainS->Args) {
     Value *StatePtr = MainCall->arg_size() > 0 ? MainCall->getArgOperand(0) : MW->getArg(0);
@@ -89,7 +239,7 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
   errs() << "[brighten-abi] callsite rewritten: caller=main_wrapper target="
          << MainS->NativeFn->getName() << "\n";
 
-  return Changed;
+  return Changed || EntrypointChanged;
 }
 
 } // namespace brighten_abi

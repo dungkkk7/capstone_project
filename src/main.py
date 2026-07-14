@@ -8,7 +8,13 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from binary_lifting.lifting import lift_binary
 from llvm_pass.britening_ir import brighten_ir
-from fuzzing_equi_check.fuzzing import SemanticFuzzer, TemplateEvaluator, make_bytes_generator, DEFAULT_TEMPLATES
+from fuzzing_equi_check.fuzzing import (
+    SemanticFuzzer,
+    TemplateEvaluator,
+    make_bytes_generator,
+    make_integers_generator,
+    DEFAULT_TEMPLATES,
+)
 
 class Color:
     BLUE = '\033[94m'
@@ -56,7 +62,47 @@ def _resolve_seed_paths(project_root, binary_path):
 
     exact_seed_file = os.path.join(seed_dir, f"{os.path.basename(binary_abs)}.seed")
     seed_paths = [exact_seed_file] if os.path.isfile(exact_seed_file) else []
+    if not seed_paths:
+        # Some dataset cases provide one canonical seed as <case>_seed.txt
+        # rather than a per-binary .seed file.  It is still valid for all
+        # obfuscation variants of that case.
+        case_seed = os.path.join(seed_dir, f"{candidate_case}_seed.txt")
+        if os.path.isfile(case_seed):
+            seed_paths.append(case_seed)
     return (seed_paths, seed_dir)
+
+
+def _find_reference_source(project_root, binary_path):
+    """Find the clean C source belonging to a dataset binary, if present."""
+    binary_abs = os.path.abspath(binary_path)
+    obfuscated_root = os.path.join(project_root, "data", "obfuscated")
+    if not binary_abs.startswith(obfuscated_root + os.sep):
+        return None
+    rel_path = os.path.relpath(binary_abs, obfuscated_root)
+    case = rel_path.split(os.sep)[0]
+    stem = os.path.splitext(os.path.basename(binary_abs))[0]
+    source_stem = stem.split("_", 1)[0]
+    candidate = os.path.join(project_root, "data", "clean_src", case, source_stem + ".c")
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def _select_generator(project_root, binary_path, template_content):
+    """Select a valid input domain for the benchmark instead of raw bytes."""
+    if template_content:
+        return TemplateEvaluator(template_content), "template"
+
+    source = _find_reference_source(project_root, binary_path)
+    if source:
+        try:
+            with open(source, "r", encoding="utf-8", errors="ignore") as f:
+                source_text = f.read()
+            if "%d" in source_text or "%i" in source_text:
+                return make_integers_generator(), "integer stdin inferred from clean source"
+        except OSError:
+            pass
+    return make_bytes_generator(), "raw byte fallback"
 
 def main(argv=None):
     print(f"{Color.BLUE}{Color.BOLD}==== Binary Deobfuscation based on LLVM and LLMs ===={Color.END}")
@@ -199,11 +245,13 @@ def main(argv=None):
                                 print(f"{Color.YELLOW}      [!] Phát hiện benchmark '{key}', sử dụng cấu hình template.{Color.END}")
                                 break
                         
+                        generator, generator_reason = _select_generator(
+                            project_root, path, template_content
+                        )
                         if template_content:
-                            generator = TemplateEvaluator(template_content)
+                            print(f"{Color.YELLOW}      [!] Phát hiện benchmark, sử dụng template generator.{Color.END}")
                         else:
-                            print(f"{Color.YELLOW}      [!] Không nhận diện được benchmark, sử dụng generator ngẫu nhiên (bytes).{Color.END}")
-                            generator = make_bytes_generator()
+                            print(f"{Color.BLUE}      [*] Input generator: {generator_reason}.{Color.END}")
                         
                         seed_paths, seed_dir = _resolve_seed_paths(project_root, path)
                         if seed_paths:
