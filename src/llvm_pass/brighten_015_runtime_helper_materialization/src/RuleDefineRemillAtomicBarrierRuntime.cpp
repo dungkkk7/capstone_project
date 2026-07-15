@@ -35,26 +35,19 @@ static bool DefineReturnMemory(Function &F) {
   return true;
 }
 
-static bool DefineFallbackBody(Function &F) {
-  if (!F.isDeclaration()) {
+static bool DefineFence(Function &F, AtomicOrdering Ordering) {
+  if (!F.isDeclaration())
     return false;
-  }
   BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
   IRBuilder<> B(BB);
+  B.CreateFence(Ordering);
   Type *RetTy = F.getReturnType();
-  if (RetTy->isVoidTy()) {
+  if (RetTy->isVoidTy())
     B.CreateRetVoid();
-    return true;
-  }
-  if (RetTy->isPointerTy()) {
-    if (Value *Mem = FindLikelyMemoryArg(F)) {
-      B.CreateRet(Mem);
-    } else {
-      B.CreateRet(ZeroValue(RetTy));
-    }
-    return true;
-  }
-  B.CreateRet(ZeroValue(RetTy));
+  else if (RetTy->isPointerTy() && FindLikelyMemoryArg(F))
+    B.CreateRet(FindLikelyMemoryArg(F));
+  else
+    B.CreateRet(ZeroValue(RetTy));
   return true;
 }
 
@@ -70,8 +63,16 @@ static std::optional<uint64_t> ParseSizeSuffix(StringRef Name) {
   return Size;
 }
 
+static bool IsSupportedAtomicWidth(uint64_t Bits) {
+  return Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64 || Bits == 128;
+}
+
 static bool DefineAtomicRMW(Function &F, Module &M, AtomicRMWInst::BinOp Op) {
-  if (!F.isDeclaration() || F.arg_size() < 3) {
+  auto Size = ParseSizeSuffix(F.getName());
+  if (!F.isDeclaration() || F.arg_size() < 3 || !Size ||
+      !IsSupportedAtomicWidth(*Size) ||
+      !F.getArg(2)->getType()->isPointerTy() ||
+      F.getReturnType() != F.getArg(0)->getType()) {
     return false;
   }
   Function *Translate = GetOrCreateTranslateGuestPointer(M);
@@ -80,55 +81,28 @@ static bool DefineAtomicRMW(Function &F, Module &M, AtomicRMWInst::BinOp Op) {
   Value *Addr = CastAddressToI64(B, F.getArg(1));
   Value *Ptr = B.CreateCall(Translate, {Addr, B.getTrue()});
   Value *ValPtr = F.getArg(2);
-  Type *ValTy = nullptr;
-  if (auto Size = ParseSizeSuffix(F.getName())) {
-    ValTy = IntegerType::get(F.getContext(), *Size);
-  }
-  if (!ValTy) {
-    B.CreateRet(F.getArg(0));
-    return true;
-  }
-  Value *Old = B.CreateLoad(ValTy, Ptr);
+  Type *ValTy = IntegerType::get(F.getContext(), *Size);
   Value *In = B.CreateLoad(ValTy, ValPtr);
-  Value *NewVal = nullptr;
-  switch (Op) {
-    case AtomicRMWInst::Add:
-      NewVal = B.CreateAdd(Old, In);
-      break;
-    case AtomicRMWInst::Sub:
-      NewVal = B.CreateSub(Old, In);
-      break;
-    case AtomicRMWInst::And:
-      NewVal = B.CreateAnd(Old, In);
-      break;
-    case AtomicRMWInst::Or:
-      NewVal = B.CreateOr(Old, In);
-      break;
-    case AtomicRMWInst::Xor:
-      NewVal = B.CreateXor(Old, In);
-      break;
-    default:
-      NewVal = B.CreateNot(B.CreateAnd(Old, In));
-      break;
-  }
-  B.CreateStore(NewVal, Ptr);
+  Value *Old = B.CreateAtomicRMW(Op, Ptr, In, MaybeAlign(),
+                                 AtomicOrdering::SequentiallyConsistent);
   B.CreateStore(Old, ValPtr);
   B.CreateRet(F.getArg(0));
   return true;
 }
 
 static bool DefineCompareExchange(Function &F, Module &M) {
-  if (!F.isDeclaration() || F.arg_size() < 4) {
+  auto Size = ParseSizeSuffix(F.getName());
+  if (!F.isDeclaration() || F.arg_size() < 4 || !Size ||
+      !IsSupportedAtomicWidth(*Size) ||
+      !F.getArg(2)->getType()->isPointerTy() ||
+      (!F.getArg(3)->getType()->isPointerTy() &&
+       !F.getArg(3)->getType()->isIntegerTy()) ||
+      F.getReturnType() != F.getArg(0)->getType()) {
     return false;
   }
   Function *Translate = GetOrCreateTranslateGuestPointer(M);
   BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
   IRBuilder<> B(BB);
-  auto Size = ParseSizeSuffix(F.getName());
-  if (!Size || *Size > 128) {
-    B.CreateRet(F.getArg(0));
-    return true;
-  }
   Type *ValTy = IntegerType::get(F.getContext(), *Size);
   Value *Ptr = B.CreateCall(Translate, {CastAddressToI64(B, F.getArg(1)), B.getTrue()});
   Value *ExpectedPtr = F.getArg(2);
@@ -138,11 +112,12 @@ static bool DefineCompareExchange(Function &F, Module &M) {
   } else if (Desired->getType() != ValTy) {
     Desired = B.CreateIntCast(Desired, ValTy, false);
   }
-  Value *Old = B.CreateLoad(ValTy, Ptr);
   Value *Expected = B.CreateLoad(ValTy, ExpectedPtr);
-  Value *Match = B.CreateICmpEQ(Old, Expected);
-  Value *StoreVal = B.CreateSelect(Match, Desired, Old);
-  B.CreateStore(StoreVal, Ptr);
+  Value *Pair = B.CreateAtomicCmpXchg(
+      Ptr, Expected, Desired, MaybeAlign(),
+      AtomicOrdering::SequentiallyConsistent,
+      AtomicOrdering::SequentiallyConsistent);
+  Value *Old = B.CreateExtractValue(Pair, 0, "cmpxchg.old");
   B.CreateStore(Old, ExpectedPtr);
   B.CreateRet(F.getArg(0));
   return true;
@@ -187,12 +162,25 @@ bool BrightenRuntimeHelperPass::DefineRemillAtomicBarrierRuntime(Module &M) {
       Changed |= DefineAtomicRMW(*F, M, AtomicRMWInst::Xor);
     } else if (Name.starts_with("__remill_fetch_and_nand_")) {
       Changed |= DefineAtomicRMW(*F, M, AtomicRMWInst::Nand);
-    } else if (Name.starts_with("__remill_read_io_port_")) {
-      Changed |= DefineFallbackBody(*F);
-    } else if (Name.starts_with("__remill_write_io_port_")) {
+    } else if (Name == "__remill_barrier_load_load") {
+      Changed |= DefineFence(*F, AtomicOrdering::Acquire);
+    } else if (Name == "__remill_barrier_store_store") {
+      Changed |= DefineFence(*F, AtomicOrdering::Release);
+    } else if (Name == "__remill_barrier_load_store" ||
+               Name == "__remill_barrier_store_load") {
+      Changed |= DefineFence(*F, AtomicOrdering::SequentiallyConsistent);
+    } else if (Name == "__remill_delay_slot_begin" ||
+               Name == "__remill_delay_slot_end") {
       Changed |= DefineReturnMemory(*F);
+    } else if (Name.starts_with("__remill_read_io_port_") ||
+               Name.starts_with("__remill_write_io_port_") ||
+               Name == "__remill_atomic_begin" ||
+               Name == "__remill_atomic_end") {
+      errs() << "[brighten-remill-runtime] exact atomic/I/O lowering unavailable: "
+             << Name << "\n";
     } else {
-      Changed |= DefineReturnMemory(*F);
+      errs() << "[brighten-remill-runtime] unresolved atomic helper: "
+             << Name << "\n";
     }
   }
   return Changed;

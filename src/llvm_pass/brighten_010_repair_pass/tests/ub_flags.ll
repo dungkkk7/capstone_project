@@ -2,7 +2,7 @@
 ; CHECK-NOT: nuw
 ; CHECK-NOT: getelementptr inbounds
 
-define i64 @ub_flags(i64 %a, i64 %b, i64* %base) {
+define i64 @sub_1000_ub_flags(i64 %a, i64 %b, i64* %base) {
 entry:
   %x = add nsw i64 %a, %b
   %y = sub nuw i64 %x, 1

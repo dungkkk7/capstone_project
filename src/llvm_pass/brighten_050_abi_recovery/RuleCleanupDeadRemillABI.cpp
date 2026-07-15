@@ -70,8 +70,8 @@ bool BrightenABIRecoveryPass::CleanupDeadRemillABI(ABIRecoveryContext &Ctx) {
   Function *FuncCall = Ctx.M.getFunction("__remill_function_call");
   Function *JumpCall = Ctx.M.getFunction("__remill_jump");
 
-  if (FuncCall) PruneDispatcherCases(Ctx.M, FuncCall);
-  if (JumpCall) PruneDispatcherCases(Ctx.M, JumpCall);
+  // if (FuncCall) PruneDispatcherCases(Ctx.M, FuncCall);
+  // if (JumpCall) PruneDispatcherCases(Ctx.M, JumpCall);
 
   bool Changed = false;
   for (FunctionABISummary *S : Ctx.Summaries) {

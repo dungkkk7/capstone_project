@@ -15,6 +15,27 @@ using namespace llvm;
 static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
                                                     const GlobalDataContext &Ctx);
 
+// McSema's data aliases carry the original guest virtual address in their
+// name (for example, @data_405040).  Do not recompute that address from the
+// LLVM aggregate GEP: segment aggregates may contain target-specific
+// alignment/padding which is not the ELF virtual-address layout.  Using the
+// GEP's DataLayout offset here can silently turn 0x405040 into a different
+// guest address and make external-call output pointers point at unrelated
+// globals.
+static std::optional<uint64_t> TryExtractNamedDataAddr(const GlobalValue *GV) {
+  if (!GV)
+    return std::nullopt;
+  StringRef Name = GV->getName();
+  if (!Name.starts_with("data_"))
+    return std::nullopt;
+
+  uint64_t Addr = 0;
+  StringRef Hex = Name.drop_front(StringRef("data_").size());
+  if (Hex.empty() || Hex.getAsInteger(16, Addr))
+    return std::nullopt;
+  return Addr;
+}
+
 static std::optional<uint64_t> ParseGlobalBase(GlobalValue *GV,
                                                 const GlobalDataContext &Ctx) {
   for (auto &Seg : Ctx.Segments) {
@@ -24,19 +45,34 @@ static std::optional<uint64_t> ParseGlobalBase(GlobalValue *GV,
   return std::nullopt;
 }
 
+static std::optional<uint64_t> TryGetUInt64(const APInt &Value) {
+  if (!Value.isIntN(64))
+    return std::nullopt;
+  return Value.getLimitedValue();
+}
+
+static std::optional<uint64_t> TryGetOffset64(const APInt &Value) {
+  if (Value.isIntN(64))
+    return Value.getLimitedValue();
+  if (!Value.isSignedIntN(64))
+    return std::nullopt;
+  return Value.trunc(64).getZExtValue();
+}
+
 static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
                                                     const GlobalDataContext &Ctx) {
   if (!V)
     return std::nullopt;
 
   if (auto *CI = dyn_cast<ConstantInt>(V))
-    return CI->getZExtValue();
+    return TryGetUInt64(CI->getValue());
 
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     auto *U = cast<User>(CE);
     if (CE->getOpcode() == Instruction::IntToPtr &&
         isa<ConstantInt>(U->getOperand(0)))
-      return cast<ConstantInt>(U->getOperand(0))->getZExtValue();
+      return TryGetUInt64(
+          cast<ConstantInt>(U->getOperand(0))->getValue());
     if (CE->getOpcode() == Instruction::PtrToInt)
       return TryExtractGuestAddr(U->getOperand(0), Ctx);
     if (CE->getOpcode() == Instruction::GetElementPtr) {
@@ -49,7 +85,10 @@ static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
       APInt Offset(DL.getPointerSizeInBits(), 0);
       if (!GEP->accumulateConstantOffset(DL, Offset))
         return std::nullopt;
-      return *BaseAddr + Offset.getZExtValue();
+      auto Offset64 = TryGetOffset64(Offset);
+      if (!Offset64)
+        return std::nullopt;
+      return *BaseAddr + *Offset64;
     }
     if (CE->getOpcode() == Instruction::Add) {
       auto LHS = TryExtractGuestAddr(U->getOperand(0), Ctx);
@@ -80,12 +119,19 @@ static std::optional<uint64_t> TryExtractGuestAddr(Value *V,
     APInt Offset(Ctx.DL.getPointerSizeInBits(), 0);
     if (!GEP->accumulateConstantOffset(Ctx.DL, Offset))
       return std::nullopt;
-    return *BaseAddr + Offset.getZExtValue();
+    auto Offset64 = TryGetOffset64(Offset);
+    if (!Offset64)
+      return std::nullopt;
+    return *BaseAddr + *Offset64;
   }
 
   if (auto *GV = dyn_cast<GlobalVariable>(V))
     return ParseGlobalBase(GV, Ctx);
   if (auto *GA = dyn_cast<GlobalAlias>(V)) {
+    // The alias name is the authoritative guest address.  This must be
+    // checked before following the aliasee GEP (see comment above).
+    if (auto NamedAddr = TryExtractNamedDataAddr(GA))
+      return NamedAddr;
     if (Constant *Aliasee = GA->getAliasee())
       return TryExtractGuestAddr(Aliasee, Ctx);
   }
@@ -134,8 +180,10 @@ static bool IsExternalStringWrapper(StringRef Name, std::string &LibcName) {
       Cleaned == "strtoul" || Cleaned == "strcmp" || Cleaned == "strncmp" ||
       Cleaned == "strcpy" || Cleaned == "strncpy" || Cleaned == "strcat" ||
       Cleaned == "strchr" || Cleaned == "strstr" || Cleaned == "printf" ||
-      Cleaned == "scanf" || Cleaned == "fprintf" || Cleaned == "sprintf" ||
-      Cleaned == "sscanf" || Cleaned == "snprintf") {
+      Cleaned == "scanf" || Cleaned == "vprintf" || Cleaned == "vscanf" ||
+      Cleaned == "fprintf" || Cleaned == "sprintf" ||
+      Cleaned == "sscanf" || Cleaned == "snprintf" ||
+      Cleaned == "memcpy" || Cleaned == "memmove" || Cleaned == "memset") {
     LibcName = Cleaned;
     return true;
   }
@@ -202,7 +250,8 @@ static bool StateRegisterMatchesLibcArg(int64_t Offset, StringRef LibcName) {
   if (LibcName == "strcpy" || LibcName == "strncpy" || LibcName == "strcat") {
     return Offset == 2280;
   }
-  if (LibcName == "printf" || LibcName == "scanf") {
+  if (LibcName == "printf" || LibcName == "scanf" ||
+      LibcName == "vprintf" || LibcName == "vscanf") {
     return Offset == 2296;
   }
   if (LibcName == "fprintf" || LibcName == "sprintf" || LibcName == "sscanf") {
@@ -210,6 +259,12 @@ static bool StateRegisterMatchesLibcArg(int64_t Offset, StringRef LibcName) {
   }
   if (LibcName == "snprintf") {
     return Offset == 2264;
+  }
+  if (LibcName == "memcpy" || LibcName == "memmove") {
+    return Offset == 2296 || Offset == 2280;
+  }
+  if (LibcName == "memset") {
+    return Offset == 2296;
   }
   return false;
 }
@@ -235,21 +290,20 @@ static std::pair<DataConsumerKind, EvidenceKind> ClassifyConsumerAndEvidence(
     if (Offset != -1) {
       BasicBlock *BB = SI->getParent();
       Instruction *Next = SI->getNextNode();
-      unsigned Limit = 50;
-      while (Next && Limit > 0) {
+      while (Next) {
         if (auto *CI = dyn_cast<CallInst>(Next)) {
           Function *Callee = CI->getCalledFunction();
           if (Callee) {
             StringRef CalleeName = Callee->getName();
             if (CalleeName.starts_with("__translate_") || CalleeName.starts_with("llvm.")) {
               Next = Next->getNextNode();
-              --Limit;
               continue;
             }
             std::string LibcName;
             if (IsExternalStringWrapper(CalleeName, LibcName)) {
               if (StateRegisterMatchesLibcArg(Offset, LibcName)) {
                 if (LibcName == "printf" || LibcName == "scanf" ||
+                    LibcName == "vprintf" || LibcName == "vscanf" ||
                     LibcName == "fprintf" || LibcName == "sprintf" ||
                     LibcName == "sscanf" || LibcName == "snprintf") {
                   Confidence = 120;
@@ -264,7 +318,6 @@ static std::pair<DataConsumerKind, EvidenceKind> ClassifyConsumerAndEvidence(
           break;
         }
         Next = Next->getNextNode();
-        --Limit;
       }
     }
     return {DataConsumerKind::IntegerAddressConsumer, EvidenceKind::LoadStoreWidth};
@@ -306,7 +359,8 @@ static std::pair<DataConsumerKind, EvidenceKind> ClassifyConsumerAndEvidence(
         return {DataConsumerKind::LibcStringArg, EvidenceKind::LibcStringArg};
       }
 
-      if (((Name == "printf" || Name == "scanf") && ArgIdx == 0) ||
+      if (((Name == "printf" || Name == "scanf" ||
+            Name == "vprintf" || Name == "vscanf") && ArgIdx == 0) ||
           ((Name == "fprintf" || Name == "sprintf" || Name == "sscanf") && ArgIdx == 1) ||
           ((Name == "snprintf") && ArgIdx == 2)) {
         Confidence = 120;
@@ -367,6 +421,169 @@ static GlobalVariable *FindReferencedGlobal(Value *V) {
   return nullptr;
 }
 
+static bool IsNamedDataAddress(const Module &M, uint64_t Addr) {
+  for (const GlobalAlias &GA : M.aliases()) {
+    StringRef Name = GA.getName();
+    if (!Name.starts_with("data_"))
+      continue;
+    uint64_t AliasAddr = 0;
+    StringRef Hex = Name.drop_front(StringRef("data_").size());
+    if (!Hex.empty() && !Hex.getAsInteger(16, AliasAddr) &&
+        AliasAddr == Addr)
+      return true;
+  }
+  return false;
+}
+
+// Earlier repair/devirt passes can fold ptrtoint(@data_x) into the original
+// guest address before this pass runs. Recover that provenance only for a
+// dynamic arithmetic expression which is subsequently consumed as a pointer;
+// a bare integer in a call/store remains an ordinary scalar or intrinsic
+// immediate and must not be rewritten.
+static bool EventuallyFeedsPointerConsumer(Value *V,
+                                           SmallPtrSetImpl<Value *> &Seen,
+                                           unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  for (User *U : V->users()) {
+    if (isa<IntToPtrInst>(U))
+      return true;
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+      if (Function *Callee = CI->getCalledFunction()) {
+        // The translator is the lifted ABI's pointer boundary.  Its result
+        // is consumed as a native pointer by a later cleanup pass, so an
+        // address expression reaching this call has guest-pointer
+        // provenance even though the final inttoptr is not present yet.
+        if (Callee->getName() == "__translate_guest_pointer")
+          return true;
+      }
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+      if (CE->getOpcode() == Instruction::IntToPtr)
+        return true;
+      continue;
+    }
+    if (isa<CastInst>(U) || isa<BinaryOperator>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U)) {
+      if (EventuallyFeedsPointerConsumer(cast<Value>(U), Seen, Depth + 1))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool IsFoldedDynamicGuestAddress(Value *V, Instruction *Inst,
+                                        const GlobalDataContext &Ctx) {
+  auto *CI = dyn_cast<ConstantInt>(V);
+  auto *BO = dyn_cast_or_null<BinaryOperator>(Inst);
+  if (!CI || !BO || (BO->getOpcode() != Instruction::Add &&
+                     BO->getOpcode() != Instruction::Sub))
+    return false;
+
+  auto Addr = TryGetUInt64(CI->getValue());
+  if (!Addr)
+    return false;
+  GuestSegment *Seg = Ctx.findSegmentForAddr(*Addr);
+  if (!Seg || Seg->Executable)
+    return false;
+
+  bool IsOperand = false;
+  for (Value *Op : BO->operands())
+    IsOperand |= Op == V;
+  if (!IsOperand)
+    return false;
+
+  // Once a named alias has been folded into its ELF address, the only
+  // remaining provenance can be `guest_base + dynamic_index`.  A writable
+  // guest-segment address in that exact form is a pointer carrier even when
+  // it first travels through a recovered native call rather than directly to
+  // inttoptr/translate.  Record it so global-data recovery can replace the
+  // constant base with a native object address before ABI lowering.
+  Value *Other = BO->getOperand(0) == V ? BO->getOperand(1)
+                                        : BO->getOperand(0);
+  if (Seg->Writable && Other->getType()->isIntegerTy() &&
+      !isa<Constant>(Other))
+    return true;
+
+  SmallPtrSet<Value *, 32> Seen;
+  return EventuallyFeedsPointerConsumer(Inst, Seen);
+}
+
+static bool EventuallyFeedsStringConsumer(Value *V,
+                                           SmallPtrSetImpl<Value *> &Seen,
+                                           unsigned Depth = 0) {
+  if (!V || Depth > 24 || !Seen.insert(V).second)
+    return false;
+  for (User *U : V->users()) {
+    if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getValueOperand() == V) {
+        unsigned Confidence = 0;
+        if (ClassifyConsumerAndEvidence(SI, V, Confidence).first ==
+            DataConsumerKind::LibcStringArg)
+          return true;
+      }
+    }
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+      unsigned Confidence = 0;
+      if (ClassifyConsumerAndEvidence(CI, V, Confidence).first ==
+          DataConsumerKind::LibcStringArg)
+        return true;
+      if (Function *Callee = CI->getCalledFunction())
+        if (Callee->getName() == "__translate_guest_pointer" &&
+            EventuallyFeedsStringConsumer(CI, Seen, Depth + 1))
+          return true;
+    }
+    if (isa<CastInst>(U) || isa<BinaryOperator>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<GetElementPtrInst>(U))
+      if (EventuallyFeedsStringConsumer(cast<Value>(U), Seen, Depth + 1))
+        return true;
+  }
+  return false;
+}
+
+static bool IsFoldedConstantGuestString(Value *V, Instruction *Inst,
+                                        const GlobalDataContext &Ctx) {
+  auto *CI = dyn_cast<ConstantInt>(V);
+  if (!CI || !Inst)
+    return false;
+
+  auto AddrValue = TryGetUInt64(CI->getValue());
+  if (!AddrValue)
+    return false;
+  uint64_t Addr = *AddrValue;
+  GuestSegment *Seg = Ctx.findSegmentForAddr(Addr);
+  if (!Seg || Seg->Executable || !Seg->ReadOnly)
+    return false;
+
+  uint64_t Off = Addr - Seg->GuestBase;
+  if (Off >= Seg->FlatBytes.size())
+    return false;
+  uint64_t End = Off;
+  constexpr uint64_t MaxStringProbe = 4096;
+  while (End < Seg->FlatBytes.size() &&
+         End - Off < MaxStringProbe && Seg->FlatBytes[End] != 0) {
+    uint8_t C = Seg->FlatBytes[End];
+    if (!((C >= 0x20 && C <= 0x7e) || C == '\n' || C == '\r' ||
+          C == '\t'))
+      return false;
+    ++End;
+  }
+  if (End == Off || End >= Seg->FlatBytes.size() ||
+      Seg->FlatBytes[End] != 0)
+    return false;
+
+  unsigned Confidence = 0;
+  if (ClassifyConsumerAndEvidence(Inst, V, Confidence).first ==
+      DataConsumerKind::LibcStringArg)
+    return true;
+
+  // Alias DCE may leave only the integer address in a select/phi before the
+  // native pointer boundary.  The read-only, printable, NUL-terminated range
+  // above proves storage; require the value flow to prove a string consumer.
+  SmallPtrSet<Value *, 32> Seen;
+  return EventuallyFeedsStringConsumer(Inst, Seen);
+}
+
 static void AddAddressRef(Value *V, Instruction *Inst, const GlobalDataContext &Ctx,
                           SmallVectorImpl<std::unique_ptr<GuestAddressRef>> &Refs) {
   for (auto &Existing : Refs) {
@@ -376,6 +593,21 @@ static void AddAddressRef(Value *V, Instruction *Inst, const GlobalDataContext &
   auto Addr = TryExtractGuestAddr(V, Ctx);
   if (!Addr)
     return;
+
+  // A raw integer operand is not, by itself, guest-pointer provenance.  The
+  // lifted IR contains ordinary constants in stores/calls (zero fill bytes,
+  // sizes, flags, and intrinsic immargs); treating all of them as addresses
+  // can rewrite an i1/i8/i64 constant into ptrtoint and produce invalid IR.
+  // Keep folded-address recovery narrow: either the value still matches a
+  // named ELF data alias, or it is the base of a dynamic arithmetic tree that
+  // demonstrably reaches a pointer consumer.
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    auto ConstantAddr = TryGetUInt64(CI->getValue());
+    if ((!ConstantAddr || !IsNamedDataAddress(Ctx.M, *ConstantAddr)) &&
+        !IsFoldedDynamicGuestAddress(V, Inst, Ctx) &&
+        !IsFoldedConstantGuestString(V, Inst, Ctx))
+      return;
+  }
 
   GlobalVariable *GV = FindReferencedGlobal(V);
   GuestSegment *Seg = nullptr;
@@ -398,9 +630,16 @@ static void AddAddressRef(Value *V, Instruction *Inst, const GlobalDataContext &
   Ref->OriginalValue = V;
   Ref->UserInst = Inst;
 
+  bool FoldedString = IsFoldedConstantGuestString(V, Inst, Ctx);
   unsigned Confidence = 0;
   auto Classified = ClassifyConsumerAndEvidence(Inst, V, Confidence);
   Ref->ConsumerKind = Classified.first;
+  if (FoldedString) {
+    Classified = {DataConsumerKind::LibcStringArg,
+                  EvidenceKind::LibcStringArg};
+    Ref->ConsumerKind = Classified.first;
+    Confidence = 100;
+  }
 
   UseEvidence Ev;
   Ev.Kind = Classified.second;
@@ -426,8 +665,19 @@ static void FindConstantExprRefs(Value *V, Instruction *Inst, const GlobalDataCo
                                  SmallVectorImpl<std::unique_ptr<GuestAddressRef>> &Refs) {
   if (!V)
     return;
-  if (isa<ConstantInt>(V))
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    // Optimisation can fold ptrtoint(@data_x) into an integer before this
+    // analysis runs.  Recover only the narrow form that is still visibly an
+    // address carrier: a select choosing between named ELF data addresses.
+    // Reinterpreting arbitrary integer literals as pointers would be unsafe.
+    auto ConstantAddr = TryGetUInt64(CI->getValue());
+    if ((isa<SelectInst>(Inst) && ConstantAddr &&
+         IsNamedDataAddress(Ctx.M, *ConstantAddr)) ||
+        IsFoldedDynamicGuestAddress(CI, Inst, Ctx) ||
+        IsFoldedConstantGuestString(CI, Inst, Ctx))
+      AddAddressRef(V, Inst, Ctx, Refs);
     return;
+  }
   auto Addr = TryExtractGuestAddr(V, Ctx);
   if (Addr) {
     AddAddressRef(V, Inst, Ctx, Refs);

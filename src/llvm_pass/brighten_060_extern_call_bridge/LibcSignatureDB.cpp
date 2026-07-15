@@ -36,6 +36,10 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
   addEntry({"strcmp", PK::Integer,
             {{PK::ConstPointer, "s1", false}, {PK::ConstPointer, "s2", false}},
             false, false, true, false, false, false, false, SK::None});
+  addEntry({"strstr", PK::Pointer,
+            {{PK::ConstPointer, "haystack", false},
+             {PK::ConstPointer, "needle", false}},
+            false, false, true, false, false, false, false, SK::None});
   addEntry({"strncmp", PK::Integer,
             {{PK::ConstPointer, "s1", false}, {PK::ConstPointer, "s2", false},
              {PK::SizeT, "n", false}},
@@ -70,6 +74,31 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
             {{PK::ConstPointer, "s1", false}, {PK::ConstPointer, "s2", false},
              {PK::SizeT, "n", false}},
             false, false, true, false, false, false, false, SK::None});
+  addEntry({"getchar", PK::Integer, {},
+            false, false, false, false, false, false, false, SK::None});
+  addEntry({"fgets", PK::Pointer,
+            {{PK::WritePointer, "s", true}, {PK::Integer, "size", false},
+             {PK::FilePointer, "stream", false}},
+            false, true, false, false, false, true, true, SK::None});
+  addEntry({"strtok", PK::Pointer,
+            {{PK::WritePointer, "str", true},
+             {PK::ConstPointer, "delim", false}},
+            false, true, true, false, false, true, true, SK::None});
+  addEntry({"gets", PK::Pointer,
+            {{PK::WritePointer, "s", true}},
+            false, true, false, false, false, true, true, SK::None});
+  addEntry({"sqrt", PK::Double,
+            {{PK::Double, "x", false}},
+            false, false, false, false, false, false, false, SK::None});
+  addEntry({"hypot", PK::Double,
+            {{PK::Double, "x", false}, {PK::Double, "y", false}},
+            false, false, false, false, false, false, false, SK::None});
+  addEntry({"atan2", PK::Double,
+            {{PK::Double, "y", false}, {PK::Double, "x", false}},
+            false, false, false, false, false, false, false, SK::None});
+  addEntry({"pow", PK::Double,
+            {{PK::Double, "x", false}, {PK::Double, "y", false}},
+            false, false, false, false, false, false, false, SK::None});
 
   // Allocators use native pointer signatures.  Keeping the return type as ptr
   // is essential: routing these through the lifted i64 RAX slot would lose
@@ -128,6 +157,18 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
             {{PK::WritePointer, "buf", true}, {PK::SizeT, "size", false},
              {PK::ConstPointer, "fmt", false}},
             true, true, true, false, false, false, false, SK::SnprintfLike});
+  // va_list entry points are fixed-arity ABI functions.  Native cleanup may
+  // expose them late as vprintf.lifted_abi/vscanf.lifted_abi inside a retained
+  // Remill dispatcher, so keep canonical signatures available to the generic
+  // lifted-ABI normalizer.
+  addEntry({"vprintf", PK::Integer,
+            {{PK::ConstPointer, "fmt", false},
+             {PK::Pointer, "ap", false}},
+            false, false, true, false, false, false, false, SK::None});
+  addEntry({"vscanf", PK::Integer,
+            {{PK::ConstPointer, "fmt", false},
+             {PK::Pointer, "ap", false}},
+            false, true, true, false, false, false, false, SK::None});
 
   // Vararg: scanf family
   addEntry({"scanf", PK::Integer,

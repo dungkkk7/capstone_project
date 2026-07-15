@@ -119,24 +119,13 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     IRBuilder<> B(Entry);
 
     if (RegState) {
-      // 1. Setup RSP from a native stack allocation.  The old implementation
-      // used a module-global 8 MiB guest-stack blob, which kept the lifted
-      // address-space model alive in otherwise native functions.  An alloca
-      // has the required lifetime (the target call is made from this frame)
-      // while preserving the guest stack layout expected by the recovered
-      // code.
-      constexpr uint64_t NativeStackBytes = 8 * 1024 * 1024;
-      AllocaInst *NativeStack = B.CreateAlloca(
-          I8, B.getInt64(NativeStackBytes), "native_stack");
-      NativeStack->setAlignment(Align(16));
-      Value *StackGEP = B.CreateInBoundsGEP(
-          I8, NativeStack, B.getInt64(NativeStackBytes - 128),
-          "native_stack_top");
-      Value *StackVal = B.CreatePtrToInt(StackGEP, I64);
-      Value *RSPPtr = B.CreateConstGEP1_64(I8, RegState, 2312);
-      B.CreateAlignedStore(StackVal, RSPPtr, Align(8));
+      // Do not synthesize a fixed-size guest stack here.  Stack-frame pass 040
+      // owns RSP/RBP recovery and creates native allocas from proven frame
+      // regions.  A fabricated 8 MiB backing both hides that provenance and
+      // can still be too small for a valid lifted access.
 
-      // 2. Setup fs_base
+      // Setup fs_base.  This is a real host TLS value used by lifted stack
+      // protector sequences until they are canonicalized.
       FunctionType *FsAsmFTy = FunctionType::get(I64, {}, false);
       InlineAsm *GetFsAsm = InlineAsm::get(FsAsmFTy, "movq %fs:0, $0", "=r", false);
       Value *FsVal = B.CreateCall(GetFsAsm, {});
@@ -238,12 +227,13 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
 
   // 4. Xoá declaration của __mcsema_attach_call
   if (Function *AttachCall = M.getFunction("__mcsema_attach_call")) {
-    if (!AttachCall->use_empty()) {
-      AttachCall->replaceAllUsesWith(Constant::getNullValue(AttachCall->getType()));
+    if (AttachCall->use_empty()) {
+      AttachCall->eraseFromParent();
+      Changed = true;
+      errs() << "[brighten-mcsema-lower] Erased unused __mcsema_attach_call declaration\n";
+    } else {
+      errs() << "[brighten-mcsema-lower] unresolved live __mcsema_attach_call preserved\n";
     }
-    AttachCall->eraseFromParent();
-    Changed = true;
-    errs() << "[brighten-mcsema-lower] Erased __mcsema_attach_call declaration\n";
   }
 
   // 5. Verify không còn unresolved __mcsema_* trừ global state
@@ -253,17 +243,9 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
       UnresolvedMcSema.push_back(&F);
     }
   }
-  for (Function *F : UnresolvedMcSema) {
-    errs() << "[brighten-mcsema-lower] Warning: fallback unresolved mcsema: " << F->getName() << "\n";
-    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
-    IRBuilder<> B(BB);
-    if (F->getReturnType()->isVoidTy()) {
-      B.CreateRetVoid();
-    } else {
-      B.CreateRet(ZeroValue(F->getReturnType()));
-    }
-    Changed = true;
-  }
+  for (Function *F : UnresolvedMcSema)
+    errs() << "[brighten-mcsema-lower] unresolved mcsema declaration preserved: "
+           << F->getName() << "\n";
 
   return Changed;
 }

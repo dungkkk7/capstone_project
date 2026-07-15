@@ -21,7 +21,16 @@ public:
   static bool AnnotateRemillReturns(llvm::Module &M);
   static bool CleanupCallbackThunks(llvm::Module &M);
   static bool CleanupUnusedRemillDispatchers(llvm::Module &M);
+  static bool LowerProvenConstantStateSwitches(llvm::Module &M);
+  static bool LowerRegionSSAStateSwitches(llvm::Module &M);
   static bool VerifyDevirtualization(llvm::Module &M);
+};
+
+class BrightenRegionSSAUnflattenPass
+    : public llvm::PassInfoMixin<BrightenRegionSSAUnflattenPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
 };
 
 // Target discovery and PC resolution helpers

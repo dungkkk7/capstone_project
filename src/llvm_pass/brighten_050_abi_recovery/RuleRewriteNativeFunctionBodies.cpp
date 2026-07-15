@@ -251,13 +251,37 @@ static bool RewriteReturns(FunctionABISummary &S) {
       continue;
     }
 
-    Value *RetV = FindRegisterValueBeforeReturn(RI, ABIReg::RAX);
-    if (!RetV) {
-      errs() << "[brighten-abi] skipped return rewrite: " << S.OriginalName
-             << " reason=no-rax-value\n";
-      continue;
+    Value *RetV = nullptr;
+    if (S.RetKind == ReturnKind::IntRDXRAX) {
+      Value *RAX = FindRegisterValueBeforeReturn(RI, ABIReg::RAX);
+      Value *RDX = FindRegisterValueBeforeReturn(RI, ABIReg::RDX);
+      if (!RAX || !RDX) {
+        errs() << "[brighten-abi] skipped return rewrite: " << S.OriginalName
+               << " reason=no-rdx-rax-value\n";
+        continue;
+      }
+      RAX = CoerceValue(B, RAX, B.getInt64Ty(), "abi.ret.rax");
+      RDX = CoerceValue(B, RDX, B.getInt64Ty(), "abi.ret.rdx");
+      if (!RAX || !RDX) {
+        errs() << "[brighten-abi] skipped return rewrite: " << S.OriginalName
+               << " reason=rdx-rax-type-conflict\n";
+        continue;
+      }
+      Type *I128Ty = Type::getIntNTy(B.getContext(), 128);
+      Value *Low = B.CreateZExt(RAX, I128Ty, "abi.ret.low");
+      Value *High = B.CreateZExt(RDX, I128Ty, "abi.ret.high");
+      High = B.CreateShl(High, ConstantInt::get(I128Ty, 64),
+                          "abi.ret.high.shifted");
+      RetV = B.CreateOr(High, Low, "abi.ret.rdxrax");
+    } else {
+      RetV = FindRegisterValueBeforeReturn(RI, ABIReg::RAX);
+      if (!RetV) {
+        errs() << "[brighten-abi] skipped return rewrite: " << S.OriginalName
+               << " reason=no-rax-value\n";
+        continue;
+      }
+      RetV = CoerceValue(B, RetV, S.RetTy, "abi.ret");
     }
-    RetV = CoerceValue(B, RetV, S.RetTy, "abi.ret");
     if (!RetV) {
       errs() << "[brighten-abi] skipped return rewrite: " << S.OriginalName
              << " reason=ret-type-conflict\n";

@@ -4,6 +4,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
@@ -77,14 +78,28 @@ static Value *NormalizeCandidate(Value *V) {
   return V;
 }
 
-static Value *FindRAXStoreInBlock(BasicBlock *BB, const DataLayout &DL) {
+static bool CallMayClobberState(CallBase *CB) {
+  if (Function *Callee = CB->getCalledFunction()) {
+    if (Callee->onlyReadsMemory() || Callee->doesNotAccessMemory())
+      return false;
+  }
+  return true;
+}
+
+static Value *FindRAXStoreInBlock(BasicBlock *BB, const DataLayout &DL,
+                                  bool &Clobbered) {
+  Clobbered = false;
   for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
     auto *SI = dyn_cast<StoreInst>(&*It);
-    if (!SI) {
-      continue;
-    }
-    if (IsRAXPointer(SI->getPointerOperand(), DL)) {
+    if (SI && IsRAXPointer(SI->getPointerOperand(), DL)) {
       return NormalizeCandidate(SI->getValueOperand());
+    }
+    // A lifted/native call can update RAX through the shared State even when
+    // its LLVM return value is the memory token.  Never use a stale store from
+    // before such a call as the recovered application return value.
+    if (auto *CB = dyn_cast<CallBase>(&*It); CB && CallMayClobberState(CB)) {
+      Clobbered = true;
+      return nullptr;
     }
   }
   return nullptr;
@@ -112,63 +127,50 @@ static Value *FindExistingPhiForPredValues(BasicBlock *BB,
   return nullptr;
 }
 
-static Value *FindRAXValueBeforeRet(ReturnInst *RI, const DataLayout &DL) {
-  BasicBlock *RetBB = RI->getParent();
-  if (Value *V = FindRAXStoreInBlock(RetBB, DL)) {
+static Value *FindReachingRAXValue(BasicBlock *BB, const DataLayout &DL,
+                                   DenseSet<BasicBlock *> &Visiting,
+                                   unsigned Depth) {
+  if (Depth > 32 || !Visiting.insert(BB).second)
+    return nullptr;
+
+  bool Clobbered = false;
+  if (Value *V = FindRAXStoreInBlock(BB, DL, Clobbered)) {
+    Visiting.erase(BB);
     return V;
   }
-
-  SmallVector<BasicBlock *, 8> Preds(predecessors(RetBB));
-  if (Preds.empty()) {
+  if (Clobbered) {
+    Visiting.erase(BB);
     return nullptr;
   }
 
-  if (Preds.size() > 1) {
-    SmallVector<Value *, 8> Values;
-    for (BasicBlock *Pred : Preds) {
-      Value *V = FindRAXStoreInBlock(Pred, DL);
-      if (!V) {
-        return nullptr;
-      }
-      Values.push_back(V);
-    }
-
-    bool Same = true;
-    for (unsigned I = 1, E = Values.size(); I < E; ++I) {
-      if (Values[I] != Values[0]) {
-        Same = false;
-        break;
-      }
-    }
-    if (Same) {
-      return Values[0];
-    }
-
-    return FindExistingPhiForPredValues(RetBB, Preds, Values);
+  SmallVector<BasicBlock *, 8> Preds(predecessors(BB));
+  if (Preds.empty()) {
+    Visiting.erase(BB);
+    return nullptr;
   }
 
-  SmallVector<BasicBlock *, 8> Worklist;
-  DenseSet<BasicBlock *> Seen;
-  Worklist.push_back(Preds.front());
-
-  unsigned Depth = 0;
-  while (!Worklist.empty() && Depth++ < 4) {
-    SmallVector<BasicBlock *, 8> Next;
-    for (BasicBlock *BB : Worklist) {
-      if (!Seen.insert(BB).second) {
-        continue;
-      }
-      if (Value *V = FindRAXStoreInBlock(BB, DL)) {
-        return V;
-      }
-      for (BasicBlock *Pred : predecessors(BB)) {
-        Next.push_back(Pred);
-      }
+  SmallVector<Value *, 8> Values;
+  for (BasicBlock *Pred : Preds) {
+    Value *V = FindReachingRAXValue(Pred, DL, Visiting, Depth + 1);
+    if (!V) {
+      Visiting.erase(BB);
+      return nullptr;
     }
-    Worklist = std::move(Next);
+    Values.push_back(V);
   }
+  Visiting.erase(BB);
 
-  return nullptr;
+  bool Same = true;
+  for (unsigned I = 1, E = Values.size(); I < E; ++I)
+    Same &= Values[I] == Values[0];
+  if (Same)
+    return Values[0];
+  return FindExistingPhiForPredValues(BB, Preds, Values);
+}
+
+static Value *FindRAXValueBeforeRet(ReturnInst *RI, const DataLayout &DL) {
+  DenseSet<BasicBlock *> Visiting;
+  return FindReachingRAXValue(RI->getParent(), DL, Visiting, 0);
 }
 
 static MDNode *MakeCandidateMetadata(LLVMContext &Ctx, StringRef Prefix,
@@ -195,9 +197,22 @@ static bool HasReturnMarker(ReturnInst *RI) {
          CB->getOperandBundle("brighten_return_rax").has_value();
 }
 
-static void InsertReturnMarker(Module &M, ReturnInst *RI, Value *RAX) {
+static bool InsertReturnMarker(Module &M, ReturnInst *RI, Value *RAX,
+                               DominatorTree &DT) {
   if (HasReturnMarker(RI)) {
-    return;
+    return true;
+  }
+
+  // The operand bundle is a real use of RAX.  In particular, a value found
+  // in one predecessor cannot be attached directly to a return in a join
+  // block unless it dominates that return.  Skipping the annotation is
+  // conservative; emitting invalid IR would poison every later pass.
+  if (auto *Def = dyn_cast<Instruction>(RAX)) {
+    if (!DT.dominates(Def, RI)) {
+      errs() << "[brighten-devirt] skipping non-dominating return RAX in "
+             << RI->getFunction()->getName() << "\n";
+      return false;
+    }
   }
 
   IRBuilder<> B(RI);
@@ -205,6 +220,7 @@ static void InsertReturnMarker(Module &M, ReturnInst *RI, Value *RAX) {
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::sideeffect);
   OperandBundleDef Bundle("brighten_return_rax", RAX);
   B.CreateCall(SideEffect, {}, {Bundle});
+  return true;
 }
 
 bool BrightenDevirtPass::AnnotateRemillReturns(Module &M) {
@@ -217,6 +233,8 @@ bool BrightenDevirtPass::AnnotateRemillReturns(Module &M) {
       continue;
     }
 
+    DominatorTree DT(F);
+
     for (BasicBlock &BB : F) {
       auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
       if (!RI) {
@@ -228,7 +246,9 @@ bool BrightenDevirtPass::AnnotateRemillReturns(Module &M) {
         continue;
       }
 
-      InsertReturnMarker(M, RI, RAX);
+      if (!InsertReturnMarker(M, RI, RAX, DT)) {
+        continue;
+      }
       RI->setMetadata("brighten.return_rax.info",
                       MakeCandidateMetadata(Ctx, "rax", RAX));
       RI->setMetadata("brighten.return_candidate",

@@ -29,6 +29,16 @@ static bool HasReturnMetadata(Function &F) {
   return false;
 }
 
+static bool HasFullWidthRegisterValueBeforeReturn(ReturnInst *RI,
+                                                  ABIReg Reg) {
+  Value *V = FindRegisterValueBeforeReturn(RI, Reg);
+  if (!V) {
+    return false;
+  }
+  Type *Ty = V->getType();
+  return Ty->isPointerTy() || Ty->isIntegerTy(64);
+}
+
 static void AnalyzeOne(FunctionABISummary &S) {
   Function &F = *S.RemillFn;
   S.HasReturnMetadata = HasReturnMetadata(F);
@@ -54,6 +64,7 @@ static void AnalyzeOne(FunctionABISummary &S) {
   }
 
   bool CompleteRAX = true;
+  bool CompleteRDX = true;
   bool ReturnsMemArg = true;
   for (ReturnInst *RI : Returns) {
     if (!FindRegisterValueBeforeReturn(RI, ABIReg::RAX)) {
@@ -62,10 +73,14 @@ static void AnalyzeOne(FunctionABISummary &S) {
     if (!ReturnOperandIsOriginalMemoryArg(F, *RI)) {
       ReturnsMemArg = false;
     }
+    if (!HasFullWidthRegisterValueBeforeReturn(RI, ABIReg::RDX)) {
+      CompleteRDX = false;
+    }
   }
 
   S.HasRAXStoreBeforeReturn = CompleteRAX;
   S.HasCompleteReturnValues = CompleteRAX;
+  S.HasCompleteRDXValues = CompleteRDX;
   S.ReturnsOriginalMemoryArg = ReturnsMemArg;
 }
 
@@ -78,4 +93,3 @@ bool BrightenABIRecoveryPass::AnalyzeFunctionLiveOuts(
 }
 
 } // namespace brighten_abi
-

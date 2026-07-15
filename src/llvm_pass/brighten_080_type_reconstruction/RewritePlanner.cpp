@@ -124,9 +124,16 @@ bool PlanAndRewrite(TypeReconstructionContext &Ctx, bool OnlyStruct, bool OnlyAr
 
           RewritePointerUses(GV, NewGV, *Plan, Ctx);
 
-          if (GV->use_empty()) {
-            GV->eraseFromParent();
-          }
+          // With opaque pointers both globals have the same `ptr` value type,
+          // even when their storage element types differ.  Keeping the old
+          // global for pointer uses that the typed-GEP planner did not rewrite
+          // creates two independent host allocations for one guest object:
+          // libc writes one allocation while reconstructed indexed accesses
+          // read the other.  Redirect every residual use to the new backing
+          // object; each existing GEP retains its own source element type.
+          if (!GV->use_empty())
+            GV->replaceAllUsesWith(NewGV);
+          GV->eraseFromParent();
 
           Ctx.Report.GlobalsRetyped++;
           Ctx.Report.ObjectsReconstructed++;

@@ -32,7 +32,21 @@ bool BrightenRepairPass::ResolveAliases(Module &M) {
     Constant *Aliasee = GA->getAliasee();
     Constant *Replacement = Aliasee;
 
-    if (auto *GEPOp = dyn_cast<GEPOperator>(Aliasee)) {
+    // Data aliases encode the original ELF virtual address in their name.
+    // Replacing @data_405040 with its aggregate GEP loses that provenance:
+    // LLVM then applies host aggregate padding and later address
+    // canonicalization can turn it into a different guest address (for
+    // example 0x405e28).  Keep the alias intact until the global-data
+    // recovery pass maps it to a native global/GEP.  In particular, replacing
+    // it with an inttoptr here makes the devirtualizer mistake a data pointer
+    // for a dynamic code target.
+    StringRef AliasName = GA->getName();
+    if (AliasName.starts_with("data_")) {
+      continue;
+    }
+
+    if (Replacement == Aliasee) {
+      if (auto *GEPOp = dyn_cast<GEPOperator>(Aliasee)) {
       Value *PtrOp = GEPOp->getPointerOperand();
       bool IsNullBase = false;
       if (isa<ConstantPointerNull>(PtrOp)) {
@@ -54,6 +68,7 @@ bool BrightenRepairPass::ResolveAliases(Module &M) {
           Base = ConstantExpr::getBitCast(Base, PtrOp->getType());
         }
         Replacement = ConstantExpr::getGetElementPtr(SrcTy, Base, Idxs, GEPOp->isInBounds());
+      }
       }
     }
 

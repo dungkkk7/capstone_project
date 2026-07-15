@@ -5,6 +5,7 @@ import os
 import sys
 import argparse
 import subprocess
+import signal
 import shutil
 import time
 import hashlib
@@ -236,32 +237,59 @@ def setup_python_path():
     else:
         print(f"{Color.YELLOW}[!] Cảnh báo: Không tìm thấy thư mục site-packages tại '{site_packages_dir}'{Color.END}")
 
-def run_command(cmd, step_name):
+def run_command(cmd, step_name, timeout_env="LIFT_STEP_TIMEOUT"):
     """ Hàm thực thi lệnh hệ thống và stream log thời gian thực """
     print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu: {step_name}...{Color.END}")
     print(f"{Color.GRAY}      Lệnh: {' '.join(cmd)}{Color.END}")
     
     start_time = time.time()
     try:
-        # Merge stdout and stderr to display all outputs in real time
+        # Keep the historical 180s budget for CFG recovery; callers running a
+        # bounded pilot can override it with LIFT_DISASS_TIMEOUT explicitly.
+        default_timeout = "180"
+        timeout = float(
+            os.environ.get(timeout_env, os.environ.get("LIFT_STEP_TIMEOUT", default_timeout))
+        )
+        # Merge stdout and stderr. communicate(timeout=...) is intentionally
+        # used instead of blocking forever in `for line in process.stdout`.
         process = subprocess.Popen(
             cmd,
             env=os.environ,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            start_new_session=True,
         )
         
-        # Read the output stream in real-time
-        for line in process.stdout:
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # IDA launches helper children; terminate the complete process
+            # group so a timed-out CFG analysis cannot leak into later cases.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            output, _ = process.communicate()
+            for line in (output or "").splitlines():
+                if line.strip():
+                    print(f"{Color.GRAY}      {line.strip()}{Color.END}")
+            print(f"{Color.RED}      [✗] Timeout tại: {step_name} "
+                  f"(sau {timeout:.1f}s){Color.END}")
+            return False
+
+        for line in (output or "").splitlines():
             stripped = line.strip()
             if stripped:
                 elapsed = int(time.time() - start_time)
                 # Print each log line in muted gray prefixed with running elapsed time
                 print(f"{Color.GRAY}      [{elapsed}s] {stripped}{Color.END}")
                 
-        process.wait()
         elapsed_total = int(time.time() - start_time)
         
         if process.returncode == 0:
@@ -413,7 +441,11 @@ def lift_binary(binary_path, disassembler="/opt/ida-pro-9.3/idat", ghidra=None, 
         "--entrypoint", entrypoint
     ]
 
-    if not run_command(disass_cmd, "Bước 1: Phân rã sinh cấu trúc CFG"):
+    if not run_command(
+        disass_cmd,
+        "Bước 1: Phân rã sinh cấu trúc CFG",
+        timeout_env="LIFT_DISASS_TIMEOUT",
+    ):
         return False
 
     # -------------------------------------------------------------------------

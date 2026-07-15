@@ -24,6 +24,9 @@ static constexpr uint64_t kOffRDX = 2264;
 static constexpr uint64_t kOffRCX = 2248;
 static constexpr uint64_t kOffR8 = 2344;
 static constexpr uint64_t kOffR9 = 2360;
+static constexpr uint64_t kOffXMM0 = 16;
+static constexpr uint64_t kOffXMM1 = 80;
+static constexpr uint64_t kOffXMM2 = 144;
 
 static bool IsGenericSafeExternalName(StringRef Name) {
   return Name == "puts" || Name == "putchar" || Name == "strlen" ||
@@ -34,7 +37,8 @@ static bool IsGenericSafeExternalName(StringRef Name) {
          Name == "__cxa_finalize" || Name == "__gmon_start__" ||
          Name == "fopen" || Name == "fclose" || Name == "fread" ||
          Name == "fwrite" || Name == "fgets" || Name == "fputs" ||
-         Name == "time" || Name == "localtime";
+         Name == "time" || Name == "localtime" || Name == "cos" ||
+         Name == "sin";
 }
 
 static bool IsScanfFamilyName(StringRef Name) {
@@ -80,12 +84,19 @@ static Value *CoercePointer(IRBuilder<> &B, Value *Raw, Type *Ty,
   if (Translated->getType() == Ty) {
     return Translated;
   }
+  if (Translated->getType()->isPointerTy() && Ty->isIntegerTy()) {
+    return B.CreatePtrToInt(Translated, Ty);
+  }
+  if (Translated->getType()->isIntegerTy() && Ty->isPointerTy()) {
+    return B.CreateIntToPtr(Translated, Ty);
+  }
   return B.CreateBitCast(Translated, Ty);
 }
 
 static Value *CoerceArg(IRBuilder<> &B, Value *Raw, Type *Ty,
-                        Function *TranslateFn, bool IsWritePointer) {
-  if (Ty->isPointerTy()) {
+                        Function *TranslateFn, bool IsWritePointer,
+                        bool IsPointer) {
+  if (Ty->isPointerTy() || IsPointer) {
     return CoercePointer(B, Raw, Ty, TranslateFn, IsWritePointer);
   }
   if (Ty->isIntegerTy()) {
@@ -98,6 +109,10 @@ static Value *CoerceArg(IRBuilder<> &B, Value *Raw, Type *Ty,
     return B.CreateBitCast(Raw, Ty);
   }
   return Constant::getNullValue(Ty);
+}
+
+static bool IsFloatingType(Type *Ty) {
+  return Ty && (Ty->isFloatTy() || Ty->isDoubleTy());
 }
 
 static bool IsWritePointerArg(StringRef Name, unsigned Index) {
@@ -119,14 +134,42 @@ static bool IsWritePointerArg(StringRef Name, unsigned Index) {
   return false;
 }
 
+// McSema commonly declares libc pointer parameters as i64.  For these
+// symbols the ABI type alone is therefore insufficient: translate the guest
+// integer before the call and coerce it back to the declaration's type.
+static bool IsPointerArg(StringRef Name, unsigned Index) {
+  if (Name == "free" || Name == "puts" || Name == "strlen" ||
+      Name == "strcmp" || Name == "strncmp" || Name == "strcpy" ||
+      Name == "strncpy" || Name == "strcat" || Name == "strncat" ||
+      Name == "strstr" || Name == "strchr" || Name == "strrchr" ||
+      Name == "memcpy" || Name == "memmove" || Name == "memcmp")
+    return Index < 2;
+  if (Name == "memset")
+    return Index == 0;
+  if (Name == "fclose" || Name == "fputs" || Name == "fopen")
+    return Index < 2;
+  if (Name == "fgets")
+    return Index == 0 || Index == 2;
+  if (Name == "fread" || Name == "fwrite")
+    return Index == 0 || Index == 3;
+  if (Name == "realloc")
+    return Index == 0;
+  if (Name == "strtol" || Name == "strtoll" || Name == "strtoul" ||
+      Name == "strtoull" || Name == "strtod")
+    return Index < 2;
+  return false;
+}
+
 static bool HasUnsupportedArgOrReturnTypes(FunctionType *FTy) {
   Type *RetTy = FTy->getReturnType();
-  if (!RetTy->isVoidTy() && !RetTy->isIntegerTy() && !RetTy->isPointerTy()) {
+  if (!RetTy->isVoidTy() && !RetTy->isIntegerTy() &&
+      !RetTy->isPointerTy() && !IsFloatingType(RetTy)) {
     return true;
   }
 
   for (Type *ParamTy : FTy->params()) {
-    if (!ParamTy->isIntegerTy() && !ParamTy->isPointerTy()) {
+    if (!ParamTy->isIntegerTy() && !ParamTy->isPointerTy() &&
+        !IsFloatingType(ParamTy)) {
       return true;
     }
   }
@@ -160,6 +203,21 @@ static void StoreRAX(IRBuilder<> &B, Value *StatePtr, Value *Ret) {
   Value *RAXPtr =
       B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, kOffRAX, "rax.ptr");
   B.CreateAlignedStore(Ret64, RAXPtr, Align(8));
+}
+
+static void StoreFPReturnInXMM0(IRBuilder<> &B, Value *StatePtr, Value *Ret) {
+  if (!Ret || !IsFloatingType(Ret->getType()))
+    return;
+  Value *Bits = nullptr;
+  if (Ret->getType()->isDoubleTy()) {
+    Bits = B.CreateBitCast(Ret, B.getInt64Ty(), "xmm0.ret.bits");
+  } else {
+    Value *Low = B.CreateBitCast(Ret, B.getInt32Ty(), "xmm0.ret.low");
+    Bits = B.CreateZExt(Low, B.getInt64Ty(), "xmm0.ret.bits");
+  }
+  Value *XMM0Ptr = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr,
+                                         kOffXMM0, "xmm0.ptr");
+  B.CreateAlignedStore(Bits, XMM0Ptr, Align(8));
 }
 
 static bool IsRemillCall(CallBase *CB, Function *RemillCall) {
@@ -250,14 +308,26 @@ bool BrightenDevirtPass::LowerExternalCalls(Module &M) {
 
     IRBuilder<> B(CI);
     SmallVector<Value *, 12> Args;
-    unsigned FixedParams = ExtTy->getNumParams();
-    unsigned RegLimit = std::min<unsigned>(FixedParams, 6);
-
-    for (unsigned I = 0; I < RegLimit; ++I) {
-      Value *Raw = LoadReg(B, StatePtr, ArgRegs[I], Twine("arg") + Twine(I));
-      Args.push_back(CoerceArg(B, Raw, ExtTy->getParamType(I), TranslateFn,
-                               IsWritePointerArg(ExtFn->getName(), I)));
+    unsigned GPIdx = 0;
+    unsigned XMMIdx = 0;
+    for (unsigned I = 0, E = ExtTy->getNumParams(); I < E; ++I) {
+      Type *ParamTy = ExtTy->getParamType(I);
+      bool FP = IsFloatingType(ParamTy);
+      unsigned RegIndex = FP ? XMMIdx++ : GPIdx++;
+      if ((!FP && RegIndex >= 6) || (FP && RegIndex >= 3)) {
+        Args.clear();
+        break;
+      }
+      static const uint64_t XMMArgs[] = {kOffXMM0, kOffXMM1, kOffXMM2};
+      uint64_t Offset = FP ? XMMArgs[RegIndex] : ArgRegs[RegIndex];
+      Value *Raw = LoadReg(B, StatePtr, Offset, Twine("arg") + Twine(I));
+      Args.push_back(CoerceArg(B, Raw, ParamTy, TranslateFn,
+                               IsWritePointerArg(ExtFn->getName(), I),
+                               IsPointerArg(ExtFn->getName(), I)));
     }
+
+    if (Args.size() != ExtTy->getNumParams())
+      continue;
 
     CallInst *NewCall = B.CreateCall(ExtTy, ExtFn, Args);
     if (!ExtTy->getReturnType()->isVoidTy()) {
@@ -271,7 +341,10 @@ bool BrightenDevirtPass::LowerExternalCalls(Module &M) {
       NewCall->addFnAttr(Attribute::ReturnsTwice);
     }
 
-    StoreRAX(B, StatePtr, NewCall);
+    if (IsFloatingType(ExtTy->getReturnType()))
+      StoreFPReturnInXMM0(B, StatePtr, NewCall);
+    else
+      StoreRAX(B, StatePtr, NewCall);
     if (!CI->use_empty()) {
       CI->replaceAllUsesWith(Mem);
     }

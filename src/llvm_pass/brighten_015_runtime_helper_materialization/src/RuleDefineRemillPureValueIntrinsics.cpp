@@ -1,63 +1,17 @@
 #include "BrightenRuntimeHelperPass.h"
 #include "Helpers.h"
 
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Instructions.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace brighten_runtime {
 
 using namespace llvm;
 
-namespace {
-
-static bool DefineFallbackBody(Function &F) {
-  if (!F.isDeclaration()) {
-    return false;
-  }
-  BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
-  IRBuilder<> B(BB);
-  Type *RetTy = F.getReturnType();
-  if (RetTy->isVoidTy()) {
-    B.CreateRetVoid();
-    return true;
-  }
-  if (RetTy->isPointerTy()) {
-    if (Value *Mem = FindLikelyMemoryArg(F)) {
-      B.CreateRet(Mem);
-    } else {
-      B.CreateRet(ZeroValue(RetTy));
-    }
-    return true;
-  }
-  B.CreateRet(ZeroValue(RetTy));
-  return true;
-}
-
-static bool DefineCompareOrFlagComputation(Function &F) {
-  if (!F.isDeclaration()) {
-    return false;
-  }
-  BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
-  IRBuilder<> B(BB);
-  Type *RetTy = F.getReturnType();
-  if (RetTy->isVoidTy()) {
-    B.CreateRetVoid();
-    return true;
-  }
-  for (Argument &Arg : F.args()) {
-    if (Arg.getType() == RetTy) {
-      B.CreateRet(&Arg);
-      return true;
-    }
-  }
-  B.CreateRet(ZeroValue(RetTy));
-  return true;
-}
-
-}  // namespace
-
 bool BrightenRuntimeHelperPass::DefineRemillPureValueIntrinsics(Module &M) {
-  bool Changed = false;
+  // The old implementation returned an arbitrary same-typed argument (or
+  // zero) for flag/FPU/undefined helpers.  Those functions are not identities,
+  // and choosing zero silently changes branches and floating-point behavior.
+  // Preserve declarations until a helper has an exact lowering.
   for (Function &F : M) {
     if (!IsRemillDecl(F)) {
       continue;
@@ -65,14 +19,13 @@ bool BrightenRuntimeHelperPass::DefineRemillPureValueIntrinsics(Module &M) {
     StringRef Name = F.getName();
     if (Name.starts_with("__remill_undefined_") ||
         Name == "__remill_fpu_exception_test_and_clear" ||
-        Name.starts_with("__remill_fpu_")) {
-      Changed |= DefineFallbackBody(F);
-    } else if (Name.starts_with("__remill_compare_") ||
-               Name.starts_with("__remill_flag_computation_")) {
-      Changed |= DefineCompareOrFlagComputation(F);
-    }
+        Name.starts_with("__remill_fpu_") ||
+        Name.starts_with("__remill_compare_") ||
+        Name.starts_with("__remill_flag_computation_"))
+      errs() << "[brighten-remill-runtime] exact value lowering unavailable: "
+             << Name << "\n";
   }
-  return Changed;
+  return false;
 }
 
 }  // namespace brighten_runtime

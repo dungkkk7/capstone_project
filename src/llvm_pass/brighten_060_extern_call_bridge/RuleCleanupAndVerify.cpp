@@ -122,6 +122,18 @@ bool BrightenExternCallBridgePass::VerifyExternalCallRecovery(
       HasError = true;
       ++Ctx.Report.VerifierErrors;
     }
+    if (Ctx.Mode == ExternRecoveryMode::NativeStrict && !CS->Rewritten) {
+      errs() << "[brighten-extern] VERIFY ERROR: NativeStrict preserved "
+                "external callsite in "
+             << CS->Caller->getName() << " -> "
+             << (CS->Target.SymbolName.empty() ? "<unresolved>"
+                                                : CS->Target.SymbolName)
+             << " reason="
+             << (CS->SkipReason.empty() ? "not-rewritten" : CS->SkipReason)
+             << "\n";
+      HasError = true;
+      ++Ctx.Report.VerifierErrors;
+    }
   }
 
   // FIX #3 verification: check vararg count accounts for scanf suppression

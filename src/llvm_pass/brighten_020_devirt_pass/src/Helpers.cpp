@@ -202,23 +202,6 @@ static Constant *ConstantAtOffset(Constant *C, Type *LoadTy, uint64_t Offset,
   return nullptr;
 }
 
-static bool IsProvenReadOnly(GlobalVariable &GV) {
-  for (User *U : GV.users()) {
-    if (auto *SI = dyn_cast<StoreInst>(U)) {
-      if (SI->getPointerOperand() == &GV) {
-        return false;
-      }
-    }
-    if (auto *CB = dyn_cast<CallBase>(U)) {
-      // A global passed to an unknown call may be mutated through an alias.
-      // Keep the proof conservative; direct constant loads are the only
-      // safe case for dispatcher resolution.
-      return false;
-    }
-  }
-  return true;
-}
-
 static std::optional<uint64_t> ExtractConstantLoadPC(LoadInst *LI,
                                                      const DataLayout &DL) {
   if (!LI || LI->isVolatile()) {
@@ -235,8 +218,12 @@ static std::optional<uint64_t> ExtractConstantLoadPC(LoadInst *LI,
 
   Base = StripAlias(Base);
   auto *GV = dyn_cast<GlobalVariable>(Base);
-  if (!GV || !GV->hasInitializer() ||
-      (!GV->isConstant() && !IsProvenReadOnly(*GV))) {
+  // Lifted guest segments are commonly mutable LLVM globals whose addresses
+  // are hidden behind aliases.  Writes reach them through the guest-pointer
+  // translator, so a scan of the global's direct LLVM users cannot prove the
+  // initializer is still current.  Folding such a load (often an initial
+  // zero in a GOT slot) silently turns a dynamic jump into the fallback path.
+  if (!GV || !GV->hasInitializer() || !GV->isConstant()) {
     return std::nullopt;
   }
 
@@ -265,8 +252,7 @@ static Function *ResolveFunctionFromConstantLoad(Value *V,
   }
   Base = StripAlias(Base);
   auto *GV = dyn_cast<GlobalVariable>(Base);
-  if (!GV || !GV->hasInitializer() ||
-      (!GV->isConstant() && !IsProvenReadOnly(*GV))) {
+  if (!GV || !GV->hasInitializer() || !GV->isConstant()) {
     return nullptr;
   }
 

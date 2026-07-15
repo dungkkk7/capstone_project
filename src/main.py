@@ -1,15 +1,34 @@
 import sys
 import os
 import csv
+import json
+import base64
 import datetime
+import shutil
+import subprocess
+import re
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 # Thêm thư mục hiện tại (src) vào sys.path để nhận diện package binary_lifting
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from binary_lifting.lifting import lift_binary
-from llvm_pass.britening_ir import brighten_ir
+from llvm_pass.britening_ir import (
+    brighten_ir,
+    native_contract_report_path,
+    read_native_contract_report,
+)
+from llm_recovery.llm_recovery import (
+    RecoveryConfig,
+    RecoveryInput,
+    read_recovery_csv,
+    run_recovery_loop,
+)
 from fuzzing_equi_check.fuzzing import (
+    DEFAULT_EXECUTION_TIMEOUT,
     SemanticFuzzer,
+    compile_to_binary,
     TemplateEvaluator,
     make_bytes_generator,
     make_integers_generator,
@@ -72,6 +91,57 @@ def _resolve_seed_paths(project_root, binary_path):
     return (seed_paths, seed_dir)
 
 
+def _decode_tested_payloads(report: Mapping[str, Any]) -> List[bytes]:
+    payloads = report.get("tested_payloads") if isinstance(report, Mapping) else None
+    if not payloads or not isinstance(payloads, list):
+        return []
+
+    decoded: List[bytes] = []
+    for item in payloads:
+        if not isinstance(item, str):
+            continue
+        try:
+            decoded.append(base64.b64decode(item.encode("ascii"), validate=True))
+        except Exception:
+            continue
+
+    return decoded
+
+
+def _write_semantic_report(report_path: str, report: Mapping[str, Any]) -> None:
+    """Atomically persist the exact JSON-compatible report returned by fuzzing."""
+    report_tmp = report_path + ".tmp"
+    with open(report_tmp, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=2, ensure_ascii=False)
+    os.replace(report_tmp, report_path)
+
+
+def _native_contract_status(report: Optional[Mapping[str, Any]]) -> str:
+    """Classify structural verification independently from brightening/fuzzing."""
+    if not report or report.get("status") == "unavailable":
+        return "unchecked"
+    return "pass" if report.get("is_fully_native") is True else "nonpass"
+
+
+def _run_fuzzer_sync(
+    fuzzer: "SemanticFuzzer",
+    iterations: int,
+    generator: Callable[[], Tuple[List[str], bytes]],
+    timeout: float,
+) -> Dict[str, Any]:
+    try:
+        fuzzer.compile()
+        return fuzzer.run_differential_test(
+            iterations=iterations,
+            generator=generator,
+            timeout=timeout,
+            compare_stderr=False,
+            num_workers=1,
+        )
+    finally:
+        fuzzer.cleanup()
+
+
 def _find_reference_source(project_root, binary_path):
     """Find the clean C source belonging to a dataset binary, if present."""
     binary_abs = os.path.abspath(binary_path)
@@ -104,6 +174,293 @@ def _select_generator(project_root, binary_path, template_content):
             pass
     return make_bytes_generator(), "raw byte fallback"
 
+
+def _select_pilot_paths(binary_paths, limit=12):
+    """Choose one representative binary per p-case for a bounded pilot run."""
+    by_case = {}
+    for path in binary_paths:
+        parts = Path(path).parts
+        case = next((part for part in parts if re.fullmatch(r"p\d+", part)), None)
+        if case is None:
+            case = os.path.dirname(path)
+        by_case.setdefault(case, []).append(path)
+
+    representatives = []
+    for case in sorted(by_case):
+        candidates = by_case[case]
+        preferred = [p for p in candidates if p.lower().endswith("_bcf.elf")]
+        representatives.append(sorted(preferred or candidates)[0])
+
+    if limit <= 0 or len(representatives) <= limit:
+        return representatives
+    if limit == 1:
+        return [representatives[0]]
+    # Spread the sample over the sorted case list so the pilot is not just
+    # the first handful of p-numbers.
+    indices = sorted({round(i * (len(representatives) - 1) / (limit - 1))
+                      for i in range(limit)})
+    return [representatives[i] for i in indices]
+
+
+def _read_llm_ir(ir_path, output_dir):
+    """Read .ll directly or disassemble .bc into a temporary .ll file."""
+    if not ir_path:
+        return ""
+    path = os.path.abspath(ir_path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".ll":
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    if ext == ".bc":
+        llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
+        if not llvm_dis:
+            raise RuntimeError("Không tìm thấy llvm-dis-21/llvm-dis để đọc bitcode")
+        output_ll = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(path))[0]}_input.ll")
+        subprocess.run([llvm_dis, path, "-o", output_ll], check=True, capture_output=True, text=True)
+        with open(output_ll, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    raise RuntimeError(f"LLM recovery chỉ nhận .ll/.bc làm IR input: {ir_path}")
+
+
+def _prepare_llm_ir(item, project_root, case_output_dir, use_cache=True, force_relift=False):
+    """Resolve IR input; returns (ir_text, original_binary, brightened_bc).
+
+    ``brightened_bc`` is provided only when the IR was produced by lift+brightening
+    in this mode, and can be used for pre-checking fuzzing before LLM recovery.
+    """
+    inline_ir = item.metadata.get("inline_ir")
+    if inline_ir:
+        return inline_ir, item.original_binary_path, None
+    if item.ir_path:
+        return _read_llm_ir(item.ir_path, case_output_dir), item.original_binary_path, None
+    if not item.original_binary_path:
+        raise RuntimeError("CSV row không có IR path hoặc binary path")
+
+    binary_path = os.path.abspath(item.original_binary_path)
+    base_name = os.path.splitext(os.path.basename(binary_path))[0]
+    lifted_bc = os.path.join(case_output_dir, f"{base_name}_lifted.bc")
+    brightened_bc = os.path.join(case_output_dir, f"{base_name}_brightened.bc")
+    if not os.path.isfile(brightened_bc) or force_relift:
+        if not lift_binary(
+            binary_path=binary_path,
+            output=lifted_bc,
+            use_cache=use_cache,
+            force_relift=force_relift,
+        ):
+            raise RuntimeError(f"Lift thất bại cho {binary_path}")
+        if not brighten_ir(lifted_bc, brightened_bc, binary_path=binary_path):
+            raise RuntimeError(f"Brightening thất bại cho {binary_path}")
+    brightened_ll = f"{os.path.splitext(brightened_bc)[0]}.ll"
+    if not os.path.isfile(brightened_ll):
+        raise RuntimeError(f"Không tìm thấy LLVM IR sau brightening: {brightened_ll}")
+    return _read_llm_ir(brightened_ll, case_output_dir), binary_path, brightened_bc
+
+
+def _llm_case_output_dir(result_root, item, index):
+    reference = item.original_binary_path or item.ir_path or f"case_{index}"
+    case = next((part for part in Path(reference).parts if part.startswith("p")), "standalone")
+    stem = os.path.splitext(os.path.basename(reference))[0] or f"case_{index}"
+    return os.path.join(result_root, case, stem)
+
+
+def _print_llm_report(report):
+    if not report:
+        print(f"      {Color.YELLOW}[!] Không có báo cáo fuzzy/semantic khi kiểm tra.{Color.END}")
+        return
+
+    ratio = report.get("equivalence_ratio", 0.0)
+    ratio_color = Color.GREEN if ratio == 100.0 else (Color.YELLOW if ratio >= 90.0 else Color.RED)
+    confirmed_ratio = report.get("confirmed_equivalence_ratio", ratio)
+    confirmed_runs = report.get(
+        "confirmed_runs",
+        report.get("matches", 0)
+        + report.get("mismatches", 0)
+        + report.get("shared_timeout_matches", 0),
+    )
+    timeouts = report.get("timeouts", {})
+    crashes = report.get("crashes", {})
+
+    print(f"      {Color.BOLD}Kết quả kiểm tra Semantic Equivalence:{Color.END}")
+    if "afl_stats" in report and report["afl_stats"]:
+        stats = report["afl_stats"]
+        print(
+            f"      - AFL++ Coverage: {stats.get('bitmap_cvg', 'N/A')} bitmap | "
+            f"{stats.get('paths_total', 'N/A')} paths | {stats.get('execs_done', 0)} execs "
+            f"({stats.get('execs_per_sec', 'N/A')} execs/s)"
+        )
+    print(f"      - Tổng số lần chạy: {report.get('total_runs', 0)}")
+    print(f"      - Số lần chạy có kết luận (Confirmed): {confirmed_runs}")
+    print(f"      - Khớp hoàn toàn (Matches): {Color.GREEN}{report.get('matches', 0)}{Color.END}")
+    print(f"      - Cùng timeout (được chấp nhận): {Color.YELLOW}{report.get('shared_timeout_matches', 0)}{Color.END}")
+    print(f"      - Không khớp (Mismatches): {Color.RED if report.get('mismatches', 0) > 0 else Color.GRAY}{report.get('mismatches', 0)}{Color.END}")
+    print(
+        f"      - Timeouts: F1: {timeouts.get('bin1', 0)} | "
+        f"F2: {timeouts.get('bin2', 0)} | Both: {timeouts.get('both', 0)}"
+    )
+    print(
+        f"      - Crashes: F1: {crashes.get('bin1', 0)} | "
+        f"F2: {crashes.get('bin2', 0)} | Both: {crashes.get('both', 0)}"
+    )
+    print(
+        f"      - Không kết luận (Inconclusive): "
+        f"{Color.YELLOW if report.get('inconclusive', 0) > 0 else Color.GRAY}"
+        f"{report.get('inconclusive', 0)}{Color.END}"
+    )
+    print(f"      - Tỉ lệ tương đương nghiêm ngặt (Strict Equivalence): {ratio_color}{ratio:.2f}%{Color.END}")
+    print(f"      - Tỉ lệ trên ca có kết luận (Confirmed Subset): {confirmed_ratio:.2f}%")
+    if report.get("early_stopped"):
+        print(
+            f"      - Early stop: sau {report.get('total_runs', 0)} input(s); "
+            f"reason={report.get('early_stop_reason', 'unknown')}"
+        )
+
+    if report.get("is_fully_equivalent", ratio == 100.0):
+        print(f"      {Color.GREEN}[✓] XÁC NHẬN SEMANTIC EQUIVALENT.{Color.END}")
+        return
+
+    if report.get("inconclusive", 0) > 0 and report.get("mismatches", 0) == 0:
+        both_timeouts = timeouts.get("both", 0)
+        both_crashes = crashes.get("both", 0)
+        if both_timeouts and both_crashes:
+            reason = "timeout/crash cả hai bên"
+        elif both_timeouts:
+            reason = "timeout cả hai bên"
+        elif both_crashes:
+            reason = "crash cả hai bên"
+        else:
+            reason = "trạng thái không kết luận"
+        print(f"      {Color.YELLOW}[!] CHƯA THỂ XÁC NHẬN ĐẦY ĐỦ: còn input {reason}.{Color.END}")
+        return
+
+    print(f"      {Color.RED}[✗] CẢNH BÁO: PHÁT HIỆN SỰ KHÁC BIỆT SEMANTIC CHƯA ĐƯỢC GIẢI QUYẾT.{Color.END}")
+    mismatch_examples = report.get("mismatch_examples", [])
+    if mismatch_examples:
+        print(f"      {Color.YELLOW}--- Chi tiết mẫu không khớp (Mismatch Samples) ---{Color.END}")
+        for sample in mismatch_examples[:3]:
+            args = sample.get("args")
+            print(f"      * [Mẫu #{sample.get('index', '?')}]: Lý do: {sample.get('reason', 'mismatch')}")
+            if args is not None:
+                print(f"        Arguments: {args}")
+            print(f"        Stdin: {repr(sample.get('stdin'))}")
+            prog1 = sample.get("prog1", {})
+            prog2 = sample.get("prog2", {})
+            print(
+                f"        Prog1 (Recovered): status={prog1.get('status')}, "
+                f"code={prog1.get('returncode')}, stdout={repr(prog1.get('stdout'))}, "
+                f"stderr={repr(prog1.get('stderr'))}"
+            )
+            print(
+                f"        Prog2 (Original): status={prog2.get('status')}, "
+                f"code={prog2.get('returncode')}, stdout={repr(prog2.get('stdout'))}, "
+                f"stderr={repr(prog2.get('stderr'))}"
+            )
+
+
+
+def _run_llm_recovery_mode(list_path, project_root, use_cache=True, force_relift=False):
+    """Run the opt-in IR -> C recovery -> existing differential fuzzer path."""
+    try:
+        recovery_inputs = read_recovery_csv(list_path, project_root)
+    except Exception as exc:
+        print(f"{Color.RED}[✗] Không đọc được input cho LLM recovery: {exc}{Color.END}")
+        return 1
+    if not recovery_inputs:
+        print(f"{Color.YELLOW}[!] Không có row nào để recovery trong '{list_path}'.{Color.END}")
+        return 0
+
+    pipeline_time = datetime.datetime.now().strftime("llm_recovery_%Y%m%d_%H%M%S")
+    result_root = os.path.join(project_root, "result", pipeline_time)
+    config = RecoveryConfig()
+    print(f"{Color.BLUE}[*] LLM model: {config.model} | Vertex location: {config.location}{Color.END}")
+    print(f"{Color.BLUE}[*] Kết quả LLM recovery: {result_root}{Color.END}")
+
+    success_count = 0
+    for index, item in enumerate(recovery_inputs, 1):
+        case_output_dir = _llm_case_output_dir(result_root, item, index)
+        os.makedirs(case_output_dir, exist_ok=True)
+        print("\n" + f"{Color.BLUE}{Color.BOLD}" + "=" * 80 + f"{Color.END}")
+        print(f"{Color.BLUE}{Color.BOLD}[*] LLM recovery case {index}/{len(recovery_inputs)}{Color.END}")
+        try:
+            ir_text, original_binary, brightened_bc = _prepare_llm_ir(
+                item,
+                project_root,
+                case_output_dir,
+                use_cache=use_cache,
+                force_relift=force_relift,
+            )
+            ir_path = item.ir_path or "generated by lift + brightening"
+            print(f"{Color.BLUE}    IR input: {ir_path} ({len(ir_text)} chars){Color.END}")
+
+            def _build_fuzzer():
+                template_content = None
+                for key in DEFAULT_TEMPLATES.keys():
+                    if key in original_binary.lower():
+                        template_content = DEFAULT_TEMPLATES[key]
+                        break
+                generator, generator_reason = _select_generator(
+                    project_root, original_binary, template_content
+                )
+                seed_paths, seed_dir = _resolve_seed_paths(project_root, original_binary)
+                return generator, generator_reason, seed_paths, seed_dir
+
+            fuzzer_callback = None
+            if original_binary and os.path.isfile(original_binary):
+                generator, generator_reason, seed_paths, seed_dir = _build_fuzzer()
+                print(f"{Color.BLUE}    Fuzzer input generator: {generator_reason}{Color.END}")
+
+                def run_fuzz(candidate_path, _binary=original_binary, _generator=generator,
+                             _seed_paths=seed_paths, _seed_dir=seed_dir):
+                    fuzzer = SemanticFuzzer(
+                        candidate_path,
+                        _binary,
+                        seed_paths=_seed_paths,
+                        seed_dir=_seed_dir,
+                    )
+                    return _run_fuzzer_sync(
+                        fuzzer,
+                        iterations=config.fuzz_iterations,
+                        generator=_generator,
+                        timeout=config.fuzz_timeout,
+                    )
+
+                fuzzer_callback = run_fuzz
+            else:
+                print(f"{Color.YELLOW}[!] Không có binary reference; chỉ compile-check, chưa fuzz được.{Color.END}")
+
+            output_source = os.path.join(
+                case_output_dir,
+                f"{os.path.splitext(os.path.basename(item.ir_path or original_binary or f'case_{index}'))[0]}_recovered.c",
+            )
+            metadata = {
+                "original_binary": original_binary or "",
+                "recovery_reference_binary": original_binary or "",
+                "recovery_reference_label": "original",
+                "input_ir": ir_path,
+                "case": str(index),
+            }
+            result = run_recovery_loop(
+                ir_text=ir_text,
+                output_recovered_c_path=output_source,
+                case_output_dir=case_output_dir,
+                metadata=metadata,
+                fuzzer_callback=fuzzer_callback,
+                config=config,
+            )
+            _print_llm_report(result.fuzz_report)
+            if result.success:
+                success_count += 1
+                print(f"{Color.GREEN}[✓] Recovery thành công: {result.source_path}{Color.END}")
+            else:
+                print(f"{Color.YELLOW}[!] Recovery chưa đạt equivalence; candidate lưu tại: {result.source_path}{Color.END}")
+                if result.compile_error:
+                    print(f"{Color.YELLOW}    Feedback cuối: {result.compile_error[:1000]}{Color.END}")
+        except Exception as exc:
+            print(f"{Color.RED}[✗] LLM recovery thất bại: {exc}{Color.END}")
+
+    print(f"\n{Color.BLUE}{Color.BOLD}[*] Hoàn thành LLM recovery: {success_count}/{len(recovery_inputs)}{Color.END}")
+    print(f"{Color.BLUE}[*] Artifacts nằm tại: {result_root}{Color.END}")
+    return 0 if success_count == len(recovery_inputs) else 1
+
 def main(argv=None):
     print(f"{Color.BLUE}{Color.BOLD}==== Binary Deobfuscation based on LLVM and LLMs ===={Color.END}")
 
@@ -113,16 +470,25 @@ def main(argv=None):
 
     # Kiểm tra tham số
     if len(argv) < 1:
-        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv> [--no-cache] [--force-relift]{Color.END}")
+        print(f"{Color.YELLOW}Usage: python main.py <input.csv> [llm-recovery] [--no-cache] [--force-relift] [--pilot[=N]]{Color.END}")
         return 1
 
     # Phân tích tham số cache từ command line
     use_cache = "--no-cache" not in argv
     force_relift = "--force-relift" in argv
+    pilot_flag = next((a for a in argv if a == "--pilot" or a.startswith("--pilot=")), None)
+    pilot_limit = 12
+    if pilot_flag and pilot_flag.startswith("--pilot="):
+        try:
+            pilot_limit = max(1, int(pilot_flag.split("=", 1)[1]))
+        except ValueError:
+            print(f"{Color.RED}[✗] Giá trị --pilot phải là số nguyên dương.{Color.END}")
+            return 1
+    llm_recovery_mode = "llm-recovery" in argv or "--llm-recovery" in argv
     # Lọc ra các flag để lấy đường dẫn CSV
-    positional_args = [a for a in argv if not a.startswith("--")]
+    positional_args = [a for a in argv if not a.startswith("--") and a != "llm-recovery"]
     if not positional_args:
-        print(f"{Color.YELLOW}Usage: python main.py <obfuscated_bin_list.csv> [--no-cache] [--force-relift]{Color.END}")
+        print(f"{Color.YELLOW}Usage: python main.py <input.csv> [llm-recovery] [--no-cache] [--force-relift] [--pilot[=N]]{Color.END}")
         return 1
 
     # CSV chứa danh sách binary bị obfuscate
@@ -139,6 +505,23 @@ def main(argv=None):
     if not os.path.exists(list_obfuscated_bin):
         print(f"{Color.RED}[✗] Lỗi: Không tìm thấy tệp CSV tại '{list_obfuscated_bin}'{Color.END}")
         return 1
+
+    if llm_recovery_mode:
+        print(f"{Color.BLUE}[*] Chế độ LLM recovery: bổ sung vòng recover + fuzz sau semantic baseline.{Color.END}")
+        llm_config = RecoveryConfig()
+        seed_mode = str(llm_config.pseudo_backend or "").strip().lower()
+        if seed_mode in {"1", "ida", "idapro", "idat", "ida-only", "idaonly"}:
+            seed_label = "1 (Ghidra pseudocode)"
+        elif seed_mode in {"2", "ir", "llvm", "raw_ir", "raw"}:
+            seed_label = "2 (direct IR)"
+        elif not seed_mode and llm_config.two_stage_recovery:
+            seed_label = "1 (Ghidra pseudocode - default)"
+        else:
+            seed_label = seed_mode or "auto"
+        print(f"{Color.BLUE}[*] LLM model: {llm_config.model} | Vertex location: {llm_config.location}{Color.END}")
+        if not seed_mode:
+            seed_label = "1 (Ghidra pseudocode - default)"
+        print(f"{Color.BLUE}[*] LLM seed mode (1=Ghidra -> LLM, 2=IR -> LLM): {seed_label}{Color.END}")
 
     binary_paths = []
     try:
@@ -173,6 +556,11 @@ def main(argv=None):
         print(f"{Color.RED}[✗] Lỗi khi đọc tệp CSV: {e}{Color.END}")
         return 1
 
+    if pilot_flag:
+        before = len(binary_paths)
+        binary_paths = _select_pilot_paths(binary_paths, pilot_limit)
+        print(f"{Color.YELLOW}[!] Pilot mode: chọn {len(binary_paths)}/{before} binary, mỗi case một đại diện (limit={pilot_limit}).{Color.END}")
+
     print(f"{Color.BLUE}[*] Tìm thấy {len(binary_paths)} tệp binary cần xử lý:{Color.END}")
     for path in binary_paths:
         print(f"{Color.GRAY}  - {path}{Color.END}")
@@ -184,7 +572,14 @@ def main(argv=None):
     print(f"{Color.BLUE}[*] Thư mục pipeline kết quả lần chạy này: {result_pipeline_root}{Color.END}")
 
     # Chạy lifting lần lượt cho từng tệp
-    success_count = 0
+    brightened_count = 0
+    native_contract_pass_count = 0
+    native_contract_nonpass_count = 0
+    native_contract_unchecked_count = 0
+    semantic_pass_count = 0
+    semantic_nonpass_count = 0
+    semantic_unchecked_count = 0
+    llm_success_count = 0
     for path in binary_paths:
         print("\n" + f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")
         print(f"{Color.BLUE}{Color.BOLD}[*] Đang thực hiện lifting cho: {path}{Color.END}")
@@ -229,10 +624,34 @@ def main(argv=None):
                 brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=path)
                 if brighten_success:
                     output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
+                    native_report = read_native_contract_report(output_brightened_bc)
+                    native_status = _native_contract_status(native_report)
                     print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
-                    print(f"{Color.GREEN}{Color.BOLD}    [✓] FILE NATIVE LLVM IR SẠCH (ĐÃ LÀM ĐẸP & ĐỂ XEM):{Color.END}")
-                    print(f"{Color.GREEN}{Color.BOLD}        {output_brightened_ll}{Color.END}")
-                    success_count += 1
+                    if native_status == "pass":
+                        native_contract_pass_count += 1
+                        print(f"{Color.GREEN}{Color.BOLD}    [✓] FILE ĐẠT FULLY-NATIVE CONTRACT:{Color.END}")
+                    elif native_status == "nonpass":
+                        native_contract_nonpass_count += 1
+                        violations = native_report.get("metrics", {}).get(
+                            "native_contract_violations", "unknown"
+                        )
+                        print(
+                            f"{Color.YELLOW}{Color.BOLD}    [!] FILE IR ĐÃ BRIGHTEN "
+                            f"NHƯNG CHƯA ĐẠT FULLY-NATIVE CONTRACT "
+                            f"(violations={violations}):{Color.END}"
+                        )
+                    else:
+                        native_contract_unchecked_count += 1
+                        print(
+                            f"{Color.YELLOW}{Color.BOLD}    [!] FILE IR ĐÃ BRIGHTEN "
+                            f"NHƯNG NATIVE CONTRACT CHƯA ĐƯỢC KIỂM TRA:{Color.END}"
+                        )
+                    print(f"{Color.BOLD}        {output_brightened_ll}{Color.END}")
+                    print(
+                        f"{Color.BLUE}        Native contract report: "
+                        f"{native_contract_report_path(output_brightened_bc)}{Color.END}"
+                    )
+                    brightened_count += 1
                     
                     # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
                     print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu kiểm tra Semantic Equivalence cho: {path}...{Color.END}")
@@ -242,9 +661,8 @@ def main(argv=None):
                         for key in DEFAULT_TEMPLATES.keys():
                             if key in path.lower():
                                 template_content = DEFAULT_TEMPLATES[key]
-                                print(f"{Color.YELLOW}      [!] Phát hiện benchmark '{key}', sử dụng cấu hình template.{Color.END}")
                                 break
-                        
+
                         generator, generator_reason = _select_generator(
                             project_root, path, template_content
                         )
@@ -252,75 +670,113 @@ def main(argv=None):
                             print(f"{Color.YELLOW}      [!] Phát hiện benchmark, sử dụng template generator.{Color.END}")
                         else:
                             print(f"{Color.BLUE}      [*] Input generator: {generator_reason}.{Color.END}")
-                        
+
                         seed_paths, seed_dir = _resolve_seed_paths(project_root, path)
                         if seed_paths:
                             print(f"{Color.BLUE}    [*] Tìm thấy seed corpus riêng cho binary: {seed_paths[0]}{Color.END}")
                         elif seed_dir:
                             print(f"{Color.BLUE}    [*] Tìm thấy seed directory cho case: {seed_dir}{Color.END}")
 
-                        fuzzer = SemanticFuzzer(
-                            output_brightened_bc,
-                            path,
-                            seed_paths=seed_paths,
-                            seed_dir=seed_dir,
+                        # Ưu tiên dùng bản binary được biên dịch từ brightened IR
+                        # (đang là file1 của baseline semantic check) cho khâu Ghidra + recovery.
+                        recovery_reference_binary = path
+                        recovery_ref_label = "original"
+                        if os.path.isfile(output_brightened_bc):
+                            recovery_reference_candidate = os.path.join(case_output_dir, f"{base_name}_brightened_ref.bin")
+                            try:
+                                compile_to_binary(output_brightened_bc, recovery_reference_candidate)
+                                if os.path.isfile(recovery_reference_candidate):
+                                    recovery_reference_binary = recovery_reference_candidate
+                                    recovery_ref_label = "brightened.bc compiled"
+                                    print(f"{Color.BLUE}    [*] Dùng binary tham chiếu để recover: {recovery_reference_candidate}{Color.END}")
+                            except Exception:
+                                print(f"{Color.YELLOW}    [!] Không thể biên dịch brightened IR làm reference, fallback về {path}{Color.END}")
+
+                        def run_fuzz(candidate_binary_path):
+                            fuzzer = SemanticFuzzer(
+                                candidate_binary_path,
+                                path,
+                                seed_paths=seed_paths,
+                                seed_dir=seed_dir,
+                            )
+                            return _run_fuzzer_sync(
+                                fuzzer,
+                                iterations=100,
+                                generator=generator,
+                                timeout=DEFAULT_EXECUTION_TIMEOUT,
+                            )
+
+                        fuzz_report = run_fuzz(output_brightened_bc)
+                        # Keep the exact per-case evidence used by the batch
+                        # summary.  Console-only reports made failed corpus
+                        # runs impossible to audit after temporary fuzz
+                        # directories were cleaned up.
+                        semantic_report_path = os.path.join(
+                            case_output_dir, f"{base_name}_semantic_report.json"
                         )
-                        fuzzer.compile()
-                        
-                        # Chạy 100 iterations với 4 thread
-                        fuzz_report = fuzzer.run_differential_test(
-                            iterations=100,
-                            generator=generator,
-                            timeout=1.0,
-                            compare_stderr=False,
-                            num_workers=1
+                        _write_semantic_report(semantic_report_path, fuzz_report)
+                        print(
+                            f"{Color.BLUE}      [*] Semantic report: "
+                            f"{semantic_report_path}{Color.END}"
                         )
-                        # fuzzer.cleanup()
-                        
-                        ratio = fuzz_report["equivalence_ratio"]
-                        ratio_color = Color.GREEN if ratio == 100.0 else (Color.YELLOW if ratio >= 90.0 else Color.RED)
-                        
-                        print(f"      {Color.BOLD}Kết quả kiểm tra Semantic Equivalence:{Color.END}")
-                        if "afl_stats" in fuzz_report:
-                            stats = fuzz_report["afl_stats"]
-                            print(f"      - AFL++ Coverage: {stats['bitmap_cvg']} bitmap | {stats['paths_total']} paths | {stats['execs_done']} execs ({stats['execs_per_sec']} execs/s)")
-                        print(f"      - Tổng số lần chạy: {fuzz_report['total_runs']}")
-                        print(f"      - Số lần chạy có kết luận (Confirmed): {fuzz_report.get('confirmed_runs', fuzz_report['matches'] + fuzz_report['mismatches'])}")
-                        print(f"      - Khớp hoàn toàn (Matches): {Color.GREEN}{fuzz_report['matches']}{Color.END}")
-                        print(f"      - Không khớp (Mismatches): {Color.RED if fuzz_report['mismatches'] > 0 else Color.GRAY}{fuzz_report['mismatches']}{Color.END}")
-                        print(f"      - Timeouts: F1: {fuzz_report['timeouts']['bin1']} | F2: {fuzz_report['timeouts']['bin2']} | Both: {fuzz_report['timeouts']['both']}")
-                        print(f"      - Crashes: F1: {fuzz_report['crashes']['bin1']} | F2: {fuzz_report['crashes']['bin2']} | Both: {fuzz_report['crashes']['both']}")
-                        print(f"      - Không kết luận (Inconclusive): {Color.YELLOW if fuzz_report.get('inconclusive', 0) > 0 else Color.GRAY}{fuzz_report.get('inconclusive', 0)}{Color.END}")
-                        confirmed_ratio = fuzz_report.get('confirmed_equivalence_ratio', ratio)
-                        print(f"      - Tỉ lệ tương đương nghiêm ngặt (Strict Equivalence): {ratio_color}{ratio:.2f}%{Color.END}")
-                        print(f"      - Tỉ lệ trên ca có kết luận (Confirmed Subset): {confirmed_ratio:.2f}%")
-                        
-                        if fuzz_report.get("is_fully_equivalent", ratio == 100.0):
-                            print(f"      {Color.GREEN}[✓] XÁC NHẬN SEMANTIC EQUIVALENT.{Color.END}")
-                        elif fuzz_report.get("inconclusive", 0) > 0 and fuzz_report["mismatches"] == 0:
-                            both_timeouts = fuzz_report["timeouts"]["both"]
-                            both_crashes = fuzz_report["crashes"]["both"]
-                            if both_timeouts and both_crashes:
-                                reason = "timeout/crash cả hai bên"
-                            elif both_timeouts:
-                                reason = "timeout cả hai bên"
-                            elif both_crashes:
-                                reason = "crash cả hai bên"
-                            else:
-                                reason = "trạng thái không kết luận"
-                            print(f"      {Color.YELLOW}[!] CHƯA THỂ XÁC NHẬN ĐẦY ĐỦ: còn input {reason}.{Color.END}")
+                        _print_llm_report(fuzz_report)
+                        if fuzz_report.get("is_fully_equivalent", False):
+                            semantic_pass_count += 1
                         else:
-                            print(f"      {Color.RED}[✗] CẢNH BÁO: PHÁT HIỆN SỰ KHÁC BIỆT SEMANTIC CHƯA ĐƯỢC GIẢI QUYẾT.{Color.END}")
-                            if "mismatch_examples" in fuzz_report and fuzz_report["mismatch_examples"]:
-                                print(f"      {Color.YELLOW}--- Chi tiết mẫu không khớp (Mismatch Samples) ---{Color.END}")
-                                for sample in fuzz_report["mismatch_examples"]:
-                                    print(f"      * [Mẫu #{sample['index']}]: Lý do: {sample['reason']}")
-                                    print(f"        Arguments: {sample['args']}")
-                                    print(f"        Stdin: {repr(sample['stdin'])}")
-                                    print(f"        Prog1 (Brightened): status={sample['prog1']['status']}, code={sample['prog1']['returncode']}, stdout={repr(sample['prog1']['stdout'])}, stderr={repr(sample['prog1']['stderr'])}")
-                                    print(f"        Prog2 (Obfuscated): status={sample['prog2']['status']}, code={sample['prog2']['returncode']}, stdout={repr(sample['prog2']['stdout'])}, stderr={repr(sample['prog2']['stderr'])}")
-                            
+                            semantic_nonpass_count += 1
+                        if fuzz_report.get("is_fully_equivalent", False) and llm_recovery_mode:
+                            print(f"{Color.BLUE}      -> Bắt đầu LLM recovery vì baseline pass.{Color.END}")
+
+                            def run_recovery_fuzz(candidate_path):
+                                recovery_compare_target = recovery_reference_binary
+                                if not os.path.isfile(recovery_compare_target):
+                                    recovery_compare_target = path
+                                print(
+                                    f"{Color.BLUE}      [*] Khởi tạo semantic compare recovery với target: "
+                                    f"{os.path.basename(recovery_compare_target)} ({recovery_ref_label}){Color.END}"
+                                )
+                                candidate_fuzzer = SemanticFuzzer(
+                                    candidate_path,
+                                    recovery_compare_target,
+                                    seed_paths=seed_paths,
+                                    seed_dir=seed_dir,
+                                )
+                                return _run_fuzzer_sync(
+                                    candidate_fuzzer,
+                                    iterations=llm_config.fuzz_iterations,
+                                    generator=generator,
+                                    timeout=llm_config.fuzz_timeout,
+                                )
+
+                            output_source = os.path.join(case_output_dir, f"{base_name}_recovered.c")
+                            metadata = {
+                                "original_binary": path,
+                                "recovery_reference_binary": recovery_reference_binary,
+                                "recovery_reference_label": recovery_ref_label,
+                                "input_ir": output_brightened_ll,
+                                "case": base_name,
+                            }
+                            result = run_recovery_loop(
+                                ir_text=_read_llm_ir(output_brightened_ll, case_output_dir),
+                                output_recovered_c_path=output_source,
+                                case_output_dir=case_output_dir,
+                                metadata=metadata,
+                                fuzzer_callback=run_recovery_fuzz,
+                                config=llm_config,
+                            )
+                            _print_llm_report(result.fuzz_report)
+                            if result.success:
+                                llm_success_count += 1
+                                print(f"{Color.GREEN}[✓] Recovery thành công: {result.source_path}{Color.END}")
+                            else:
+                                print(f"{Color.YELLOW}[!] Recovery chưa đạt equivalence; candidate lưu tại: {result.source_path}{Color.END}")
+                                if result.compile_error:
+                                    print(f"{Color.YELLOW}    Feedback cuối: {result.compile_error[:1000]}{Color.END}")
+                        elif llm_recovery_mode:
+                            print(f"{Color.YELLOW}      [!] Bỏ qua LLM recovery vì semantic chưa pass đầy đủ.{Color.END}")
+
                     except Exception as fe:
+                        semantic_unchecked_count += 1
                         print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")
                 else:
                     print(f"{Color.RED}[✗] Làm đẹp mã IR THẤT BẠI cho: {path}{Color.END}")
@@ -330,7 +786,48 @@ def main(argv=None):
             print(f"{Color.RED}[✗] Nâng mã (Lift) THẤT BẠI cho: {path}{Color.END}")
 
     print("\n" + f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")
-    print(f"{Color.GREEN}{Color.BOLD}[✓] Đã hoàn thành xử lý. Thành công: {success_count}/{len(binary_paths)}{Color.END}")
+    semantic_checked_count = semantic_pass_count + semantic_nonpass_count
+    native_contract_checked_count = (
+        native_contract_pass_count + native_contract_nonpass_count
+    )
+    all_native_contract_pass = (
+        brightened_count == len(binary_paths) and
+        native_contract_checked_count == brightened_count and
+        native_contract_nonpass_count == 0 and
+        native_contract_unchecked_count == 0
+    )
+    all_semantic_pass = (
+        brightened_count == len(binary_paths) and
+        semantic_checked_count == brightened_count and
+        semantic_nonpass_count == 0 and
+        semantic_unchecked_count == 0
+    )
+    all_verified = all_semantic_pass and all_native_contract_pass
+    summary_color = Color.GREEN if all_verified else Color.YELLOW
+    summary_mark = "[✓]" if all_verified else "[!]"
+    if llm_recovery_mode:
+        print(
+            f"{summary_color}{Color.BOLD}"
+            f"{summary_mark} Đã hoàn thành xử lý. Brightening: {brightened_count}/{len(binary_paths)} | "
+            f"Native contract PASS: {native_contract_pass_count}/{native_contract_checked_count} | "
+            f"Native contract non-pass: {native_contract_nonpass_count} | "
+            f"Native contract unchecked: {native_contract_unchecked_count} | "
+            f"Semantic PASS: {semantic_pass_count}/{semantic_checked_count} | "
+            f"Semantic non-pass: {semantic_nonpass_count} | "
+            f"Semantic unchecked: {semantic_unchecked_count} | "
+            f"LLM Recovery thành công: {llm_success_count}/{len(binary_paths)}{Color.END}"
+        )
+    else:
+        print(
+            f"{summary_color}{Color.BOLD}{summary_mark} Đã hoàn thành xử lý. "
+            f"Brightening: {brightened_count}/{len(binary_paths)} | "
+            f"Native contract PASS: {native_contract_pass_count}/{native_contract_checked_count} | "
+            f"Native contract non-pass: {native_contract_nonpass_count} | "
+            f"Native contract unchecked: {native_contract_unchecked_count} | "
+            f"Semantic PASS: {semantic_pass_count}/{semantic_checked_count} | "
+            f"Semantic non-pass: {semantic_nonpass_count} | "
+            f"Semantic unchecked: {semantic_unchecked_count}{Color.END}"
+        )
     print(f"{Color.BLUE}[*] Tất cả kết quả được lưu tại: {result_pipeline_root}{Color.END}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")
 

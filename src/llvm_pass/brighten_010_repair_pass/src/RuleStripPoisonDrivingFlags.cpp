@@ -94,6 +94,9 @@ bool BrightenRepairPass::StripPoisonDrivingFlags(Module &M) {
   bool Changed = false;
 
   for (Function &F : M) {
+    StringRef Name = F.getName();
+    if (!Name.starts_with("sub_") && !Name.starts_with("__remill_") && !Name.starts_with("__mcsema_"))
+      continue;
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (auto *BO = dyn_cast<BinaryOperator>(&I)) {

@@ -11,7 +11,17 @@ public:
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
 
   // Phase 3 Rules
+  static bool LowerKnownFlagComputations(llvm::Module &M);
   static bool PromoteStateToSSA(llvm::Module &M);
+  static bool PromoteLocalStateAllocas(llvm::Module &M);
+  static bool SimplifyFlagConsumers(llvm::Module &M);
+};
+
+class BrightenLocalStateAllocaPass
+    : public llvm::PassInfoMixin<BrightenLocalStateAllocaPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
 };
 
 } // namespace brighten_state_ssa

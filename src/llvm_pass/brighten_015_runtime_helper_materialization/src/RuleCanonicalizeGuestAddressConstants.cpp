@@ -46,6 +46,19 @@ bool IsGuestMemoryObject(GlobalVariable &GV) {
 
 std::optional<uint64_t> ResolveGuestPointerConstant(Value *Ptr, Module &M,
                                                     bool AllowExternal) {
+  // A McSema alias such as @data_405040 is itself the authoritative guest
+  // address.  stripPointerCasts() may peel the alias to its aggregate GEP;
+  // that GEP is laid out using LLVM's host aggregate alignment and can have
+  // a different byte offset than the original ELF image.  Resolve the named
+  // GlobalValue before stripping anything.
+  if (auto *NamedGV = dyn_cast<GlobalValue>(Ptr)) {
+    if (IsGuestNamedAddress(NamedGV) || AllowExternal) {
+      uint64_t GuestAddr = ResolveGuestAddress(NamedGV);
+      if (GuestAddr != 0)
+        return GuestAddr;
+    }
+  }
+
   Value *DirectBase = Ptr->stripPointerCasts();
   if (auto *GV = dyn_cast<GlobalValue>(DirectBase)) {
     if (IsGuestNamedAddress(GV) || AllowExternal) {

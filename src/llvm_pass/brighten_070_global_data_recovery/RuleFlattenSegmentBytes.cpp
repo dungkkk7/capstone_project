@@ -28,9 +28,15 @@ static bool FlattenConstant(Constant *C, const DataLayout &DL,
 
   if (auto *CI = dyn_cast<ConstantInt>(C)) {
     uint64_t Size = DL.getTypeStoreSize(CI->getType());
-    APInt Val = CI->getValue();
+    const APInt &Val = CI->getValue();
     for (unsigned I = 0; I < Size; ++I) {
-      Bytes.push_back(Val.extractBits(8, I * 8).getZExtValue());
+      uint64_t MemoryByte = DL.isLittleEndian() ? I : Size - 1 - I;
+      unsigned Bit = static_cast<unsigned>(MemoryByte * 8);
+      Bytes.push_back(Bit < Val.getBitWidth()
+                          ? Val.lshr(Bit)
+                                .trunc(std::min(8u, Val.getBitWidth() - Bit))
+                                .getZExtValue()
+                          : 0);
     }
     return true;
   }
@@ -40,7 +46,13 @@ static bool FlattenConstant(Constant *C, const DataLayout &DL,
     APInt API = APF.bitcastToAPInt();
     uint64_t Size = DL.getTypeStoreSize(CFP->getType());
     for (unsigned I = 0; I < Size; ++I) {
-      Bytes.push_back(API.extractBits(8, I * 8).getZExtValue());
+      uint64_t MemoryByte = DL.isLittleEndian() ? I : Size - 1 - I;
+      unsigned Bit = static_cast<unsigned>(MemoryByte * 8);
+      Bytes.push_back(Bit < API.getBitWidth()
+                          ? API.lshr(Bit)
+                                .trunc(std::min(8u, API.getBitWidth() - Bit))
+                                .getZExtValue()
+                          : 0);
     }
     return true;
   }
@@ -83,11 +95,12 @@ static bool FlattenConstant(Constant *C, const DataLayout &DL,
     return true;
   }
 
-  if (isa<UndefValue>(C)) {
-    uint64_t Size = DL.getTypeAllocSize(C->getType());
-    Bytes.insert(Bytes.end(), Size, 0);
-    return true;
-  }
+  // Undefined/poison bytes are unresolved semantics.  Inventing zero bytes
+  // here can turn an arbitrary initializer into a concrete live value and
+  // hide the issue from the final native verifier.  Reject the segment and
+  // leave its provenance intact for an explicit diagnostic.
+  if (isa<UndefValue>(C) || isa<PoisonValue>(C))
+    return false;
 
   errs() << "unsupported initializer constant: ";
   C->print(errs());

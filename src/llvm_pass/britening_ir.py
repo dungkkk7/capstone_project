@@ -62,6 +62,7 @@ import argparse
 import subprocess
 import shutil
 import re
+import json
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -81,25 +82,8 @@ PLUGINS = [
     "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so",
     "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
 ]
-# Danh sách các pass plugin và đường dẫn tương đối từ SCRIPT_DIR
-PLUGINS1 = [
-    "brighten_010_repair_pass/build/BrightenRepairPass.so",
-    "brighten_015_runtime_helper_materialization/build/BrightenRuntimeHelperPass.so",
-    "brighten_020_devirt_pass/build/BrightenDevirtPass.so",
-    "brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so",
-    "brighten_040_stack_frame_pass/build/BrightenStackFramePass.so",
-    "brighten_050_abi_recovery/build/BrightenABIRecoveryPass.so",
-    "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
-    "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
-    "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so",
-    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
-]
-
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass"
-)
-PASS_PIPELINE1 = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,verify"
 )
 class Color:
     BLUE = '\033[94m'
@@ -109,6 +93,84 @@ class Color:
     GRAY = '\033[90m'
     BOLD = '\033[1m'
     END = '\033[0m'
+
+
+NATIVE_CONTRACT_REPORT_SUFFIX = "_native_contract_report.json"
+
+
+def native_contract_report_path(output_path):
+    """Return the machine-readable native-contract report beside an output."""
+    return f"{os.path.splitext(output_path)[0]}{NATIVE_CONTRACT_REPORT_SUFFIX}"
+
+
+def parse_native_contract_reports(stderr):
+    """Parse every cleanup report and return the authoritative final report."""
+    reports = []
+    current = None
+    metric_re = re.compile(r"^  ([^:]+): ([0-9]+)(?:/([0-9]+))?$")
+    for line in (stderr or "").splitlines():
+        if line == "brighten-native-cleanup report:":
+            current = {"metrics": {}, "findings": []}
+            reports.append(current)
+            continue
+        if current is None:
+            continue
+        if line.startswith("  native contract finding: "):
+            current["findings"].append(
+                line[len("  native contract finding: "):]
+            )
+            continue
+        match = metric_re.match(line)
+        if not match:
+            continue
+        key = match.group(1).strip().replace(" ", "_").replace("/", "_")
+        if match.group(3) is None:
+            current["metrics"][key] = int(match.group(2))
+        else:
+            current["metrics"][key] = {
+                "ptrtoint": int(match.group(2)),
+                "inttoptr": int(match.group(3)),
+            }
+
+    if not reports:
+        return None
+    final = reports[-1]
+    violations = final["metrics"].get("native_contract_violations")
+    final["is_fully_native"] = violations == 0 if violations is not None else False
+    final["status"] = "compliant" if final["is_fully_native"] else "non_compliant"
+    final["report_count"] = len(reports)
+    return final
+
+
+def write_native_contract_report(output_path, report, strict_enforced=False):
+    """Atomically persist the verifier result used to label one output."""
+    report_path = native_contract_report_path(output_path)
+    payload = {
+        "schema_version": 1,
+        "output": os.path.abspath(output_path),
+        "strict_enforced": bool(strict_enforced),
+        **(report or {
+            "status": "unavailable",
+            "is_fully_native": False,
+            "metrics": {},
+            "findings": [],
+            "report_count": 0,
+        }),
+    }
+    tmp_path = report_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, report_path)
+    return report_path
+
+
+def read_native_contract_report(output_path):
+    report_path = native_contract_report_path(output_path)
+    try:
+        with open(report_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
 
 def clean_unused_types_and_globals(content):
     # 1. Skip function stripping (keep all defined functions to avoid undefined reference errors)
@@ -214,6 +276,13 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_brightened{ext}"
 
+    # A repeated CLI invocation must never inherit a stale compliance result
+    # from an older output if opt fails before producing a new report.
+    try:
+        os.unlink(native_contract_report_path(output_path))
+    except FileNotFoundError:
+        pass
+
     # Build command
     cmd = [opt_bin]
 
@@ -228,6 +297,8 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
     if os.environ.get("BRIGHTEN_NATIVE_STRICT", "0") == "1":
         # The plugin must be loaded before opt parses its pass-specific flag.
         cmd.append("-brighten-native-strict")
+    if os.environ.get("BRIGHTEN_SAVE_CHECKPOINTS", "0") == "1":
+        cmd.append("-print-after-all")
     # Native ABI lowering is part of the production pipeline.  Keep an
     # explicit opt-out for debugging old lifted IR, but do not make the
     # dataset path depend on a hidden environment variable.
@@ -258,17 +329,21 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                 print(f"{Color.RED}    Stderr trước timeout: {exc.stderr}{Color.END}")
             return False
         if res.returncode == 0:
-            report_lines = []
-            in_native_report = False
-            for stderr_line in (res.stderr or "").splitlines():
-                if stderr_line.startswith("brighten-native-cleanup report:"):
-                    in_native_report = True
-                if in_native_report:
-                    report_lines.append(stderr_line)
-                    if stderr_line.startswith("  native contract violations:"):
-                        break
-            if report_lines:
-                print("\n".join(report_lines))
+            native_report = parse_native_contract_reports(res.stderr)
+            report_path = write_native_contract_report(
+                output_path,
+                native_report,
+                strict_enforced=os.environ.get("BRIGHTEN_NATIVE_STRICT", "0") == "1",
+            )
+            if native_report:
+                metrics = native_report.get("metrics", {})
+                print("brighten-native-cleanup final contract report:")
+                print(
+                    "  native contract violations: "
+                    f"{metrics.get('native_contract_violations', 'unknown')}"
+                )
+                print(f"  contract status: {native_report.get('status')}")
+            print(f"{Color.BLUE}[*] Native contract report: {report_path}{Color.END}")
             print(f"{Color.GREEN}[✓] Brightening hoàn tất! Kết quả đã ghi ra: {output_path}{Color.END}")
             
             # Chạy llvm-dis để sinh file .ll cho dễ đọc nếu file output là .bc
@@ -276,7 +351,11 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                 llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
                 if llvm_dis:
                     output_ll = f"{os.path.splitext(output_path)[0]}.ll"
-                    subprocess.run([llvm_dis, output_path, "-o", output_ll])
+                    dis = subprocess.run([llvm_dis, output_path, "-o", output_ll],
+                                         capture_output=True, text=True)
+                    if dis.returncode != 0:
+                        print(f"{Color.RED}[✗] llvm-dis thất bại: {dis.stderr}{Color.END}")
+                        return False
                     print(f"{Color.BLUE}[*] Đã disassemble kết quả LLVM; không sửa textual IR hậu kỳ: {output_ll}{Color.END}")
             return True
         else:

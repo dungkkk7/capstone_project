@@ -1,0 +1,4 @@
+case_id,submission_id,binary,seed_file
+p00016,s150561866,data/obfuscated/p00016/s150561866_fla_bcf_instsub.elf,data/seeds/p00016/s150561866_fla_bcf_instsub.elf.seed
+p00100,s475375811,data/obfuscated/p00100/s475375811_fla_bcf_instsub.elf,data/seeds/p00100/p00100_seed.txt
+p00241,s241954296,data/obfuscated/p00241/s241954296_fla_bcf_instsub.elf,data/seeds/p00241/p00241_seed.txt

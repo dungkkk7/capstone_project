@@ -58,7 +58,20 @@ static void InferReturn(FunctionABISummary &S, ABIRecoveryContext &Ctx) {
   if (S.HasCompleteReturnValues &&
       (S.ReturnObservedByCaller || S.HasReturnMetadata ||
        S.OriginalName.find("_main") != std::string::npos)) {
-    S.RetKind = ReturnKind::IntRAX;
+    // SysV returns a 128-bit integer in RDX:RAX.  Return metadata alone only
+    // proves the primary RAX value; require one caller to directly consume
+    // both registers before turning mutable lifted register state into a
+    // composite native ABI return.
+    // A surviving RDX value is often just an incoming third argument carried
+    // through the lifted State.  Treat it as the high half of an i128 return
+    // only when the callee has its own RDX live-out definition and RDX is not
+    // part of the recovered input ABI.
+    S.RetKind = S.HasCompleteRDXValues &&
+                        S.LiveOutStores.count(ABIReg::RDX) != 0 &&
+                        !S.LiveIns.count(ABIReg::RDX) &&
+                        S.ReturnRDXRAXObservedBySameCallsite
+                    ? ReturnKind::IntRDXRAX
+                    : ReturnKind::IntRAX;
   } else {
     S.RetKind = ReturnKind::Void;
   }
@@ -73,14 +86,11 @@ bool BrightenABIRecoveryPass::InferFunctionABISignatures(
              << " reason=" << S->SkipReason << "\n";
       continue;
     }
-    if (HasDirectSelfCall(*S->RemillFn)) {
-      S->Recursive = true;
-      S->SkipNative = true;
-      S->SkipReason = "recursive";
-      errs() << "[brighten-abi] skipped: " << S->OriginalName
-             << " reason=recursive\n";
-      continue;
-    }
+    // Recursive lifted functions are still recoverable.  The native clone is
+    // created first, then RewriteKnownCallsites retargets the cloned body's
+    // self-call to that native clone.  Skipping recursion here leaves a live
+    // lifted State/pc/memory ABI in otherwise recoverable modules.
+    S->Recursive = HasDirectSelfCall(*S->RemillFn);
 
     InferHiddenArgs(*S);
     InferArgs(*S, Ctx);

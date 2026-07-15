@@ -11,6 +11,7 @@ namespace brighten_extern {
 using namespace llvm;
 
 static constexpr uint64_t kOffRAX = 2216;
+static constexpr uint64_t kOffXMM0 = 16;
 
 static Module *FindModule(Value *V) {
   if (!V) return nullptr;
@@ -124,8 +125,10 @@ static std::optional<uint64_t> IdentifyStateOffset(Value *Ptr) {
 // memory-token positions).
 static bool IsMemoryTokenUse(Value *V, SmallPtrSetImpl<Value *> &Visited,
                               unsigned Depth) {
-  if (!V || Depth > 16 || !Visited.insert(V).second)
-    return true; // cycles are ok (conservative: memory token loops)
+  if (!V || Depth > 16)
+    return false;
+  if (!Visited.insert(V).second)
+    return true; // already-validated cycles are memory-token loops
 
   for (User *U : V->users()) {
     if (auto *CI = dyn_cast<CallInst>(U)) {
@@ -188,34 +191,47 @@ static Function *GetOrDeclareLibcFunction(Module &M,
   return F;
 }
 
-static void StoreReturnToRAX(IRBuilder<> &B, Value *StatePtr, Value *Ret) {
-  if (!Ret || Ret->getType()->isVoidTy()) return;
-  Value *Ret64 = nullptr;
-  Type *Ty = Ret->getType();
-  if (Ty->isPointerTy()) {
-    Ret64 = B.CreatePtrToInt(Ret, B.getInt64Ty(), "ext.ret.pti");
-  } else if (Ty->isIntegerTy()) {
-    unsigned Bits = Ty->getIntegerBitWidth();
-    if (Bits < 64) Ret64 = B.CreateZExt(Ret, B.getInt64Ty(), "ext.ret.zext");
-    else if (Bits > 64) Ret64 = B.CreateTrunc(Ret, B.getInt64Ty(), "ext.ret.trunc");
-    else Ret64 = Ret;
-  } else {
-    return;
-  }
-  Value *RAXPtr = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, kOffRAX,
-                                        "rax.ptr");
-  B.CreateAlignedStore(Ret64, RAXPtr, Align(8));
+static std::optional<uint64_t> ReturnStateOffset(Type *Ty) {
+  if (Ty->isPointerTy() || Ty->isIntegerTy())
+    return kOffRAX;
+  if (Ty->isFloatingPointTy())
+    return kOffXMM0;
+  return std::nullopt;
 }
 
-static bool ReplaceImmediateRAXLoads(CallInst *NewCall) {
+static void StoreReturnToState(IRBuilder<> &B, Value *StatePtr, Value *Ret) {
+  if (!Ret || Ret->getType()->isVoidTy()) return;
+  Type *Ty = Ret->getType();
+  auto Offset = ReturnStateOffset(Ty);
+  if (!Offset) return;
+
+  Value *Stored = Ret;
+  if (Ty->isPointerTy()) {
+    Stored = B.CreatePtrToInt(Ret, B.getInt64Ty(), "ext.ret.pti");
+  } else if (Ty->isIntegerTy()) {
+    unsigned Bits = Ty->getIntegerBitWidth();
+    if (Bits < 64) Stored = B.CreateZExt(Ret, B.getInt64Ty(), "ext.ret.zext");
+    else if (Bits > 64) Stored = B.CreateTrunc(Ret, B.getInt64Ty(), "ext.ret.trunc");
+  }
+
+  Value *Slot = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, *Offset,
+                                     Ty->isFloatingPointTy()
+                                         ? "xmm0.ptr" : "rax.ptr");
+  B.CreateAlignedStore(Stored, Slot,
+                       Ty->isFloatingPointTy() ? Align(1) : Align(8));
+}
+
+static bool ReplaceImmediateReturnLoads(CallInst *NewCall) {
   if (NewCall->getType()->isVoidTy()) return false;
+  auto Offset = ReturnStateOffset(NewCall->getType());
+  if (!Offset) return false;
   bool Changed = false;
   BasicBlock *BB = NewCall->getParent();
   for (auto It = std::next(NewCall->getIterator()); It != BB->end(); ++It) {
     Instruction &I = *It;
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
       auto Off = IdentifyStateOffset(LI->getPointerOperand());
-      if (Off && *Off == kOffRAX) {
+      if (Off && *Off == *Offset) {
         IRBuilder<> B(LI);
         Value *V = NewCall;
         Type *Dst = LI->getType();
@@ -229,6 +245,12 @@ static bool ReplaceImmediateRAXLoads(CallInst *NewCall) {
             unsigned DW = Dst->getIntegerBitWidth();
             if (SW > DW) V = B.CreateTrunc(V, Dst);
             else V = B.CreateZExt(V, Dst);
+          } else if (V->getType()->isFloatingPointTy() &&
+                     Dst->isFloatingPointTy()) {
+            unsigned SW = V->getType()->getPrimitiveSizeInBits();
+            unsigned DW = Dst->getPrimitiveSizeInBits();
+            if (SW > DW) V = B.CreateFPTrunc(V, Dst);
+            else V = B.CreateFPExt(V, Dst);
           } else break;
         }
         LI->replaceAllUsesWith(V);
@@ -237,28 +259,11 @@ static bool ReplaceImmediateRAXLoads(CallInst *NewCall) {
     }
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
       auto Off = IdentifyStateOffset(SI->getPointerOperand());
-      if (Off && *Off == kOffRAX) break;
+      if (Off && *Off == *Offset) break;
     }
     if (isa<CallBase>(&I) && &I != NewCall) break;
   }
   return Changed;
-}
-
-// FIX #9: Check if caller is a native Phase 5 function (non-Remill signature)
-static bool CallerIsNativeFunction(Function *F) {
-  if (!F) return false;
-  // Native functions have non-Remill signatures: not (ptr, i64, ptr) -> ptr
-  if (F->arg_size() == 3 && F->getReturnType()->isPointerTy()) {
-    auto It = F->arg_begin();
-    if ((It++)->getType()->isPointerTy() &&
-        (It++)->getType()->isIntegerTy(64) &&
-        (It++)->getType()->isPointerTy())
-      return false; // Remill signature
-  }
-  // Check for .native suffix
-  if (F->getName().ends_with(".native")) return true;
-  // Non-Remill signature => native
-  return true;
 }
 
 bool BrightenExternCallBridgePass::RewriteExternalCallsites(
@@ -331,15 +336,18 @@ bool BrightenExternCallBridgePass::RewriteExternalCallsites(
     }
     NewCall->setCallingConv(ExtFn->getCallingConv());
 
-    // FIX #9: For native callers (post-Phase5), prefer direct SSA use.
-    // For Remill-style callers, store into RAX.
-    bool IsNativeCaller = CallerIsNativeFunction(CS->Caller);
+    // The callsite is still a lifted State-ABI wrapper at this stage, even
+    // when its caller already has a `.native` suffix.  The suffix only means
+    // that the caller is being lowered; it does not prove that its State RAX
+    // slot has disappeared.  Preserve the machine-level return convention at
+    // the boundary: a non-void external result writes RAX, and subsequent
+    // State loads are then replaced with the same SSA value.  Skipping this
+    // store based on the caller name loses allocator provenance and makes a
+    // later stack/State load observe the old pointer.
     if (!NewCall->getType()->isVoidTy() && OldCI->arg_size() >= 1) {
       Value *StatePtr = OldCI->getArgOperand(0);
-      if (!IsNativeCaller) {
-        StoreReturnToRAX(B, StatePtr, NewCall);
-      }
-      ReplaceImmediateRAXLoads(NewCall);
+      StoreReturnToState(B, StatePtr, NewCall);
+      ReplaceImmediateReturnLoads(NewCall);
     }
 
     // FIX #7: Handle noreturn safely — remove successor edges, clear PHI incoming, and truncate block safely
@@ -440,7 +448,7 @@ bool BrightenExternCallBridgePass::RewriteExternalReturns(
 
         // Found the native call — now scan for RAX loads after it
         // that load from the same RAX store we made
-        ReplaceImmediateRAXLoads(CI);
+        ReplaceImmediateReturnLoads(CI);
         Changed = true;
       }
     }

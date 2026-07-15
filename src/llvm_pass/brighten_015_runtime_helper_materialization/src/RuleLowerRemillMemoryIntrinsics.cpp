@@ -12,15 +12,21 @@ using namespace llvm;
 namespace {
 
 static bool DefineMemoryRead(Function &F, Module &M) {
-  if (!F.isDeclaration() || F.arg_size() < 2) {
+  Type *RetTy = F.getReturnType();
+  Type *AddrTy = F.arg_size() >= 2 ? F.getArg(1)->getType() : nullptr;
+  if (!F.isDeclaration() || F.arg_size() < 2 ||
+      (!AddrTy->isIntegerTy() && !AddrTy->isPointerTy()) ||
+      (!RetTy->isVoidTy() && !RetTy->isFirstClassType())) {
     return false;
   }
+  if ((F.getName().ends_with("_f80") || F.getName().ends_with("_f128")) &&
+      !RetTy->isFloatingPointTy())
+    return false;
   Function *Translate = GetOrCreateTranslateGuestPointer(M);
   BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
   IRBuilder<> B(BB);
   Value *Addr = CastAddressToI64(B, F.getArg(1));
-  Value *Ptr = B.CreateCall(Translate, {Addr, B.getTrue()});
-  Type *RetTy = F.getReturnType();
+  Value *Ptr = B.CreateCall(Translate, {Addr, B.getFalse()});
   if (RetTy->isVoidTy()) {
     B.CreateRetVoid();
     return true;
@@ -29,27 +35,27 @@ static bool DefineMemoryRead(Function &F, Module &M) {
   if (Name.ends_with("_f80")) {
     Type *F80Ty = Type::getX86_FP80Ty(F.getContext());
     LoadInst *LI = B.CreateLoad(F80Ty, Ptr);
-    LI->setAlignment(Align(16));
-    Value *Cast = B.CreateFPTrunc(LI, RetTy);
+    LI->setAlignment(Align(1));
+    Value *Cast = F80Ty == RetTy ? static_cast<Value *>(LI)
+                                 : B.CreateFPCast(LI, RetTy);
     B.CreateRet(Cast);
     return true;
   }
   if (Name.ends_with("_f128")) {
     Type *F128Ty = Type::getFP128Ty(F.getContext());
     LoadInst *LI = B.CreateLoad(F128Ty, Ptr);
-    LI->setAlignment(Align(16));
-    Value *Cast = B.CreateFPTrunc(LI, RetTy);
+    LI->setAlignment(Align(1));
+    Value *Cast = F128Ty == RetTy ? static_cast<Value *>(LI)
+                                  : B.CreateFPCast(LI, RetTy);
     B.CreateRet(Cast);
     return true;
   }
-  if (RetTy->isPointerTy()) {
-    B.CreateRet(B.CreateBitCast(Ptr, RetTy));
-  } else if (RetTy->isFirstClassType()) {
+  if (RetTy->isFirstClassType()) {
     LoadInst *LI = B.CreateLoad(RetTy, Ptr);
-    unsigned Bits = M.getDataLayout().getTypeStoreSizeInBits(RetTy);
-    if (Bits >= 8 && llvm::isPowerOf2_32(Bits / 8)) {
-      LI->setAlignment(Align(Bits / 8));
-    }
+    // Remill memory intrinsics model guest ISA accesses, which may be
+    // unaligned (notably on x86).  Claiming natural alignment turns valid
+    // guest accesses into LLVM UB and lets optimization change semantics.
+    LI->setAlignment(Align(1));
     B.CreateRet(LI);
   } else {
     B.CreateRet(ZeroValue(RetTy));
@@ -58,9 +64,20 @@ static bool DefineMemoryRead(Function &F, Module &M) {
 }
 
 static bool DefineMemoryWrite(Function &F, Module &M) {
-  if (!F.isDeclaration() || F.arg_size() < 3) {
+  Type *AddrTy = F.arg_size() >= 2 ? F.getArg(1)->getType() : nullptr;
+  Type *RetTy = F.getReturnType();
+  bool SupportedReturn = RetTy->isVoidTy() ||
+                         (RetTy->isPointerTy() &&
+                          F.arg_size() >= 1 &&
+                          F.getArg(0)->getType() == RetTy);
+  if (!F.isDeclaration() || F.arg_size() < 3 ||
+      (!AddrTy->isIntegerTy() && !AddrTy->isPointerTy()) ||
+      !F.getArg(2)->getType()->isFirstClassType() || !SupportedReturn) {
     return false;
   }
+  if ((F.getName().ends_with("_f80") || F.getName().ends_with("_f128")) &&
+      !F.getArg(2)->getType()->isFloatingPointTy())
+    return false;
   Function *Translate = GetOrCreateTranslateGuestPointer(M);
   BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
   IRBuilder<> B(BB);
@@ -70,20 +87,17 @@ static bool DefineMemoryWrite(Function &F, Module &M) {
   StringRef Name = F.getName();
   if (Name.ends_with("_f80")) {
     Type *F80Ty = Type::getX86_FP80Ty(F.getContext());
-    Value *Cast = B.CreateFPExt(Val, F80Ty);
+    Value *Cast = Val->getType() == F80Ty ? Val : B.CreateFPCast(Val, F80Ty);
     StoreInst *SI = B.CreateStore(Cast, Ptr);
-    SI->setAlignment(Align(16));
+    SI->setAlignment(Align(1));
   } else if (Name.ends_with("_f128")) {
     Type *F128Ty = Type::getFP128Ty(F.getContext());
-    Value *Cast = B.CreateFPExt(Val, F128Ty);
+    Value *Cast = Val->getType() == F128Ty ? Val : B.CreateFPCast(Val, F128Ty);
     StoreInst *SI = B.CreateStore(Cast, Ptr);
-    SI->setAlignment(Align(16));
+    SI->setAlignment(Align(1));
   } else {
     StoreInst *SI = B.CreateStore(Val, Ptr);
-    unsigned Bits = M.getDataLayout().getTypeStoreSizeInBits(Val->getType());
-    if (Bits >= 8 && llvm::isPowerOf2_32(Bits / 8)) {
-      SI->setAlignment(Align(Bits / 8));
-    }
+    SI->setAlignment(Align(1));
   }
   if (F.getReturnType()->isVoidTy()) {
     B.CreateRetVoid();

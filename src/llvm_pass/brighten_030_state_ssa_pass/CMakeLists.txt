@@ -19,4 +19,7 @@ include(AddLLVM)
 add_llvm_pass_plugin(BrightenStateSSAPass
   src/main.cpp
   src/RulePromoteStateToSSA.cpp
+  src/RulePromoteLocalStateAllocas.cpp
+  src/RuleLowerFlagFormulas.cpp
+  src/RuleSimplifyFlagConsumers.cpp
 )

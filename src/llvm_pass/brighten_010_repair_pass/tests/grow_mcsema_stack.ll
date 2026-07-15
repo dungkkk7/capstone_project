@@ -1,4 +1,4 @@
-; RUN: opt-16 -load-pass-plugin %plugin -passes=refine-semantic-pass -S %s | FileCheck-16 %s
+; RUN: opt-21 -load-pass-plugin %plugin -passes=brighten-repair-pass -S %s | FileCheck-21 %s
 
 %struct.State = type { [8 x i8] }
 
@@ -8,7 +8,9 @@
 
 define ptr @__mcsema_init_reg_state() {
 entry:
-  store i64 and (i64 ptrtoint (ptr getelementptr inbounds ([1048576 x i8], ptr @__mcsema_stack, i32 0, i32 1048064) to i64), i64 -16), ptr @RSP
+  %stack.top = ptrtoint ptr getelementptr inbounds ([1048576 x i8], ptr @__mcsema_stack, i32 0, i32 1048064) to i64
+  %stack.aligned = and i64 %stack.top, -16
+  store i64 %stack.aligned, ptr @RSP
   ret ptr @__mcsema_reg_state
 }
 
@@ -20,6 +22,8 @@ entry:
 
 ; CHECK: @__lifter_refine_mcsema_stack = internal global [16777216 x i8] zeroinitializer
 ; CHECK-LABEL: define internal ptr @__mcsema_init_reg_state
-; CHECK: store i64 and (i64 ptrtoint (ptr getelementptr inbounds ([16777216 x i8], ptr @__lifter_refine_mcsema_stack, i32 0, i32 16776704) to i64), i64 -16)
+; CHECK: %stack.top = ptrtoint ptr getelementptr inbounds ([16777216 x i8], ptr @__lifter_refine_mcsema_stack, i32 0, i32 16776704) to i64
+; CHECK: %stack.aligned = and i64 %stack.top, -16
+; CHECK: store i64 %stack.aligned, ptr @RSP
 ; CHECK-LABEL: define ptr @caller
 ; CHECK: call ptr @__mcsema_init_reg_state()

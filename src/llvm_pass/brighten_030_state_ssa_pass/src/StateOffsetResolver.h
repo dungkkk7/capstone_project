@@ -47,9 +47,16 @@ inline bool IsLiftedFunction(Function &F) {
   StringRef Name = F.getName();
   bool LiftedName = Name.starts_with("sub_") ||
                     Name.starts_with("auto_sub_") ||
+                    Name.starts_with("callback_sub_") ||
+                    Name.starts_with("ext_") ||
+                    Name.starts_with("__remill_") ||
+                    Name.starts_with("__mcsema_") ||
+                    Name.ends_with("_wrapper") ||
                     Name == "main_wrapper" ||
                     Name == "start_wrapper";
-  return LiftedName && HasLiftedSignature(F);
+  bool LiftedMetadata = F.getMetadata("remill.function.type") != nullptr ||
+                        F.getMetadata("lifter.function.type") != nullptr;
+  return (LiftedName || LiftedMetadata) && HasLiftedSignature(F);
 }
 
 // ===================================================================

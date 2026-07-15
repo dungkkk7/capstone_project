@@ -19,11 +19,24 @@ static bool IsKnownDispatcherName(StringRef Name) {
 
 bool BrightenDevirtPass::CleanupUnusedRemillDispatchers(Module &M) {
   SmallVector<Function *, 16> Dead;
+  bool Changed = false;
 
   for (Function &F : M) {
     StringRef Name = F.getName();
     if (!IsKnownDispatcherName(Name) && !Name.starts_with("ext_")) {
       continue;
+    }
+
+    // Remill control helpers are implementation details, not program entry
+    // points.  Their external linkage otherwise roots an unreachable
+    // dispatcher/lifted-body SCC and makes every shared State access appear
+    // live during the following recovery passes.  Internalization plus the
+    // GlobalDCE scheduled by this plugin removes only SCCs not reachable from
+    // a real module entry; genuinely used dynamic dispatchers remain intact.
+    if (IsKnownDispatcherName(Name) && !F.isDeclaration() &&
+        !F.hasLocalLinkage()) {
+      F.setLinkage(GlobalValue::InternalLinkage);
+      Changed = true;
     }
 
     if (F.use_empty()) {
@@ -37,7 +50,7 @@ bool BrightenDevirtPass::CleanupUnusedRemillDispatchers(Module &M) {
     F->eraseFromParent();
   }
 
-  return !Dead.empty();
+  return Changed || !Dead.empty();
 }
 
 } // namespace brighten_devirt

@@ -19,7 +19,7 @@ static Value *BuildArgLoad(IRBuilder<> &B, Value *State, ABIArgInfo &Arg) {
 }
 
 static Value *BuildEntrypointRegisterArg(IRBuilder<> &B, Function &Main,
-                                         Value *State, ABIReg Reg) {
+                                         Value *State, ABIReg Reg, Type *Ty) {
   if (Reg == ABIReg::RDI && Main.arg_size() > 0)
     return CoerceValue(B, Main.getArg(0), B.getInt64Ty(), "main.argc");
   if (Reg == ABIReg::RSI && Main.arg_size() > 1)
@@ -31,7 +31,7 @@ static Value *BuildEntrypointRegisterArg(IRBuilder<> &B, Function &Main,
 
   ABIArgInfo Arg;
   Arg.Reg = Reg;
-  Arg.Ty = B.getInt64Ty();
+  Arg.Ty = Ty ? Ty : B.getInt64Ty();
   return BuildArgLoad(B, State, Arg);
 }
 
@@ -102,8 +102,9 @@ static bool RewriteNativeMainEntrypoint(ABIRecoveryContext &Ctx,
                                         FunctionABISummary &S) {
   Function *Main = Ctx.M.getFunction("main");
   GlobalVariable *State = Ctx.M.getGlobalVariable("__mcsema_reg_state");
-  if (!Main || !S.NativeFn || !State)
+  if (!Main || !S.NativeFn || !State) {
     return false;
+  }
 
   CallInst *WrapperCall = nullptr;
   for (BasicBlock &BB : *Main) {
@@ -118,12 +119,14 @@ static bool RewriteNativeMainEntrypoint(ABIRecoveryContext &Ctx,
     if (WrapperCall)
       break;
   }
-  if (!WrapperCall)
+  if (!WrapperCall) {
     return false;
+  }
 
   Value *LocalState = MaterializeLocalState(Ctx, *Main, State);
-  if (!LocalState)
+  if (!LocalState) {
     return false;
+  }
 
   IRBuilder<> B(WrapperCall);
   SmallVector<Value *, 12> Args;
@@ -134,13 +137,25 @@ static bool RewriteNativeMainEntrypoint(ABIRecoveryContext &Ctx,
   if (S.HiddenMemory)
     Args.push_back(ConstantPointerNull::get(B.getPtrTy()));
   for (const ABIArgInfo &Arg : S.Args) {
-    Value *V = BuildEntrypointRegisterArg(B, *Main, LocalState, Arg.Reg);
-    if (!V)
+    Value *V =
+        BuildEntrypointRegisterArg(B, *Main, LocalState, Arg.Reg, Arg.Ty);
+    if (!V) {
       return false;
-    Args.push_back(CoerceValue(B, V, Arg.Ty, GetRegisterName(Arg.Reg)));
+    }
+    Value *Coerced =
+        CoerceValue(B, V, Arg.Ty, GetRegisterName(Arg.Reg));
+    // Never let an unsupported ABI conversion become a null call operand.
+    // The verifier will reject such IR, while returning false leaves the
+    // original wrapper intact for a later, conservative failure path.
+    if (!Coerced) {
+      return false;
+    }
+    Args.push_back(Coerced);
   }
 
-  CallInst *NativeCall = B.CreateCall(S.NativeFn, Args, "main.native");
+  CallInst *NativeCall = B.CreateCall(
+      S.NativeFn, Args,
+      S.RetKind == ReturnKind::Void ? "" : "main.native");
   NativeCall->setCallingConv(S.NativeFn->getCallingConv());
   if (S.RetKind != ReturnKind::Void) {
     Value *RAX = BuildStateRegisterPointer(B, LocalState, ABIReg::RAX);
@@ -172,11 +187,12 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
       Function *Target = ResolveCalledFunction(CI->getCalledOperand());
       if (!Target) continue;
 
-      MainS = FindSummary(Ctx, Target);
+      FunctionABISummary *Candidate = FindSummary(Ctx, Target);
       // RewriteKnownCallsites runs before this compatibility-specific pass.
       // Do not reinterpret the already-native call as a Remill call and add
       // the ABI arguments a second time.
-      if (MainS && MainS->NativeFn && Target == MainS->RemillFn) {
+      if (Candidate && Candidate->NativeFn && Target == Candidate->RemillFn) {
+        MainS = Candidate;
         MainCall = CI;
         break;
       }
@@ -184,8 +200,40 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
     if (MainCall) break;
   }
 
-  if (!MainS)
-    MainS = FindSummaryByOriginalName(Ctx, "sub_1190_main");
+  // The lifted entry function address is not stable across binaries.  After
+  // RewriteKnownCallsites the wrapper normally calls the recovered native
+  // function directly, so discover the summary from that call instead of
+  // relying on the old single-binary `sub_1190_main` spelling.
+  if (!MainS) {
+    for (BasicBlock &BB : *MW) {
+      for (Instruction &I : BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (!CI)
+          continue;
+        if (FunctionABISummary *Candidate =
+                FindSummary(Ctx, ResolveCalledFunction(CI->getCalledOperand()))) {
+          if (Candidate->NativeFn) {
+            MainS = Candidate;
+            break;
+          }
+        }
+      }
+      if (MainS)
+        break;
+    }
+  }
+
+  if (!MainS) {
+    // Keep a name-based fallback for modules whose wrapper call could not be
+    // rewritten, but accept any recovered *_main candidate.
+    for (FunctionABISummary *Candidate : Ctx.Summaries) {
+      if (Candidate->NativeFn &&
+          StringRef(Candidate->OriginalName).contains("_main")) {
+        MainS = Candidate;
+        break;
+      }
+    }
+  }
 
   bool EntrypointChanged =
       MainS && MainS->NativeFn && RewriteNativeMainEntrypoint(Ctx, *MainS);

@@ -27,6 +27,7 @@ PreservedAnalyses BrightenRepairPass::run(Module &M, ModuleAnalysisManager &) {
 
   Changed |= StripPoisonDrivingFlags(M);
   Changed |= StripPoisonDrivingAttributes(M);
+  Changed |= RepairX86FPToIntIndefiniteGuards(M);
 
   Changed |= RepairObfuscatedStackSubtractions(M);
   Changed |= FixCallbackFunctionPointerStores(M);

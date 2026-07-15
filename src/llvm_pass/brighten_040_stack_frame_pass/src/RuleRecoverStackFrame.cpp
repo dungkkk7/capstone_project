@@ -12,6 +12,7 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <queue>
@@ -117,6 +118,7 @@ enum SkipReason : unsigned {
   SkipInvalidRange = 1u << 9,
   SkipFrameTooLarge = 1u << 10,
   SkipMemoryBoundary = 1u << 11,
+  SkipReadBeforeWrite = 1u << 12,
 };
 
 struct StackFrameReportEntry {
@@ -179,6 +181,7 @@ static void printSkipReasons(raw_ostream &OS, unsigned Reasons) {
   Emit(SkipInvalidRange, "invalid_range");
   Emit(SkipFrameTooLarge, "frame_too_large");
   Emit(SkipMemoryBoundary, "memory_boundary");
+  Emit(SkipReadBeforeWrite, "read_before_write");
 
   if (First) OS << "none";
 }
@@ -230,6 +233,59 @@ static int64_t resolveStateOffset(Value *ptr, const DataLayout &DL, Function &F)
   auto Res = brighten_state_ssa::ResolveStateOffset(ptr, DL, F, StateGV);
   if (Res) {
     return (int64_t)Res->Offset;
+  }
+
+  // State-SSA runs before stack recovery in the production pipeline.  Older
+  // State-SSA output promoted every State field, including RSP/RBP, to an
+  // entry-block alloca.  Looking only through the original State pointer then
+  // makes this pass blind to every stack expression.  Recover the slot's
+  // identity from its initialization, not merely from its generated name:
+  //
+  //   %slot = alloca i64
+  //   %initial = load i64, ptr (%state + N)
+  //   store i64 %initial, ptr %slot
+  //
+  // Requiring a unique, type-compatible State source prevents an unrelated
+  // user alloca from being classified as an architectural register slot.
+  Value *Base = ptr ? ptr->stripPointerCasts() : nullptr;
+  auto *AI = dyn_cast_or_null<AllocaInst>(Base);
+  if (!AI || AI->getFunction() != &F ||
+      AI->getParent() != &F.getEntryBlock() || !AI->isStaticAlloca()) {
+    return -1;
+  }
+
+  if (MDNode *MD = AI->getMetadata("brighten.state.offset")) {
+    if (MD->getNumOperands() == 1) {
+      if (auto *CAM = dyn_cast<ConstantAsMetadata>(MD->getOperand(0))) {
+        if (auto *CI = dyn_cast<ConstantInt>(CAM->getValue())) {
+          return static_cast<int64_t>(CI->getZExtValue());
+        }
+      }
+    }
+  }
+
+  std::optional<uint64_t> PromotedOffset;
+  for (User *U : AI->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand()->stripPointerCasts() != AI) {
+      continue;
+    }
+    auto *LI = dyn_cast<LoadInst>(SI->getValueOperand());
+    if (!LI || LI->getType() != AI->getAllocatedType()) {
+      continue;
+    }
+    auto Init = brighten_state_ssa::ResolveStateOffset(
+        LI->getPointerOperand(), DL, F, StateGV);
+    if (!Init) {
+      continue;
+    }
+    if (PromotedOffset && *PromotedOffset != Init->Offset) {
+      return -1;
+    }
+    PromotedOffset = Init->Offset;
+  }
+  if (PromotedOffset) {
+    return static_cast<int64_t>(*PromotedOffset);
   }
   return -1;
 }
@@ -438,9 +494,63 @@ static bool CallTakesStackPointer(CallBase *CB, const DenseMap<Value *, StackExp
   return false;
 }
 
-static bool isAllowedNonFrameMemoryPointer(Value *Ptr, const DataLayout &DL, Function &F) {
-  return isRSPRegisterState(Ptr, DL, F) || isRBPRegisterState(Ptr, DL, F) ||
-         resolveStateOffset(Ptr, DL, F) >= 0;
+static bool CallMayClobberGuestStackState(CallBase *CB, const DataLayout &DL,
+                                          Function &Caller) {
+  Function *CalledF = CB->getCalledFunction();
+  if (!CalledF) {
+    // An indirect callback may re-enter lifted code and update the shared
+    // architectural State.  There is no callee summary proving otherwise.
+    return true;
+  }
+
+  StringRef Name = CalledF->getName();
+  if (Name == "__translate_guest_pointer" ||
+      Name == "llvm.sideeffect" ||
+      Name.starts_with("llvm.lifetime.") ||
+      Name.starts_with("llvm.dbg.")) {
+    return false;
+  }
+  if (CalledF->isIntrinsic()) {
+    return false;
+  }
+  if (brighten_state_ssa::IsLiftedFunction(*CalledF)) {
+    return true;
+  }
+
+  // Also cover native wrappers whose names do not identify them as lifted but
+  // which receive State (or a State field) explicitly.
+  for (Use &Arg : CB->args()) {
+    Value *V = Arg.get();
+    if (V->getType()->isPointerTy() && resolveStateOffset(V, DL, Caller) >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool IsDirectNativeFrame(ArrayRef<StackAccess *> Accesses,
+                                Function &F) {
+  DominatorTree DT(F);
+  for (const StackAccess *Read : Accesses) {
+    if (!Read->IsRead) {
+      continue;
+    }
+    bool Initialized = false;
+    for (const StackAccess *Write : Accesses) {
+      if (!Write->IsWrite || Write->I == Read->I ||
+          Write->Begin > Read->Begin || Write->End < Read->End) {
+        continue;
+      }
+      if (DT.dominates(Write->I, Read->I)) {
+        Initialized = true;
+        break;
+      }
+    }
+    if (!Initialized) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
@@ -632,6 +742,16 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
           if (CalledF && CalledF->getName() == "__translate_guest_pointer") {
             Expr = getStackExpr(CB->getArgOperand(0), ExprMap);
           }
+          if (CallMayClobberGuestStackState(CB, DL, F)) {
+            // Lifted callees communicate the post-return RSP/RBP through the
+            // shared architectural State.  Keeping the pre-call affine value
+            // here rewrites a post-call pop to the synthetic call-return slot
+            // (p00230), eventually producing a double-based host address after
+            // inlining.  Start a new unresolved base at the next register load;
+            // the mixed-base safety check will preserve the physical frame.
+            CurrentState.RSP.K = StackExpr::Kind::Unknown;
+            CurrentState.RBP.K = StackExpr::Kind::Unknown;
+          }
         } else if (auto *PHI = dyn_cast<PHINode>(&I)) {
           if (PHI->getNumIncomingValues() > 0) {
             auto EFirst = getStackExpr(PHI->getIncomingValue(0), ExprMap);
@@ -707,6 +827,8 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
     }
 
     std::map<BaseKey, unsigned> BaseReasons;
+    std::map<BaseKey, SmallVector<std::pair<int64_t, int64_t>, 8>>
+        EscapedRanges;
     for (const auto &Pair : ExprMap) {
       Value *V = Pair.first;
       const StackExpr &E = Pair.second;
@@ -716,7 +838,19 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
         traceValueUses(V, DL, Visited, Escaped);
         if (Escaped) {
           BaseKey Key{E.Base.V, E.Base.Kind, E.Base.Epoch};
-          addSkipReason(BaseReasons, Key, SkipBaseEscaped);
+          // An escaped address does not make unrelated stack objects alias it.
+          // Keep the exact byte position as an exclusion boundary and reject
+          // only accesses that overlap it.  This is important for lifted
+          // functions that pass one local (for example a scanf destination)
+          // across an ABI boundary while keeping independent compiler-created
+          // control-flow or arithmetic temporaries in the same physical
+          // frame.  Dynamic addresses remain a base-wide rejection below.
+          int64_t End = 0;
+          if (AddNoSignedOverflow(E.Offset, 8, End)) {
+            EscapedRanges[Key].push_back({E.Offset, End});
+          } else {
+            addSkipReason(BaseReasons, Key, SkipBaseEscaped);
+          }
         }
       } else if (E.K == StackExpr::Kind::StackDynamic) {
         BaseKey Key{E.Base.V, E.Base.Kind, E.Base.Epoch};
@@ -826,39 +960,13 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       BaseAccesses[Key].push_back(Acc);
     }
 
-    bool HasNonStackMemoryBoundary = false;
-    auto CheckMemoryPtr = [&](Value *Ptr) {
-      if (HasNonStackMemoryBoundary) return;
-      StackExpr E = getStackExpr(Ptr, ExprMap);
-      if (E.K == StackExpr::Kind::StackConst || E.K == StackExpr::Kind::StackDynamic) {
-        return;
-      }
-      if (isAllowedNonFrameMemoryPointer(Ptr, DL, F)) {
-        return;
-      }
-      HasNonStackMemoryBoundary = true;
-    };
-
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        if (auto *LI = dyn_cast<LoadInst>(&I)) {
-          CheckMemoryPtr(LI->getPointerOperand());
-        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-          CheckMemoryPtr(SI->getPointerOperand());
-        } else if (auto *MemI = dyn_cast<MemIntrinsic>(&I)) {
-          CheckMemoryPtr(MemI->getRawDest());
-          if (auto *MemT = dyn_cast<MemTransferInst>(MemI)) {
-            CheckMemoryPtr(MemT->getRawSource());
-          }
-        }
-      }
-    }
-
-    if (HasNonStackMemoryBoundary) {
-      for (const auto &Pair : BaseAccesses) {
-        addSkipReason(BaseReasons, Pair.first, SkipMemoryBoundary);
-      }
-    }
+    // Do not reject a frame merely because the function also accesses some
+    // other memory object.  A callee-local stack object's lifetime prevents
+    // an unrelated pointer from aliasing it.  Any legitimate alias must be
+    // derived from the stack value, and traceValueUses above marks precisely
+    // such stores, dynamic derivations, and escapes as unsafe.  The old
+    // blanket rule disabled stack recovery in every function that touched a
+    // global, heap object, argv, or translated guest data.
 
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
@@ -876,22 +984,28 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
           }
         }
 
-        for (const auto &Pair : BaseAccesses) {
-          addSkipReason(BaseReasons, Pair.first, SkipMemoryBoundary);
-        }
+        bool TakesStackPointer = CallTakesStackPointer(CB, ExprMap);
 
-        if (!CallTakesStackPointer(CB, ExprMap)) {
+        // A direct native declaration can only access the local frame when a
+        // frame-derived pointer is passed explicitly.  Lifted runtime calls
+        // are different: State/memory are hidden arguments and can expose
+        // guest stack storage even when no explicit operand is recognized.
+        bool HiddenGuestBoundary = true;
+        if (CalledF && CalledF->isDeclaration()) {
+          StringRef Name = CalledF->getName();
+          HiddenGuestBoundary =
+              Name.starts_with("__remill_") ||
+              Name.starts_with("__mcsema_") ||
+              Name == "__translate_guest_pointer";
+        }
+        if (!TakesStackPointer && !HiddenGuestBoundary) {
           continue;
         }
 
-        for (Use &Arg : CB->args()) {
-          StackExpr E = getStackExpr(Arg.get(), ExprMap);
-          if (E.K == StackExpr::Kind::StackConst || E.K == StackExpr::Kind::StackDynamic) {
-            addSkipReason(BaseReasons,
-                          BaseKey{E.Base.V, E.Base.Kind, E.Base.Epoch},
-                          SkipStackPointerCall);
-          }
-        }
+        // Stack-derived call arguments were recorded as escaped intervals by
+        // traceValueUses.  A hidden lifted boundary can only reach a local
+        // object through such an escaped address.  Do not poison every other
+        // byte in the frame merely because State/memory are hidden operands.
       }
     }
 
@@ -904,24 +1018,13 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       }
     }
 
-    // Avoid splitting one physical stack frame between a recovered alloca and
-    // preserved guest-memory accesses. RBP/non-entry/dynamic/escaping stack
-    // users may alias entry-RSP slots after prologue rewrites.
-    bool HasMixedOrUnsafeStackRegion = false;
-    for (const auto &Pair : BaseAccesses) {
-      const BaseKey &Key = Pair.first;
-      if (BaseReasons.find(Key) != BaseReasons.end() ||
-          Key.Kind != StackBaseKind::RSP || Key.V != nullptr) {
-        HasMixedOrUnsafeStackRegion = true;
-        break;
-      }
-    }
-    if (HasMixedOrUnsafeStackRegion) {
+    // Different unresolved base identities may still denote the same
+    // physical guest frame after RSP/RBP updates.  Until their affine
+    // relationship is proven, do not move only the entry-RSP view to a host
+    // object while preserving another view in guest memory.
+    if (BaseAccesses.size() > 1) {
       for (const auto &Pair : BaseAccesses) {
-        const BaseKey &Key = Pair.first;
-        if (Key.Kind == StackBaseKind::RSP && Key.V == nullptr) {
-          addSkipReason(BaseReasons, Key, SkipUnsafeOverlap);
-        }
+        addSkipReason(BaseReasons, Pair.first, SkipUnsafeOverlap);
       }
     }
 
@@ -972,6 +1075,12 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
 
       SmallVector<std::pair<int64_t, int64_t>, 8> UnsafeRanges;
       unsigned LocalReasons = SkipNone;
+
+      auto EscapedIt = EscapedRanges.find(Key);
+      if (EscapedIt != EscapedRanges.end()) {
+        UnsafeRanges.append(EscapedIt->second.begin(), EscapedIt->second.end());
+        LocalReasons |= SkipBaseEscaped;
+      }
 
       for (auto &Acc : Accesses) {
         unsigned AccReasons = SkipNone;
@@ -1040,7 +1149,6 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
         }
       }
 
-      Report.SafeAccesses = SafeAccesses.size();
       Report.Reasons |= LocalReasons;
       Report.UnsafeRanges = UnsafeRanges;
 
@@ -1052,107 +1160,95 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
         continue;
       }
 
+      // One StackBase is still one physical guest object.  Do not place only
+      // a subset of its accesses in host alloca storage while volatile,
+      // positive, escaping, or otherwise unsafe accesses remain in guest
+      // memory.  Without an object-separation proof those two views may alias.
+      if (Report.UnsafeAccesses != 0) {
+        UnsafeCount += SafeAccesses.size();
+        Report.UnsafeAccesses += SafeAccesses.size();
+        Report.Reasons |= SkipUnsafeOverlap;
+        PreservedCount++;
+        PreservedAccessCount += Report.UnsafeAccesses;
+        ReportEntries.push_back(Report);
+        continue;
+      }
+
+      // At this stage all offsets still belong to one physical guest frame,
+      // not to independently-proven LLVM objects.  An incoming read in any
+      // component means a preserved alias or callee can observe the shared
+      // frame, so splitting out only the locally-written components is not
+      // semantics-preserving.  Recover the base only when every read in the
+      // complete eligible set is initialized locally.
+      if (!IsDirectNativeFrame(SafeAccesses, F)) {
+        UnsafeCount += SafeAccesses.size();
+        Report.UnsafeAccesses += SafeAccesses.size();
+        Report.Reasons |= SkipReadBeforeWrite;
+        PreservedCount++;
+        PreservedAccessCount += Report.UnsafeAccesses;
+        ReportEntries.push_back(Report);
+        continue;
+      }
+
       int64_t MinOff = INT64_MAX;
       int64_t MaxOff = INT64_MIN;
-      for (const auto *Acc : SafeAccesses) {
-        if (Acc->Begin < MinOff) MinOff = Acc->Begin;
-        if (Acc->End > MaxOff) MaxOff = Acc->End;
+      for (const StackAccess *Acc : SafeAccesses) {
+        MinOff = std::min(MinOff, Acc->Begin);
+        MaxOff = std::max(MaxOff, Acc->End);
       }
-
       if (MinOff == INT64_MAX || MaxOff == INT64_MIN || MaxOff <= MinOff) {
-        UnsafeCount += SafeAccesses.size();
-        PreservedAccessCount += Accesses.size();
-        PreservedCount++;
-        Report.UnsafeAccesses += SafeAccesses.size();
-        Report.SafeAccesses = 0;
         Report.Reasons |= SkipInvalidRange;
+        Report.UnsafeAccesses += SafeAccesses.size();
+        UnsafeCount += SafeAccesses.size();
+        PreservedCount++;
+        PreservedAccessCount += Report.UnsafeAccesses;
         ReportEntries.push_back(Report);
         continue;
       }
-
       int64_t FrameSize = MaxOff - MinOff;
       if (FrameSize <= 0 || FrameSize > 1024 * 1024) {
-        UnsafeCount += SafeAccesses.size();
-        PreservedAccessCount += Accesses.size();
-        PreservedCount++;
-        Report.UnsafeAccesses += SafeAccesses.size();
-        Report.SafeAccesses = 0;
         Report.Reasons |= SkipFrameTooLarge;
+        Report.UnsafeAccesses += SafeAccesses.size();
+        UnsafeCount += SafeAccesses.size();
+        PreservedCount++;
+        PreservedAccessCount += Report.UnsafeAccesses;
         ReportEntries.push_back(Report);
         continue;
       }
 
-      Report.Recovered = true;
-      Report.HasRange = true;
-      Report.MinOff = MinOff;
-      Report.MaxOff = MaxOff;
-      Report.FrameSize = FrameSize;
-
       Type *FrameTy = ArrayType::get(Int8Ty, FrameSize);
-      AllocaInst *FrameAlloca = EntryBuilder.CreateAlloca(FrameTy, nullptr, "stack_frame");
+      AllocaInst *FrameAlloca =
+          EntryBuilder.CreateAlloca(FrameTy, nullptr, "native_local_frame");
       FrameAlloca->setAlignment(Align(16));
-
-      Value *BaseGuestVal = getInitialRegisterValue(F, 2312, EntryBuilder);
-
-      if (BaseGuestVal) {
-        Value *MinOffVal = EntryBuilder.getInt64(MinOff);
-        Value *GuestAddr = EntryBuilder.CreateAdd(BaseGuestVal, MinOffVal, "guest_addr");
-        
-        Function *TranslateFn = F.getParent()->getFunction("__translate_guest_pointer");
-        if (!TranslateFn) {
-          Type *RetTy = PointerType::getUnqual(F.getContext());
-          Type *ArgTys[] = { EntryBuilder.getInt64Ty(), EntryBuilder.getInt1Ty() };
-          FunctionType *FTy = FunctionType::get(RetTy, ArgTys, false);
-          TranslateFn = Function::Create(FTy, Function::ExternalLinkage, "__translate_guest_pointer", F.getParent());
-        }
-        
-        Value *TranslatePtr = EntryBuilder.CreateCall(TranslateFn, {GuestAddr, EntryBuilder.getInt1(false)}, "translate_ptr");
-        EntryBuilder.CreateMemCpy(FrameAlloca, Align(16), TranslatePtr, Align(1), FrameSize);
-      }
-
       Value *Zero = EntryBuilder.getInt32(0);
 
-      for (auto *Acc : SafeAccesses) {
+      for (StackAccess *Acc : SafeAccesses) {
         IRBuilder<> B(Acc->I);
         Value *Idx = ConstantInt::get(Int64Ty, Acc->Addr.Offset - MinOff);
-        Value *GEP = B.CreateInBoundsGEP(FrameTy, FrameAlloca, {Zero, Idx}, "frame_ptr");
-
+        Value *GEP = B.CreateInBoundsGEP(
+            FrameTy, FrameAlloca, {Zero, Idx}, "frame_ptr");
         if (auto *LI = dyn_cast<LoadInst>(Acc->I)) {
           LI->setOperand(0, GEP);
-          Changed = true;
         } else if (auto *SI = dyn_cast<StoreInst>(Acc->I)) {
           SI->setOperand(1, GEP);
-          Changed = true;
         } else if (auto *MemI = dyn_cast<MemIntrinsic>(Acc->I)) {
           if (MemI->getRawDest() == Acc->Ptr) {
             MemI->setOperand(0, GEP);
-            Changed = true;
           } else if (auto *MemT = dyn_cast<MemTransferInst>(MemI)) {
             if (MemT->getRawSource() == Acc->Ptr) {
               MemT->setOperand(1, GEP);
-              Changed = true;
             }
           }
         }
       }
 
-      if (BaseGuestVal) {
-        Function *TranslateFn = F.getParent()->getFunction("__translate_guest_pointer");
-        SmallVector<ReturnInst *, 8> Returns;
-        for (BasicBlock &BB : F) {
-          if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
-            Returns.push_back(RI);
-          }
-        }
-        for (ReturnInst *RI : Returns) {
-          IRBuilder<> RetBuilder(RI);
-          Value *MinOffVal = RetBuilder.getInt64(MinOff);
-          Value *GuestAddr = RetBuilder.CreateAdd(BaseGuestVal, MinOffVal, "guest_addr.flush");
-          Value *TranslatePtr =
-              RetBuilder.CreateCall(TranslateFn, {GuestAddr, RetBuilder.getInt1(true)}, "translate_ptr.flush");
-          RetBuilder.CreateMemCpy(TranslatePtr, Align(1), FrameAlloca, Align(16), FrameSize);
-        }
-      }
+      Changed = true;
+      Report.Recovered = true;
+      Report.HasRange = true;
+      Report.MinOff = MinOff;
+      Report.MaxOff = MaxOff;
+      Report.FrameSize = FrameSize;
+      Report.SafeAccesses = SafeAccesses.size();
       RecoveredCount++;
       RecoveredAccessCount += SafeAccesses.size();
       PreservedAccessCount += Report.UnsafeAccesses;

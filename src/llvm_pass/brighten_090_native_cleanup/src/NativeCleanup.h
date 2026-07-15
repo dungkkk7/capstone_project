@@ -9,10 +9,16 @@ namespace brighten_native_cleanup {
 class NativeCleanupPass
     : public llvm::PassInfoMixin<NativeCleanupPass> {
 public:
+  explicit NativeCleanupPass(bool EnforceStrict = false)
+      : EnforceStrict(EnforceStrict) {}
+
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &AM);
 
-  static bool cleanupModule(llvm::Module &M);
+  static bool cleanupModule(llvm::Module &M, bool EnforceStrict = false);
+
+private:
+  bool EnforceStrict;
 };
 
 } // namespace brighten_native_cleanup

@@ -2,6 +2,9 @@
 #include <queue>
 #include <set>
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Analysis/CaptureTracking.h"
+#include "llvm/IR/InstIterator.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalAlias.h"
@@ -165,36 +168,8 @@ static Value *FindStoreBeforeCall(CallInst *CI, uint64_t RegOffset) {
       return SI->getValueOperand();
   }
 
-  std::queue<BasicBlock *> Worklist;
-  std::set<BasicBlock *> Visited;
-  for (BasicBlock *Pred : predecessors(StartBB)) {
-    Worklist.push(Pred);
-    Visited.insert(Pred);
-  }
-
-  unsigned BlocksVisited = 0;
-  while (!Worklist.empty() && BlocksVisited < 32) {
-    BasicBlock *BB = Worklist.front();
-    Worklist.pop();
-    BlocksVisited++;
-
-    for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
-      Instruction &I = *It;
-      auto *SI = dyn_cast<StoreInst>(&I);
-      if (!SI)
-        continue;
-      auto Off = IdentifyStateOffset(SI->getPointerOperand());
-      if (Off && *Off == RegOffset)
-        return SI->getValueOperand();
-    }
-
-    for (BasicBlock *Pred : predecessors(BB)) {
-      if (Visited.insert(Pred).second) {
-        Worklist.push(Pred);
-      }
-    }
-  }
-
+  // A predecessor-local store is not proof that it reaches this callsite.
+  // Recover the current State value instead of guessing across CFG edges.
   return nullptr;
 }
 
@@ -225,45 +200,28 @@ static Value *FindStoreToStackOffset(AllocaInst *AI, uint64_t Offset, Instructio
     }
   }
 
-  std::queue<BasicBlock *> Worklist;
-  std::set<BasicBlock *> Visited;
-  for (BasicBlock *Pred : predecessors(StartBB)) {
-    Worklist.push(Pred);
-    Visited.insert(Pred);
-  }
-
-  unsigned BlocksVisited = 0;
-  while (!Worklist.empty() && BlocksVisited < 32) {
-    BasicBlock *BB = Worklist.front();
-    Worklist.pop();
-    BlocksVisited++;
-
-    for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
-      auto *SI = dyn_cast<StoreInst>(&*It);
-      if (!SI) continue;
-
-      Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
-      if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
-        if (GEP->getPointerOperand()->stripPointerCasts() == AI) {
-          APInt Off(DL.getPointerSizeInBits(), 0, true);
-          if (GEP->accumulateConstantOffset(DL, Off) && !Off.isNegative() &&
-              Off.getZExtValue() == Offset) {
-            return SI->getValueOperand();
-          }
-        }
-      } else if (Ptr == AI && Offset == 0) {
-        return SI->getValueOperand();
-      }
+  // Picking the first store found by predecessor BFS is not a reaching-def
+  // proof: in a diamond it can select a store from the branch that was not
+  // executed.  Captured allocas may also be clobbered by calls.  Only trust
+  // the closest exact-offset store that dominates the load.
+  if (PointerMayBeCaptured(AI, true)) return nullptr;
+  DominatorTree DT(*Before->getFunction());
+  StoreInst *Best = nullptr;
+  for (Instruction &I : instructions(*Before->getFunction())) {
+    auto *SI = dyn_cast<StoreInst>(&I);
+    if (!SI || !DT.dominates(SI, Before)) continue;
+    Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
+    bool Exact = Ptr == AI && Offset == 0;
+    if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+      APInt Off(DL.getPointerSizeInBits(), 0, true);
+      Exact = GEP->getPointerOperand()->stripPointerCasts() == AI &&
+              GEP->accumulateConstantOffset(DL, Off) && !Off.isNegative() &&
+              Off.getZExtValue() == Offset;
     }
-
-    for (BasicBlock *Pred : predecessors(BB)) {
-      if (Visited.insert(Pred).second) {
-        Worklist.push(Pred);
-      }
-    }
+    if (!Exact) continue;
+    if (!Best || DT.dominates(Best, SI)) Best = SI;
   }
-
-  return nullptr;
+  return Best ? Best->getValueOperand() : nullptr;
 }
 
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth = 0);

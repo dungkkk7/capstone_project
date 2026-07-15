@@ -1,6 +1,8 @@
 #include "BrightenGlobalDataRecoveryPass.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
@@ -41,6 +43,21 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     GlobalDataContext &Ctx) {
   unsigned Removed = 0;
 
+  // `data_<address>` aliases are only lifter provenance markers.  Once all
+  // instruction references have been rewritten to recovered objects, an
+  // otherwise-unused alias still keeps its constant GEP (and therefore the
+  // original aggregate segment) alive.  Remove only aliases with no users;
+  // any unresolved instruction use remains intact and is still rejected by
+  // the strict verifier below.
+  SmallVector<GlobalAlias *, 64> DeadDataAliases;
+  for (GlobalAlias &GA : Ctx.M.aliases()) {
+    if (GA.getName().starts_with("data_") &&
+        !HasLiveInstructionUsers(&GA))
+      DeadDataAliases.push_back(&GA);
+  }
+  for (GlobalAlias *GA : DeadDataAliases)
+    GA->eraseFromParent();
+
   for (auto &Seg : Ctx.Segments) {
     if (!Seg->GV)
       continue;
@@ -70,6 +87,60 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
 bool BrightenGlobalDataRecoveryPass::VerifyGlobalDataRecovery(
     GlobalDataContext &Ctx) {
   bool HasError = false;
+
+  // NativeStrict is a provenance contract, not a best-effort cleanup mode.
+  // A resolved ELF data reference which survived rewriting means that the
+  // pass did not prove what object/field the reference denotes.  Previously
+  // these references were silently preserved (especially address-identity
+  // cases), allowing the later native-cleanup pass to report a structurally
+  // clean module whose behavior still depended on the lifted guest image.
+  // Make the unresolved provenance explicit and fail the strict run here.
+  if (Ctx.Mode == DataRecoveryMode::NativeStrict) {
+    for (auto &Ref : Ctx.AddressRefs) {
+      if (Ref->Rewritten || !Ref->Segment ||
+          !Ref->Segment->BaseResolved || !Ref->UserInst ||
+          !Ref->UserInst->getParent())
+        continue;
+      if (Ref->Segment->Kind != SegmentKind::Rodata &&
+          Ref->Segment->Kind != SegmentKind::Data &&
+          Ref->Segment->Kind != SegmentKind::Bss)
+        continue;
+
+      // Identity-sensitive pointers are deliberately preserved: replacing a
+      // guest-address identity test with the address of a newly materialized
+      // native object would be an unsound semantic rewrite.  Keep this as an
+      // explicit preserved-provenance diagnostic, but do not classify the
+      // safe refusal itself as a malformed data object.
+      if (Ref->SkipReason == "address-identity-observable")
+        continue;
+
+      // The translator is an intermediate analysis helper.  Its range
+      // dispatch GEPs are intentionally consumed by RewriteGuestPointer-
+      // TranslatorCalls and NativeCleanup later in the pipeline; they are not
+      // application data uses.  Do not make the global pass abort before
+      // those consumers get a chance to remove the helper.
+      if (Ref->UserInst->getFunction() &&
+          Ref->UserInst->getFunction()->getName() ==
+              "__translate_guest_pointer")
+        continue;
+
+      errs() << "[brighten-global-data] VERIFY ERROR: unresolved guest data "
+                "reference at 0x"
+             << Twine::utohexstr(Ref->GuestAddr) << " (segment base 0x"
+             << Twine::utohexstr(Ref->Segment->GuestBase) << ", consumer="
+             << static_cast<unsigned>(Ref->ConsumerKind);
+      if (!Ref->SkipReason.empty())
+        errs() << ", reason=" << Ref->SkipReason;
+      errs() << ")\n";
+      if (Ref->UserInst) {
+        errs() << "  instruction: ";
+        Ref->UserInst->print(errs());
+        errs() << "\n";
+      }
+      HasError = true;
+      ++Ctx.Report.VerifierErrors;
+    }
+  }
 
   // Live segment check: in strict mode, no data/rodata/bss segment should still have uses.
   for (auto &Seg : Ctx.Segments) {

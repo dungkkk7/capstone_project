@@ -2,10 +2,14 @@
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <cstring>
+#include <optional>
 
 namespace brighten_global {
 
@@ -13,7 +17,11 @@ using namespace llvm;
 
 static Constant *ReadInitFromFlatBytes(const std::vector<uint8_t> &FlatBytes,
                                        const std::map<uint64_t, Constant *> &Relocs,
-                                       uint64_t Off, Type *Ty) {
+                                       const DataLayout &DL, uint64_t Off,
+                                       Type *Ty) {
+  if (!Ty || !Ty->isSized())
+    return nullptr;
+
   auto It = Relocs.find(Off);
   if (It != Relocs.end()) {
     Constant *Rel = It->second;
@@ -25,40 +33,288 @@ static Constant *ReadInitFromFlatBytes(const std::vector<uint8_t> &FlatBytes,
       return ConstantExpr::getPtrToInt(Rel, Ty);
   }
 
-  if (Ty->isIntegerTy(8)) {
-    return ConstantInt::get(Ty, FlatBytes[Off]);
-  }
-  if (Ty->isIntegerTy(16)) {
-    uint16_t Val = FlatBytes[Off] | (FlatBytes[Off + 1] << 8);
+  if (auto *IT = dyn_cast<IntegerType>(Ty)) {
+    unsigned Width = IT->getBitWidth();
+    uint64_t Size = DL.getTypeStoreSize(Ty).getFixedValue();
+    if (Off > FlatBytes.size() || Size > FlatBytes.size() - Off)
+      return nullptr;
+    APInt Val(Width, 0);
+    for (uint64_t I = 0; I < Size; ++I) {
+      uint64_t MemoryByte = DL.isLittleEndian() ? I : Size - 1 - I;
+      unsigned Shift = static_cast<unsigned>(MemoryByte * 8);
+      if (Shift < Width)
+        Val |= APInt(Width, FlatBytes[Off + I]).shl(Shift);
+    }
     return ConstantInt::get(Ty, Val);
   }
-  if (Ty->isIntegerTy(32)) {
-    uint32_t Val = FlatBytes[Off] | (FlatBytes[Off + 1] << 8) |
-                   (FlatBytes[Off + 2] << 16) | (FlatBytes[Off + 3] << 24);
-    return ConstantInt::get(Ty, Val);
+  if (Ty->isFloatingPointTy()) {
+    uint64_t Size = DL.getTypeStoreSize(Ty).getFixedValue();
+    unsigned Width = Ty->getPrimitiveSizeInBits().getFixedValue();
+    if (Off > FlatBytes.size() || Size > FlatBytes.size() - Off)
+      return nullptr;
+    APInt Bits(Width, 0);
+    for (uint64_t I = 0; I < Size; ++I) {
+      uint64_t MemoryByte = DL.isLittleEndian() ? I : Size - 1 - I;
+      unsigned Shift = static_cast<unsigned>(MemoryByte * 8);
+      if (Shift < Width)
+        Bits |= APInt(Width, FlatBytes[Off + I]).shl(Shift);
+    }
+    return ConstantFP::get(Ty->getContext(),
+                           APFloat(Ty->getFltSemantics(), Bits));
   }
-  if (Ty->isIntegerTy(64)) {
-    uint64_t Val = 0;
-    for (unsigned I = 0; I < 8; ++I)
-      Val |= (uint64_t)FlatBytes[Off + I] << (I * 8);
-    return ConstantInt::get(Ty, Val);
+  if (auto *ST = dyn_cast<StructType>(Ty)) {
+    SmallVector<Constant *, 16> Fields;
+    const StructLayout *Layout = DL.getStructLayout(ST);
+    for (unsigned I = 0; I < ST->getNumElements(); ++I) {
+      Type *FieldTy = ST->getElementType(I);
+      Constant *Field = ReadInitFromFlatBytes(
+          FlatBytes, Relocs, DL, Off + Layout->getElementOffset(I), FieldTy);
+      if (!Field)
+        return nullptr;
+      Fields.push_back(Field);
+    }
+    return ConstantStruct::get(ST, Fields);
   }
-  if (Ty->isFloatTy()) {
-    uint32_t Val = FlatBytes[Off] | (FlatBytes[Off + 1] << 8) |
-                   (FlatBytes[Off + 2] << 16) | (FlatBytes[Off + 3] << 24);
-    float F;
-    memcpy(&F, &Val, 4);
-    return ConstantFP::get(Ty, F);
-  }
-  if (Ty->isDoubleTy()) {
-    uint64_t Val = 0;
-    for (unsigned I = 0; I < 8; ++I)
-      Val |= (uint64_t)FlatBytes[Off + I] << (I * 8);
-    double D;
-    memcpy(&D, &Val, 8);
-    return ConstantFP::get(Ty, D);
+  if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+    Type *ElemTy = AT->getElementType();
+    uint64_t ElemBytes = DL.getTypeAllocSize(ElemTy).getFixedValue();
+    if (!ElemBytes)
+      return nullptr;
+    SmallVector<Constant *, 64> Elems;
+    for (uint64_t I = 0; I < AT->getNumElements(); ++I) {
+      Constant *Elem = ReadInitFromFlatBytes(
+          FlatBytes, Relocs, DL, Off + I * ElemBytes, ElemTy);
+      if (!Elem)
+        return nullptr;
+      Elems.push_back(Elem);
+    }
+    return ConstantArray::get(AT, Elems);
   }
   return nullptr;
+}
+
+// A byte-record object is a memory snapshot, not a typed relocation table.
+// Feeding ELF relocations through ReadInitFromFlatBytes for a nested [N x i8]
+// array turns a code/data relocation into ptrtoint(... to i8), which both
+// truncates the address and leaves fixed guest pointers in the native module.
+// Preserve the actual bytes for recursively byte-only aggregates instead.
+static bool IsByteOnlyType(Type *Ty) {
+  if (!Ty)
+    return false;
+  if (Ty->isIntegerTy(8))
+    return true;
+  auto *AT = dyn_cast<ArrayType>(Ty);
+  return AT && IsByteOnlyType(AT->getElementType());
+}
+
+static Constant *ReadByteOnlyInit(const std::vector<uint8_t> &FlatBytes,
+                                  const DataLayout &DL, uint64_t Off,
+                                  Type *Ty) {
+  if (!Ty || !IsByteOnlyType(Ty))
+    return nullptr;
+  if (Ty->isIntegerTy(8)) {
+    if (Off >= FlatBytes.size())
+      return nullptr;
+    return ConstantInt::get(Ty, FlatBytes[Off]);
+  }
+
+  auto *AT = cast<ArrayType>(Ty);
+  Type *ElemTy = AT->getElementType();
+  uint64_t ElemSize = DL.getTypeAllocSize(ElemTy).getFixedValue();
+  if (ElemSize == 0)
+    return nullptr;
+  SmallVector<Constant *, 64> Elems;
+  for (uint64_t I = 0; I < AT->getNumElements(); ++I) {
+    Constant *Elem = ReadByteOnlyInit(FlatBytes, DL, Off + I * ElemSize,
+                                      ElemTy);
+    if (!Elem)
+      return nullptr;
+    Elems.push_back(Elem);
+  }
+  return ConstantArray::get(AT, Elems);
+}
+
+static bool IsStructurallyZeroRange(Constant *C, const DataLayout &DL,
+                                    uint64_t QueryBegin, uint64_t QueryEnd,
+                                    uint64_t CurrentBegin = 0) {
+  if (!C || QueryBegin >= QueryEnd)
+    return true;
+  uint64_t CurrentEnd = CurrentBegin + DL.getTypeAllocSize(C->getType());
+  if (QueryEnd <= CurrentBegin || QueryBegin >= CurrentEnd)
+    return true;
+  if (isa<ConstantAggregateZero>(C))
+    return true;
+  if (isa<UndefValue>(C) || isa<PoisonValue>(C))
+    return false;
+
+  if (auto *CDA = dyn_cast<ConstantDataArray>(C)) {
+    StringRef Bytes = CDA->getRawDataValues();
+    uint64_t Begin = std::max(QueryBegin, CurrentBegin) - CurrentBegin;
+    uint64_t End = std::min(QueryEnd, CurrentEnd) - CurrentBegin;
+    for (uint64_t I = Begin; I < End && I < Bytes.size(); ++I)
+      if (static_cast<uint8_t>(Bytes[I]) != 0)
+        return false;
+    return End <= Bytes.size();
+  }
+
+  if (auto *CA = dyn_cast<ConstantArray>(C)) {
+    uint64_t ElemSize = DL.getTypeAllocSize(CA->getType()->getElementType());
+    for (unsigned I = 0; I < CA->getNumOperands(); ++I) {
+      if (!IsStructurallyZeroRange(cast<Constant>(CA->getOperand(I)), DL,
+                                   QueryBegin, QueryEnd,
+                                   CurrentBegin + I * ElemSize))
+        return false;
+    }
+    return true;
+  }
+
+  if (auto *CS = dyn_cast<ConstantStruct>(C)) {
+    const StructLayout *Layout = DL.getStructLayout(CS->getType());
+    for (unsigned I = 0; I < CS->getNumOperands(); ++I) {
+      if (!IsStructurallyZeroRange(cast<Constant>(CS->getOperand(I)), DL,
+                                   QueryBegin, QueryEnd,
+                                   CurrentBegin + Layout->getElementOffset(I)))
+        return false;
+    }
+    return true;
+  }
+
+  // Scalar bytes are zero only when the overlapping bits are zero.  Pointer
+  // and other constant-expression values are conservatively non-zero.
+  if (auto *CI = dyn_cast<ConstantInt>(C)) {
+    uint64_t Size = DL.getTypeStoreSize(CI->getType());
+    uint64_t Begin = std::max(QueryBegin, CurrentBegin) - CurrentBegin;
+    uint64_t End = std::min(QueryEnd, CurrentBegin + Size) - CurrentBegin;
+    for (uint64_t I = Begin; I < End; ++I)
+      if (CI->getValue().extractBits(8, I * 8).getZExtValue() != 0)
+        return false;
+    return true;
+  }
+  if (auto *CFP = dyn_cast<ConstantFP>(C)) {
+    APInt Bits = CFP->getValueAPF().bitcastToAPInt();
+    uint64_t Size = DL.getTypeStoreSize(CFP->getType());
+    uint64_t Begin = std::max(QueryBegin, CurrentBegin) - CurrentBegin;
+    uint64_t End = std::min(QueryEnd, CurrentBegin + Size) - CurrentBegin;
+    for (uint64_t I = Begin; I < End; ++I)
+      if (Bits.extractBits(8, I * 8).getZExtValue() != 0)
+        return false;
+    return true;
+  }
+  return false;
+}
+
+static bool IsAliasBackedZeroObject(ObjectCandidate *Cand,
+                                    GlobalDataContext &Ctx) {
+  if (!Cand || !Cand->SourceSegment || !Cand->SourceSegment->GV)
+    return false;
+  for (GlobalAlias &GA : Ctx.M.aliases()) {
+    StringRef Name = GA.getName();
+    if (!Name.starts_with("data_"))
+      continue;
+    uint64_t Addr = 0;
+    StringRef Hex = Name.drop_front(StringRef("data_").size());
+    if (Hex.empty() || Hex.getAsInteger(16, Addr) || Addr != Cand->Begin)
+      continue;
+
+    auto *GEP = dyn_cast<GEPOperator>(GA.getAliasee());
+    if (!GEP || GEP->getPointerOperand() != Cand->SourceSegment->GV)
+      continue;
+
+    uint64_t Off = Cand->Begin - Cand->SourceSegment->GuestBase;
+    uint64_t End = Off + (Cand->End - Cand->Begin);
+    Constant *Current = Cand->SourceSegment->GV->getInitializer();
+    uint64_t CurrentOffset = 0;
+    bool First = true;
+    for (Value *Index : GEP->indices()) {
+      auto *CI = dyn_cast<ConstantInt>(Index);
+      if (!CI)
+        break;
+      if (First) {
+        First = false;
+        if (!CI->isZero())
+          break;
+        continue;
+      }
+
+      // A zero aggregate proves a range, not just the first byte selected by
+      // the alias.  Check that the complete recovered object fits inside that
+      // aggregate before treating it as implicit BSS.
+      if (isa<ConstantAggregateZero>(Current)) {
+        uint64_t ZeroEnd = CurrentOffset +
+                           Ctx.DL.getTypeAllocSize(Current->getType());
+        if (Off >= CurrentOffset && End <= ZeroEnd)
+          return true;
+        // A few lifted ELF images describe a BSS tail with an alias whose
+        // textual guest address starts in an earlier zero byte field, while
+        // the typed GEP lands at the large zero aggregate that follows the
+        // synthetic init-array records.  Preserve that proven BSS-tail case
+        // only when the large zero aggregate contains the whole candidate;
+        // this does not classify a zero prefix followed by live data as zero.
+        if (Off < CurrentOffset && End <= ZeroEnd &&
+            Cand->End - Cand->Begin >= 4096)
+          return true;
+        break;
+      }
+
+      auto *Agg = dyn_cast<ConstantAggregate>(Current);
+      if (!Agg)
+        break;
+      uint64_t ElemIndex = CI->getZExtValue();
+      if (auto *ST = dyn_cast<StructType>(Agg->getType())) {
+        if (ElemIndex >= ST->getNumElements())
+          break;
+        CurrentOffset +=
+            Ctx.DL.getStructLayout(ST)->getElementOffset(ElemIndex);
+      } else if (auto *AT = dyn_cast<ArrayType>(Agg->getType())) {
+        if (ElemIndex >= AT->getNumElements())
+          break;
+        CurrentOffset +=
+            ElemIndex * Ctx.DL.getTypeAllocSize(AT->getElementType());
+      } else {
+        break;
+      }
+      Current = Agg->getAggregateElement(ElemIndex);
+      if (!Current)
+        break;
+    }
+    if (isa<ConstantAggregateZero>(Current)) {
+      uint64_t ZeroEnd = CurrentOffset +
+                         Ctx.DL.getTypeAllocSize(Current->getType());
+      if (Off >= CurrentOffset && End <= ZeroEnd)
+        return true;
+    }
+  }
+  return false;
+}
+
+static uint64_t GetCandidateSourceOffset(ObjectCandidate *Cand,
+                                         GlobalDataContext &Ctx) {
+  auto *Seg = Cand ? Cand->SourceSegment : nullptr;
+  if (!Seg || !Seg->GV)
+    return 0;
+
+  // Guest segments emitted by the lifter are typed synthetic aggregates.
+  // Their DataLayout offsets are not necessarily equal to GuestAddr-Base:
+  // padding and split fields can make that arithmetic select unrelated BSS
+  // bytes.  An exact data_<address> alias is the authoritative mapping from
+  // a guest address to the corresponding initializer field.
+  for (GlobalAlias &GA : Ctx.M.aliases()) {
+    StringRef Name = GA.getName();
+    if (!Name.starts_with("data_"))
+      continue;
+    uint64_t Addr = 0;
+    if (Name.drop_front(5).getAsInteger(16, Addr) || Addr != Cand->Begin)
+      continue;
+
+    auto *GEP = dyn_cast<GEPOperator>(GA.getAliasee());
+    if (!GEP || GEP->getPointerOperand()->stripPointerCasts() != Seg->GV)
+      continue;
+    APInt SourceOffset(Ctx.DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+    if (GEP->accumulateConstantOffset(Ctx.DL, SourceOffset) &&
+        SourceOffset.getActiveBits() <= 64)
+      return SourceOffset.getZExtValue();
+  }
+  return Cand->Begin - Seg->GuestBase;
 }
 
 static Function *FindFnByGuestAddr(Module &M, uint64_t Addr) {
@@ -79,6 +335,53 @@ static Function *FindFnByGuestAddr(Module &M, uint64_t Addr) {
   return nullptr;
 }
 
+static std::optional<uint64_t> NamedDataGuestAddress(Value *V) {
+  auto *GV = dyn_cast<GlobalValue>(V);
+  if (!GV)
+    return std::nullopt;
+  StringRef Name = GV->getName();
+  if (!Name.starts_with("data_"))
+    return std::nullopt;
+  uint64_t Addr = 0;
+  StringRef Hex = Name.drop_front(StringRef("data_").size());
+  if (Hex.empty() || Hex.getAsInteger(16, Addr))
+    return std::nullopt;
+  return Addr;
+}
+
+static std::optional<uint64_t> ConstantGuestAddress(Value *V) {
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return CI->getZExtValue();
+  auto *CE = dyn_cast<ConstantExpr>(V);
+  if (!CE || !CE->isCast() || CE->getNumOperands() != 1)
+    return std::nullopt;
+  auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0));
+  return CI ? std::optional<uint64_t>(CI->getZExtValue()) : std::nullopt;
+}
+
+static bool HasGuestCodeLabel(Module &M, uint64_t Addr) {
+  for (Function &F : M) {
+    for (BasicBlock &BB : F) {
+      StringRef Name = BB.getName();
+      for (const char *Prefix : {"inst_", "case_"}) {
+        if (!Name.starts_with(Prefix))
+          continue;
+        StringRef Rest = Name.drop_front(strlen(Prefix));
+        size_t Sep = Rest.find('_');
+        if (Sep != StringRef::npos)
+          Rest = Rest.substr(0, Sep);
+        uint64_t LabelAddr = 0;
+        if (!Rest.empty() && !Rest.getAsInteger(16, LabelAddr) &&
+            (LabelAddr == Addr ||
+             (LabelAddr > Addr && LabelAddr - Addr <= 16) ||
+             (Addr > LabelAddr && Addr - LabelAddr <= 16)))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataContext &Ctx);
 
 static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataContext &Ctx) {
@@ -92,11 +395,36 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
   GuestSegment *Seg = Cand->SourceSegment;
   if (!Seg)
     return nullptr;
-
-  uint64_t Off = Cand->Begin - Seg->GuestBase;
+  uint64_t Off = GetCandidateSourceOffset(Cand, Ctx);
   Constant *Init = nullptr;
 
-  if (Seg->Kind == SegmentKind::Bss) {
+  // Some lifted ELF images fold a large zero-initialized BSS tail into a
+  // synthetic segment named __init_array.  The segment classifier therefore
+  // says Data even though this particular recovered object has no file bytes
+  // or relocations.  Treat only that proven zero range as zero-initialized;
+  // do not let unrelated segment relocations become bytes of the object.
+  bool RangeIsZero = true;
+  for (uint64_t I = 0; I < Cand->End - Cand->Begin; ++I) {
+    if (Off + I >= Seg->FlatBytes.size() || Seg->FlatBytes[Off + I] != 0) {
+      RangeIsZero = false;
+      break;
+    }
+  }
+  if (RangeIsZero) {
+    for (const auto &Rel : Seg->Relocations) {
+      if (Rel.first >= Off && Rel.first < Off + (Cand->End - Cand->Begin)) {
+        RangeIsZero = false;
+        break;
+      }
+    }
+  }
+  bool StructuralZero = IsStructurallyZeroRange(
+      Seg->GV->getInitializer(), Ctx.DL, Off,
+      Off + (Cand->End - Cand->Begin));
+  RangeIsZero = RangeIsZero || StructuralZero ||
+                IsAliasBackedZeroObject(Cand, Ctx);
+
+  if (Seg->Kind == SegmentKind::Bss || RangeIsZero) {
     Init = Constant::getNullValue(Cand->Ty);
   } else {
     if (Cand->Kind == ObjectKind::StringLiteral) {
@@ -110,19 +438,30 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
       unsigned ElemSize = Ctx.DL.getTypeStoreSize(ElemTy);
       unsigned NumElems = ArrTy->getNumElements();
 
-      if (ElemTy->isIntegerTy(8)) {
+      if (Cand->Kind == ObjectKind::RawBytes || IsByteOnlyType(Cand->Ty)) {
+        Init = ReadByteOnlyInit(Seg->FlatBytes, Ctx.DL, Off, Cand->Ty);
+      } else if (ElemTy->isIntegerTy(8)) {
         std::vector<uint8_t> Bytes(Seg->FlatBytes.begin() + Off,
                                    Seg->FlatBytes.begin() + Off + NumElems);
         Init = ConstantDataArray::get(Ctx.M.getContext(), Bytes);
       } else {
         SmallVector<Constant *, 64> Elems;
         for (unsigned I = 0; I < NumElems; ++I) {
-          Constant *E = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Off + I * ElemSize, ElemTy);
-          if (!E)
-            E = Constant::getNullValue(ElemTy);
+          Constant *E = ReadInitFromFlatBytes(Seg->FlatBytes,
+                                              Seg->Relocations, Ctx.DL,
+                                              Off + I * ElemSize, ElemTy);
+          // Failure to decode an element is unresolved semantics, not a zero
+          // initializer.  Substituting null/zero changes live program data and
+          // violates the native contract; preserve the source segment so a
+          // later rule (or strict verification) can diagnose it instead.
+          if (!E) {
+            Elems.clear();
+            break;
+          }
           Elems.push_back(E);
         }
-        Init = ConstantArray::get(ArrTy, Elems);
+        if (Elems.size() == NumElems)
+          Init = ConstantArray::get(ArrTy, Elems);
       }
     } else if (Cand->Kind == ObjectKind::PointerTable) {
       auto *ArrTy = cast<ArrayType>(Cand->Ty);
@@ -130,8 +469,51 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
       unsigned NumElems = ArrTy->getNumElements();
       PointerType *PtrTy = PointerType::get(Ctx.M.getContext(), 0);
 
-      SmallVector<Constant *, 32> Elems;
+      // Relocation-backed entries into executable guest segments are jump
+      // table labels, not callable pointers.  Materialize those as integer
+      // guest targets so a native switch can consume them without creating
+      // fixed guest inttoptr constants.
+      bool IntegerTargets = true;
       for (unsigned I = 0; I < NumElems; ++I) {
+        auto RelIt = Seg->Relocations.find(Off + I * PtrSize);
+        auto TargetAddr = RelIt == Seg->Relocations.end()
+                              ? std::nullopt
+                              : NamedDataGuestAddress(RelIt->second);
+        if (!TargetAddr && RelIt != Seg->Relocations.end())
+          TargetAddr = ConstantGuestAddress(RelIt->second);
+        GuestSegment *TargetSeg =
+            TargetAddr ? Ctx.findSegmentForAddr(*TargetAddr) : nullptr;
+        if ((!TargetSeg || !TargetSeg->Executable) &&
+            (!TargetAddr || !HasGuestCodeLabel(Ctx.M, *TargetAddr))) {
+          IntegerTargets = false;
+          break;
+        }
+      }
+
+      if (IntegerTargets) {
+        IntegerType *IntTy = Type::getInt64Ty(Ctx.M.getContext());
+        ArrayType *IntArrTy = ArrayType::get(IntTy, NumElems);
+        SmallVector<Constant *, 32> Targets;
+        for (unsigned I = 0; I < NumElems; ++I) {
+          uint64_t EntryVal = 0;
+          auto RelIt = Seg->Relocations.find(Off + I * PtrSize);
+          if (RelIt != Seg->Relocations.end()) {
+            if (auto Addr = NamedDataGuestAddress(RelIt->second))
+              EntryVal = *Addr;
+            else if (auto Addr = ConstantGuestAddress(RelIt->second))
+              EntryVal = *Addr;
+          } else {
+            for (unsigned B = 0; B < PtrSize; ++B)
+              EntryVal |= (uint64_t)Seg->FlatBytes[Off + I * PtrSize + B]
+                          << (B * 8);
+          }
+          Targets.push_back(ConstantInt::get(IntTy, EntryVal));
+        }
+        Init = ConstantArray::get(IntArrTy, Targets);
+      } else {
+
+        SmallVector<Constant *, 32> Elems;
+        for (unsigned I = 0; I < NumElems; ++I) {
         uint64_t EntryVal = 0;
         for (unsigned B = 0; B < PtrSize; ++B)
           EntryVal |= (uint64_t)Seg->FlatBytes[Off + I * PtrSize + B] << (B * 8);
@@ -164,16 +546,24 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
           }
         }
 
-        if (Target) {
-          Constant *CastVal = ConstantExpr::getPointerCast(Target, PtrTy);
-          Elems.push_back(CastVal);
-        } else {
-          Elems.push_back(Constant::getNullValue(PtrTy));
+          if (Target) {
+            Constant *CastVal = ConstantExpr::getPointerCast(Target, PtrTy);
+            Elems.push_back(CastVal);
+          } else if (EntryVal == 0) {
+            // A zero entry is a proven null pointer.  A non-zero unresolved
+            // address must never be silently rewritten to null.
+            Elems.push_back(Constant::getNullValue(PtrTy));
+          } else {
+            Elems.clear();
+            break;
+          }
         }
+        if (Elems.size() == NumElems)
+          Init = ConstantArray::get(ArrTy, Elems);
       }
-      Init = ConstantArray::get(ArrTy, Elems);
     } else {
-      Init = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Off, Cand->Ty);
+      Init = ReadInitFromFlatBytes(Seg->FlatBytes, Seg->Relocations, Ctx.DL,
+                                   Off, Cand->Ty);
     }
   }
 
@@ -199,6 +589,28 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
   auto *GV = new GlobalVariable(Ctx.M, Init->getType(), IsReadOnly,
                                 Linkage, Init, Name);
   GV->setAlignment(Align(Ctx.DL.getABITypeAlign(Init->getType())));
+
+  // Keep the original ELF range as non-semantic provenance for the final
+  // native cleanup pass.  It is needed when an ABI/state rewrite recreates a
+  // dynamic pointer expression after this pass has already rewritten the
+  // direct constant references.
+  SmallVector<Metadata *, 2> RangeMetadata;
+  RangeMetadata.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt64Ty(Ctx.M.getContext()), Cand->Begin)));
+  RangeMetadata.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(Type::getInt64Ty(Ctx.M.getContext()), Cand->End)));
+  GV->setMetadata("brighten.guest.range", MDNode::get(Ctx.M.getContext(),
+                                                       RangeMetadata));
+
+  // A dynamic address can remain in a State slot until ABI/native cleanup
+  // reconstructs the pointer consumer.  At this point the recovered object
+  // has no direct IR use yet, so globaldce would otherwise erase both it and
+  // the range provenance before that late rewrite runs.  Keep byte-backed
+  // objects alive through the intervening optimization pipeline; final
+  // native cleanup removes temporary native-data roots once their consumers
+  // have been materialized.
+  if (Cand->Kind == ObjectKind::RawBytes)
+    appendToUsed(Ctx.M, {GV});
 
   if (Cand->Kind == ObjectKind::StringLiteral) {
     GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);

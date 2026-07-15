@@ -96,8 +96,10 @@ bool BrightenRepairPass::FixCallbackFunctionPointerStores(Module &M) {
   LLVMContext &Ctx = M.getContext();
   Type *Int64Ty = Type::getInt64Ty(Ctx);
 
-  // 1. Thao tác trên tất cả các hàm callback_sub_*
-  // Thay thế tất cả các references tới callback_sub_N bằng inttoptr(N)
+  // Rewrite only the integer guest-PC representation of callback thunks.
+  // Replacing every use of the Function itself is not semantics preserving:
+  // a native direct call (or a real host function-pointer use) must continue
+  // to refer to the function, not to inttoptr(guest_pc).
   SmallVector<Function *, 16> Callbacks;
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
@@ -111,10 +113,16 @@ bool BrightenRepairPass::FixCallbackFunctionPointerStores(Module &M) {
     auto PC = ParseCallbackPC(F->getName());
     if (!PC.has_value()) continue;
 
-    Constant *IntVal = ConstantInt::get(Int64Ty, *PC);
-    Constant *Replacement = ConstantExpr::getIntToPtr(IntVal, F->getType());
-    F->replaceAllUsesWith(Replacement);
-    Changed = true;
+    SmallVector<ConstantExpr *, 8> GuestPCUses;
+    for (User *U : F->users()) {
+      auto *CE = dyn_cast<ConstantExpr>(U);
+      if (CE && CE->getOpcode() == Instruction::PtrToInt)
+        GuestPCUses.push_back(CE);
+    }
+    for (ConstantExpr *CE : GuestPCUses) {
+      CE->replaceAllUsesWith(ConstantInt::get(CE->getType(), *PC));
+      Changed = true;
+    }
   }
 
   // 2. Scan và dọn dẹp các PtrToIntInst thô đang chứa inttoptr
@@ -158,4 +166,3 @@ bool BrightenRepairPass::FixCallbackFunctionPointerStores(Module &M) {
 }
 
 }  // namespace brighten_repair
-

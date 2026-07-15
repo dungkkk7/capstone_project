@@ -2,6 +2,8 @@
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
@@ -37,19 +39,13 @@ static Value *CreateGEPToObject(IRBuilder<> &Builder, RecoveredObject *Obj,
   }
 
   if (Obj->Kind == ObjectKind::Array || Obj->Kind == ObjectKind::RawBytes) {
-    auto *ArrTy = dyn_cast<ArrayType>(ObjTy);
-    if (!ArrTy)
+    if (!isa<ArrayType>(ObjTy))
       return nullptr;
-    unsigned ElemSize = Obj->GV->getParent()->getDataLayout().getTypeStoreSize(
-        ArrTy->getElementType());
-    if (ElemSize == 0)
-      return nullptr;
-    if (Offset % ElemSize != 0)
-      return nullptr;
-    uint64_t Idx = Offset / ElemSize;
-    return Builder.CreateGEP(
-        ObjTy, Obj->GV,
-        {Builder.getInt64(0), Builder.getInt64(Idx)});
+    // Use a byte GEP for recovered arrays.  This is required for packed
+    // records and for field references whose offset is not an element-sized
+    // multiple (for example input[i].index at record+4).
+    return Builder.CreateGEP(Builder.getInt8Ty(), Obj->GV,
+                             Builder.getInt64(Offset), "native.data.ptr");
   }
 
   if (Obj->Kind == ObjectKind::PointerTable) {
@@ -92,15 +88,10 @@ static Constant *CreateConstantGEPToObject(RecoveredObject *Obj,
              Obj->Kind == ObjectKind::RawBytes) {
     auto *ArrTy = dyn_cast<ArrayType>(ObjTy);
     if (ArrTy) {
-      unsigned ElemSize = Obj->GV->getParent()->getDataLayout().getTypeStoreSize(
-          ArrTy->getElementType());
-      if (ElemSize != 0 && Offset % ElemSize == 0) {
-        uint64_t Idx = Offset / ElemSize;
-        GEP = ConstantExpr::getGetElementPtr(
-            ObjTy, Obj->GV,
-            ArrayRef<Constant *>{ConstantInt::get(Type::getInt64Ty(LCtx), 0),
-                                 ConstantInt::get(Type::getInt64Ty(LCtx), Idx)});
-      }
+      (void)ArrTy;
+      GEP = ConstantExpr::getGetElementPtr(
+          Type::getInt8Ty(LCtx), Obj->GV,
+          ArrayRef<Constant *>{ConstantInt::get(Type::getInt64Ty(LCtx), Offset)});
     }
   }
 
@@ -113,20 +104,402 @@ static Constant *CreateConstantGEPToObject(RecoveredObject *Obj,
   return GEP;
 }
 
-static bool IsAddressIdentitySensitive(GuestAddressRef *Ref) {
-  if (!Ref->UserInst)
+// A guest data address is often used as an opaque-predicate constant before
+// it is ever materialized as a pointer.  Replacing that integer with
+// ptrtoint(@recovered_object) changes its value under PIE/ASLR and therefore
+// changes control flow.  Follow only value-preserving integer operations: a
+// load, store, or call is a pointer/data boundary rather than evidence that
+// the address identity itself is observed.
+static bool HasGuestAddressIdentityUse(Value *V,
+                                       SmallPtrSetImpl<Value *> &Seen,
+                                       unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
     return false;
-  // In NativeStrict, only treat ICmp (comparison) as identity sensitive.
-  // Arithmetic (like ptrtoint used in xor/add) is safe to rewrite because
-  // we just map the pointer value to the new global.
+  if (isa<ICmpInst>(V) || isa<SwitchInst>(V))
+    return true;
+
+  for (User *U : V->users()) {
+    if (isa<ICmpInst>(U) || isa<SwitchInst>(U))
+      return true;
+    if (isa<PtrToIntInst>(U) || isa<CastInst>(U) ||
+        isa<BinaryOperator>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<FreezeInst>(U)) {
+      if (HasGuestAddressIdentityUse(cast<Value>(U), Seen, Depth + 1))
+        return true;
+      continue;
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+      if (HasGuestAddressIdentityUse(CE, Seen, Depth + 1))
+        return true;
+    }
+    if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getValueOperand() != V)
+        continue;
+      Value *StoredAt = SI->getPointerOperand()->stripPointerCasts();
+      for (BasicBlock &BB : *SI->getFunction())
+        for (Instruction &I : BB) {
+          auto *LI = dyn_cast<LoadInst>(&I);
+          if (!LI || LI->getPointerOperand()->stripPointerCasts() != StoredAt)
+            continue;
+          if (HasGuestAddressIdentityUse(LI, Seen, Depth + 1))
+            return true;
+        }
+    }
+  }
+  return false;
+}
+
+static bool EventuallyFeedsPointerConsumer(Value *V,
+                                           SmallPtrSetImpl<Value *> &Seen,
+                                           unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  for (User *U : V->users()) {
+    if (isa<IntToPtrInst>(U))
+      return true;
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+      if (Function *Callee = CI->getCalledFunction()) {
+        if (Callee->getName() == "__translate_guest_pointer")
+          return true;
+      }
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+      if (CE->getOpcode() == Instruction::IntToPtr)
+        return true;
+      continue;
+    }
+    if (isa<CastInst>(U) || isa<BinaryOperator>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<FreezeInst>(U)) {
+      if (EventuallyFeedsPointerConsumer(cast<Value>(U), Seen, Depth + 1))
+        return true;
+    }
+    if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getValueOperand() != V)
+        continue;
+      Value *StoredAt = SI->getPointerOperand()->stripPointerCasts();
+      for (BasicBlock &BB : *SI->getFunction())
+        for (Instruction &I : BB) {
+          auto *LI = dyn_cast<LoadInst>(&I);
+          if (!LI || LI->getPointerOperand()->stripPointerCasts() != StoredAt)
+            continue;
+          if (EventuallyFeedsPointerConsumer(LI, Seen, Depth + 1))
+            return true;
+        }
+    }
+  }
+  return false;
+}
+
+static bool EventuallyNarrowsBelowPointerWidth(Value *V, unsigned PointerBits,
+                                               SmallPtrSetImpl<Value *> &Seen,
+                                               unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (auto *IT = dyn_cast<IntegerType>(V->getType()))
+    if (IT->getBitWidth() < PointerBits)
+      return true;
+  if (isa<ConstantData>(V))
+    return false;
+  for (User *U : V->users()) {
+    if (isa<CastInst>(U) || isa<BinaryOperator>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<FreezeInst>(U))
+      if (EventuallyNarrowsBelowPointerWidth(cast<Value>(U), PointerBits,
+                                             Seen, Depth + 1))
+        return true;
+  }
+  return false;
+}
+
+static bool IsGuestAddressIntegerConstant(Value *V) {
+  if (isa<ConstantInt>(V))
+    return true;
+
+  auto *CE = dyn_cast<ConstantExpr>(V);
+  if (!CE || CE->getOpcode() != Instruction::PtrToInt)
+    return false;
+  Value *Pointer = CE->getOperand(0)->stripPointerCasts();
+  auto *GV = dyn_cast<GlobalValue>(Pointer);
+  return GV && GV->getName().starts_with("data_");
+}
+
+static bool IsAddressIdentitySensitive(GuestAddressRef *Ref) {
+  if (!Ref || !Ref->UserInst)
+    return false;
+  // Direct pointer equality is identity-sensitive regardless of whether the
+  // lifted operand is spelled as an integer guest address, a data alias, or a
+  // GEP rooted at a segment.  The spelling must not decide whether replacing
+  // it with an ASLR-dependent recovered-object address is legal.
   if (Ref->ConsumerKind == DataConsumerKind::ComparisonOnly)
     return true;
-  return false;
+  // Preserve producer nodes whose result flows to an identity boundary as
+  // well.  Address collection records both the final comparison operand and
+  // intermediate GEP/cast nodes; rewriting an intermediate segment operand
+  // would still mutate the comparison even if its own GuestAddressRef is
+  // skipped.  This test is intentionally spelling-independent.
+  SmallPtrSet<Value *, 32> DirectIdentitySeen;
+  if (HasGuestAddressIdentityUse(Ref->UserInst, DirectIdentitySeen))
+    return true;
+  // McSema also represents an integer immediate as ptrtoint(data_<addr>)
+  // whenever it falls inside a broad BSS mapping.  That symbolic form is not
+  // proof of pointer intent: flattened dispatcher states routinely use it as
+  // an opaque numeric value.  Preserve the guest integer at an identity
+  // boundary and let the native-pointer lowering handle actual dereferences.
+  if (!IsGuestAddressIntegerConstant(Ref->OriginalValue))
+    return false;
+  if (Ref->ConsumerKind != DataConsumerKind::ArithmeticOnly &&
+      Ref->ConsumerKind != DataConsumerKind::IntegerAddressConsumer &&
+      Ref->ConsumerKind != DataConsumerKind::Unknown)
+    return false;
+  SmallPtrSet<Value *, 32> PointerSeen;
+  if (EventuallyFeedsPointerConsumer(Ref->UserInst, PointerSeen))
+    return false;
+  const DataLayout &DL = Ref->UserInst->getModule()->getDataLayout();
+  unsigned PointerBits = DL.getPointerSizeInBits(0);
+  SmallPtrSet<Value *, 32> NarrowSeen;
+  return EventuallyNarrowsBelowPointerWidth(Ref->OriginalValue, PointerBits,
+                                            NarrowSeen) ||
+         EventuallyNarrowsBelowPointerWidth(Ref->UserInst, PointerBits,
+                                            NarrowSeen);
+}
+
+static bool FindSegmentBase(Value *Ptr, GlobalVariable *Segment,
+                            const DataLayout &DL, uint64_t &Offset,
+                            SmallPtrSetImpl<Value *> &Seen) {
+  if (!Ptr || !Seen.insert(Ptr).second)
+    return false;
+  Ptr = Ptr->stripPointerCasts();
+  if (Ptr == Segment)
+    return true;
+  if (auto *GA = dyn_cast<GlobalAlias>(Ptr)) {
+    StringRef Name = GA->getName();
+    if (Name.starts_with("data_")) {
+      uint64_t GuestAddress = 0;
+      StringRef Hex = Name.drop_front(StringRef("data_").size());
+      if (!Hex.empty() && !Hex.getAsInteger(16, GuestAddress)) {
+        uint64_t SegmentSize = DL.getTypeAllocSize(Segment->getValueType())
+                                   .getFixedValue();
+        for (auto &S : Segment->getParent()->globals()) {
+          if (&S != Segment)
+            continue;
+          (void)S;
+          MDNode *Range = Segment->getMetadata("brighten.guest.range");
+          if (!Range || Range->getNumOperands() != 2)
+            break;
+          auto *BeginMD = dyn_cast<ConstantAsMetadata>(Range->getOperand(0));
+          auto *Begin = BeginMD
+                            ? dyn_cast<ConstantInt>(BeginMD->getValue())
+                            : nullptr;
+          if (Begin && GuestAddress >= Begin->getZExtValue() &&
+              GuestAddress < Begin->getZExtValue() + SegmentSize) {
+            Offset = GuestAddress - Begin->getZExtValue();
+            return true;
+          }
+          break;
+        }
+      }
+    }
+    if (Constant *Aliasee = GA->getAliasee())
+      return FindSegmentBase(Aliasee, Segment, DL, Offset, Seen);
+  }
+  auto *GEP = dyn_cast<GEPOperator>(Ptr);
+  if (!GEP)
+    return false;
+
+  APInt Local(DL.getPointerSizeInBits(0), 0, true);
+  bool HasOnlyConstantOffset = GEP->accumulateConstantOffset(DL, Local);
+  if (!FindSegmentBase(GEP->getPointerOperand(), Segment, DL, Offset, Seen))
+    return false;
+  if (HasOnlyConstantOffset) {
+    if (Local.isNegative() || Offset > UINT64_MAX - Local.getZExtValue())
+      return false;
+    Offset += Local.getZExtValue();
+  }
+  return true;
+}
+
+static bool IsVarargPointerSaveSlot(Value *Ptr) {
+  auto *GEP = dyn_cast<GEPOperator>(Ptr ? Ptr->stripPointerCasts() : nullptr);
+  if (!GEP || GEP->getNumIndices() == 0)
+    return false;
+
+  Value *Base = GEP->getPointerOperand()->stripPointerCasts();
+  auto *AI = dyn_cast<AllocaInst>(Base);
+  if (!AI || !AI->getName().contains("reg_save_area"))
+    return false;
+
+  auto It = GEP->idx_end();
+  --It;
+  auto *Slot = dyn_cast<ConstantInt>(*It);
+  if (!Slot)
+    return false;
+  // The inlined helper usually addresses the byte offsets directly (8..40)
+  // rather than using the original array element index.  Slot zero contains
+  // the fixed format/stream argument; slots one through five are the GP
+  // variadic arguments used by scanf-family calls.
+  uint64_t ByteOffset = Slot->getZExtValue();
+  return ByteOffset >= 8 && ByteOffset <= 40 && (ByteOffset % 8) == 0;
+}
+
+static bool RewriteDynamicScanfPointerAddresses(GlobalDataContext &Ctx,
+                                                 unsigned &Count) {
+  bool Changed = false;
+  SmallVector<std::pair<StoreInst *, BinaryOperator *>, 64> Stores;
+
+  for (Function &F : Ctx.M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *BO = dyn_cast<BinaryOperator>(&I);
+        if (!BO || BO->getOpcode() != Instruction::Add ||
+            !BO->getType()->isIntegerTy())
+          continue;
+
+        for (User *U : BO->users()) {
+          auto *SI = dyn_cast<StoreInst>(U);
+          if (SI && SI->getValueOperand() == BO &&
+              IsVarargPointerSaveSlot(SI->getPointerOperand()))
+            Stores.push_back({SI, BO});
+        }
+      }
+    }
+  }
+
+  for (auto [SI, BO] : Stores) {
+    ConstantInt *BaseConst = dyn_cast<ConstantInt>(BO->getOperand(0));
+    Value *DynamicOffset = BO->getOperand(1);
+    if (!BaseConst) {
+      BaseConst = dyn_cast<ConstantInt>(BO->getOperand(1));
+      DynamicOffset = BO->getOperand(0);
+    }
+    if (!BaseConst || !DynamicOffset)
+      continue;
+
+    const RecoveredObject *Obj =
+        Ctx.findObjectAt(BaseConst->getZExtValue());
+    if (!Obj || !Obj->GV ||
+        BaseConst->getZExtValue() < Obj->Begin ||
+        BaseConst->getZExtValue() >= Obj->End)
+      continue;
+
+    IRBuilder<> Builder(SI);
+    uint64_t BaseOffset = BaseConst->getZExtValue() - Obj->Begin;
+    Value *ByteOffset = DynamicOffset;
+    if (BaseOffset != 0)
+      ByteOffset = Builder.CreateAdd(
+          DynamicOffset, Builder.getInt64(BaseOffset),
+          "native.vararg.offset");
+    Value *NativePtr = Builder.CreateGEP(
+        Builder.getInt8Ty(), Obj->GV, ByteOffset, "native.vararg.ptr");
+    Value *NativeInt = Builder.CreatePtrToInt(
+        NativePtr, BO->getType(), "native.vararg.addr");
+    SI->setOperand(0, NativeInt);
+    ++Count;
+    Changed = true;
+  }
+  return Changed;
+}
+
+static std::optional<uint64_t>
+FindNamedDataAddressInIntegerExpr(Value *V,
+                                  SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return std::nullopt;
+
+  if (auto *GA = dyn_cast<GlobalAlias>(V->stripPointerCasts())) {
+    StringRef Name = GA->getName();
+    if (Name.starts_with("data_")) {
+      uint64_t Addr = 0;
+      StringRef Hex = Name.drop_front(StringRef("data_").size());
+      if (!Hex.empty() && !Hex.getAsInteger(16, Addr))
+        return Addr;
+    }
+    if (Constant *Aliasee = GA->getAliasee())
+      return FindNamedDataAddressInIntegerExpr(Aliasee, Seen);
+  }
+
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->getOpcode() == Instruction::PtrToInt)
+      return FindNamedDataAddressInIntegerExpr(CE->getOperand(0), Seen);
+  }
+  if (auto *PTI = dyn_cast<PtrToIntInst>(V))
+    return FindNamedDataAddressInIntegerExpr(PTI->getPointerOperand(), Seen);
+
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::Add ||
+        BO->getOpcode() == Instruction::Sub) {
+      if (auto Addr = FindNamedDataAddressInIntegerExpr(BO->getOperand(0), Seen))
+        return Addr;
+      if (auto Addr = FindNamedDataAddressInIntegerExpr(BO->getOperand(1), Seen))
+        return Addr;
+    }
+  }
+  return std::nullopt;
+}
+
+static bool RewriteDynamicDataIntToPtrs(GlobalDataContext &Ctx,
+                                        unsigned &Count) {
+  SmallVector<IntToPtrInst *, 64> Work;
+  for (Function &F : Ctx.M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *ITP = dyn_cast<IntToPtrInst>(&I))
+          Work.push_back(ITP);
+  }
+
+  bool Changed = false;
+  for (IntToPtrInst *ITP : Work) {
+    Value *Address = ITP->getOperand(0);
+    SmallPtrSet<Value *, 32> Seen;
+    std::optional<uint64_t> GuestBase;
+    if (auto *CI = dyn_cast<ConstantInt>(Address))
+      GuestBase = CI->getZExtValue();
+    else
+      GuestBase = FindNamedDataAddressInIntegerExpr(Address, Seen);
+    if (!GuestBase)
+      continue;
+    const RecoveredObject *Obj = Ctx.findObjectAt(*GuestBase);
+    if (!Obj || !Obj->GV ||
+        (Obj->Kind != ObjectKind::Array && Obj->Kind != ObjectKind::RawBytes) ||
+        *GuestBase < Obj->Begin || *GuestBase >= Obj->End)
+      continue;
+
+    IRBuilder<> Builder(ITP);
+    Value *Address64 = Address;
+    Type *I64 = Type::getInt64Ty(Ctx.M.getContext());
+    if (Address64->getType() != I64) {
+      if (Address64->getType()->isIntegerTy())
+        Address64 = Builder.CreateZExtOrTrunc(Address64, I64,
+                                              "native.data.address");
+      else
+        continue;
+    }
+    Value *Offset = Builder.CreateSub(
+        Address64, Builder.getInt64(Obj->Begin), "native.data.offset");
+    Value *NativePtr = Builder.CreateGEP(
+        Builder.getInt8Ty(), Obj->GV, Offset, "native.data.dynamic.ptr");
+    if (NativePtr->getType() != ITP->getType())
+      NativePtr = Builder.CreateBitCast(NativePtr, ITP->getType());
+    ITP->replaceAllUsesWith(NativePtr);
+    ITP->eraseFromParent();
+    ++Count;
+    Changed = true;
+  }
+  return Changed;
 }
 
 bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     GlobalDataContext &Ctx) {
   unsigned Count = 0;
+
+  // Keep the original data aliases alive until all AddressRefs have been
+  // consumed.  Erasing an alias here invalidates GuestAddressRef::OriginalValue
+  // and makes a later rewrite depend on a dangling LLVM Value.  Alias uses are
+  // rewritten through the same provenance/object path as every other constant
+  // reference; a fallback alias-to-string shortcut is intentionally not used.
+  bool AliasChanged = false;
 
   // 1. Constant Address Refs (including new raw byte locations)
   for (auto &Ref : Ctx.AddressRefs) {
@@ -141,14 +514,6 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
       continue;
     }
 
-    // Address identity sensitive check in NativeStrict mode
-    if (Ctx.Mode == DataRecoveryMode::NativeStrict &&
-        IsAddressIdentitySensitive(Ref.get())) {
-      Ref->SkipReason = "address-identity-observable";
-      ++Ctx.Report.PreservedRefs;
-      continue;
-    }
-
     auto It = Ctx.RecoveredObjects.upper_bound(Ref->GuestAddr);
     RecoveredObject *Obj = nullptr;
     if (It != Ctx.RecoveredObjects.begin()) {
@@ -159,6 +524,17 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     }
 
     if (!Obj) {
+      ++Ctx.Report.PreservedRefs;
+      continue;
+    }
+
+    // Classify each use independently.  A libc use elsewhere in the same
+    // recovered object does not make a numeric comparison of this guest
+    // address safe to replace with an ASLR-dependent host pointer.  The libc
+    // reference is rewritten by its own GuestAddressRef while this identity
+    // boundary keeps the original guest value.
+    if (IsAddressIdentitySensitive(Ref.get())) {
+      Ref->SkipReason = "address-identity-observable";
       ++Ctx.Report.PreservedRefs;
       continue;
     }
@@ -215,41 +591,96 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     }
   }
 
-  // 2. Rewrite dynamic users of segment globals to point to appropriate recovered or raw-byte objects
+  // A scanf vararg destination can be computed as guest_base + dynamic
+  // index*stride before it is placed in the ABI register-save area.  Direct
+  // constant-reference rewriting cannot see that pointer context; materialize
+  // the same address from the recovered native object instead.
+  RewriteDynamicScanfPointerAddresses(Ctx, Count);
+  // The same address form also appears in ordinary stores after the lifted
+  // code materializes a pointer with inttoptr(add(ptrtoint(data_alias), ...)).
+  // Rewrite it from the recovered object provenance before native cleanup can
+  // mistake the expression for an opaque integer address.
+  RewriteDynamicDataIntToPtrs(Ctx, Count);
+
+  // 2. Rewrite dynamic users of segment globals to typed recovered objects.
+  // Unresolved dynamic references are deliberately left intact; creating a
+  // whole-segment byte blob would hide missing provenance and violate the
+  // native IR contract.
   for (auto &Seg : Ctx.Segments) {
     if (!Seg->GV || !Seg->BaseResolved)
       continue;
 
     const RecoveredObject *Obj = Ctx.findObjectAt(Seg->GuestBase);
-    if (!Obj || !Obj->GV)
-      continue;
+    if (Obj && Obj->GV) {
+      SmallVector<User *, 8> Users(Seg->GV->users());
+      for (User *U : Users) {
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          Value *Idx = nullptr;
+          uint64_t BaseOffset = 0;
+          if (GEP->getNumIndices() == 1) {
+            Idx = GEP->getOperand(1);
+          } else if (GEP->getNumIndices() >= 2) {
+            Idx = GEP->getOperand(2);
+          }
 
-    SmallVector<User *, 8> Users(Seg->GV->users());
-    for (User *U : Users) {
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-        Value *Idx = nullptr;
-        uint64_t BaseOffset = 0;
-        if (GEP->getNumIndices() == 1) {
-          Idx = GEP->getOperand(1);
-        } else if (GEP->getNumIndices() >= 2) {
-          Idx = GEP->getOperand(2);
-          if (auto *ConstFirst = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
-            // usually 0
+          if (Idx && !isa<ConstantInt>(Idx)) {
+            uint64_t GuestAddr = Seg->GuestBase + BaseOffset;
+            const RecoveredObject *Obj = Ctx.findObjectAt(GuestAddr);
+            if (Obj && Obj->GV && (Obj->End - Obj->Begin == Seg->Size)) {
+              IRBuilder<> Builder(GEP);
+              Value *NewBase = Obj->GV;
+              if (NewBase->getType() != GEP->getPointerOperand()->getType()) {
+                NewBase = Builder.CreateBitCast(
+                    NewBase, GEP->getPointerOperand()->getType());
+              }
+              GEP->setOperand(0, NewBase);
+              ++Count;
+            }
           }
         }
+      }
+    }
 
-        if (Idx && !isa<ConstantInt>(Idx)) {
-          uint64_t GuestAddr = Seg->GuestBase + BaseOffset;
-          const RecoveredObject *Obj = Ctx.findObjectAt(GuestAddr);
-          if (Obj && Obj->GV && (Obj->End - Obj->Begin == Seg->Size)) {
-            IRBuilder<> Builder(GEP);
-            Value *NewBase = Obj->GV;
-            if (NewBase->getType() != GEP->getPointerOperand()->getType()) {
-              NewBase = Builder.CreateBitCast(NewBase, GEP->getPointerOperand()->getType());
+    for (Function &F : Ctx.M) {
+      if (F.isDeclaration())
+        continue;
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+          if (!GEP || GEP->getNumIndices() == 0)
+            continue;
+          bool HasDynamicIndex = false;
+          for (unsigned Index = 1; Index < GEP->getNumOperands(); ++Index) {
+            if (!isa<ConstantInt>(GEP->getOperand(Index))) {
+              HasDynamicIndex = true;
+              break;
             }
-            GEP->setOperand(0, NewBase);
-            ++Count;
           }
+          if (!HasDynamicIndex)
+            continue;
+
+          uint64_t ConstantOffset = 0;
+          SmallPtrSet<Value *, 8> Seen;
+          if (!FindSegmentBase(GEP, Seg->GV, Ctx.DL, ConstantOffset, Seen))
+            continue;
+
+          const RecoveredObject *DynamicObj =
+              Ctx.findObjectAt(Seg->GuestBase + ConstantOffset);
+          if (!DynamicObj || !DynamicObj->GV ||
+              Seg->GuestBase + ConstantOffset < DynamicObj->Begin)
+            continue;
+
+          Value *NativeBase = DynamicObj->GV;
+          uint64_t ObjectOffset =
+              Seg->GuestBase + ConstantOffset - DynamicObj->Begin;
+          if (ObjectOffset != 0) {
+            NativeBase = IRBuilder<>(GEP).CreateGEP(
+                Type::getInt8Ty(Ctx.M.getContext()), NativeBase,
+                ConstantInt::get(Type::getInt64Ty(Ctx.M.getContext()),
+                                 ObjectOffset));
+          }
+          GEP->setOperand(0, NativeBase);
+          ++Count;
         }
       }
     }
@@ -260,7 +691,7 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
     errs() << "[brighten-global-data] rewritten " << Count
            << " data references\n";
 
-  return Count > 0;
+  return AliasChanged || Count > 0;
 }
 
 

@@ -2,6 +2,9 @@
 #include <queue>
 #include <set>
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Analysis/CaptureTracking.h"
+#include "llvm/IR/InstIterator.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalAlias.h"
@@ -145,33 +148,10 @@ static Value *FindStoreBeforeCall(CallInst *CI, uint64_t RegOffset) {
     if (Off && *Off == RegOffset) return SI->getValueOperand();
   }
 
-  std::queue<BasicBlock *> Worklist;
-  std::set<BasicBlock *> Visited;
-  for (BasicBlock *Pred : predecessors(StartBB)) {
-    Worklist.push(Pred);
-    Visited.insert(Pred);
-  }
-
-  unsigned BlocksVisited = 0;
-  while (!Worklist.empty() && BlocksVisited < 32) {
-    BasicBlock *BB = Worklist.front();
-    Worklist.pop();
-    BlocksVisited++;
-
-    for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
-      auto *SI = dyn_cast<StoreInst>(&*It);
-      if (!SI) continue;
-      auto Off = IdentifyStateOffset(SI->getPointerOperand());
-      if (Off && *Off == RegOffset) return SI->getValueOperand();
-    }
-
-    for (BasicBlock *Pred : predecessors(BB)) {
-      if (Visited.insert(Pred).second) {
-        Worklist.push(Pred);
-      }
-    }
-  }
-
+  // A store in an arbitrary predecessor does not necessarily dominate this
+  // callsite.  In flattened CFGs the old BFS selected one unrelated branch's
+  // register value, corrupting recovered varargs.  Fall back to the State
+  // value at the call boundary unless a same-block store proves the value.
   return nullptr;
 }
 
@@ -199,46 +179,27 @@ static Value *FindStoreToStackOffset(AllocaInst *AI, uint64_t Offset, Instructio
     }
   }
 
-  std::queue<BasicBlock *> Worklist;
-  std::set<BasicBlock *> Visited;
-  for (BasicBlock *Pred : predecessors(StartBB)) {
-    Worklist.push(Pred);
-    Visited.insert(Pred);
-  }
-
-  unsigned BlocksVisited = 0;
-  while (!Worklist.empty() && BlocksVisited < 32) {
-    BasicBlock *BB = Worklist.front();
-    Worklist.pop();
-    BlocksVisited++;
-
-    for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
-      auto *SI = dyn_cast<StoreInst>(&*It);
-      if (!SI) continue;
-
-      Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
-      if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
-        if (GEP->getPointerOperand()->stripPointerCasts() == AI) {
-          APInt Off(DL.getPointerSizeInBits(), 0, true);
-          if (GEP->accumulateConstantOffset(DL, Off) && !Off.isNegative() &&
-              Off.getZExtValue() == Offset) {
-            return SI->getValueOperand();
-          }
-        }
-      } else if (Ptr == AI && Offset == 0) {
-        return SI->getValueOperand();
-      }
+  if (PointerMayBeCaptured(AI, true)) return nullptr;
+  DominatorTree DT(*Before->getFunction());
+  StoreInst *Best = nullptr;
+  for (Instruction &I : instructions(*Before->getFunction())) {
+    auto *SI = dyn_cast<StoreInst>(&I);
+    if (!SI || !DT.dominates(SI, Before)) continue;
+    Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
+    bool Exact = Ptr == AI && Offset == 0;
+    if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
+      APInt Off(DL.getPointerSizeInBits(), 0, true);
+      Exact = GEP->getPointerOperand()->stripPointerCasts() == AI &&
+              GEP->accumulateConstantOffset(DL, Off) && !Off.isNegative() &&
+              Off.getZExtValue() == Offset;
     }
-
-    for (BasicBlock *Pred : predecessors(BB)) {
-      if (Visited.insert(Pred).second) {
-        Worklist.push(Pred);
-      }
-    }
+    if (!Exact) continue;
+    if (!Best || DT.dominates(Best, SI)) Best = SI;
   }
-
-  return nullptr;
+  return Best ? Best->getValueOperand() : nullptr;
 }
+
+static Value *FindSameBlockRegisterStore(LoadInst *LI);
 
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth = 0);
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
@@ -405,7 +366,7 @@ static std::string ExtractStringFromConstant(Constant *C, uint64_t Offset, const
 }
 
 static std::string ResolveFormatString(Value *V, unsigned Depth = 0) {
-  if (!V || Depth > 4) return "";
+  if (!V || Depth > 12) return "";
   V = V->stripPointerCasts();
 
   if (auto *GV = dyn_cast<GlobalVariable>(V)) {
@@ -457,6 +418,8 @@ static std::string ResolveFormatString(Value *V, unsigned Depth = 0) {
 
   // Trace through stack loads
   if (auto *LI = dyn_cast<LoadInst>(V)) {
+    if (Value *Stored = FindSameBlockRegisterStore(LI))
+      return ResolveFormatString(Stored, Depth + 1);
     Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
     if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
       Value *Base = GEP->getPointerOperand()->stripPointerCasts();
@@ -481,6 +444,25 @@ static std::string ResolveFormatString(Value *V, unsigned Depth = 0) {
   if (auto *Alias = dyn_cast<GlobalAlias>(V))
     if (Constant *Aliasee = Alias->getAliasee())
       return ResolveFormatString(Aliasee, Depth + 1);
+
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    // Global-data recovery builds a range-translation chain whose false edge
+    // preserves the original native pointer.  When that fallback is a static
+    // string, it is the authoritative format for an already-materialized
+    // native va_list; true edges may mention unrelated recovered strings and
+    // must not make the format look ambiguous.
+    if (Sel->getName().starts_with("native.data.pointer.select")) {
+      std::string F = ResolveFormatString(Sel->getFalseValue(), Depth + 1);
+      if (!F.empty())
+        return F;
+    }
+    std::string T = ResolveFormatString(Sel->getTrueValue(), Depth + 1);
+    std::string F = ResolveFormatString(Sel->getFalseValue(), Depth + 1);
+    if (T.empty() != F.empty())
+      return T.empty() ? F : T;
+    if (!T.empty() && T == F)
+      return T;
+  }
 
   return "";
 }
@@ -626,8 +608,12 @@ bool BrightenExternCallBridgePass::RecoverVarargArguments(
 
     if (!FixedOk) {
       CS->Action = "preserve";
-      if (CS->SkipReason.empty())
-        CS->SkipReason = "unsupported-vararg-format";
+      if (CS->SkipReason.empty()) {
+        if (!CS->Args.empty() && !CS->Args.back().SkipReason.empty())
+          CS->SkipReason = CS->Args.back().SkipReason;
+        else
+          CS->SkipReason = "unsupported-vararg-format";
+      }
       continue;
     }
 
@@ -811,6 +797,541 @@ bool BrightenExternCallBridgePass::RecoverVarargArguments(
     Changed = true;
   }
 
+  return Changed;
+}
+
+static AllocaInst *RootAlloca(Value *V) {
+  if (!V) return nullptr;
+  V = V->stripPointerCasts();
+  if (auto *AI = dyn_cast<AllocaInst>(V)) return AI;
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return RootAlloca(GEP->getPointerOperand());
+  return nullptr;
+}
+
+static std::optional<uint64_t> OffsetFromAlloca(Value *Ptr, AllocaInst *Root,
+                                                 const DataLayout &DL) {
+  if (!Ptr || !Root) return std::nullopt;
+  APInt Offset(DL.getPointerSizeInBits(0), 0, true);
+  Value *Base = Ptr->stripAndAccumulateConstantOffsets(DL, Offset, true);
+  if (Base->stripPointerCasts() != Root || Offset.isNegative())
+    return std::nullopt;
+  return Offset.getZExtValue();
+}
+
+static Value *FindLocalStoreValue(CallInst *Before, AllocaInst *Root,
+                                  uint64_t WantedOffset,
+                                  const DataLayout &DL) {
+  for (auto It = BasicBlock::reverse_iterator(Before->getIterator());
+       It != Before->getParent()->rend(); ++It) {
+    auto *SI = dyn_cast<StoreInst>(&*It);
+    if (!SI) continue;
+    auto Offset = OffsetFromAlloca(SI->getPointerOperand(), Root, DL);
+    if (Offset && *Offset == WantedOffset)
+      return SI->getValueOperand();
+  }
+  return nullptr;
+}
+
+static std::optional<int64_t> ConstantOffsetFrom(Value *Ptr, Value *Base,
+                                                  const DataLayout &DL,
+                                                  unsigned Depth = 0) {
+  if (!Ptr || !Base || Depth > 8) return std::nullopt;
+  Ptr = Ptr->stripPointerCasts();
+  Base = Base->stripPointerCasts();
+  if (Ptr == Base) return 0;
+  auto *GEP = dyn_cast<GEPOperator>(Ptr);
+  if (!GEP) return std::nullopt;
+  APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0, true);
+  if (!GEP->accumulateConstantOffset(DL, Offset)) return std::nullopt;
+  auto Parent = ConstantOffsetFrom(GEP->getPointerOperand(), Base, DL,
+                                   Depth + 1);
+  if (!Parent) return std::nullopt;
+  return *Parent + Offset.getSExtValue();
+}
+
+struct AffineValue {
+  Value *Base = nullptr;
+  int64_t Offset = 0;
+};
+
+static Value *FindSameBlockRegisterStore(LoadInst *LI) {
+  auto Wanted = IdentifyStateOffset(LI->getPointerOperand());
+  if (!Wanted) return nullptr;
+  for (auto It = BasicBlock::reverse_iterator(LI->getIterator());
+       It != LI->getParent()->rend(); ++It) {
+    if (auto *SI = dyn_cast<StoreInst>(&*It)) {
+      auto Offset = IdentifyStateOffset(SI->getPointerOperand());
+      if (!Offset) return nullptr;
+      if (*Offset == *Wanted) return SI->getValueOperand();
+      continue;
+    }
+    if (auto *CB = dyn_cast<CallBase>(&*It)) {
+      if (Function *Callee = CB->getCalledFunction())
+        if (Callee->getName().starts_with("llvm.lifetime.")) continue;
+      if (CB->mayWriteToMemory()) return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+static std::optional<AffineValue> GetAffineValue(Value *V,
+                                                  unsigned Depth = 0) {
+  if (!V || Depth > 12 || !V->getType()->isIntegerTy()) return std::nullopt;
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return AffineValue{nullptr, CI->getSExtValue()};
+  if (auto *LI = dyn_cast<LoadInst>(V))
+    if (Value *Stored = FindSameBlockRegisterStore(LI))
+      return GetAffineValue(Stored, Depth + 1);
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::Add) {
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        auto A = GetAffineValue(BO->getOperand(0), Depth + 1);
+        if (A) { A->Offset += C->getSExtValue(); return A; }
+      }
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0))) {
+        auto A = GetAffineValue(BO->getOperand(1), Depth + 1);
+        if (A) { A->Offset += C->getSExtValue(); return A; }
+      }
+    }
+    if (BO->getOpcode() == Instruction::Sub)
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        auto A = GetAffineValue(BO->getOperand(0), Depth + 1);
+        if (A) { A->Offset -= C->getSExtValue(); return A; }
+      }
+  }
+  return AffineValue{V, 0};
+}
+
+static bool IsPtrToIntOf(Value *V, Value *Ptr) {
+  Value *P = nullptr;
+  if (auto *I = dyn_cast<PtrToIntInst>(V)) P = I->getPointerOperand();
+  else if (auto *CE = dyn_cast<ConstantExpr>(V);
+           CE && CE->getOpcode() == Instruction::PtrToInt)
+    P = CE->getOperand(0);
+  return P && P->stripPointerCasts() == Ptr->stripPointerCasts();
+}
+
+// Recognize an integer which explicitly changes from an absolute pointer
+// coordinate into Anchor-relative coordinates.  Affine add/sub by constants
+// preserves that proof; an architectural RSP/RBP value by itself does not.
+static bool IsExplicitFrameRelativeOffset(Value *V, Value *Anchor,
+                                          unsigned Depth = 0) {
+  if (!V || !Anchor || Depth > 8 || !V->getType()->isIntegerTy())
+    return false;
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO)
+    return false;
+  if (BO->getOpcode() == Instruction::Sub &&
+      IsPtrToIntOf(BO->getOperand(1), Anchor))
+    return true;
+  if ((BO->getOpcode() == Instruction::Add ||
+       BO->getOpcode() == Instruction::Sub) &&
+      isa<ConstantInt>(BO->getOperand(1)))
+    return IsExplicitFrameRelativeOffset(BO->getOperand(0), Anchor,
+                                         Depth + 1);
+  if (BO->getOpcode() == Instruction::Add &&
+      isa<ConstantInt>(BO->getOperand(0)))
+    return IsExplicitFrameRelativeOffset(BO->getOperand(1), Anchor,
+                                         Depth + 1);
+  return false;
+}
+
+static bool IsFrameStoragePointer(Value *V, const DataLayout &DL) {
+  APInt Offset(DL.getPointerSizeInBits(0), 0, true);
+  Value *Base = V->stripAndAccumulateConstantOffsets(DL, Offset, true);
+  auto *GV = dyn_cast_or_null<GlobalVariable>(Base->stripPointerCasts());
+  return GV && GV->getName().starts_with("frame_storage_backing.");
+}
+
+static bool IsEntryStackPointer(Value *V) {
+  auto *LI = dyn_cast<LoadInst>(V);
+  if (!LI || LI->getParent() != &LI->getFunction()->getEntryBlock())
+    return false;
+  auto Offset = IdentifyStateOffset(LI->getPointerOperand());
+  return Offset && *Offset == kOffRSP;
+}
+
+// Recover the guest/host stack coordinate represented by the two pointer
+// translations emitted by earlier passes:
+//   frame + (address - ptrtoint(frame))
+//   frame_top + (address - entry_rsp)
+// The latter is valid only for the recovered frame top and the entry RSP load.
+static std::optional<AffineValue>
+GetTranslatedStackCoordinate(Value *Ptr, const DataLayout &DL,
+                             unsigned Depth = 0) {
+  if (!Ptr || Depth > 8) return std::nullopt;
+  Ptr = Ptr->stripPointerCasts();
+  auto *GEP = dyn_cast<GEPOperator>(Ptr);
+  if (!GEP || GEP->getNumIndices() != 1) return std::nullopt;
+
+  Value *Index = *GEP->idx_begin();
+  if (auto *C = dyn_cast<ConstantInt>(Index)) {
+    auto Parent = GetTranslatedStackCoordinate(GEP->getPointerOperand(), DL,
+                                                Depth + 1);
+    if (Parent) {
+      Parent->Offset += C->getSExtValue();
+      return Parent;
+    }
+    return std::nullopt;
+  }
+
+  auto *Sub = dyn_cast<BinaryOperator>(Index);
+  if (!Sub || Sub->getOpcode() != Instruction::Sub) return std::nullopt;
+  Value *Frame = GEP->getPointerOperand();
+  bool RecoveredFrameAddress = IsPtrToIntOf(Sub->getOperand(1), Frame);
+  bool EntryRelativeAddress = IsFrameStoragePointer(Frame, DL) &&
+                              IsEntryStackPointer(Sub->getOperand(1));
+  if (!RecoveredFrameAddress && !EntryRelativeAddress) return std::nullopt;
+  return GetAffineValue(Sub->getOperand(0));
+}
+
+static Value *FindStoreRelativeTo(CallInst *Before, Value *Base,
+                                  uint64_t WantedOffset,
+                                  const DataLayout &DL) {
+  auto BaseCoordinate = GetTranslatedStackCoordinate(Base, DL);
+  for (auto It = BasicBlock::reverse_iterator(Before->getIterator());
+       It != Before->getParent()->rend(); ++It) {
+    auto *SI = dyn_cast<StoreInst>(&*It);
+    if (!SI) continue;
+    auto Offset = ConstantOffsetFrom(SI->getPointerOperand(), Base, DL);
+    if (Offset && *Offset >= 0 && static_cast<uint64_t>(*Offset) == WantedOffset)
+      return SI->getValueOperand();
+    if (!BaseCoordinate) continue;
+    auto StoreCoordinate =
+        GetTranslatedStackCoordinate(SI->getPointerOperand(), DL);
+    if (!StoreCoordinate || StoreCoordinate->Base != BaseCoordinate->Base)
+      continue;
+    int64_t Relative = StoreCoordinate->Offset - BaseCoordinate->Offset;
+    if (Relative >= 0 && static_cast<uint64_t>(Relative) == WantedOffset)
+      return SI->getValueOperand();
+  }
+  return nullptr;
+}
+
+struct RecoveredFrameAnchor {
+  Value *Ptr = nullptr;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+};
+
+static std::optional<RecoveredFrameAnchor>
+GetRecoveredFrameAnchor(Value *V, const DataLayout &DL, unsigned Depth = 0) {
+  if (!V || Depth > 8) return std::nullopt;
+  V = V->stripPointerCasts();
+
+  APInt Offset(DL.getPointerSizeInBits(0), 0, true);
+  Value *Base = V->stripAndAccumulateConstantOffsets(DL, Offset, true);
+  if (auto *GV = dyn_cast_or_null<GlobalVariable>(Base)) {
+    if (GV->getName().starts_with("frame_storage_backing.")) {
+      uint64_t Size = DL.getTypeAllocSize(GV->getValueType());
+      int64_t Signed = Offset.getSExtValue();
+      if (Signed >= 0 && static_cast<uint64_t>(Signed) <= Size)
+        return RecoveredFrameAnchor{V, Signed, Size};
+    }
+  }
+  if (auto *AI = dyn_cast_or_null<AllocaInst>(Base)) {
+    auto *Count = dyn_cast<ConstantInt>(AI->getArraySize());
+    if (!Count)
+      return std::nullopt;
+    uint64_t ElementSize = DL.getTypeAllocSize(AI->getAllocatedType());
+    uint64_t CountValue = Count->getLimitedValue();
+    if (CountValue != 0 && ElementSize > UINT64_MAX / CountValue)
+      return std::nullopt;
+    uint64_t Size = ElementSize * CountValue;
+    int64_t Signed = Offset.getSExtValue();
+    if (Signed >= 0 && static_cast<uint64_t>(Signed) <= Size)
+      return RecoveredFrameAnchor{V, Signed, Size};
+  }
+
+  // Primary native cleanup may outline the recovered body and pass the frame
+  // top as an explicit pointer argument.  Prove that contract from every
+  // direct callsite, then keep using the argument inside the outlined body.
+  // This lets the late extern sweep translate guest stack offsets without
+  // depending on inlining happening before it.
+  if (auto *Arg = dyn_cast<Argument>(V)) {
+    if (!Arg->getName().starts_with("frame_base"))
+      return std::nullopt;
+    Function *F = Arg->getParent();
+    std::optional<RecoveredFrameAnchor> Proven;
+    bool SawDirectCall = false;
+    for (User *U : F->users()) {
+      auto *CB = dyn_cast<CallBase>(U);
+      if (!CB || CB->getCalledOperand()->stripPointerCasts() != F ||
+          Arg->getArgNo() >= CB->arg_size())
+        continue;
+      Value *ActualValue = CB->getArgOperand(Arg->getArgNo());
+      if (auto *CallerArg = dyn_cast<Argument>(ActualValue)) {
+        if (!CallerArg->getName().starts_with("frame_base"))
+          return std::nullopt;
+        SawDirectCall = true;
+        continue;
+      }
+      auto Actual = GetRecoveredFrameAnchor(ActualValue, DL, Depth + 1);
+      if (!Actual)
+        return std::nullopt;
+      SawDirectCall = true;
+      if (!Proven) {
+        Proven = Actual;
+      } else {
+        uint64_t Before = std::min<uint64_t>(Proven->Offset, Actual->Offset);
+        uint64_t ProvenAfter = Proven->Size - Proven->Offset;
+        uint64_t ActualAfter = Actual->Size - Actual->Offset;
+        uint64_t After = std::min(ProvenAfter, ActualAfter);
+        Proven->Offset = static_cast<int64_t>(Before);
+        Proven->Size = Before + After;
+      }
+    }
+    if (SawDirectCall && Proven)
+      return RecoveredFrameAnchor{Arg, Proven->Offset, Proven->Size};
+  }
+
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return GetRecoveredFrameAnchor(GEP->getPointerOperand(), DL, Depth + 1);
+  return std::nullopt;
+}
+
+static Value *TranslateProvenFrameOffset(IRBuilder<> &B, Value *V,
+                                         const RecoveredFrameAnchor &Anchor) {
+  if (!V || !V->getType()->isIntegerTy()) return nullptr;
+  if (auto *PTI = dyn_cast<PtrToIntInst>(V))
+    return PTI->getPointerOperand();
+  if (auto *CE = dyn_cast<ConstantExpr>(V);
+      CE && CE->getOpcode() == Instruction::PtrToInt)
+    return CE->getOperand(0);
+
+  if (IsExplicitFrameRelativeOffset(V, Anchor.Ptr)) {
+    Value *Relative = V;
+    if (V->getType()->getIntegerBitWidth() < 64)
+      Relative = B.CreateSExt(V, B.getInt64Ty(),
+                              "native.overflow.frame.sext");
+    else if (V->getType()->getIntegerBitWidth() > 64)
+      Relative = B.CreateTrunc(V, B.getInt64Ty(),
+                               "native.overflow.frame.trunc");
+    return B.CreateGEP(B.getInt8Ty(), Anchor.Ptr, Relative,
+                       "native.overflow.frame.ptr");
+  }
+
+  // Classify the stored coordinate itself.  The kind of the owning anchor is
+  // not a coordinate proof: an outlined function can receive `frame_base`
+  // while its explicit RSP/RBP State values remain native absolute addresses.
+  // Adding frame_base to such a value doubles the address (p00241).
+  if (!isa<ConstantInt>(V)) {
+    auto Affine = GetAffineValue(V);
+    Value *Base = Affine ? Affine->Base : nullptr;
+    bool AbsoluteStackCoordinate = false;
+    if (auto *LI = dyn_cast_or_null<LoadInst>(Base)) {
+      auto Offset = IdentifyStateOffset(LI->getPointerOperand());
+      AbsoluteStackCoordinate =
+          Offset && (*Offset == kOffRSP || *Offset == 2328);
+    } else if (Base && Base->hasName()) {
+      StringRef Name = Base->getName();
+      AbsoluteStackCoordinate = Name.starts_with("state_2312") ||
+                                Name.starts_with("state_2328") ||
+                                Name.starts_with("state_in_2312") ||
+                                Name.starts_with("state_in_2328");
+    }
+    if (!AbsoluteStackCoordinate)
+      return nullptr;
+    return B.CreateIntToPtr(V, B.getPtrTy(),
+                            "native.overflow.absolute.ptr");
+  }
+
+  Value *Relative = V;
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    int64_t Signed = CI->getSExtValue();
+    int64_t Absolute = Anchor.Offset + Signed;
+    if (Absolute < 0 || static_cast<uint64_t>(Absolute) >= Anchor.Size)
+      return nullptr;
+    Relative = ConstantInt::getSigned(B.getInt64Ty(), Signed);
+  } else if (V->getType()->getIntegerBitWidth() < 64) {
+    Relative = B.CreateSExt(V, B.getInt64Ty(), "native.overflow.frame.sext");
+  } else if (V->getType()->getIntegerBitWidth() > 64) {
+    Relative = B.CreateTrunc(V, B.getInt64Ty(), "native.overflow.frame.trunc");
+  }
+  return B.CreateGEP(B.getInt8Ty(), Anchor.Ptr, Relative,
+                     "native.overflow.frame.ptr");
+}
+
+static bool NormalizeScanfOverflowSlots(CallInst *Before, Value *OverflowArea,
+                                        const RecoveredFrameAnchor &Anchor,
+                                        const DataLayout &DL) {
+  bool Changed = false;
+  for (auto It = BasicBlock::iterator(Before->getParent()->begin());
+       It != Before->getIterator(); ++It) {
+    auto *SI = dyn_cast<StoreInst>(&*It);
+    if (!SI || !SI->getValueOperand()->getType()->isIntegerTy()) continue;
+    auto Offset = ConstantOffsetFrom(SI->getPointerOperand(), OverflowArea, DL);
+    if (!Offset || *Offset < 0 || (*Offset % 8) != 0) continue;
+    auto *Raw = dyn_cast<ConstantInt>(SI->getValueOperand());
+    if (!Raw) continue;
+    IRBuilder<> B(SI);
+    Value *HostPtr = TranslateProvenFrameOffset(B, Raw, Anchor);
+    if (!HostPtr) continue;
+    Value *HostInt = B.CreatePtrToInt(HostPtr, Raw->getType(),
+                                      "native.overflow.frame.address");
+    SI->setOperand(0, HostInt);
+    Changed = true;
+  }
+  return Changed;
+}
+
+bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
+    ExternCallContext &Ctx) {
+  SmallVector<CallInst *, 16> Work;
+  for (Function &F : Ctx.M)
+    if (!F.isDeclaration())
+      for (Instruction &I : instructions(F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Callee = CI->getCalledFunction())
+            if ((Callee->getName() == "vprintf" ||
+                 Callee->getName() == "vscanf") && CI->arg_size() == 2)
+              Work.push_back(CI);
+
+  bool Changed = false;
+  for (CallInst *CI : Work) {
+    Function *OldCallee = CI->getCalledFunction();
+    bool IsScanf = OldCallee->getName() == "vscanf";
+    AllocaInst *VAList = RootAlloca(CI->getArgOperand(1));
+    if (!VAList) continue;
+    Value *OverflowArea = FindLocalStoreValue(CI, VAList, 8, Ctx.DL);
+    auto FrameAnchor = GetRecoveredFrameAnchor(OverflowArea, Ctx.DL);
+    if (IsScanf && OverflowArea && FrameAnchor)
+      Changed |= NormalizeScanfOverflowSlots(CI, OverflowArea, *FrameAnchor,
+                                             Ctx.DL);
+
+    std::string Format = ResolveFormatString(CI->getArgOperand(0));
+    if (Format.empty()) continue;
+
+    SmallVector<VarargSpecifier, 16> Specs;
+    if (!parseFormatString(Format, Specs, IsScanf)) continue;
+
+    Value *RegSaveValue = FindLocalStoreValue(CI, VAList, 16, Ctx.DL);
+    AllocaInst *RegSave = RootAlloca(RegSaveValue);
+    if (!RegSave) continue;
+    uint64_t OverflowOffset = 0;
+
+    uint64_t GPOffset = 8;
+    if (Value *StoredGP = FindLocalStoreValue(CI, VAList, 0, Ctx.DL)) {
+      auto *GP = dyn_cast<ConstantInt>(StoredGP);
+      if (!GP || GP->getZExtValue() > 40) continue;
+      GPOffset = GP->getZExtValue();
+    }
+
+    IRBuilder<> B(CI);
+    SmallVector<Value *, 8> Args;
+    Args.push_back(CI->getArgOperand(0));
+    bool Safe = true;
+    for (const VarargSpecifier &Spec : Specs) {
+      if (!Spec.ConsumesArg || Spec.Ty == VarargType::Percent ||
+          Spec.Ty == VarargType::ScanfSuppressed)
+        continue;
+      if (Spec.UsesXMMReg && !IsScanf) { Safe = false; break; }
+      Value *Stored = nullptr;
+      bool FromOverflow = GPOffset > 40;
+      if (FromOverflow) {
+        if (!OverflowArea || !FrameAnchor) { Safe = false; break; }
+        Stored = FindStoreRelativeTo(CI, OverflowArea, OverflowOffset, Ctx.DL);
+        if (!Stored) {
+          Value *Slot = B.CreateGEP(B.getInt8Ty(), OverflowArea,
+                                    B.getInt64(OverflowOffset),
+                                    "native.overflow.slot");
+          Stored = B.CreateLoad(B.getInt64Ty(), Slot,
+                                "native.overflow.value");
+        }
+        OverflowOffset += 8;
+      } else {
+        Stored = FindLocalStoreValue(CI, RegSave, GPOffset, Ctx.DL);
+        GPOffset += 8;
+      }
+      if (!Stored) { Safe = false; break; }
+      Type *Ty = VarargLLVMType(Ctx.M.getContext(), Spec.Ty, IsScanf);
+      Value *Arg = nullptr;
+      if (FromOverflow && IsScanf && Ty->isPointerTy())
+        Arg = TranslateProvenFrameOffset(B, Stored, *FrameAnchor);
+      if (!Arg)
+        Arg = CoerceToType(B, Stored, Ty);
+      if (!Arg) { Safe = false; break; }
+      Args.push_back(Arg);
+    }
+    if (!Safe) continue;
+
+    FunctionType *FT = FunctionType::get(B.getInt32Ty(), {B.getPtrTy()}, true);
+    FunctionCallee Native = Ctx.M.getOrInsertFunction(
+        IsScanf ? "scanf" : "printf", FT);
+    CallInst *NewCall = B.CreateCall(FT, Native.getCallee(), Args,
+                                     "native.vararg.direct");
+    NewCall->setCallingConv(CI->getCallingConv());
+    CI->replaceAllUsesWith(NewCall);
+    CI->eraseFromParent();
+    ++Ctx.Report.VarargRecovered;
+    Changed = true;
+  }
+  return Changed;
+}
+
+bool BrightenExternCallBridgePass::LowerLiftedExternalABICalls(
+    ExternCallContext &Ctx) {
+  SmallVector<CallInst *, 32> Work;
+  for (Function &F : Ctx.M)
+    if (!F.isDeclaration())
+      for (Instruction &I : instructions(F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Callee = CI->getCalledFunction())
+            if (Callee->getName().ends_with(".lifted_abi"))
+              Work.push_back(CI);
+
+  bool Changed = false;
+  for (CallInst *OldCall : Work) {
+    Function *OldCallee = OldCall->getCalledFunction();
+    StringRef Name = OldCallee->getName();
+    Name = Name.drop_back(StringRef(".lifted_abi").size());
+    const LibcSignature *Sig = Ctx.SigDB.lookup(Name);
+    if (!Sig || Sig->IsVarArg || OldCall->arg_size() != Sig->FixedParams.size())
+      continue;
+
+    FunctionType *Expected = Ctx.SigDB.buildFunctionType(
+        Ctx.M.getContext(), *Sig);
+    Function *Native = Ctx.M.getFunction(Name);
+    if (!Native || Native->getFunctionType() != Expected)
+      continue;
+
+    IRBuilder<> B(OldCall);
+    SmallVector<Value *, 8> Args;
+    bool Valid = true;
+    for (unsigned I = 0; I < Expected->getNumParams(); ++I) {
+      Value *OldArg = OldCall->getArgOperand(I);
+      Type *DstTy = Expected->getParamType(I);
+      Value *Arg = nullptr;
+      if (DstTy->isPointerTy() && OldArg->getType()->isIntegerTy()) {
+        if (auto *PTI = dyn_cast<PtrToIntInst>(OldArg))
+          Arg = PTI->getPointerOperand();
+        else if (auto *CE = dyn_cast<ConstantExpr>(OldArg);
+                 CE && CE->getOpcode() == Instruction::PtrToInt)
+          Arg = CE->getOperand(0);
+      }
+      if (!Arg)
+        Arg = CoerceToType(B, OldArg, DstTy);
+      if (!Arg) {
+        Valid = false;
+        break;
+      }
+      Args.push_back(Arg);
+    }
+    if (!Valid)
+      continue;
+
+    CallInst *NewCall = B.CreateCall(Native, Args, "native.lifted_abi.ret");
+    NewCall->setCallingConv(Native->getCallingConv());
+    Value *Replacement = CoerceToType(B, NewCall, OldCall->getType());
+    if (!Replacement) {
+      NewCall->eraseFromParent();
+      continue;
+    }
+    OldCall->replaceAllUsesWith(Replacement);
+    OldCall->eraseFromParent();
+    Changed = true;
+  }
   return Changed;
 }
 

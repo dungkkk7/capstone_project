@@ -47,12 +47,36 @@ static Value *BuildABIArg(IRBuilder<> &B, FunctionABISummary &S,
   return CoerceValue(B, V, Arg.Ty, GetRegisterName(Arg.Reg));
 }
 
-static void StoreReturnToRAX(IRBuilder<> &B, FunctionABISummary &S,
-                             CallInst &Old, Value *Ret) {
+static void StoreReturnToState(IRBuilder<> &B, FunctionABISummary &S,
+                               CallInst &Old, Value *Ret) {
   if (!Ret || S.RetKind == ReturnKind::Void) {
     return;
   }
-  Value *Ptr = BuildStateRegisterPointer(B, StateArg(Old), ABIReg::RAX);
+  Value *State = StateArg(Old);
+  if (!State) {
+    return;
+  }
+
+  if (S.RetKind == ReturnKind::IntRDXRAX) {
+    Type *I128Ty = Type::getIntNTy(B.getContext(), 128);
+    Value *Packed = CoerceValue(B, Ret, I128Ty, "abi.ret.i128");
+    if (!Packed) {
+      return;
+    }
+    Value *RAX = B.CreateTrunc(Packed, B.getInt64Ty(), "abi.ret.rax");
+    Value *High = B.CreateLShr(Packed, ConstantInt::get(I128Ty, 64),
+                                "abi.ret.rdx.shifted");
+    Value *RDX = B.CreateTrunc(High, B.getInt64Ty(), "abi.ret.rdx");
+    Value *RAXPtr = BuildStateRegisterPointer(B, State, ABIReg::RAX);
+    Value *RDXPtr = BuildStateRegisterPointer(B, State, ABIReg::RDX);
+    if (RAXPtr && RDXPtr) {
+      B.CreateStore(RAX, RAXPtr);
+      B.CreateStore(RDX, RDXPtr);
+    }
+    return;
+  }
+
+  Value *Ptr = BuildStateRegisterPointer(B, State, ABIReg::RAX);
   if (!Ptr) {
     return;
   }
@@ -78,7 +102,48 @@ static bool RewriteImmediateRAXLoads(CallInst &NewCall) {
         if (RA->IsLoad) {
           auto *LI = cast<LoadInst>(&I);
           IRBuilder<> B(LI);
-          Value *V = CoerceValue(B, &NewCall, LI->getType(), "abi.ret.use");
+          Value *ReturnValue = &NewCall;
+          if (NewCall.getType()->isIntegerTy(128)) {
+            ReturnValue = B.CreateTrunc(ReturnValue, B.getInt64Ty(),
+                                        "abi.ret.rax");
+          }
+          Value *V = CoerceValue(B, ReturnValue, LI->getType(),
+                                 "abi.ret.use");
+          if (V) {
+            LI->replaceAllUsesWith(V);
+            Changed = true;
+          }
+        }
+      }
+    }
+    if (isa<CallBase>(&I) && &I != &NewCall) {
+      break;
+    }
+  }
+  return Changed;
+}
+
+static bool RewriteImmediateRDXLoads(CallInst &NewCall) {
+  if (!NewCall.getType()->isIntegerTy(128)) {
+    return false;
+  }
+  bool Changed = false;
+  BasicBlock *BB = NewCall.getParent();
+  for (auto It = std::next(NewCall.getIterator()); It != BB->end(); ++It) {
+    Instruction &I = *It;
+    if (auto RA = IdentifyRegAccess(I)) {
+      if (RA->Reg == ABIReg::RDX) {
+        if (RA->IsStore) {
+          break;
+        }
+        if (RA->IsLoad) {
+          auto *LI = cast<LoadInst>(&I);
+          IRBuilder<> B(LI);
+          Type *I128Ty = Type::getIntNTy(B.getContext(), 128);
+          Value *High = B.CreateLShr(
+              &NewCall, ConstantInt::get(I128Ty, 64), "abi.ret.rdx.shifted");
+          Value *RDX = B.CreateTrunc(High, B.getInt64Ty(), "abi.ret.rdx");
+          Value *V = CoerceValue(B, RDX, LI->getType(), "abi.ret.rdx.use");
           if (V) {
             LI->replaceAllUsesWith(V);
             Changed = true;
@@ -113,7 +178,9 @@ static bool CanRewrite(CallInst &CI, FunctionABISummary &S,
 
 static bool IsMemoryTokenUse(Value *V, SmallPtrSetImpl<Value *> &Visited,
                              unsigned Depth) {
-  if (!V || Depth > 16 || !Visited.insert(V).second)
+  if (!V || Depth > 16)
+    return false;
+  if (!Visited.insert(V).second)
     return true;
 
   for (User *U : V->users()) {
@@ -177,8 +244,11 @@ static bool RewriteOne(FunctionABISummary &S, CallsiteABIInfo &Info) {
   NewCall->setCallingConv(S.NativeFn->getCallingConv());
 
   if (S.RetKind != ReturnKind::Void) {
-    StoreReturnToRAX(B, S, *Old, NewCall);
+    StoreReturnToState(B, S, *Old, NewCall);
     RewriteImmediateRAXLoads(*NewCall);
+    if (S.RetKind == ReturnKind::IntRDXRAX) {
+      RewriteImmediateRDXLoads(*NewCall);
+    }
   }
 
   if (!Old->use_empty()) {

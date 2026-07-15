@@ -383,6 +383,87 @@ entry:
 }
 """
 
+# 30. An outer alloca count is part of the allocation semantics.  The current
+# reconstruction plan models one object only, so multi/dynamic counts must be
+# preserved instead of being silently shrunk to one inferred object.
+test_cases["test_alloca_array_count.ll"] = """
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @dynamic_count(i64 %count) {
+entry:
+  ; CHECK: %obj = alloca [16 x i8], i64 %count, align 8
+  ; CHECK-NOT: brighten.stack
+  %obj = alloca [16 x i8], i64 %count, align 8
+  %p = getelementptr [16 x i8], ptr %obj, i64 1, i64 0
+  store i32 42, ptr %p, align 4
+  ret void
+}
+
+define void @constant_multi_count() {
+entry:
+  ; CHECK: %obj = alloca [16 x i8], i64 3, align 8
+  %obj = alloca [16 x i8], i64 3, align 8
+  %p = getelementptr [16 x i8], ptr %obj, i64 2, i64 0
+  store i32 7, ptr %p, align 4
+  ret void
+}
+"""
+
+# 31. Initializer reconstruction must not truncate integers wider than 64 bits.
+test_cases["test_wide_integer_initializer.ll"] = r"""
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+; CHECK: %brighten.struct.global.wide = type { i128 }
+; CHECK: @wide = internal global %brighten.struct.global.wide { i128 21345817372864405881847059188222722561 }
+@wide = internal global [16 x i8] c"\01\02\03\04\05\06\07\08\09\0A\0B\0C\0D\0E\0F\10"
+
+define i128 @read_wide() {
+entry:
+  %p = getelementptr [16 x i8], ptr @wide, i64 0, i64 0
+  %v = load i128, ptr %p, align 16
+  ret i128 %v
+}
+"""
+
+# 32. Byte snapshots follow the module DataLayout, not host endianness.
+test_cases["test_big_endian_initializer.ll"] = r"""
+target datalayout = "E-m:e-p:64:64-i64:64-n32:64-S128"
+target triple = "powerpc64-unknown-linux-gnu"
+
+; CHECK: @big = internal global [2 x i32] [i32 16909060, i32 84281096]
+@big = internal global [8 x i8] c"\01\02\03\04\05\06\07\08"
+
+define i32 @read_big() {
+entry:
+  %p0 = getelementptr [8 x i8], ptr @big, i64 0, i64 0
+  %v0 = load i32, ptr %p0, align 4
+  %p4 = getelementptr [8 x i8], ptr @big, i64 0, i64 4
+  %v4 = load i32, ptr %p4, align 4
+  %sum = add i32 %v0, %v4
+  ret i32 %sum
+}
+"""
+
+# 33. A non-zero raw pointer bit-pattern without relocation provenance is not
+# null.  Reject retyping rather than inventing a null pointer initializer.
+test_cases["test_unresolved_pointer_initializer.ll"] = r"""
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+; CHECK: @raw_pointer = internal global [8 x i8] c"\01\00\00\00\00\00\00\00"
+; CHECK-NOT: brighten.struct.global.raw_pointer
+@raw_pointer = internal global [8 x i8] c"\01\00\00\00\00\00\00\00"
+
+define ptr @read_raw_pointer() {
+entry:
+  %p = getelementptr [8 x i8], ptr @raw_pointer, i64 0, i64 0
+  %v = load ptr, ptr %p, align 8
+  ret ptr %v
+}
+"""
+
 failed = 0
 passed = 0
 

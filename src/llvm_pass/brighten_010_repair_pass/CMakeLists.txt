@@ -24,6 +24,7 @@ add_llvm_pass_plugin(BrightenRepairPass
   src/RuleStripPoisonDrivingFlags.cpp
   src/RuleStripPoisonDrivingAttributes.cpp
   src/RuleStripMcSemaInlineAsmDirectives.cpp
+  src/RuleRepairX86FPToIntIndefiniteGuards.cpp
   src/RuleResolveAliases.cpp
   src/RuleFixCallbackFunctionPointerStores.cpp
   src/RuleRepairObfuscatedStackSubtractions.cpp

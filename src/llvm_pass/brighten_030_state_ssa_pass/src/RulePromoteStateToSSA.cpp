@@ -1,4 +1,5 @@
 #include "BrightenStateSSAPass.h"
+#include "StateOffsetResolver.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -7,49 +8,14 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Metadata.h"
+
+#include <optional>
+#include <limits>
 
 namespace brighten_state_ssa {
 
 using namespace llvm;
-
-static int64_t resolveStateOffset(Value *ptr, const DataLayout &DL) {
-  int64_t total_offset = 0;
-  Value *base = ptr;
-
-  while (true) {
-    if (auto *GEP = dyn_cast<GEPOperator>(base)) {
-      APInt ap_offset(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-        total_offset += ap_offset.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;
-    }
-    if (auto *BC = dyn_cast<BitCastOperator>(base)) {
-      base = BC->getOperand(0);
-      continue;
-    }
-    if (auto *GA = dyn_cast<GlobalAlias>(base)) {
-      base = GA->getAliasee();
-      continue;
-    }
-    break;
-  }
-
-  base = base->stripPointerCasts();
-  if (auto *GV = dyn_cast<GlobalVariable>(base)) {
-    if (GV->getName() == "__mcsema_reg_state") {
-      return total_offset;
-    }
-  }
-  if (auto *Arg = dyn_cast<Argument>(base)) {
-    if (Arg->getArgNo() == 0 && Arg->getParent()->getName() != "main") {
-      return total_offset;
-    }
-  }
-  return -1;
-}
 
 static Value *buildStateFieldGEP(IRBuilder<> &B, Value *StatePtr, unsigned offset, Type *Ty) {
   return B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, offset);
@@ -63,11 +29,27 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
   GlobalVariable *StateGV = M.getGlobalVariable("__mcsema_reg_state");
 
   for (Function &F : M) {
-    if (F.isDeclaration()) continue;
-    if (F.getName() == "main") continue;
+    // An arbitrary native function can also have a first pointer argument and
+    // a large constant GEP.  Treating that pointer as Remill State corrupts
+    // unrelated application memory, so promotion is restricted to the
+    // canonical lifted ABI.
+    if (F.isDeclaration() || !IsLiftedFunction(F)) continue;
 
-    Value *StatePtr = (F.arg_size() > 0) ? cast<Value>(F.getArg(0)) : cast<Value>(StateGV);
-    if (!StatePtr) continue;
+    bool HasUnsupportedCallBoundary = false;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (isa<InvokeInst>(I) || isa<CallBrInst>(I)) {
+          HasUnsupportedCallBoundary = true;
+          break;
+        }
+        if (auto *CI = dyn_cast<CallInst>(&I); CI && CI->isMustTailCall()) {
+          HasUnsupportedCallBoundary = true;
+          break;
+        }
+      }
+      if (HasUnsupportedCallBoundary) break;
+    }
+    if (HasUnsupportedCallBoundary) continue;
 
     struct FieldInfo {
       unsigned offset;
@@ -78,13 +60,25 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
     };
 
     DenseMap<unsigned, FieldInfo> fields;
+    DenseSet<unsigned> unsupported_fields;
+    std::optional<StateBaseKind> FunctionBase;
+    bool MixedStateBases = false;
+    bool UnsupportedStateAccess = false;
 
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
-          int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
-          if (off >= 2065) {
-            unsigned u_off = static_cast<unsigned>(off);
+          auto Resolved = ResolveStateOffset(LI->getPointerOperand(), DL, F, StateGV);
+          if (Resolved &&
+              Resolved->Offset <= std::numeric_limits<unsigned>::max()) {
+            unsigned u_off = static_cast<unsigned>(Resolved->Offset);
+            if (!FunctionBase) FunctionBase = Resolved->Base;
+            else if (*FunctionBase != Resolved->Base) MixedStateBases = true;
+            if (LI->isVolatile() || LI->isAtomic()) {
+              unsupported_fields.insert(u_off);
+              UnsupportedStateAccess = true;
+              continue;
+            }
             auto &info = fields[u_off];
             info.offset = u_off;
             unsigned sz = DL.getTypeStoreSize(LI->getType());
@@ -95,9 +89,17 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
             info.loads.push_back(LI);
           }
         } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-          int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
-          if (off >= 2065) {
-            unsigned u_off = static_cast<unsigned>(off);
+          auto Resolved = ResolveStateOffset(SI->getPointerOperand(), DL, F, StateGV);
+          if (Resolved &&
+              Resolved->Offset <= std::numeric_limits<unsigned>::max()) {
+            unsigned u_off = static_cast<unsigned>(Resolved->Offset);
+            if (!FunctionBase) FunctionBase = Resolved->Base;
+            else if (*FunctionBase != Resolved->Base) MixedStateBases = true;
+            if (SI->isVolatile() || SI->isAtomic()) {
+              unsupported_fields.insert(u_off);
+              UnsupportedStateAccess = true;
+              continue;
+            }
             auto &info = fields[u_off];
             info.offset = u_off;
             unsigned sz = DL.getTypeStoreSize(SI->getValueOperand()->getType());
@@ -111,7 +113,29 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
       }
     }
 
+    if (MixedStateBases || UnsupportedStateAccess || !FunctionBase) continue;
+
+    // Exact-offset slots may be accessed at several widths, but independently
+    // promoting partially-overlapping slots makes writes incoherent.  Keep
+    // every ambiguous interval in State for a later byte-accurate recovery.
+    for (auto A = fields.begin(); A != fields.end(); ++A) {
+      uint64_t AEnd = uint64_t(A->first) + A->second.max_access_size;
+      for (auto B = std::next(A); B != fields.end(); ++B) {
+        uint64_t BEnd = uint64_t(B->first) + B->second.max_access_size;
+        if (uint64_t(A->first) < BEnd && uint64_t(B->first) < AEnd) {
+          unsupported_fields.insert(A->first);
+          unsupported_fields.insert(B->first);
+        }
+      }
+    }
+    for (unsigned Offset : unsupported_fields)
+      fields.erase(Offset);
     if (fields.empty()) continue;
+
+    Value *StatePtr = *FunctionBase == StateBaseKind::Arg0
+                          ? static_cast<Value *>(F.getArg(0))
+                          : static_cast<Value *>(StateGV);
+    if (!StatePtr) continue;
 
     // Create allocas in the entry block
     IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
@@ -126,6 +150,10 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
       info.type = AllocaTy;
 
       AllocaInst *Alloca = EntryBuilder.CreateAlloca(AllocaTy, nullptr, "state_" + std::to_string(offset));
+      Alloca->setMetadata(
+          "brighten.state.offset",
+          MDNode::get(Ctx, ConstantAsMetadata::get(
+                               ConstantInt::get(Type::getInt64Ty(Ctx), offset))));
       field_allocas[offset] = Alloca;
 
       // Initialize alloca from state
@@ -193,9 +221,8 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
         } else {
           // Sub-register write (masking)
           Value *Curr = B.CreateLoad(info.type, Alloca);
-          uint64_t mask_val = ~((1ULL << val_bits) - 1);
-          if (val_bits == 64) mask_val = 0; // Avoid shift overflow if 64 bits
-          Value *Mask = ConstantInt::get(info.type, mask_val);
+          APInt MaskValue = ~APInt::getLowBitsSet(alloca_bits, val_bits);
+          Value *Mask = ConstantInt::get(info.type, MaskValue);
           Value *Cleared = B.CreateAnd(Curr, Mask);
           Value *ZextVal = B.CreateZExt(IntStoredVal, info.type);
           Value *NewVal = B.CreateOr(Cleared, ZextVal);
@@ -226,9 +253,6 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
         }
 
         if (CI->arg_size() < 1) continue;
-        Value *CallStatePtr = CI->getArgOperand(0);
-        if (!CallStatePtr->getType()->isPointerTy()) continue;
-
         // Flush before call
         {
           IRBuilder<> B(CI);
@@ -237,7 +261,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
             auto &info = pair.second;
             AllocaInst *Alloca = field_allocas[offset];
             Value *Val = B.CreateLoad(info.type, Alloca);
-            Value *GEP = buildStateFieldGEP(B, CallStatePtr, offset, info.type);
+            Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
             B.CreateStore(Val, GEP);
           }
         }
@@ -249,7 +273,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
             unsigned offset = pair.first;
             auto &info = pair.second;
             AllocaInst *Alloca = field_allocas[offset];
-            Value *GEP = buildStateFieldGEP(B, CallStatePtr, offset, info.type);
+            Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
             Value *Val = B.CreateLoad(info.type, GEP);
             B.CreateStore(Val, Alloca);
           }

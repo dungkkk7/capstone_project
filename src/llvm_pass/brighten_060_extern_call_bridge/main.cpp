@@ -29,6 +29,8 @@ PreservedAnalyses BrightenExternCallBridgePass::run(Module &M,
   Changed |= AnalyzeExternalCallsites(Ctx);
   Changed |= RecoverLibcArguments(Ctx);
   Changed |= RecoverVarargArguments(Ctx);
+  Changed |= LowerMaterializedVAListCalls(Ctx);
+  Changed |= LowerLiftedExternalABICalls(Ctx);
   Changed |= RewriteExternalCallsites(Ctx);
   Changed |= RewriteExternalReturns(Ctx);
   Changed |= CleanupExternalCallArtifacts(Ctx);

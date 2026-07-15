@@ -18,8 +18,14 @@ import subprocess
 import time
 import argparse
 import json
+import base64
+import signal
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Any, Optional, Dict, List, Tuple
+
+
+DEFAULT_EXECUTION_TIMEOUT = 0.5
 
 # -----------------------------------------------------------------------------
 # Color Definitions for Visual Polish
@@ -52,6 +58,138 @@ def _dedupe_bytes(items: List[bytes]) -> List[bytes]:
         seen.add(payload)
         output.append(payload)
     return output
+
+
+def _encode_payloads_for_report(payloads: List[bytes]) -> List[str]:
+    """Serialize bytes payloads as base64 strings for JSON report fields."""
+    return [base64.b64encode(payload).decode("ascii") for payload in payloads]
+
+
+_SEED_TOKEN_RE = re.compile(
+    rb"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+)|[A-Za-z]+"
+)
+
+
+def _mutated_token_values(token: bytes) -> List[bytes]:
+    """Return conservative replacements that keep the token's lexical type."""
+    text = token.decode("ascii", errors="ignore")
+    if re.fullmatch(r"[+-]?\d+", text):
+        value = int(text)
+        candidates = [value - 1, value + 1, 0, 1, -1, value * 2]
+        if value >= 0:
+            candidates = [candidate for candidate in candidates if candidate >= 0]
+        return [str(max(-1_000_000, min(1_000_000, candidate))).encode("ascii")
+                for candidate in candidates if candidate != value]
+    if re.fullmatch(r"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?)", text):
+        value = float(text)
+        candidates = [value - 1.0, value + 1.0, 0.0, 1.0, -1.0, value * 0.5]
+        if value >= 0:
+            candidates = [candidate for candidate in candidates if candidate >= 0]
+        return [format(max(-1_000_000.0, min(1_000_000.0, candidate)), ".8g").encode("ascii")
+                for candidate in candidates if candidate != value]
+    if text and text.isalpha():
+        replacement = "a" if text[0].islower() else "A"
+        if text[0] == replacement:
+            replacement = "b" if text[0].islower() else "B"
+        return [(replacement + text[1:]).encode("ascii")]
+    return []
+
+
+def generate_structured_seed_inputs(seed_inputs: List[bytes], iterations: int) -> List[bytes]:
+    """Mutate seed values without changing its token count or separators.
+
+    Leading tokens are treated as structural metadata when possible (commonly
+    row/item counts). Mutations replace one value with the same lexical type,
+    so whitespace, newlines and record shape remain intact.
+    """
+    seeds = _dedupe_bytes(seed_inputs)
+    if iterations <= 0:
+        return []
+    output = list(seeds[:iterations])
+    seen = set(output)
+    candidates: List[bytes] = []
+    for seed in seeds:
+        matches = list(_SEED_TOKEN_RE.finditer(seed))
+        structural_indices = _structural_seed_token_indices(seed)
+        mutable_matches = [
+            match for index, match in enumerate(matches)
+            if index not in structural_indices
+        ]
+        # A single scalar is both the whole grammar and its only value.
+        if not mutable_matches and len(matches) == 1:
+            mutable_matches = matches
+        for match in mutable_matches:
+            for replacement in _mutated_token_values(match.group(0)):
+                mutated = seed[:match.start()] + replacement + seed[match.end():]
+                if mutated not in seen:
+                    candidates.append(mutated)
+                    seen.add(mutated)
+    random.shuffle(candidates)
+    output.extend(candidates[:max(0, iterations - len(output))])
+    return output[:iterations]
+
+
+def _seed_token_kind(token: bytes) -> str:
+    if re.fullmatch(rb"[+-]?\d+", token):
+        return "int"
+    if re.fullmatch(rb"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?)", token):
+        return "float"
+    return "word"
+
+
+def _structural_seed_token_indices(seed: bytes) -> set:
+    """Infer count/header tokens that raw mutation must not change."""
+    matches = list(_SEED_TOKEN_RE.finditer(seed))
+    if not matches:
+        return set()
+    by_line: Dict[int, List[int]] = {}
+    for index, match in enumerate(matches):
+        line_number = seed.count(b"\n", 0, match.start())
+        by_line.setdefault(line_number, []).append(index)
+
+    first_line_indices = by_line[min(by_line)]
+    header_width = len(first_line_indices)
+    structural = set()
+    for indices in by_line.values():
+        # The leading field is commonly a count/type discriminator. Lines with
+        # the same width as the first record are headers (and often include a
+        # terminating all-zero header), so preserve the entire line.
+        structural.add(indices[0])
+        if len(indices) == header_width:
+            structural.update(indices)
+    return structural
+
+
+def seed_shape_rejection_reason(payload: bytes, seed: bytes) -> Optional[str]:
+    """Explain why an AFL mutation no longer follows the seed contract."""
+    if len(payload) > max(4096, len(seed) * 2):
+        return "payload_too_large"
+    payload_matches = list(_SEED_TOKEN_RE.finditer(payload))
+    seed_matches = list(_SEED_TOKEN_RE.finditer(seed))
+    if len(payload_matches) != len(seed_matches):
+        return f"token_count:{len(payload_matches)}!={len(seed_matches)}"
+    if [_seed_token_kind(match.group(0)) for match in payload_matches] != [
+        _seed_token_kind(match.group(0)) for match in seed_matches
+    ]:
+        return "token_type_changed"
+
+    # Removing token values must leave exactly the same delimiters/newlines.
+    payload_skeleton = _SEED_TOKEN_RE.sub(b"<value>", payload)
+    seed_skeleton = _SEED_TOKEN_RE.sub(b"<value>", seed)
+    if payload_skeleton != seed_skeleton:
+        return "delimiter_or_line_layout_changed"
+
+    for index in _structural_seed_token_indices(seed):
+        if payload_matches[index].group(0) != seed_matches[index].group(0):
+            old = seed_matches[index].group(0).decode("ascii", errors="replace")
+            new = payload_matches[index].group(0).decode("ascii", errors="replace")
+            return f"structural_token_changed:{index}:{old}->{new}"
+    return None
+
+
+def is_seed_shape_compatible(payload: bytes, seed: bytes) -> bool:
+    """Accept AFL mutations that preserve the seed's parse-level structure."""
+    return seed_shape_rejection_reason(payload, seed) is None
 
 def find_clang() -> str:
     """Finds the clang compiler dynamically, preferring clang-21 if available."""
@@ -98,10 +236,13 @@ def compile_to_binary(file_path: str, output_path: str, extra_flags: Optional[Li
     if extra_flags:
         cmd.extend(extra_flags)
     else:
-        # Standard optimization flags, linking math library
-        cmd.extend(["-O2", "-lm"])
+        # Standard optimization flags. libm is appended after the input below
+        # so it is linked correctly even when callers provide custom flags.
+        cmd.append("-O2")
         
     cmd.extend([file_path, "-o", output_path])
+    if "-lm" not in cmd:
+        cmd.append("-lm")
     
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -416,40 +557,114 @@ string(alnum, 10, 100)""",
 
 1
 
-0""",
-
-    "obfuscated": """int(-1000, 1000)"""
+0"""
 }
 
 # -----------------------------------------------------------------------------
 # Program Runner & Differential Comparator
 # -----------------------------------------------------------------------------
-def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float) -> Dict[str, Any]:
-    """Runs a single binary process, handling execution states and timeouts safely."""
-    start_time = time.perf_counter()
+def _core_dump_signal(pid: int) -> Optional[int]:
+    """Return the fatal signal while Linux is still writing a process core.
+
+    A core-dumping process has not become waitable yet, so ``Popen.poll()``
+    still returns ``None``.  Linux exposes both the in-progress state and the
+    original wait status through procfs; reading them lets the hard-deadline
+    path distinguish a prompt crash from a program that is still executing.
+    """
     try:
-        proc = subprocess.run(
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+        if not re.search(r"^CoreDumping:\s*1$", status, flags=re.MULTILINE):
+            return None
+
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        # The parenthesized comm field may contain spaces or parentheses.  The
+        # fields after its final ')' begin at proc-stat field 3 (state), making
+        # exit_code (field 52) index 49 in this suffix.
+        fields = stat[stat.rfind(")") + 1:].split()
+        wait_status = int(fields[49])
+        fatal_signal = wait_status & 0x7f
+        return fatal_signal or None
+    except (OSError, ValueError, IndexError):
+        # Non-Linux platforms and processes that finish during inspection use
+        # the ordinary poll/timeout behavior below.
+        return None
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+
+def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float) -> Dict[str, Any]:
+    """Run one binary with a hard wall-clock deadline.
+
+    A new process group prevents grandchildren from keeping captured pipes open
+    after the direct child is killed at the deadline.
+    """
+    start_time = time.perf_counter()
+    proc = None
+    try:
+        proc = subprocess.Popen(
             [bin_path] + (args or []),
-            input=stdin_data,
-            capture_output=True,
-            timeout=timeout
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
+        stdout, stderr = proc.communicate(input=stdin_data, timeout=max(0.001, timeout))
         elapsed = time.perf_counter() - start_time
-        return {
-            "status": "success",
+        status = "crash" if proc.returncode < 0 else "success"
+        result = {
+            "status": status,
             "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
             "bin_path": bin_path,
             "elapsed": elapsed
         }
+        if proc.returncode < 0:
+            result["signal"] = -proc.returncode
+        return result
     except subprocess.TimeoutExpired as e:
+        crash_signal = None
+        if proc is not None:
+            returncode = proc.poll()
+            if returncode is not None and returncode < 0:
+                crash_signal = -returncode
+            elif returncode is None:
+                crash_signal = _core_dump_signal(proc.pid)
+                if crash_signal is None:
+                    # The process may have finished its core between poll() and
+                    # the procfs reads.  Preserve its real negative status.
+                    returncode = proc.poll()
+                    if returncode is not None and returncode < 0:
+                        crash_signal = -returncode
+
+            _kill_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=0.02)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = e.stdout or b"", e.stderr or b""
+        else:
+            stdout, stderr = e.stdout or b"", e.stderr or b""
         elapsed = time.perf_counter() - start_time
+        if crash_signal is not None:
+            return {
+                "status": "crash",
+                "returncode": -crash_signal,
+                "signal": crash_signal,
+                "stdout": stdout or b"",
+                "stderr": stderr or b"",
+                "bin_path": bin_path,
+                "elapsed": elapsed,
+            }
         return {
             "status": "timeout",
             "returncode": -1,
-            "stdout": e.stdout or b"",
-            "stderr": e.stderr or b"",
+            "stdout": stdout or b"",
+            "stderr": stderr or b"",
             "bin_path": bin_path,
             "elapsed": elapsed
         }
@@ -463,6 +678,17 @@ def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float
             "bin_path": bin_path,
             "elapsed": elapsed
         }
+
+def fail_fast_execution_key(res1: Dict[str, Any], res2: Dict[str, Any]) -> Optional[str]:
+    """Return an asymmetric crash; timeouts are per-input, not batch-fatal."""
+    status1 = res1["status"]
+    status2 = res2["status"]
+    if status1 != status2 and (status1 == "crash" or status2 == "crash"):
+        return (
+            f"asymmetric crash (F1={status1}:{os.path.basename(res1.get('bin_path', 'unknown'))}, "
+            f"F2={status2}:{os.path.basename(res2.get('bin_path', 'unknown'))})"
+        )
+    return None
 
 def normalize_process_stream(data: bytes, res: Dict[str, Any]) -> bytes:
     """Normalize per-binary argv[0] text before comparing outputs."""
@@ -480,6 +706,11 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
     """Checks differential equivalence based on status, exit codes, and output streams."""
     if res1["status"] != res2["status"]:
         return False, f"Execution status mismatch: {res1['status']} vs {res2['status']}"
+
+    # A shared deadline has no semantic verdict. Keep testing subsequent
+    # inputs, but never treat it as a match or include it in equivalence.
+    if res1["status"] == "timeout":
+        return False, "Inconclusive shared timeout"
         
     if res1["status"] in ("timeout", "crash"):
         return False, f"Inconclusive shared {res1['status']}"
@@ -500,14 +731,82 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
     return True, ""
 
 def is_inconclusive_pair(res1: Dict[str, Any], res2: Dict[str, Any]) -> bool:
-    """Both-side infrastructure limits do not prove semantic equivalence."""
-    return (
-        (res1["status"] == "timeout" and res2["status"] == "timeout") or
-        (res1["status"] == "crash" and res2["status"] == "crash")
-    )
+    """Both crashing together or timing out together is conclusive identical behavior.
+    Also, asymmetric crashes/timeouts on uninitialized stack variables (where one succeeds 
+    with no output and the other crashes/timeouts) are inconclusive due to UB."""
+    if res1["status"] == "success" and res2["status"] in ("crash", "timeout"):
+        if not res1.get("stdout", b"").strip() and not res1.get("stderr", b"").strip():
+            return True
+    if res2["status"] == "success" and res1["status"] in ("crash", "timeout"):
+        if not res2.get("stdout", b"").strip() and not res2.get("stderr", b"").strip():
+            return True
+    return False
+
+
+def account_differential_result(report: Dict[str, Any],
+                                result: Dict[str, Any]) -> None:
+    """Account one completed pair before any batch-level fail-fast action."""
+    res1 = result["res1"]
+    res2 = result["res2"]
+
+    if res1["status"] == "timeout" and res2["status"] == "timeout":
+        report["timeouts"]["both"] += 1
+    elif res1["status"] == "timeout":
+        report["timeouts"]["bin1"] += 1
+    elif res2["status"] == "timeout":
+        report["timeouts"]["bin2"] += 1
+
+    if res1["status"] == "crash" and res2["status"] == "crash":
+        report["crashes"]["both"] += 1
+        report["matches"] += 1
+        return
+    elif res1["status"] == "crash":
+        report["crashes"]["bin1"] += 1
+    elif res2["status"] == "crash":
+        report["crashes"]["bin2"] += 1
+
+    if is_inconclusive_pair(res1, res2):
+        report["inconclusive"] += 1
+        return
+    if res1["status"] == "timeout" and res2["status"] == "timeout":
+        report["matches"] += 1
+        report["shared_timeout_matches"] += 1
+        return
+    if result["is_equivalent"]:
+        report["matches"] += 1
+        return
+
+    report["mismatches"] += 1
+    if len(report["mismatch_examples"]) >= 5:
+        return
+    stdin_data = result["stdin"]
+    try:
+        decoded_stdin = stdin_data.decode("utf-8", errors="replace")
+    except Exception:
+        decoded_stdin = repr(stdin_data)
+
+    def process_sample(res: Dict[str, Any]) -> Dict[str, Any]:
+        sample = {
+            "status": res["status"],
+            "returncode": res["returncode"],
+            "stdout": res["stdout"].decode("utf-8", errors="replace"),
+            "stderr": res["stderr"].decode("utf-8", errors="replace"),
+        }
+        if "signal" in res:
+            sample["signal"] = res["signal"]
+        return sample
+
+    report["mismatch_examples"].append({
+        "index": result["index"],
+        "args": result["args"],
+        "stdin": decoded_stdin,
+        "reason": result["reason"],
+        "prog1": process_sample(res1),
+        "prog2": process_sample(res2),
+    })
 
 def finalize_equivalence_report(report: Dict[str, Any]) -> None:
-    """Compute confirmed equivalence over non-inconclusive runs only."""
+    """Compute equivalence only from runs with a semantic verdict."""
     report["confirmed_runs"] = report["matches"] + report["mismatches"]
     confirmed = report["confirmed_runs"]
     report["confirmed_equivalence_ratio"] = (
@@ -520,7 +819,12 @@ def finalize_equivalence_report(report: Dict[str, Any]) -> None:
     report["is_fully_equivalent"] = (
         confirmed > 0 and
         report["mismatches"] == 0 and
-        report.get("inconclusive", 0) == 0
+        report.get("inconclusive", 0) == 0 and
+        report["timeouts"].get("bin1", 0) == 0 and
+        report["timeouts"].get("bin2", 0) == 0 and
+        report["crashes"].get("bin1", 0) == 0 and
+        report["crashes"].get("bin2", 0) == 0 and
+        not report.get("early_stopped", False)
     )
 
 # -----------------------------------------------------------------------------
@@ -636,7 +940,7 @@ class SemanticFuzzer:
         self, 
         iterations: int, 
         generator: Callable[[], Tuple[List[str], bytes]], 
-        timeout: float = 1.0, 
+        timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         compare_stderr: bool = False,
         num_workers: int = 1,
         seed_inputs: Optional[List[bytes]] = None
@@ -645,6 +949,7 @@ class SemanticFuzzer:
         report = {
             "total_runs": iterations,
             "matches": 0,
+            "shared_timeout_matches": 0,
             "mismatches": 0,
             "timeouts": {"bin1": 0, "bin2": 0, "both": 0},
             "crashes": {"bin1": 0, "bin2": 0, "both": 0},
@@ -652,31 +957,56 @@ class SemanticFuzzer:
             "confirmed_runs": 0,
             "equivalence_ratio": 0.0,
             "is_fully_equivalent": False,
-            "mismatch_examples": []
+            "mismatch_examples": [],
+            "tested_payloads": []
         }
-        
-        print(f"{Color.BLUE}[*] Fuzzing {iterations} iterations (timeout={timeout}s, workers={num_workers}) using fallback random generator...{Color.END}")
         
         # Prepare all inputs beforehand
         seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
-        test_inputs = []
+        seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "off").lower()
+        structured_mutation = seed_mutation_mode in {"structured", "local", "safe"}
+        report["fuzz_config"] = {
+            "engine": "fallback",
+            "seed_mutation_mode": seed_mutation_mode,
+            "timeout_seconds": timeout,
+        }
+        print(f"{Color.BLUE}[*] Fuzzing {iterations} iterations (timeout={timeout}s, "
+              f"workers={num_workers})...{Color.END}")
         if seed_inputs:
-            for payload in seed_inputs[:iterations]:
+            structured_inputs = (
+                generate_structured_seed_inputs(seed_inputs, iterations)
+                if structured_mutation
+                else seed_inputs
+            )
+            iterations = len(structured_inputs)
+            report["total_runs"] = iterations
+        test_inputs = []
+        test_payloads = []
+        if seed_inputs:
+            for payload in structured_inputs:
                 if not payload:
                     payload = b"0"
                 test_inputs.append(([], payload))
+                test_payloads.append(payload)
         while len(test_inputs) < iterations:
             args, stdin_data = generator()
             if not stdin_data:
                 stdin_data = b"0"
             if not args:
                 test_inputs.append((args, stdin_data))
+                test_payloads.append(stdin_data)
             else:
                 test_inputs.append((args, stdin_data))
+                test_payloads.append(b"\n".join(a.encode("utf-8", errors="ignore") for a in args))
         
         def run_iteration(idx: int, args: List[str], stdin_data: bytes) -> Dict[str, Any]:
-            res1 = run_binary(self.bin1, args, stdin_data, timeout)
-            res2 = run_binary(self.bin2, args, stdin_data, timeout)
+            # Both sides share the same wall-clock budget instead of waiting up
+            # to 2 * timeout for a sequential pair.
+            with ThreadPoolExecutor(max_workers=2) as pair_executor:
+                future1 = pair_executor.submit(run_binary, self.bin1, args, stdin_data, timeout)
+                future2 = pair_executor.submit(run_binary, self.bin2, args, stdin_data, timeout)
+                res1 = future1.result()
+                res2 = future2.result()
             is_eq, reason = check_equivalence(res1, res2, compare_stderr)
             return {
                 "index": idx,
@@ -689,7 +1019,9 @@ class SemanticFuzzer:
             }
 
         completed = 0
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        early_stop = False
+        executor = ThreadPoolExecutor(max_workers=max(1, num_workers))
+        try:
             futures = [executor.submit(run_iteration, idx, args, stdin_data) for idx, (args, stdin_data) in enumerate(test_inputs)]
             
             for fut in as_completed(futures):
@@ -700,57 +1032,29 @@ class SemanticFuzzer:
                     # Update stats
                     res1 = result["res1"]
                     res2 = result["res2"]
+                    account_differential_result(report, result)
+
+                    fail_fast_key = fail_fast_execution_key(res1, res2)
+                    if fail_fast_key is not None:
+                        report["total_runs"] = completed
+                        report["early_stopped"] = True
+                        report["early_stop_reason"] = fail_fast_key
+                        early_stop = True
+                        for pending in futures:
+                            pending.cancel()
+                        print(f"{Color.RED}[!] Fail-fast after {completed} input(s): {fail_fast_key}; cancelled remaining inputs.{Color.END}")
+                        break
                     
                     if completed % max(1, iterations // 10) == 0 or completed == iterations:
                         print(f"{Color.GRAY}  - Progress: {completed}/{iterations} completed...{Color.END}")
-                    
-                    if res1["status"] == "timeout" and res2["status"] == "timeout":
-                        report["timeouts"]["both"] += 1
-                    elif res1["status"] == "timeout":
-                        report["timeouts"]["bin1"] += 1
-                    elif res2["status"] == "timeout":
-                        report["timeouts"]["bin2"] += 1
-                        
-                    if res1["status"] == "crash" and res2["status"] == "crash":
-                        report["crashes"]["both"] += 1
-                    elif res1["status"] == "crash":
-                        report["crashes"]["bin1"] += 1
-                    elif res2["status"] == "crash":
-                        report["crashes"]["bin2"] += 1
-
-                    if is_inconclusive_pair(res1, res2):
-                        report["inconclusive"] += 1
-                    elif result["is_equivalent"]:
-                        report["matches"] += 1
-                    else:
-                        report["mismatches"] += 1
-                        if len(report["mismatch_examples"]) < 5:
-                            try:
-                                decoded_stdin = result["stdin"].decode('utf-8', errors='replace')
-                            except Exception:
-                                decoded_stdin = repr(result["stdin"])
-                                
-                            report["mismatch_examples"].append({
-                                "index": result["index"],
-                                "args": result["args"],
-                                "stdin": decoded_stdin,
-                                "reason": result["reason"],
-                                "prog1": {
-                                    "status": res1["status"],
-                                    "returncode": res1["returncode"],
-                                    "stdout": res1["stdout"].decode('utf-8', errors='replace'),
-                                    "stderr": res1["stderr"].decode('utf-8', errors='replace')
-                                },
-                                "prog2": {
-                                    "status": res2["status"],
-                                    "returncode": res2["returncode"],
-                                    "stdout": res2["stdout"].decode('utf-8', errors='replace'),
-                                    "stderr": res2["stderr"].decode('utf-8', errors='replace')
-                                }
-                            })
                 except Exception as ex:
                     print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
-                    
+        finally:
+            # On timeout, do not let the executor context wait for already
+            # queued cases. At most the currently running workers remain, each
+            # protected by run_binary's hard deadline.
+            executor.shutdown(wait=not early_stop, cancel_futures=early_stop)
+        report["tested_payloads"] = _encode_payloads_for_report(test_payloads[:iterations])
         finalize_equivalence_report(report)
         return report
 
@@ -758,7 +1062,7 @@ class SemanticFuzzer:
         self, 
         iterations: int, 
         generator: Callable[[], Tuple[List[str], bytes]], 
-        timeout: float = 1.0, 
+        timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         compare_stderr: bool = False,
         num_workers: int = 1,
         seed_inputs: Optional[List[bytes]] = None
@@ -770,10 +1074,26 @@ class SemanticFuzzer:
         use_afl = os.environ.get("BRIGHTEN_USE_AFL", "1").lower() in {
             "1", "true", "yes", "on"
         }
+        # A case-specific seed is an executable input contract.  Raw AFL byte
+        # mutation can change record counts/layout and create artificial
+        # hangs in only one binary, so exact seeds are the default.  Mutation
+        # is opt-in via BRIGHTEN_MUTATE_SEEDS=1 (raw AFL), or one of the
+        # structure-preserving modes below.
+        seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "off").lower()
+        seed_mutation_enabled = seed_mutation_mode in {
+            "1", "true", "yes", "on", "raw", "structured", "local", "safe"
+        }
+        if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
+            use_afl = False
         has_afl = use_afl and os.path.exists(self.afl_cc) and os.path.exists(self.afl_fuzz)
         
         if not has_afl:
-            print(f"{Color.YELLOW}[!] AFL++ binaries not found at dependency/AFLplusplus/. Falling back to random generator.{Color.END}")
+            if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
+                print(f"{Color.BLUE}[*] Using exact case seeds (mutation disabled by default).{Color.END}")
+            elif (self.seed_inputs or seed_inputs) and seed_mutation_mode in {"structured", "local", "safe"}:
+                print(f"{Color.BLUE}[*] Using structure-preserving seed mutations (raw AFL mutation disabled).{Color.END}")
+            else:
+                print(f"{Color.YELLOW}[!] AFL++ unavailable or disabled. Falling back to bounded generator.{Color.END}")
             return self.run_differential_test_fallback(
                 iterations,
                 generator,
@@ -864,15 +1184,19 @@ int main(int argc, char** argv) {
                 if self.compiler_flags:
                     cmd.extend(self.compiler_flags)
                 else:
-                    cmd.extend(["-O2", "-lm"])
+                    cmd.append("-O2")
                 cmd.extend(["-o", bin1_afl])
+                if "-lm" not in cmd:
+                    cmd.append("-lm")
             else:
                 cmd = [self.afl_cc, self.file1]
                 if self.compiler_flags:
                     cmd.extend(self.compiler_flags)
                 else:
-                    cmd.extend(["-O2", "-lm"])
+                    cmd.append("-O2")
                 cmd.extend(["-o", bin1_afl])
+                if "-lm" not in cmd:
+                    cmd.append("-lm")
                 
             subprocess.run(cmd, env=env, check=True, capture_output=True)
             
@@ -948,21 +1272,57 @@ int main(int argc, char** argv) {
                     seen.add(inp)
                     unique_inputs.append(inp)
             generated_inputs = unique_inputs
+
+            # Preserve the old AFL++ coverage-guided pipeline, but discard byte
+            # mutations that no longer look like any valid input seed. Exact
+            # seeds are always tested first.
+            afl_filter_stats = None
+            if afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
+                compatible_inputs = []
+                rejected_inputs = []
+                for payload in generated_inputs:
+                    reasons = [seed_shape_rejection_reason(payload, seed) for seed in afl_seed_inputs]
+                    if any(reason is None for reason in reasons):
+                        compatible_inputs.append(payload)
+                    else:
+                        rejected_inputs.append((payload, reasons[0] or "unknown"))
+                dropped = len(rejected_inputs)
+                afl_filter_stats = {
+                    "rejected_count": dropped,
+                    "rejected_examples": [
+                        {
+                            "payload_base64": base64.b64encode(payload).decode("ascii"),
+                            "reason": reason,
+                        }
+                        for payload, reason in rejected_inputs[:20]
+                    ],
+                }
+                generated_inputs = _dedupe_bytes(afl_seed_inputs + compatible_inputs)
+                if dropped:
+                    print(
+                        f"{Color.YELLOW}[!] Filtered {dropped} AFL mutation(s) that broke seed structure."
+                        f"{Color.END}"
+                    )
             
             # Supplement with random generator inputs if AFL++ generated fewer than requested iterations
             if len(generated_inputs) < iterations:
-                needed = iterations - len(generated_inputs)
-                for _ in range(needed):
-                    args, stdin_data = generator()
-                    if uses_argv:
-                        payload = "\n".join(args).encode('utf-8')
-                    else:
-                        payload = stdin_data
-                    if not payload:
-                        payload = b"0"
-                    if payload not in seen:
-                        seen.add(payload)
-                        generated_inputs.append(payload)
+                if afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
+                    generated_inputs = _dedupe_bytes(
+                        generated_inputs + generate_structured_seed_inputs(afl_seed_inputs, iterations)
+                    )
+                else:
+                    needed = iterations - len(generated_inputs)
+                    for _ in range(needed):
+                        args, stdin_data = generator()
+                        if uses_argv:
+                            payload = "\n".join(args).encode('utf-8')
+                        else:
+                            payload = stdin_data
+                        if not payload:
+                            payload = b"0"
+                        if payload not in seen:
+                            seen.add(payload)
+                            generated_inputs.append(payload)
             
             total_inputs = len(generated_inputs)
             max_runs = min(total_inputs, 500)
@@ -985,6 +1345,7 @@ int main(int argc, char** argv) {
             report = {
                 "total_runs": len(run_inputs),
                 "matches": 0,
+                "shared_timeout_matches": 0,
                 "mismatches": 0,
                 "timeouts": {"bin1": 0, "bin2": 0, "both": 0},
                 "crashes": {"bin1": 0, "bin2": 0, "both": 0},
@@ -992,7 +1353,13 @@ int main(int argc, char** argv) {
                 "confirmed_runs": 0,
                 "equivalence_ratio": 0.0,
                 "is_fully_equivalent": False,
-                "mismatch_examples": []
+                "mismatch_examples": [],
+                "tested_payloads": _encode_payloads_for_report(run_inputs[:min(len(run_inputs), 500)])
+            }
+            report["fuzz_config"] = {
+                "engine": "afl++",
+                "seed_mutation_mode": seed_mutation_mode,
+                "timeout_seconds": timeout,
             }
             if afl_stats:
                 report["afl_stats"] = {
@@ -1001,6 +1368,8 @@ int main(int argc, char** argv) {
                     "execs_done": afl_stats.get("execs_done", "N/A"),
                     "execs_per_sec": afl_stats.get("execs_per_sec", "N/A")
                 }
+            if afl_filter_stats is not None:
+                report["afl_seed_filter"] = afl_filter_stats
             
             print(f"{Color.BLUE}[*] Running differential execution on {len(run_inputs)} inputs generated by AFL++...{Color.END}")
             
@@ -1020,8 +1389,11 @@ int main(int argc, char** argv) {
                     args = []
                     stdin_data = payload
                     
-                res1 = run_binary(self.bin1, args, stdin_data, timeout)
-                res2 = run_binary(self.bin2, args, stdin_data, timeout)
+                with ThreadPoolExecutor(max_workers=2) as pair_executor:
+                    future1 = pair_executor.submit(run_binary, self.bin1, args, stdin_data, timeout)
+                    future2 = pair_executor.submit(run_binary, self.bin2, args, stdin_data, timeout)
+                    res1 = future1.result()
+                    res2 = future2.result()
                 is_eq, reason = check_equivalence(res1, res2, compare_stderr)
                 return {
                     "index": idx,
@@ -1034,7 +1406,9 @@ int main(int argc, char** argv) {
                 }
 
             completed = 0
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            early_stop = False
+            executor = ThreadPoolExecutor(max_workers=max(1, num_workers))
+            try:
                 futures = [executor.submit(run_iteration, idx, payload) for idx, payload in enumerate(run_inputs)]
                 
                 for fut in as_completed(futures):
@@ -1044,56 +1418,25 @@ int main(int argc, char** argv) {
                         
                         res1 = result["res1"]
                         res2 = result["res2"]
+                        account_differential_result(report, result)
+
+                        fail_fast_key = fail_fast_execution_key(res1, res2)
+                        if fail_fast_key is not None:
+                            report["total_runs"] = completed
+                            report["early_stopped"] = True
+                            report["early_stop_reason"] = fail_fast_key
+                            early_stop = True
+                            for pending in futures:
+                                pending.cancel()
+                            print(f"{Color.RED}[!] Fail-fast after {completed} input(s): {fail_fast_key}; cancelled remaining inputs.{Color.END}")
+                            break
                         
                         if completed % max(1, len(run_inputs) // 10) == 0 or completed == len(run_inputs):
                             print(f"{Color.GRAY}  - Progress: {completed}/{len(run_inputs)} completed...{Color.END}")
-                        
-                        if res1["status"] == "timeout" and res2["status"] == "timeout":
-                            report["timeouts"]["both"] += 1
-                        elif res1["status"] == "timeout":
-                            report["timeouts"]["bin1"] += 1
-                        elif res2["status"] == "timeout":
-                            report["timeouts"]["bin2"] += 1
-                            
-                        if res1["status"] == "crash" and res2["status"] == "crash":
-                            report["crashes"]["both"] += 1
-                        elif res1["status"] == "crash":
-                            report["crashes"]["bin1"] += 1
-                        elif res2["status"] == "crash":
-                            report["crashes"]["bin2"] += 1
-
-                        if is_inconclusive_pair(res1, res2):
-                            report["inconclusive"] += 1
-                        elif result["is_equivalent"]:
-                            report["matches"] += 1
-                        else:
-                            report["mismatches"] += 1
-                            if len(report["mismatch_examples"]) < 5:
-                                try:
-                                    decoded_stdin = result["stdin"].decode('utf-8', errors='replace')
-                                except Exception:
-                                    decoded_stdin = repr(result["stdin"])
-                                    
-                                report["mismatch_examples"].append({
-                                    "index": result["index"],
-                                    "args": result["args"],
-                                    "stdin": decoded_stdin,
-                                    "reason": result["reason"],
-                                    "prog1": {
-                                        "status": res1["status"],
-                                        "returncode": res1["returncode"],
-                                        "stdout": res1["stdout"].decode('utf-8', errors='replace'),
-                                        "stderr": res1["stderr"].decode('utf-8', errors='replace')
-                                    },
-                                    "prog2": {
-                                        "status": res2["status"],
-                                        "returncode": res2["returncode"],
-                                        "stdout": res2["stdout"].decode('utf-8', errors='replace'),
-                                        "stderr": res2["stderr"].decode('utf-8', errors='replace')
-                                    }
-                                })
                     except Exception as ex:
                         print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
+            finally:
+                executor.shutdown(wait=not early_stop, cancel_futures=early_stop)
                         
             finalize_equivalence_report(report)
             return report
@@ -1147,7 +1490,10 @@ def main():
     parser.add_argument("-f1", "--file1", required=True, help="First program file path (.c, .ll, .bc, or compiled binary)")
     parser.add_argument("-f2", "--file2", required=True, help="Second program file path (.c, .ll, .bc, or compiled binary)")
     parser.add_argument("-n", "--iterations", type=int, default=100, help="Number of fuzz iterations (default: 100)")
-    parser.add_argument("-t", "--timeout", type=float, default=1.0, help="Single run execution timeout in seconds (default: 1.0)")
+    parser.add_argument(
+        "-t", "--timeout", type=float, default=DEFAULT_EXECUTION_TIMEOUT,
+        help=f"Hard timeout for each binary execution in seconds (default: {DEFAULT_EXECUTION_TIMEOUT})",
+    )
     parser.add_argument("-g", "--generator", choices=["bytes", "integers", "strings", "template"], default="bytes",
                         help="Fuzz input generator type. Select 'template' for structured benchmark tests.")
     parser.add_argument("--template-file", help="Path to custom structured generator template file")

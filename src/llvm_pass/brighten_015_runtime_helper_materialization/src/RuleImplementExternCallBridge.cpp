@@ -42,6 +42,16 @@ static constexpr uint64_t kOffRDX = 2264;
 static constexpr uint64_t kOffRCX = 2248;
 static constexpr uint64_t kOffR8  = 2344;
 static constexpr uint64_t kOffR9  = 2360;
+// XMM slots are 16-byte values in State.  The low 64 bits are at these
+// offsets; this is the part used by the SysV scalar FP ABI.
+static constexpr uint64_t kOffXMM0 = 16;
+static constexpr uint64_t kOffXMM1 = 80;
+static constexpr uint64_t kOffXMM2 = 144;
+static constexpr uint64_t kOffXMM3 = 208;
+static constexpr uint64_t kOffXMM4 = 272;
+static constexpr uint64_t kOffXMM5 = 336;
+static constexpr uint64_t kOffXMM6 = 400;
+static constexpr uint64_t kOffXMM7 = 464;
 
 static bool IsSetjmpName(StringRef Name) {
   return Name == "_setjmp" || Name == "setjmp" ||
@@ -53,11 +63,67 @@ static bool IsLongjmpName(StringRef Name) {
          Name == "siglongjmp";
 }
 
+static bool IsSupportedDirectABIType(Type *Ty) {
+  return Ty->isVoidTy() || Ty->isIntegerTy() || Ty->isPointerTy() ||
+         Ty->isFloatTy() || Ty->isDoubleTy();
+}
+
+static bool IsSupportedDirectABI(Function *ExtFn) {
+  FunctionType *FTy = ExtFn->getFunctionType();
+  if (!IsSupportedDirectABIType(FTy->getReturnType()))
+    return false;
+  unsigned GPCount = 0;
+  unsigned FPCount = 0;
+  for (Type *Ty : FTy->params()) {
+    if (!IsSupportedDirectABIType(Ty) || Ty->isVoidTy())
+      return false;
+    if (Ty->isFloatTy() || Ty->isDoubleTy())
+      ++FPCount;
+    else
+      ++GPCount;
+  }
+  return GPCount <= 6 && FPCount <= 8;
+}
+
 // Load một thanh ghi i64 từ State tại byte offset đã biết.
 static Value *LoadReg(IRBuilder<> &B, Value *StatePtr, uint64_t Offset,
                       const char *Name) {
   auto *GEP = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, Offset, Name);
   return B.CreateAlignedLoad(B.getInt64Ty(), GEP, Align(8), Name);
+}
+
+static uint64_t XMMOffset(unsigned Index) {
+  static constexpr uint64_t Offsets[] = {
+      kOffXMM0, kOffXMM1, kOffXMM2, kOffXMM3,
+      kOffXMM4, kOffXMM5, kOffXMM6, kOffXMM7};
+  return Index < 8 ? Offsets[Index] : kOffXMM0;
+}
+
+static Value *LoadFPArg(IRBuilder<> &B, Value *StatePtr, unsigned Index,
+                        Type *ParamTy) {
+  Value *Raw = LoadReg(B, StatePtr, XMMOffset(Index), "xmm_arg_bits");
+  if (ParamTy->isDoubleTy())
+    return B.CreateBitCast(Raw, ParamTy, "xmm_arg_double");
+  if (ParamTy->isFloatTy()) {
+    Value *Low32 = B.CreateTrunc(Raw, B.getInt32Ty(), "xmm_arg_float_bits");
+    return B.CreateBitCast(Low32, ParamTy, "xmm_arg_float");
+  }
+  return nullptr;
+}
+
+static void StoreXMM0(IRBuilder<> &B, Value *StatePtr, Value *Val) {
+  Value *Bits = nullptr;
+  if (Val->getType()->isDoubleTy()) {
+    Bits = B.CreateBitCast(Val, B.getInt64Ty(), "xmm0_ret_bits");
+  } else if (Val->getType()->isFloatTy()) {
+    Value *Low32 = B.CreateBitCast(Val, B.getInt32Ty(), "xmm0_ret_float_bits");
+    Bits = B.CreateZExt(Low32, B.getInt64Ty(), "xmm0_ret_bits");
+  }
+  if (!Bits)
+    return;
+  auto *GEP = B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, kOffXMM0,
+                                   "xmm0_ret_ptr");
+  B.CreateAlignedStore(Bits, GEP, Align(8));
 }
 
 // Store một giá trị i64 vào thanh ghi RAX trong State.
@@ -69,9 +135,6 @@ static void StoreRAX(IRBuilder<> &B, Value *StatePtr, Value *Val) {
     V64 = B.CreatePtrToInt(Val, B.getInt64Ty());
   } else if (Val->getType()->isIntegerTy() && !Val->getType()->isIntegerTy(64)) {
     V64 = B.CreateZExt(Val, B.getInt64Ty());
-  } else if (Val->getType()->isFloatingPointTy()) {
-    // float/double → bitcast to int, then zext; just zero for now
-    V64 = B.getInt64(0);
   }
   B.CreateAlignedStore(V64, GEP, Align(8));
 }
@@ -122,6 +185,8 @@ static Function *MatchExternCallStub(Function &F, Function *RemillCall) {
       if (!ExtFn || !ExtFn->isDeclaration())
         return nullptr;
       if (ExtFn == &F)
+        return nullptr;
+      if (!ExtFn->getFunctionType()->isVarArg() && !IsSupportedDirectABI(ExtFn))
         return nullptr;
       TheCall = CI;
     }
@@ -352,6 +417,9 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     StoreRAX(B, StatePtr, Ret);
   } else if (ExtFTy->isVarArg()) {
     StringRef Name = ExtFn->getName();
+    bool IsScanfFamily = Name == "scanf" || Name == "__isoc99_scanf" ||
+                         Name == "fscanf" || Name == "__isoc99_fscanf" ||
+                         Name == "sscanf" || Name == "__isoc99_sscanf";
     unsigned ActualNumParams = NumParams;
     if (Name == "printf" || Name == "scanf" || Name == "__isoc99_scanf") {
       ActualNumParams = 1;
@@ -392,6 +460,21 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
       B.CreateStore(Val, GetSlot(idx));
     };
 
+    // scanf-family varargs are write pointers.  The lifted call carries them
+    // as guest integer addresses in the register save area; passing those
+    // integers unchanged to vscanf/vfscanf makes libc dereference a guest
+    // address (and commonly segfault).  Translate the variadic GP slots while
+    // the original guest-address map is still available.  The later native
+    // cleanup/global-data passes fold constant translations to native GEPs.
+    auto StoreTranslatedScanfVarargReg = [&](unsigned idx, const char *name) {
+      Value *Val = LoadReg(B, StatePtr, kArgRegs[idx], name);
+      Function *TranslateFn = GetOrCreateTranslateGuestPointer(*M);
+      Value *Translated = B.CreateCall(
+          TranslateFn, {Val, B.getTrue()}, "scanf_vararg_ptr");
+      Value *AsInt = B.CreatePtrToInt(Translated, B.getInt64Ty());
+      B.CreateStore(AsInt, GetSlot(idx));
+    };
+
     // Load, translate và store 6 GP registers
     StoreTranslatedReg(kOffRDI, 0, "rdi");
     StoreTranslatedReg(kOffRSI, 1, "rsi");
@@ -399,6 +482,13 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     StoreTranslatedReg(kOffRCX, 3, "rcx");
     StoreTranslatedReg(kOffR8,  4, "r8");
     StoreTranslatedReg(kOffR9,  5, "r9");
+
+    if (IsScanfFamily) {
+      unsigned FirstVararg = ActualNumParams < 6 ? ActualNumParams : 6;
+      for (unsigned I = FirstVararg; I < 6; ++I) {
+        StoreTranslatedScanfVarargReg(I, "scanf_vararg");
+      }
+    }
 
     // Load và store 8 FP/Vector registers (chỉ lấy low 8 bytes của XMM0-XMM7)
     StructType *StateType = nullptr;
@@ -498,35 +588,46 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
 
     Ret = B.CreateCall(VFunc, VArgs);
   } else {
-    // Với non-vararg: load RDI, RSI, RDX, RCX, R8, R9
+    // Với non-vararg: phân loại argument theo SysV ABI.  Integer/pointer
+    // arguments dùng dãy GPR; float/double dùng dãy XMM độc lập.
     SmallVector<Value *, 8> Args;
+    unsigned GPIndex = 0;
+    unsigned FPIndex = 0;
     for (unsigned i = 0; i < NumParams; ++i) {
       Type *ParamTy = ExtFTy->getParamType(i);
-      uint64_t RegOff = (i < 6) ? kArgRegs[i] : 0;
-
-      if (RegOff == 0) {
-        Args.push_back(ZeroValue(ParamTy));
-        continue;
-      }
-
-      Value *RawI64 = LoadReg(B, StatePtr, RegOff, "arg_reg");
       Value *Arg = nullptr;
-      bool IsPointer = ParamTy->isPointerTy() || IsExternalParamPointer(ExtFn->getName(), i);
-      if (IsPointer) {
-        Function *TranslateFn = GetOrCreateTranslateGuestPointer(*M);
-        Value *Translated = B.CreateCall(TranslateFn, {RawI64, B.getTrue()});
-        if (ParamTy->isPointerTy()) {
-          Arg = B.CreateBitCast(Translated, ParamTy);
-        } else {
-          Arg = B.CreatePtrToInt(Translated, ParamTy);
-        }
-      } else if (ParamTy->isIntegerTy(64)) {
-        Arg = RawI64;
-      } else if (ParamTy->isIntegerTy(32)) {
-        Arg = B.CreateTrunc(RawI64, B.getInt32Ty());
-      } else if (ParamTy->isIntegerTy()) {
-        Arg = B.CreateTrunc(RawI64, ParamTy);
+      if (ParamTy->isFloatingPointTy()) {
+        if (FPIndex < 8)
+          Arg = LoadFPArg(B, StatePtr, FPIndex, ParamTy);
+        ++FPIndex;
       } else {
+        uint64_t RegOff = GPIndex < 6 ? kArgRegs[GPIndex] : 0;
+        ++GPIndex;
+        if (RegOff != 0) {
+          Value *RawI64 = LoadReg(B, StatePtr, RegOff, "arg_reg");
+          bool IsPointer = ParamTy->isPointerTy() ||
+                           IsExternalParamPointer(ExtFn->getName(), i);
+          if (IsPointer) {
+            Function *TranslateFn = GetOrCreateTranslateGuestPointer(*M);
+            Value *Translated = B.CreateCall(TranslateFn, {RawI64, B.getTrue()});
+            if (ParamTy->isPointerTy()) {
+              Arg = B.CreateBitCast(Translated, ParamTy);
+            } else {
+              Arg = B.CreatePtrToInt(Translated, ParamTy);
+            }
+          } else if (ParamTy->isIntegerTy(64)) {
+            Arg = RawI64;
+          } else if (ParamTy->isIntegerTy(32)) {
+            Arg = B.CreateTrunc(RawI64, B.getInt32Ty());
+          } else if (ParamTy->isIntegerTy()) {
+            Arg = B.CreateTrunc(RawI64, ParamTy);
+          }
+        }
+      }
+      if (!Arg) {
+        // Không được bịa giá trị cho ABI chưa hỗ trợ.  Giữ stub nguyên
+        // trạng thái bằng cách bỏ qua rewrite ở caller là tốt hơn, nhưng
+        // ở đây các stub đã được xác định là scalar SysV signatures.
         Arg = ZeroValue(ParamTy);
       }
       Args.push_back(Arg);
@@ -539,9 +640,12 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
     Ret = DirectCall;
   }
 
-  // Store return value vào RAX nếu cần
+  // Scalar FP returns live in XMM0; integer/pointer returns live in RAX.
   if (!ExtFTy->getReturnType()->isVoidTy() && Ret != nullptr) {
-    StoreRAX(B, StatePtr, Ret);
+    if (ExtFTy->getReturnType()->isFloatingPointTy())
+      StoreXMM0(B, StatePtr, Ret);
+    else
+      StoreRAX(B, StatePtr, Ret);
   }
 
   // Simulating the pop of the return address from guest stack (add guest RSP by 8)

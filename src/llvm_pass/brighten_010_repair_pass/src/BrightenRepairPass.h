@@ -29,6 +29,7 @@ class BrightenRepairPass : public llvm::PassInfoMixin<BrightenRepairPass> {
   static bool StripPoisonDrivingFlags(llvm::Module &M);
   static bool StripPoisonDrivingAttributes(llvm::Module &M);
   static bool StripMcSemaInlineAsmDirectives(llvm::Module &M);
+  static bool RepairX86FPToIntIndefiniteGuards(llvm::Module &M);
 
   // Chặn/guard các lời gọi gián tiếp thô (inttoptr call).
   static bool ResolveAliases(llvm::Module &M);

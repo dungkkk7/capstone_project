@@ -2,6 +2,8 @@
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cctype>
@@ -34,10 +36,11 @@ static bool IsExecutableSegmentName(StringRef Name) {
   }
 
   return Name.contains("__text") ||
-         Name.ends_with("__init") ||
-         Name.ends_with("__fini") ||
+         Name.contains("__init_") || Name.ends_with("__init") ||
+         Name.contains("__fini_") || Name.ends_with("__fini") ||
          Name.contains("__plt") ||
-         Name.contains("__code");
+         Name.contains("__code") ||
+         Name.contains("_LOAD_");
 }
 
 static SegmentKind ClassifySegmentName(StringRef Name) {
@@ -112,6 +115,24 @@ bool BrightenGlobalDataRecoveryPass::DiscoverGuestSegments(
     }
 
     Seg->Size = ComputeSegmentSize(&GV);
+    // McSema may place a named data alias exactly at the aggregate's
+    // computed end (typically a BSS/global boundary).  Keep one pointer-sized
+    // zero-backed slot so address-map lookup and materialization can represent
+    // that legitimate object instead of reporting a false unresolved ref.
+    for (GlobalAlias &GA : M.aliases()) {
+      StringRef AliasName = GA.getName();
+      if (!AliasName.starts_with("data_"))
+        continue;
+      uint64_t AliasAddr = 0;
+      if (AliasName.drop_front(5).getAsInteger(16, AliasAddr) ||
+          AliasAddr != Seg->GuestBase + Seg->Size)
+        continue;
+      auto *GEP = dyn_cast<GEPOperator>(GA.getAliasee());
+      if (!GEP || GEP->getPointerOperand()->stripPointerCasts() != &GV)
+        continue;
+      Seg->Size += M.getDataLayout().getPointerSize();
+      break;
+    }
     Seg->Kind = ClassifySegmentName(Name);
 
     switch (Seg->Kind) {

@@ -10,35 +10,13 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace brighten_runtime {
 
 using namespace llvm;
 
 namespace {
-
-static bool DefineReturnMemory(Function &F) {
-  if (!F.isDeclaration()) {
-    return false;
-  }
-  BasicBlock *BB = BasicBlock::Create(F.getContext(), "entry", &F);
-  IRBuilder<> B(BB);
-  Type *RetTy = F.getReturnType();
-  if (RetTy->isVoidTy()) {
-    B.CreateRetVoid();
-    return true;
-  }
-  if (RetTy->isPointerTy()) {
-    if (Value *Mem = FindLikelyMemoryArg(F)) {
-      B.CreateRet(Mem);
-    } else {
-      B.CreateRet(ZeroValue(RetTy));
-    }
-    return true;
-  }
-  B.CreateRet(ZeroValue(RetTy));
-  return true;
-}
 
 static bool DefinePCDispatcher(Function &Helper, Module &M) {
   if (!Helper.isDeclaration() || !HasMemoryThreadingSignature(Helper)) {
@@ -66,7 +44,9 @@ static bool DefinePCDispatcher(Function &Helper, Module &M) {
 
   {
     IRBuilder<> B(DefaultBB);
-    B.CreateRet(Mem);
+    FunctionCallee Missing =
+        M.getOrInsertFunction("__remill_missing_block", FTy);
+    B.CreateRet(B.CreateCall(Missing, {State, PC, Mem}));
   }
   std::sort(Targets.begin(), Targets.end(), [](const auto &A, const auto &B) {
     if (A.first != B.first) {
@@ -102,12 +82,22 @@ bool BrightenRuntimeHelperPass::DefineRemillControlFlowRuntime(Module &M) {
     StringRef Name = F.getName();
     if (Name == "__remill_function_call" || Name == "__remill_jump") {
       Changed |= DefinePCDispatcher(F, M);
-    } else if (Name == "__remill_function_return" ||
-               Name == "__remill_missing_block" ||
-               Name == "__remill_error" ||
-               Name == "__remill_async_hyper_call" ||
-               Name == "__remill_sync_hyper_call") {
-      Changed |= DefineReturnMemory(F);
+    } else if (Name == "__remill_missing_block" || Name == "__remill_error") {
+      if (F.isDeclaration() && HasMemoryThreadingSignature(F)) {
+        BasicBlock *TrapBB = BasicBlock::Create(M.getContext(), "entry", &F);
+        IRBuilder<> B(TrapBB);
+        FunctionCallee Trap = Intrinsic::getDeclaration(&M, Intrinsic::trap);
+        B.CreateCall(Trap);
+        B.CreateUnreachable();
+        Changed = true;
+        errs() << "[brighten-remill-runtime] materialized trap body for: " << Name << "\n";
+      }
+    } else if (Name == "__remill_function_return" || Name == "__remill_async_hyper_call" || Name == "__remill_sync_hyper_call") {
+      // Returning the incoming Memory token is not the semantics of return,
+      // missing-block, error, or a hypercall.  Keep live declarations visible
+      // so devirtualization/strict cleanup must resolve them explicitly.
+      errs() << "[brighten-remill-runtime] unresolved control helper preserved: "
+             << Name << "\n";
     }
   }
   return Changed;

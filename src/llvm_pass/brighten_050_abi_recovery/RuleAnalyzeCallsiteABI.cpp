@@ -44,12 +44,12 @@ static void FindStoredArgsInBlock(CallInst &CI, CallsiteABIInfo &Info,
   }
 }
 
-static bool ObservesRAXAfter(CallInst &CI) {
+static bool ObservesRegisterAfter(CallInst &CI, ABIReg Reg) {
   BasicBlock *BB = CI.getParent();
   for (auto It = std::next(CI.getIterator()); It != BB->end(); ++It) {
     Instruction &I = *It;
     if (auto RA = IdentifyRegAccess(I)) {
-      if (RA->Reg == ABIReg::RAX) {
+      if (RA->Reg == Reg) {
         if (RA->IsLoad) {
           return true;
         }
@@ -98,7 +98,8 @@ bool BrightenABIRecoveryPass::AnalyzeCallsiteABI(ABIRecoveryContext &Ctx) {
         Info.Caller = &Caller;
         Info.Target = Target;
         FindStoredArgsInBlock(*CI, Info, Ctx.DL);
-        Info.ObservesRAX = ObservesRAXAfter(*CI);
+        Info.ObservesRAX = ObservesRegisterAfter(*CI, ABIReg::RAX);
+        Info.ObservesRDX = ObservesRegisterAfter(*CI, ABIReg::RDX);
         Info.RewritableMemoryResult = HasOnlyMemoryReplacementUses(*CI, *S);
 
         for (auto &[Reg, Ty] : Info.ArgTypes) {
@@ -108,6 +109,12 @@ bool BrightenABIRecoveryPass::AnalyzeCallsiteABI(ABIRecoveryContext &Ctx) {
         if (Info.ObservesRAX) {
           S->ReturnObservedByCaller = true;
         }
+        if (Info.ObservesRDX) {
+          S->ReturnRDXObservedByCaller = true;
+        }
+        if (Info.ObservesRAX && Info.ObservesRDX) {
+          S->ReturnRDXRAXObservedBySameCallsite = true;
+        }
         S->Calls.push_back(Info);
       }
     }
@@ -116,4 +123,3 @@ bool BrightenABIRecoveryPass::AnalyzeCallsiteABI(ABIRecoveryContext &Ctx) {
 }
 
 } // namespace brighten_abi
-

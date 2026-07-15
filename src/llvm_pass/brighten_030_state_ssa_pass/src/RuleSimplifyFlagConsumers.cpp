@@ -179,7 +179,10 @@ static bool CanonicalizeFlagSSA(Function &F, const DataLayout &DL,
 
         if (PeelZExtI1(InVal)) continue;
         if (IsBoolByteConstant(InVal)) continue;
-        if (IsLoadFromFlag(InVal, DL, F, StateGV, FlagLayout)) continue;
+        // A flag State slot is stored as i8 but is not an LLVM i1 contract.
+        // Boundary/initial State can contain any byte value, and users other
+        // than a zero-test may observe that exact byte.  Do not normalize a
+        // raw load to 0/1 merely because its offset is flag-shaped.
         if (IsAndMaskOne(InVal)) continue;
 
         if (auto *InPN = dyn_cast<PHINode>(InVal)) {

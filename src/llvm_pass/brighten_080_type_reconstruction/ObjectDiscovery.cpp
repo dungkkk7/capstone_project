@@ -30,6 +30,16 @@ bool DiscoverCandidates(TypeReconstructionContext &Ctx) {
         if (!AI->getAllocatedType()->isSized())
           continue;
 
+        // The allocated type and the alloca array count are independent in
+        // LLVM IR.  Retyping `alloca [N x i8], i64 %count` as a single
+        // inferred object silently shrinks a runtime-sized allocation because
+        // RewritePlanner creates one new object.  A constant count greater
+        // than one has the same problem.  Reconstruct only the single-object
+        // form until a plan can explicitly preserve the outer array count.
+        auto *ArrayCount = dyn_cast<ConstantInt>(AI->getArraySize());
+        if (!ArrayCount || !ArrayCount->isOne())
+          continue;
+
         // Only reconstruct raw i8 byte arrays!
         if (!IsByteArrayType(AI->getAllocatedType()))
           continue;

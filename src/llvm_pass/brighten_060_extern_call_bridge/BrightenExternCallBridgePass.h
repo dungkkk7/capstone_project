@@ -18,6 +18,8 @@ public:
   static bool AnalyzeExternalCallsites(ExternCallContext &Ctx);
   static bool RecoverLibcArguments(ExternCallContext &Ctx);
   static bool RecoverVarargArguments(ExternCallContext &Ctx);
+  static bool LowerMaterializedVAListCalls(ExternCallContext &Ctx);
+  static bool LowerLiftedExternalABICalls(ExternCallContext &Ctx);
   static bool RewriteExternalCallsites(ExternCallContext &Ctx);
   static bool RewriteExternalReturns(ExternCallContext &Ctx);
   static bool CleanupExternalCallArtifacts(ExternCallContext &Ctx);

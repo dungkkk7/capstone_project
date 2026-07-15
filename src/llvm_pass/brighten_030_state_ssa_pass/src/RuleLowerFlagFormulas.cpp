@@ -129,33 +129,11 @@ bool BrightenStateSSAPass::LowerKnownFlagComputations(Module &M) {
     }
   }
 
-  // Step 3: Remove dead flag stores (only in lifted functions without unsafe boundaries)
-  SmallVector<StoreInst *, 64> DeadStores;
+  // Do not remove a State flag store merely because this module has no
+  // constant-offset load.  State can be observed through a dynamic access,
+  // callback, or linked runtime.  Once State is truly localized, LLVM DSE can
+  // prove deadness without this whole-program escape assumption.
   unsigned DeadCount = 0;
-
-  for (Function &F : M) {
-    if (F.isDeclaration() || !IsLiftedFunction(F)) continue;
-    if (FunctionHasUnsupportedStateBoundary(F, StateGV, DL)) continue;
-
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        auto *SI = dyn_cast<StoreInst>(&I);
-        if (!SI || SI->isVolatile()) continue;
-        auto Resolved = ResolveStateOffset(SI->getPointerOperand(), DL, F, StateGV);
-        if (!Resolved) continue;
-        if (IsFlagOffset(FlagLayout, Resolved->Offset) &&
-            !FlagOffsetsWithLoads.count(Resolved->Offset)) {
-          DeadStores.push_back(SI);
-        }
-      }
-    }
-  }
-
-  for (StoreInst *SI : DeadStores) {
-    SI->eraseFromParent();
-    DeadCount++;
-    Changed = true;
-  }
 
   // Step 4: Intra-block flag forwarding (guarded by call & unknown write invalidation)
   unsigned ForwardedCount = 0;
@@ -171,7 +149,10 @@ bool BrightenStateSSAPass::LowerKnownFlagComputations(Module &M) {
         Instruction &I = *It++;
 
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
-          if (SI->isVolatile()) continue;
+          if (SI->isVolatile() || SI->isAtomic()) {
+            LastFlagI8.clear();
+            continue;
+          }
           auto Resolved = ResolveStateOffset(SI->getPointerOperand(), DL, F, StateGV);
 
           if (Resolved && IsFlagOffset(FlagLayout, Resolved->Offset)) {
@@ -186,7 +167,10 @@ bool BrightenStateSSAPass::LowerKnownFlagComputations(Module &M) {
         }
 
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
-          if (LI->isVolatile()) continue;
+          if (LI->isVolatile() || LI->isAtomic()) {
+            LastFlagI8.clear();
+            continue;
+          }
           auto Resolved = ResolveStateOffset(LI->getPointerOperand(), DL, F, StateGV);
           if (!Resolved || !IsFlagOffset(FlagLayout, Resolved->Offset)) continue;
 
