@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from main import _write_semantic_report  # noqa: E402
+from main import _semantic_status, _write_semantic_report  # noqa: E402
 
 
 class SemanticReportPersistenceTests(unittest.TestCase):
@@ -46,6 +46,29 @@ class SemanticReportPersistenceTests(unittest.TestCase):
 
             self.assertEqual(persisted, report)
             self.assertFalse(Path(str(report_path) + ".tmp").exists())
+
+    def test_semantic_status_separates_mismatch_from_no_verdict(self):
+        self.assertEqual(_semantic_status(None), "unchecked")
+        self.assertEqual(
+            _semantic_status({"is_fully_equivalent": True, "mismatches": 0}),
+            "pass",
+        )
+        self.assertEqual(
+            _semantic_status({
+                "is_fully_equivalent": False,
+                "mismatches": 1,
+                "inconclusive": 0,
+            }),
+            "nonpass",
+        )
+        self.assertEqual(
+            _semantic_status({
+                "is_fully_equivalent": False,
+                "mismatches": 0,
+                "inconclusive": 3,
+            }),
+            "unchecked",
+        )
 
 
 if __name__ == "__main__":

@@ -224,6 +224,18 @@ bool BrightenGlobalDataRecoveryPass::RecoverJumpTableCFG(
           continue;
         }
 
+        // The table load is removed below.  If it still has a live use, the
+        // use is part of the program's data flow and cannot be replaced with
+        // a fabricated null value.  Preserve the original CFG instead.
+        if (!I.use_empty()) {
+          JT->TableBase = TableBase;
+          JT->Recovered = false;
+          JT->SkipReason = "jump-table-load-has-live-users";
+          JT->Action = "preserved";
+          Ctx.JumpTables.push_back(std::move(JT));
+          continue;
+        }
+
         JT->BranchInst = &I;
         JT->IndexValue = IndexVal;
         JT->Action = "recovered-jumptable";
@@ -308,7 +320,6 @@ unsigned GEP_ElemSize = 1;
         }
 
         Value *Ptr = cast<LoadInst>(&I)->getPointerOperand();
-        I.replaceAllUsesWith(Constant::getNullValue(I.getType()));
         I.eraseFromParent();
         if (auto *GEPInst = dyn_cast<GetElementPtrInst>(Ptr)) {
           if (GEPInst->use_empty()) {

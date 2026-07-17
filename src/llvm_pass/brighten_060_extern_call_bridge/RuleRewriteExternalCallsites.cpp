@@ -294,6 +294,39 @@ bool BrightenExternCallBridgePass::RewriteExternalCallsites(
     }
 
     const LibcSignature &Sig = *CS->Target.Signature;
+
+    // Replacing a lifted State-ABI call is only semantics-preserving when a
+    // live result has a real memory operand to carry it forward.  Never
+    // fabricate a null value here: this pass must be fail-closed for unusual
+    // or partially recovered call signatures.
+    const bool HasLiveResult = !OldCI->use_empty();
+    const bool HasMemoryOperand = OldCI->arg_size() >= 3;
+    if (HasLiveResult && !HasMemoryOperand) {
+      CS->Action = "preserve";
+      CS->SkipReason = "live-result-without-memory-operand";
+      continue;
+    }
+
+    // A noreturn rewrite truncates the remainder of the block.  Preflight
+    // all instructions after the old call so we never need to RAUW their
+    // users with a fabricated null value while deleting dead code.
+    if (Sig.Special == LibcSpecialKind::NoReturn) {
+      bool UnsafeTail = false;
+      bool SeenOld = false;
+      for (Instruction &I : *OldCI->getParent()) {
+        if (&I == OldCI) { SeenOld = true; continue; }
+        if (SeenOld && !I.isTerminator() && !I.use_empty()) {
+          UnsafeTail = true;
+          break;
+        }
+      }
+      if (UnsafeTail) {
+        CS->Action = "preserve";
+        CS->SkipReason = "noreturn-tail-has-live-users";
+        continue;
+      }
+    }
+
     Function *ExtFn = GetOrDeclareLibcFunction(Ctx.M, Ctx.SigDB, Sig);
     if (!ExtFn) {
       CS->Action = "preserve";
@@ -369,15 +402,11 @@ bool BrightenExternCallBridgePass::RewriteExternalCallsites(
         }
       }
       if (!OldCI->use_empty()) {
-        Value *Mem = OldCI->arg_size() >= 3 ? OldCI->getArgOperand(2) : nullptr;
-        if (Mem) OldCI->replaceAllUsesWith(Mem);
-        else OldCI->replaceAllUsesWith(Constant::getNullValue(OldCI->getType()));
+        Value *Mem = OldCI->getArgOperand(2);
+        OldCI->replaceAllUsesWith(Mem);
       }
       OldCI->eraseFromParent();
       for (auto It = ToErase.rbegin(); It != ToErase.rend(); ++It) {
-        if (!(*It)->use_empty()) {
-          (*It)->replaceAllUsesWith(Constant::getNullValue((*It)->getType()));
-        }
         (*It)->eraseFromParent();
       }
       IRBuilder<> B2(BB);
@@ -385,9 +414,8 @@ bool BrightenExternCallBridgePass::RewriteExternalCallsites(
     } else {
       // Normal case: replace old call uses with memory arg
       if (!OldCI->use_empty()) {
-        Value *Mem = OldCI->arg_size() >= 3 ? OldCI->getArgOperand(2) : nullptr;
-        if (Mem) OldCI->replaceAllUsesWith(Mem);
-        else OldCI->replaceAllUsesWith(Constant::getNullValue(OldCI->getType()));
+        Value *Mem = OldCI->getArgOperand(2);
+        OldCI->replaceAllUsesWith(Mem);
       }
       OldCI->eraseFromParent();
     }

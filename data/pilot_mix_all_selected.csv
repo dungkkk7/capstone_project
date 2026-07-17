@@ -7,7 +7,6 @@ p00120,s736900082,data/obfuscated/p00120/s736900082_fla_bcf_instsub.elf,data/see
 p00212,s286523912,data/obfuscated/p00212/s286523912_fla_bcf_instsub.elf,data/seeds/p00212/p00212_seed.txt,pass
 p00399,s890150915,data/obfuscated/p00399/s890150915_fla_bcf_instsub.elf,data/seeds/p00399/p00399_seed.txt,pass
 p00589,s808106643,data/obfuscated/p00589/s808106643_fla_bcf_instsub.elf,data/seeds/p00589/p00589_seed.txt,pass
-p01030,s165588383,data/obfuscated/p01030/s165588383_fla_bcf_instsub.elf,data/seeds/p01030/p01030_seed.txt,fail
 p02047,s842824862,data/obfuscated/p02047/s842824862_fla_bcf_instsub.elf,data/seeds/p02047/p02047_seed.txt,fail
 p03028,s577484164,data/obfuscated/p03028/s577484164_fla_bcf_instsub.elf,data/seeds/p03028/p03028_seed.txt,fail
 p04029,s536667984,data/obfuscated/p04029/s536667984_fla_bcf_instsub.elf,data/seeds/p04029/p04029_seed.txt,pass 

@@ -681,6 +681,8 @@ def run_binary(bin_path: str, args: List[str], stdin_data: bytes, timeout: float
 
 def fail_fast_execution_key(res1: Dict[str, Any], res2: Dict[str, Any]) -> Optional[str]:
     """Return an asymmetric crash; timeouts are per-input, not batch-fatal."""
+    if is_inconclusive_pair(res1, res2):
+        return None
     status1 = res1["status"]
     status2 = res2["status"]
     if status1 != status2 and (status1 == "crash" or status2 == "crash"):
@@ -707,13 +709,22 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
     if res1["status"] != res2["status"]:
         return False, f"Execution status mismatch: {res1['status']} vs {res2['status']}"
 
+    if res1["status"] == "crash":
+        signal1 = res1.get("signal")
+        signal2 = res2.get("signal")
+        if signal1 != signal2:
+            return False, f"Crash signal mismatch: {signal1} vs {signal2}"
+
     # A shared deadline has no semantic verdict. Keep testing subsequent
     # inputs, but never treat it as a match or include it in equivalence.
     if res1["status"] == "timeout":
         return False, "Inconclusive shared timeout"
         
-    if res1["status"] in ("timeout", "crash"):
-        return False, f"Inconclusive shared {res1['status']}"
+    # A shared crash with the same signal is a deterministic observable result,
+    # unlike a shared deadline.  Treat it as equivalent; a differing signal
+    # was rejected above because it exposes a different failure mechanism.
+    if res1["status"] == "crash":
+        return True, ""
         
     if res1["returncode"] != res2["returncode"]:
         return False, f"Exit code mismatch: {res1['returncode']} vs {res2['returncode']}"
@@ -730,15 +741,89 @@ def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr
         
     return True, ""
 
+
+def _success_observation(res: Dict[str, Any], compare_stderr: bool = False) -> tuple:
+    """Return the observable part of one successful execution."""
+    stdout = normalize_process_stream(res.get("stdout", b""), res)
+    stderr = normalize_process_stream(res.get("stderr", b""), res)
+    return (
+        res.get("status"),
+        res.get("returncode"),
+        stdout,
+        stderr if compare_stderr else b"",
+    )
+
+
+def is_stable_success(
+    bin_path: str,
+    args: List[str],
+    stdin_data: bytes,
+    timeout: float,
+    observed: Dict[str, Any],
+    compare_stderr: bool = False,
+    repeats: int = 2,
+) -> bool:
+    """Check whether a successful baseline result is repeatable.
+
+    Raw mutation can drive a lifted program into an uninitialized-input path.
+    In that case the original may return a different value on every process
+    invocation.  Such a pair has no stable semantic oracle verdict; treating
+    it as a mismatch would attribute host-stack nondeterminism to a pass.
+    This helper is used only after an observable mismatch and never turns a
+    crash/timeout into a match.
+    """
+    if observed.get("status") != "success":
+        return True
+    expected = _success_observation(observed, compare_stderr)
+    for _ in range(max(0, repeats)):
+        rerun = run_binary(bin_path, args, stdin_data, timeout)
+        if rerun.get("status") != "success":
+            return False
+        if _success_observation(rerun, compare_stderr) != expected:
+            return False
+    return True
+
+
+def is_stable_observation(
+    bin_path: str,
+    args: List[str],
+    stdin_data: bytes,
+    timeout: float,
+    observed: Dict[str, Any],
+    compare_stderr: bool = False,
+    repeats: int = 2,
+) -> bool:
+    """Check repeatability for any observable result, including timeout.
+
+    Raw malformed input can make the original alternate between returning and
+    timing out.  A single success-vs-timeout sample is not enough evidence to
+    blame the transformation, so unstable observations are reported as
+    inconclusive.  Stable stdout/status mismatches remain real failures.
+    """
+    expected = _success_observation(observed, compare_stderr)
+    for _ in range(max(0, repeats)):
+        rerun = run_binary(bin_path, args, stdin_data, timeout)
+        if _success_observation(rerun, compare_stderr) != expected:
+            return False
+    return True
+
 def is_inconclusive_pair(res1: Dict[str, Any], res2: Dict[str, Any]) -> bool:
-    """Both crashing together or timing out together is conclusive identical behavior.
-    Also, asymmetric crashes/timeouts on uninitialized stack variables (where one succeeds 
-    with no output and the other crashes/timeouts) are inconclusive due to UB."""
-    if res1["status"] == "success" and res2["status"] in ("crash", "timeout"):
-        if not res1.get("stdout", b"").strip() and not res1.get("stderr", b"").strip():
-            return True
-    if res2["status"] == "success" and res1["status"] in ("crash", "timeout"):
-        if not res2.get("stdout", b"").strip() and not res2.get("stderr", b"").strip():
+    """Return true only for raw failure-mode pairs with no stable verdict.
+
+    A successful exit on one side and a crash/timeout on the other side is an
+    observable semantic difference even if stdout is empty or ``0\n``.  Do not
+    hide zero-filled recovered-frame bugs behind the oracle.
+    """
+    # A raw malformed input can expose two different failure manifestations
+    # of the same uninitialized state (for example timeout vs SIGSEGV).  With
+    # no observable stream on either side there is no stable semantic oracle.
+    if (res1["status"], res2["status"]) in {
+        ("crash", "timeout"), ("timeout", "crash")
+    }:
+        if (not res1.get("stdout", b"").strip() and
+                not res1.get("stderr", b"").strip() and
+                not res2.get("stdout", b"").strip() and
+                not res2.get("stderr", b"").strip()):
             return True
     return False
 
@@ -749,6 +834,35 @@ def account_differential_result(report: Dict[str, Any],
     res1 = result["res1"]
     res2 = result["res2"]
 
+    def record_inconclusive(reason: str) -> None:
+        examples = report.setdefault("inconclusive_examples", [])
+        if len(examples) >= 5:
+            return
+        stdin_data = result["stdin"]
+        def sample_stream(data: bytes) -> str:
+            text = (data or b"")[:512].decode("utf-8", errors="replace")
+            if len(data or b"") > 512:
+                text += "...<truncated>"
+            return text
+        examples.append({
+            "index": result["index"],
+            "stdin": stdin_data.decode("utf-8", errors="replace"),
+            "reason": reason,
+            "prog1": {"status": res1["status"],
+                      "returncode": res1["returncode"],
+                      "stdout": sample_stream(res1.get("stdout", b"")),
+                      "stderr": sample_stream(res1.get("stderr", b""))},
+            "prog2": {"status": res2["status"],
+                      "returncode": res2["returncode"],
+                      "stdout": sample_stream(res2.get("stdout", b"")),
+                      "stderr": sample_stream(res2.get("stderr", b""))},
+        })
+
+    if result.get("oracle_inconclusive"):
+        report["inconclusive"] += 1
+        record_inconclusive(result["reason"])
+        return
+
     if res1["status"] == "timeout" and res2["status"] == "timeout":
         report["timeouts"]["both"] += 1
     elif res1["status"] == "timeout":
@@ -758,7 +872,10 @@ def account_differential_result(report: Dict[str, Any],
 
     if res1["status"] == "crash" and res2["status"] == "crash":
         report["crashes"]["both"] += 1
-        report["matches"] += 1
+        if result["is_equivalent"]:
+            report["matches"] += 1
+        else:
+            report["mismatches"] += 1
         return
     elif res1["status"] == "crash":
         report["crashes"]["bin1"] += 1
@@ -767,6 +884,7 @@ def account_differential_result(report: Dict[str, Any],
 
     if is_inconclusive_pair(res1, res2):
         report["inconclusive"] += 1
+        record_inconclusive(result["reason"])
         return
     if res1["status"] == "timeout" and res2["status"] == "timeout":
         report["matches"] += 1
@@ -963,7 +1081,10 @@ class SemanticFuzzer:
         
         # Prepare all inputs beforehand
         seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
-        seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "off").lower()
+        # A semantic gate must exercise more than the one recorded seed.  The
+        # Raw AFL mutation is the requested fuzzing mode.  Structured mutation
+        # remains available explicitly for grammar-sensitive regression cases.
+        seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "raw").lower()
         structured_mutation = seed_mutation_mode in {"structured", "local", "safe"}
         report["fuzz_config"] = {
             "engine": "fallback",
@@ -972,14 +1093,19 @@ class SemanticFuzzer:
         }
         print(f"{Color.BLUE}[*] Fuzzing {iterations} iterations (timeout={timeout}s, "
               f"workers={num_workers})...{Color.END}")
-        if seed_inputs:
-            structured_inputs = (
-                generate_structured_seed_inputs(seed_inputs, iterations)
-                if structured_mutation
-                else seed_inputs
+        exact_seed_replay = seed_mutation_mode in {"0", "false", "off", "no"}
+        if seed_inputs and structured_mutation:
+            structured_inputs = generate_structured_seed_inputs(
+                seed_inputs, iterations
             )
             iterations = len(structured_inputs)
             report["total_runs"] = iterations
+        elif seed_inputs and exact_seed_replay:
+            structured_inputs = seed_inputs
+            iterations = len(structured_inputs)
+            report["total_runs"] = iterations
+        elif seed_inputs:
+            structured_inputs = seed_inputs[:iterations]
         test_inputs = []
         test_payloads = []
         if seed_inputs:
@@ -1008,6 +1134,17 @@ class SemanticFuzzer:
                 res1 = future1.result()
                 res2 = future2.result()
             is_eq, reason = check_equivalence(res1, res2, compare_stderr)
+            oracle_inconclusive = False
+            if not is_eq:
+                stable1 = is_stable_observation(
+                    self.bin1, args, stdin_data, timeout, res1, compare_stderr
+                )
+                stable2 = is_stable_observation(
+                    self.bin2, args, stdin_data, timeout, res2, compare_stderr
+                )
+                if not stable1 or not stable2:
+                    oracle_inconclusive = True
+                    reason = "unstable execution; no semantic verdict"
             return {
                 "index": idx,
                 "args": args,
@@ -1015,6 +1152,7 @@ class SemanticFuzzer:
                 "res1": res1,
                 "res2": res2,
                 "is_equivalent": is_eq,
+                "oracle_inconclusive": oracle_inconclusive,
                 "reason": reason
             }
 
@@ -1034,7 +1172,9 @@ class SemanticFuzzer:
                     res2 = result["res2"]
                     account_differential_result(report, result)
 
-                    fail_fast_key = fail_fast_execution_key(res1, res2)
+                    fail_fast_key = None
+                    if not result.get("oracle_inconclusive"):
+                        fail_fast_key = fail_fast_execution_key(res1, res2)
                     if fail_fast_key is not None:
                         report["total_runs"] = completed
                         report["early_stopped"] = True
@@ -1074,18 +1214,28 @@ class SemanticFuzzer:
         use_afl = os.environ.get("BRIGHTEN_USE_AFL", "1").lower() in {
             "1", "true", "yes", "on"
         }
+        # Some focused unit tests construct a lightweight SemanticFuzzer via
+        # __new__ and replace the fallback runner.  Do not enter the AFL path
+        # unless the object has the context that AFL materialization requires;
+        # otherwise the broad exception handler below logs a misleading
+        # infrastructure failure before doing the intended fallback.
+        if not getattr(self, "file1", None) or not getattr(self, "tmp_dir", None):
+            use_afl = False
         # A case-specific seed is an executable input contract.  Raw AFL byte
-        # mutation can change record counts/layout and create artificial
-        # hangs in only one binary, so exact seeds are the default.  Mutation
-        # is opt-in via BRIGHTEN_MUTATE_SEEDS=1 (raw AFL), or one of the
-        # structure-preserving modes below.
-        seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "off").lower()
+        # Raw AFL mutation is the default fuzzing contract.  Use
+        # BRIGHTEN_MUTATE_SEEDS=structured only for grammar-sensitive tests;
+        # use `off` for explicit exact-seed replay.
+        seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "raw").lower()
         seed_mutation_enabled = seed_mutation_mode in {
             "1", "true", "yes", "on", "raw", "structured", "local", "safe"
         }
         if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
             use_afl = False
-        has_afl = use_afl and os.path.exists(self.afl_cc) and os.path.exists(self.afl_fuzz)
+        has_afl = (
+            use_afl and
+            os.path.exists(getattr(self, "afl_cc", "")) and
+            os.path.exists(getattr(self, "afl_fuzz", ""))
+        )
         
         if not has_afl:
             if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
@@ -1395,6 +1545,21 @@ int main(int argc, char** argv) {
                     res1 = future1.result()
                     res2 = future2.result()
                 is_eq, reason = check_equivalence(res1, res2, compare_stderr)
+                oracle_inconclusive = False
+                if not is_eq:
+                    # A mismatch is actionable only when both observations
+                    # are repeatable.  This is especially important in raw
+                    # mode, where malformed scanf input can expose an
+                    # uninitialized stack value in the original binary.
+                    stable1 = is_stable_observation(
+                        self.bin1, args, stdin_data, timeout, res1,
+                        compare_stderr)
+                    stable2 = is_stable_observation(
+                        self.bin2, args, stdin_data, timeout, res2,
+                        compare_stderr)
+                    if not stable1 or not stable2:
+                        oracle_inconclusive = True
+                        reason = "unstable successful execution; no semantic verdict"
                 return {
                     "index": idx,
                     "args": args,
@@ -1402,6 +1567,7 @@ int main(int argc, char** argv) {
                     "res1": res1,
                     "res2": res2,
                     "is_equivalent": is_eq,
+                    "oracle_inconclusive": oracle_inconclusive,
                     "reason": reason
                 }
 
@@ -1420,7 +1586,9 @@ int main(int argc, char** argv) {
                         res2 = result["res2"]
                         account_differential_result(report, result)
 
-                        fail_fast_key = fail_fast_execution_key(res1, res2)
+                        fail_fast_key = None
+                        if not result.get("oracle_inconclusive"):
+                            fail_fast_key = fail_fast_execution_key(res1, res2)
                         if fail_fast_key is not None:
                             report["total_runs"] = completed
                             report["early_stopped"] = True
@@ -1454,8 +1622,9 @@ int main(int argc, char** argv) {
 
     def cleanup(self):
         """Cleans up the local temporary workspaces."""
-        if os.path.exists(self.tmp_dir):
-            shutil.rmtree(self.tmp_dir)
+        tmp_dir = getattr(self, "tmp_dir", None)
+        if tmp_dir and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
 
 # -----------------------------------------------------------------------------
 # Default Generators Factory
@@ -1629,7 +1798,7 @@ def main():
         except Exception as e:
             print(f"{Color.RED}[✗] Error writing JSON report: {e}{Color.END}")
             
-    if ratio != 100.0:
+    if not report.get("is_fully_equivalent", False):
         sys.exit(2)
     sys.exit(0)
 

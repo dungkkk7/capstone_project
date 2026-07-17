@@ -88,7 +88,7 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     }
     StringRef Name = F.getName();
     if (Name == "main" || Name == "start" || Name == ".init_proc" ||
-        Name.starts_with("callback_sub_")) {
+        Name == "compar" || Name.starts_with("callback_sub_")) {
       // Check if it calls inline asm to attach_call
       if (ParsePCFromInlineAsm(F).has_value()) {
         ThunkFunctions.push_back(&F);
@@ -107,6 +107,52 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     if (!Target) {
       errs() << "[brighten-mcsema-lower] Target not found for thunk " << Name
              << " (PC: 0x" << utohexstr(*PC) << ")\n";
+      continue;
+    }
+
+    // qsort's comparator is a McSema naked thunk with no C arguments, but
+    // libc calls it as (const void *, const void *).  Preserve that boundary
+    // before generic thunk lowering erases the only wrapper-to-body link.
+    // The comparator body communicates its result through the canonical RAX
+    // State slot, just like the original lifted call bridge.
+    if (Name == "compar" && RegState &&
+        HasMemoryThreadingSignature(*Target)) {
+      Type *PtrTy = PointerType::getUnqual(Ctx);
+      FunctionType *AdapterTy =
+          FunctionType::get(Type::getInt32Ty(Ctx), {PtrTy, PtrTy}, false);
+      Function *Adapter = Function::Create(
+          AdapterTy, GlobalValue::InternalLinkage, "compar.native_callback", &M);
+      Adapter->setCallingConv(F->getCallingConv());
+      Adapter->setDSOLocal(true);
+      Adapter->getArg(0)->setName("lhs");
+      Adapter->getArg(1)->setName("rhs");
+      BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Adapter);
+      IRBuilder<> AB(Entry);
+      AB.CreateAlignedStore(AB.CreatePtrToInt(Adapter->getArg(0), I64),
+                            AB.CreateConstGEP1_64(I8, RegState, 2296), Align(8));
+      AB.CreateAlignedStore(AB.CreatePtrToInt(Adapter->getArg(1), I64),
+                            AB.CreateConstGEP1_64(I8, RegState, 2280), Align(8));
+      SmallVector<Value *, 3> Args;
+      FunctionType *TargetTy = Target->getFunctionType();
+      if (TargetTy->getNumParams() != 3) {
+        Adapter->eraseFromParent();
+        continue;
+      }
+      Args.push_back(AB.CreateBitCast(RegState, TargetTy->getParamType(0)));
+      Args.push_back(ConstantInt::get(TargetTy->getParamType(1), *PC));
+      Args.push_back(ConstantPointerNull::get(
+          cast<PointerType>(TargetTy->getParamType(2))));
+      AB.CreateCall(TargetTy, Target, Args);
+      Value *RAX = AB.CreateAlignedLoad(
+          Type::getInt32Ty(Ctx), AB.CreateConstGEP1_64(I8, RegState, 2216),
+          Align(8));
+      AB.CreateRet(RAX);
+      F->replaceAllUsesWith(Adapter);
+      if (F->use_empty())
+        F->eraseFromParent();
+      Changed = true;
+      errs() << "[brighten-mcsema-lower] Lowered qsort comparator thunk: "
+             << Name << " -> " << Target->getName() << "\n";
       continue;
     }
 

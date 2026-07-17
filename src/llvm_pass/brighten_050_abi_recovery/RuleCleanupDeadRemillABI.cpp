@@ -55,13 +55,24 @@ static void PruneDispatcherCases(Module &M, Function *Dispatcher) {
   }
 
   for (BasicBlock *BB : TargetBBsToRemove) {
-    for (auto It = BB->begin(); It != BB->end(); ) {
-      Instruction &I = *It++;
-      if (!I.use_empty()) {
-        I.replaceAllUsesWith(Constant::getNullValue(I.getType()));
+    // A dead dispatcher case may contain an internal SSA dependency chain.
+    // Erase it backwards, but reject the case if any value escapes the block;
+    // replacing such an escape with null changes observable behavior.
+    bool Escapes = false;
+    for (Instruction &I : *BB) {
+      for (User *U : I.users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || UI->getParent() != BB) {
+          Escapes = true;
+          break;
+        }
       }
-      I.eraseFromParent();
+      if (Escapes) break;
     }
+    if (Escapes)
+      continue;
+    while (!BB->empty())
+      BB->back().eraseFromParent();
     BB->eraseFromParent();
   }
 }

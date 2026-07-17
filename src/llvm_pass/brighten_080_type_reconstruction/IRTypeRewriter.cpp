@@ -7,6 +7,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <optional>
 
 namespace brighten_type {
 
@@ -58,26 +59,29 @@ static void ResolveIndexExpression(Value *Idx, int64_t CurrentStride, int64_t &C
   FinalStride = CurrentStride;
 }
 
-uint8_t ExtractByteFromConstant(Constant *C, uint64_t Offset, const DataLayout &DL) {
+static std::optional<uint8_t> ExtractByteFromConstant(Constant *C,
+                                                     uint64_t Offset,
+                                                     const DataLayout &DL) {
   if (isa<ConstantAggregateZero>(C))
-    return 0;
+    return uint8_t(0);
   if (auto *CDS = dyn_cast<ConstantDataSequential>(C)) {
     if (Offset < CDS->getNumElements() * CDS->getElementByteSize()) {
       uint64_t ElemIdx = Offset / CDS->getElementByteSize();
       uint64_t ByteIdx = Offset % CDS->getElementByteSize();
       uint64_t Val = CDS->getElementAsInteger(ElemIdx);
-      return (Val >> (ByteIdx * 8)) & 0xFF;
+      return static_cast<uint8_t>((Val >> (ByteIdx * 8)) & 0xFF);
     }
-    return 0;
+    return std::nullopt;
   }
   if (auto *CA = dyn_cast<ConstantArray>(C)) {
     Type *ElemTy = CA->getType()->getElementType();
     uint64_t ElemSize = DL.getTypeAllocSize(ElemTy).getFixedValue();
     uint64_t ElemIdx = Offset / ElemSize;
     if (ElemIdx < CA->getNumOperands()) {
-      return ExtractByteFromConstant(cast<Constant>(CA->getOperand(ElemIdx)), Offset % ElemSize, DL);
+      return ExtractByteFromConstant(cast<Constant>(CA->getOperand(ElemIdx)),
+                                     Offset % ElemSize, DL);
     }
-    return 0;
+    return std::nullopt;
   }
   if (auto *CS = dyn_cast<ConstantStruct>(C)) {
     const StructLayout *SL = DL.getStructLayout(CS->getType());
@@ -85,38 +89,41 @@ uint8_t ExtractByteFromConstant(Constant *C, uint64_t Offset, const DataLayout &
       uint64_t FieldOffset = SL->getElementOffset(i);
       uint64_t FieldSize = DL.getTypeAllocSize(CS->getOperand(i)->getType()).getFixedValue();
       if (Offset >= FieldOffset && Offset < FieldOffset + FieldSize) {
-        return ExtractByteFromConstant(cast<Constant>(CS->getOperand(i)), Offset - FieldOffset, DL);
+        return ExtractByteFromConstant(cast<Constant>(CS->getOperand(i)),
+                                       Offset - FieldOffset, DL);
       }
     }
-    return 0;
+    return std::nullopt;
   }
   if (auto *CI = dyn_cast<ConstantInt>(C)) {
     const APInt &Val = CI->getValue();
     uint64_t StoreBytes = DL.getTypeStoreSize(CI->getType()).getFixedValue();
     if (Offset >= StoreBytes)
-      return 0;
+      return std::nullopt;
     uint64_t MemoryByte = DL.isLittleEndian() ? Offset
                                                : StoreBytes - 1 - Offset;
     unsigned Bit = static_cast<unsigned>(MemoryByte * 8);
     if (Bit < Val.getBitWidth())
-      return Val.lshr(Bit).trunc(std::min(8u, Val.getBitWidth() - Bit))
-          .getZExtValue();
-    return 0;
+      return static_cast<uint8_t>(Val.lshr(Bit)
+                                      .trunc(std::min(8u, Val.getBitWidth() - Bit))
+                                      .getZExtValue());
+    return std::nullopt;
   }
   if (auto *CFP = dyn_cast<ConstantFP>(C)) {
     APInt Bits = CFP->getValueAPF().bitcastToAPInt();
     uint64_t StoreBytes = DL.getTypeStoreSize(CFP->getType()).getFixedValue();
     if (Offset >= StoreBytes)
-      return 0;
+      return std::nullopt;
     uint64_t MemoryByte = DL.isLittleEndian() ? Offset
                                                : StoreBytes - 1 - Offset;
     unsigned Bit = static_cast<unsigned>(MemoryByte * 8);
     if (Bit < Bits.getBitWidth())
-      return Bits.lshr(Bit).trunc(std::min(8u, Bits.getBitWidth() - Bit))
-          .getZExtValue();
-    return 0;
+      return static_cast<uint8_t>(Bits.lshr(Bit)
+                                      .trunc(std::min(8u, Bits.getBitWidth() - Bit))
+                                      .getZExtValue());
+    return std::nullopt;
   }
-  return 0;
+  return std::nullopt;
 }
 
 Constant *ExtractPointerFromConstant(Constant *C, uint64_t Offset, const DataLayout &DL) {
@@ -160,8 +167,13 @@ Constant *RebuildConstant(Constant *OldInit, Type *NewTy, uint64_t Offset, const
 
   auto ReadBytes = [&](uint64_t Off, uint64_t Size, std::vector<uint8_t> &Out) {
     for (uint64_t i = 0; i < Size; ++i) {
-      Out.push_back(ExtractByteFromConstant(OldInit, Off + i, DL));
+      std::optional<uint8_t> Byte =
+          ExtractByteFromConstant(OldInit, Off + i, DL);
+      if (!Byte)
+        return false;
+      Out.push_back(*Byte);
     }
+    return true;
   };
 
   auto AssembleBits = [&](ArrayRef<uint8_t> Bytes,
@@ -180,14 +192,16 @@ Constant *RebuildConstant(Constant *OldInit, Type *NewTy, uint64_t Offset, const
   if (NewTy->isIntegerTy()) {
     unsigned Width = NewTy->getIntegerBitWidth();
     std::vector<uint8_t> Bytes;
-    ReadBytes(Offset, (Width + 7) / 8, Bytes);
+    if (!ReadBytes(Offset, (Width + 7) / 8, Bytes))
+      return nullptr;
     return ConstantInt::get(NewTy, AssembleBits(Bytes, Width));
   }
 
   if (NewTy->isFloatingPointTy()) {
     std::vector<uint8_t> Bytes;
     unsigned Size = DL.getTypeStoreSize(NewTy).getFixedValue();
-    ReadBytes(Offset, Size, Bytes);
+    if (!ReadBytes(Offset, Size, Bytes))
+      return nullptr;
     unsigned Width = NewTy->getPrimitiveSizeInBits().getFixedValue();
     APFloat Value(NewTy->getFltSemantics(), AssembleBits(Bytes, Width));
     return ConstantFP::get(Ctx, Value);
@@ -204,7 +218,8 @@ Constant *RebuildConstant(Constant *OldInit, Type *NewTy, uint64_t Offset, const
     // (and can hide a still-lifted guest address).  Reject the reconstruction
     // plan and preserve the original byte object instead.
     std::vector<uint8_t> Bytes;
-    ReadBytes(Offset, DL.getTypeStoreSize(NewTy).getFixedValue(), Bytes);
+    if (!ReadBytes(Offset, DL.getTypeStoreSize(NewTy).getFixedValue(), Bytes))
+      return nullptr;
     if (!DL.isNonIntegralPointerType(NewTy) &&
         std::all_of(Bytes.begin(), Bytes.end(),
                     [](uint8_t Byte) { return Byte == 0; }))
@@ -219,7 +234,8 @@ Constant *RebuildConstant(Constant *OldInit, Type *NewTy, uint64_t Offset, const
 
     if (ElemTy->isIntegerTy(8)) {
       std::vector<uint8_t> Bytes;
-      ReadBytes(Offset, NumElems, Bytes);
+      if (!ReadBytes(Offset, NumElems, Bytes))
+        return nullptr;
       return ConstantDataArray::get(Ctx, Bytes);
     } else {
       std::vector<Constant *> Elems;

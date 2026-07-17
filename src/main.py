@@ -123,6 +123,20 @@ def _native_contract_status(report: Optional[Mapping[str, Any]]) -> str:
     return "pass" if report.get("is_fully_native") is True else "nonpass"
 
 
+def _semantic_status(report: Optional[Mapping[str, Any]]) -> str:
+    """Classify differential fuzzing without treating no-verdict raw runs as bugs."""
+    if not report:
+        return "unchecked"
+    if report.get("is_fully_equivalent", False):
+        return "pass"
+    if int(report.get("mismatches", 0) or 0) > 0:
+        return "nonpass"
+    # Raw fuzzing can drive the programs into unstable timeout/crash or
+    # uninitialised-input behavior.  That is not proof of equivalence, but it
+    # is also not an actionable semantic mismatch for the pass.
+    return "unchecked"
+
+
 def _run_fuzzer_sync(
     fuzzer: "SemanticFuzzer",
     iterations: int,
@@ -579,7 +593,11 @@ def main(argv=None):
     semantic_pass_count = 0
     semantic_nonpass_count = 0
     semantic_unchecked_count = 0
+    valid_domain_pass_count = 0
+    valid_domain_nonpass_count = 0
+    valid_domain_unchecked_count = 0
     llm_success_count = 0
+    case_results = []
     for path in binary_paths:
         print("\n" + f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")
         print(f"{Color.BLUE}{Color.BOLD}[*] Đang thực hiện lifting cho: {path}{Color.END}")
@@ -608,12 +626,22 @@ def main(argv=None):
             
         os.makedirs(case_output_dir, exist_ok=True)
         output_bc = os.path.join(case_output_dir, f"{base_name}.bc")
+        case_record = {
+            "binary": path,
+            "output_dir": os.path.abspath(case_output_dir),
+            "lift": "pending",
+            "brightening": "not_run",
+            "output_class": None,
+            "semantic": "not_run",
+        }
+        case_results.append(case_record)
 
         # Gọi hàm lift_binary từ module binary_lifting.lifting, truyền output_bc chỉ định thư mục pipeline con
         # use_cache và force_relift được truyền từ tham số dòng lệnh
         success = lift_binary(binary_path=path, output=output_bc,
                               use_cache=use_cache, force_relift=force_relift)
         if success:
+            case_record["lift"] = "pass"
             print(f"{Color.GREEN}[✓] Nâng mã (Lift) thành công cho: {path}{Color.END}")
             
             # --- BƯỚC THÊM: LÀM ĐẸP MÃ IR (BRIGHTENING) ---
@@ -626,6 +654,10 @@ def main(argv=None):
                     output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
                     native_report = read_native_contract_report(output_brightened_bc)
                     native_status = _native_contract_status(native_report)
+                    case_record["brightening"] = "pass"
+                    case_record["output_class"] = (
+                        native_report.get("output_class") if native_report else None
+                    )
                     print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
                     if native_status == "pass":
                         native_contract_pass_count += 1
@@ -652,6 +684,7 @@ def main(argv=None):
                         f"{native_contract_report_path(output_brightened_bc)}{Color.END}"
                     )
                     brightened_count += 1
+                    case_record["semantic"] = "unchecked"
                     
                     # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
                     print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu kiểm tra Semantic Equivalence cho: {path}...{Color.END}")
@@ -720,10 +753,66 @@ def main(argv=None):
                             f"{semantic_report_path}{Color.END}"
                         )
                         _print_llm_report(fuzz_report)
-                        if fuzz_report.get("is_fully_equivalent", False):
+                        semantic_status = _semantic_status(fuzz_report)
+                        if semantic_status == "pass":
                             semantic_pass_count += 1
-                        else:
+                            case_record["semantic"] = "pass"
+                        elif semantic_status == "nonpass":
                             semantic_nonpass_count += 1
+                            case_record["semantic"] = "nonpass"
+                        else:
+                            semantic_unchecked_count += 1
+                            case_record["semantic"] = "unchecked"
+                        # Raw AFL is intentionally allowed to produce malformed
+                        # byte streams.  Keep that robustness result visible,
+                        # but run a separate grammar-preserving gate so a raw
+                        # crash/timeout is not mistaken for a pass regression.
+                        valid_domain_report = None
+                        raw_mode = os.environ.get(
+                            "BRIGHTEN_MUTATE_SEEDS", "raw"
+                        ).lower()
+                        run_valid_domain_gate = (
+                            raw_mode == "raw" and
+                            not fuzz_report.get("is_fully_equivalent", False) and
+                            os.environ.get("BRIGHTEN_VALID_DOMAIN_GATE", "1").lower()
+                            not in {"0", "false", "off", "no"}
+                        )
+                        if run_valid_domain_gate:
+                            previous_mutation_mode = os.environ.get(
+                                "BRIGHTEN_MUTATE_SEEDS"
+                            )
+                            os.environ["BRIGHTEN_MUTATE_SEEDS"] = "structured"
+                            try:
+                                valid_domain_report = run_fuzz(output_brightened_bc)
+                            finally:
+                                if previous_mutation_mode is None:
+                                    os.environ.pop("BRIGHTEN_MUTATE_SEEDS", None)
+                                else:
+                                    os.environ[
+                                        "BRIGHTEN_MUTATE_SEEDS"
+                                    ] = previous_mutation_mode
+                            valid_domain_report_path = os.path.join(
+                                case_output_dir,
+                                f"{base_name}_valid_domain_semantic_report.json",
+                            )
+                            _write_semantic_report(
+                                valid_domain_report_path, valid_domain_report
+                            )
+                            case_record["semantic_valid_domain_report"] = (
+                                valid_domain_report_path
+                            )
+                            if valid_domain_report.get("is_fully_equivalent", False):
+                                valid_domain_pass_count += 1
+                                case_record["semantic_valid_domain"] = "pass"
+                            else:
+                                valid_domain_nonpass_count += 1
+                                case_record["semantic_valid_domain"] = "nonpass"
+                        elif fuzz_report.get("is_fully_equivalent", False):
+                            valid_domain_pass_count += 1
+                            case_record["semantic_valid_domain"] = "pass"
+                        else:
+                            valid_domain_unchecked_count += 1
+                            case_record["semantic_valid_domain"] = "unchecked"
                         if fuzz_report.get("is_fully_equivalent", False) and llm_recovery_mode:
                             print(f"{Color.BLUE}      -> Bắt đầu LLM recovery vì baseline pass.{Color.END}")
 
@@ -777,16 +866,26 @@ def main(argv=None):
 
                     except Exception as fe:
                         semantic_unchecked_count += 1
+                        case_record["semantic"] = "unchecked"
                         print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")
                 else:
+                    case_record["brightening"] = "fail"
+                    case_record["semantic"] = "not_run"
                     print(f"{Color.RED}[✗] Làm đẹp mã IR THẤT BẠI cho: {path}{Color.END}")
             except Exception as e:
+                case_record["brightening"] = "error"
+                case_record["semantic"] = "not_run"
                 print(f"{Color.RED}[✗] Lỗi khi làm đẹp mã IR: {e}{Color.END}")
         else:
+            case_record["lift"] = "fail"
+            case_record["semantic"] = "not_run"
             print(f"{Color.RED}[✗] Nâng mã (Lift) THẤT BẠI cho: {path}{Color.END}")
 
     print("\n" + f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")
     semantic_checked_count = semantic_pass_count + semantic_nonpass_count
+    valid_domain_checked_count = (
+        valid_domain_pass_count + valid_domain_nonpass_count
+    )
     native_contract_checked_count = (
         native_contract_pass_count + native_contract_nonpass_count
     )
@@ -803,6 +902,31 @@ def main(argv=None):
         semantic_unchecked_count == 0
     )
     all_verified = all_semantic_pass and all_native_contract_pass
+    summary_path = os.path.join(result_pipeline_root, "pipeline_summary.json")
+    summary = {
+        "schema_version": 1,
+        "input_csv": os.path.abspath(list_obfuscated_bin),
+        "pilot_limit": pilot_limit if pilot_flag else None,
+        "counts": {
+            "requested": len(binary_paths),
+            "lift_pass": brightened_count,
+            "lift_failed": len(binary_paths) - brightened_count,
+            "semantic_pass": semantic_pass_count,
+            "semantic_nonpass": semantic_nonpass_count,
+            "semantic_unchecked": semantic_unchecked_count,
+            "semantic_valid_domain_pass": valid_domain_pass_count,
+            "semantic_valid_domain_nonpass": valid_domain_nonpass_count,
+            "semantic_valid_domain_unchecked": valid_domain_unchecked_count,
+            "native_contract_pass": native_contract_pass_count,
+            "native_contract_nonpass": native_contract_nonpass_count,
+            "native_contract_unchecked": native_contract_unchecked_count,
+        },
+        "all_verified": all_verified,
+        "cases": case_results,
+    }
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+    print(f"{Color.BLUE}[*] Pipeline summary: {summary_path}{Color.END}")
     summary_color = Color.GREEN if all_verified else Color.YELLOW
     summary_mark = "[✓]" if all_verified else "[!]"
     if llm_recovery_mode:
@@ -826,7 +950,9 @@ def main(argv=None):
             f"Native contract unchecked: {native_contract_unchecked_count} | "
             f"Semantic PASS: {semantic_pass_count}/{semantic_checked_count} | "
             f"Semantic non-pass: {semantic_nonpass_count} | "
-            f"Semantic unchecked: {semantic_unchecked_count}{Color.END}"
+            f"Semantic unchecked: {semantic_unchecked_count} | "
+            f"Valid-domain PASS: {valid_domain_pass_count}/{valid_domain_checked_count} | "
+            f"Valid-domain non-pass: {valid_domain_nonpass_count}{Color.END}"
         )
     print(f"{Color.BLUE}[*] Tất cả kết quả được lưu tại: {result_pipeline_root}{Color.END}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")

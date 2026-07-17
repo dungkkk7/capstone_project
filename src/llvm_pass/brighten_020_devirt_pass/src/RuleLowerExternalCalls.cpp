@@ -108,7 +108,7 @@ static Value *CoerceArg(IRBuilder<> &B, Value *Raw, Type *Ty,
   if (Ty->isDoubleTy()) {
     return B.CreateBitCast(Raw, Ty);
   }
-  return Constant::getNullValue(Ty);
+  return nullptr;
 }
 
 static bool IsFloatingType(Type *Ty) {
@@ -310,6 +310,7 @@ bool BrightenDevirtPass::LowerExternalCalls(Module &M) {
     SmallVector<Value *, 12> Args;
     unsigned GPIdx = 0;
     unsigned XMMIdx = 0;
+    bool UnsupportedArg = false;
     for (unsigned I = 0, E = ExtTy->getNumParams(); I < E; ++I) {
       Type *ParamTy = ExtTy->getParamType(I);
       bool FP = IsFloatingType(ParamTy);
@@ -321,12 +322,20 @@ bool BrightenDevirtPass::LowerExternalCalls(Module &M) {
       static const uint64_t XMMArgs[] = {kOffXMM0, kOffXMM1, kOffXMM2};
       uint64_t Offset = FP ? XMMArgs[RegIndex] : ArgRegs[RegIndex];
       Value *Raw = LoadReg(B, StatePtr, Offset, Twine("arg") + Twine(I));
-      Args.push_back(CoerceArg(B, Raw, ParamTy, TranslateFn,
-                               IsWritePointerArg(ExtFn->getName(), I),
-                               IsPointerArg(ExtFn->getName(), I)));
+      Value *Arg = CoerceArg(B, Raw, ParamTy, TranslateFn,
+                             IsWritePointerArg(ExtFn->getName(), I),
+                             IsPointerArg(ExtFn->getName(), I));
+      // Unsupported ABI types must reject the whole lowering.  A fabricated
+      // null argument changes the external call's contract and can silently
+      // turn a semantic mismatch into apparently valid IR.
+      if (!Arg) {
+        UnsupportedArg = true;
+        break;
+      }
+      Args.push_back(Arg);
     }
 
-    if (Args.size() != ExtTy->getNumParams())
+    if (UnsupportedArg || Args.size() != ExtTy->getNumParams())
       continue;
 
     CallInst *NewCall = B.CreateCall(ExtTy, ExtFn, Args);

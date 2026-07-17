@@ -102,17 +102,23 @@ bool PlanAndRewrite(TypeReconstructionContext &Ctx, bool OnlyStruct, bool OnlyAr
       auto *GV = cast<GlobalVariable>(Cand->BaseVal);
 
       bool CanRetypeGlobal = true;
-      if (GV->hasExternalLinkage() || GV->hasWeakLinkage() || GV->hasLinkOnceLinkage()) {
+      if (GV->hasExternalLinkage() || GV->hasWeakLinkage() ||
+          GV->hasLinkOnceLinkage() || GV->isExternallyInitialized()) {
         CanRetypeGlobal = false;
       }
 
       if (CanRetypeGlobal) {
-        Constant *NewInit = nullptr;
-        if (GV->hasInitializer()) {
-          NewInit = RebuildConstant(GV->getInitializer(), InferredTy, 0, Ctx.DL, Ctx.M.getContext());
-        } else {
-          NewInit = Constant::getNullValue(InferredTy);
+        if (!GV->hasInitializer()) {
+          Ctx.Report.ObjectsRejectedInitializer++;
+          if (Ctx.DumpRejections) {
+            errs() << "Rejected candidate " << Cand->Name
+                   << " because global has no initializer to rebuild.\n";
+          }
+          continue;
         }
+
+        Constant *NewInit = nullptr;
+        NewInit = RebuildConstant(GV->getInitializer(), InferredTy, 0, Ctx.DL, Ctx.M.getContext());
 
         if (NewInit) {
           GlobalVariable *NewGV = new GlobalVariable(Ctx.M, InferredTy, GV->isConstant(),

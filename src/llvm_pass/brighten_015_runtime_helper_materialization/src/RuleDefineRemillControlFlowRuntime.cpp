@@ -82,17 +82,11 @@ bool BrightenRuntimeHelperPass::DefineRemillControlFlowRuntime(Module &M) {
     StringRef Name = F.getName();
     if (Name == "__remill_function_call" || Name == "__remill_jump") {
       Changed |= DefinePCDispatcher(F, M);
-    } else if (Name == "__remill_missing_block" || Name == "__remill_error") {
-      if (F.isDeclaration() && HasMemoryThreadingSignature(F)) {
-        BasicBlock *TrapBB = BasicBlock::Create(M.getContext(), "entry", &F);
-        IRBuilder<> B(TrapBB);
-        FunctionCallee Trap = Intrinsic::getDeclaration(&M, Intrinsic::trap);
-        B.CreateCall(Trap);
-        B.CreateUnreachable();
-        Changed = true;
-        errs() << "[brighten-remill-runtime] materialized trap body for: " << Name << "\n";
-      }
-    } else if (Name == "__remill_function_return" || Name == "__remill_async_hyper_call" || Name == "__remill_sync_hyper_call") {
+    } else if (Name == "__remill_function_return" ||
+               Name == "__remill_missing_block" ||
+               Name == "__remill_error" ||
+               Name == "__remill_async_hyper_call" ||
+               Name == "__remill_sync_hyper_call") {
       // Returning the incoming Memory token is not the semantics of return,
       // missing-block, error, or a hypercall.  Keep live declarations visible
       // so devirtualization/strict cleanup must resolve them explicitly.

@@ -1,4 +1,6 @@
-; CHECK-NOT: getelementptr inbounds
+; Global constexpr relocations are outside the lifted-instruction repair
+; scope and must retain their original layout/provenance.
+; CHECK: @p = global ptr getelementptr inbounds
 
 @buf = global [4 x i64] zeroinitializer
 @p = global ptr getelementptr inbounds ([4 x i64], ptr @buf, i64 0, i64 8)

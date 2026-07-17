@@ -1028,6 +1028,17 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       }
     }
 
+    // A large recovered region is not a simple compiler-created local frame:
+    // it commonly mixes saved registers, control-flow temporaries and guest
+    // data carriers.  The affine analysis above can still classify every
+    // access as constant while missing those semantic roles.  Preserve such
+    // regions until a stronger object-separation proof exists.
+    for (const auto &Pair : BaseAccesses) {
+      if (Pair.second.size() > 8) {
+        addSkipReason(BaseReasons, Pair.first, SkipUnsafeOverlap);
+      }
+    }
+
     if (!BaseAccesses.empty()) {
       FunctionsWithStackAccess++;
     }

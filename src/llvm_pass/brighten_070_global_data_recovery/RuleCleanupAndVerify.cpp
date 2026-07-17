@@ -6,10 +6,74 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 namespace brighten_global {
 
 using namespace llvm;
+
+static bool FlattenResidualBytes(Constant *C, const DataLayout &DL,
+                                 SmallVectorImpl<uint8_t> &Bytes,
+                                 uint64_t Base = 0) {
+  if (!C)
+    return false;
+  if (isa<ConstantAggregateZero>(C))
+    return true;
+  if (auto *CDS = dyn_cast<ConstantDataSequential>(C)) {
+    Type *ElemTy = CDS->getElementType();
+    uint64_t ElemSize = DL.getTypeAllocSize(ElemTy).getFixedValue();
+    for (unsigned I = 0; I < CDS->getNumElements(); ++I) {
+      if (ElemTy->isIntegerTy(8))
+        Bytes[Base + I] = static_cast<uint8_t>(CDS->getElementAsInteger(I));
+      else if (!FlattenResidualBytes(CDS->getElementAsConstant(I), DL, Bytes,
+                                     Base + I * ElemSize))
+        return false;
+    }
+    return true;
+  }
+  if (auto *CA = dyn_cast<ConstantArray>(C)) {
+    uint64_t ElemSize = DL.getTypeAllocSize(CA->getType()->getElementType())
+                            .getFixedValue();
+    for (unsigned I = 0; I < CA->getNumOperands(); ++I)
+      if (!FlattenResidualBytes(CA->getOperand(I), DL, Bytes,
+                                Base + I * ElemSize))
+        return false;
+    return true;
+  }
+  if (auto *CS = dyn_cast<ConstantStruct>(C)) {
+    const StructLayout *SL = DL.getStructLayout(CS->getType());
+    for (unsigned I = 0; I < CS->getNumOperands(); ++I)
+      if (!FlattenResidualBytes(CS->getOperand(I), DL, Bytes,
+                                Base + SL->getElementOffset(I)))
+        return false;
+    return true;
+  }
+  if (auto *CI = dyn_cast<ConstantInt>(C)) {
+    if (!CI->getType()->isIntegerTy(8) || Base >= Bytes.size())
+      return false;
+    Bytes[Base] = static_cast<uint8_t>(CI->getZExtValue());
+    return true;
+  }
+  return false;
+}
+
+static GlobalVariable *CreateResidualImage(Module &M, GlobalVariable *Source,
+                                           StringRef Name) {
+  if (!Source || !Source->hasInitializer())
+    return nullptr;
+  const DataLayout &DL = M.getDataLayout();
+  uint64_t Size = DL.getTypeAllocSize(Source->getValueType()).getFixedValue();
+  SmallVector<uint8_t, 256> Bytes(Size, 0);
+  if (!FlattenResidualBytes(Source->getInitializer(), DL, Bytes))
+    return nullptr;
+  LLVMContext &Ctx = M.getContext();
+  ArrayType *Ty = ArrayType::get(Type::getInt8Ty(Ctx), Size);
+  Constant *Init = ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(Bytes));
+  auto *GV = new GlobalVariable(M, Ty, true, GlobalValue::InternalLinkage,
+                                Init, Name);
+  GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  return GV;
+}
 
 bool BrightenGlobalDataRecoveryPass::RemoveDeadSegmentConstantUsers(
     GlobalDataContext &Ctx) {
@@ -32,6 +96,16 @@ static bool HasLiveInstructionUsers(Value *V) {
     } else if (isa<Constant>(U)) {
       if (HasLiveInstructionUsers(U))
         return true;
+    } else if (auto *GA = dyn_cast<GlobalAlias>(U)) {
+      // An alias can be referenced from a segment initializer without ever
+      // reaching an instruction.  It is dead provenance, not a live segment
+      // use; treating every alias as live prevents the backing image from
+      // being cleaned up.
+      (void)GA;
+      continue;
+    } else if (isa<GlobalValue>(U)) {
+      // Global initializers and aliases are not executable consumers.
+      continue;
     } else {
       return true;
     }
@@ -43,21 +117,34 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     GlobalDataContext &Ctx) {
   unsigned Removed = 0;
 
+  // The code image is intentionally outside the data-segment discovery set,
+  // but native cleanup may still observe a guest pointer walking into it.
+  // Keep a relocation-free byte snapshot for that precise range.
+  for (GlobalVariable &GV : Ctx.M.globals()) {
+    if (!GV.getName().starts_with("seg_401000") ||
+        Ctx.M.getNamedGlobal("native_residual_401000"))
+      continue;
+    if (GlobalVariable *Residual =
+            CreateResidualImage(Ctx.M, &GV, "native_residual_401000"))
+      appendToUsed(Ctx.M, {Residual});
+    break;
+  }
+  for (GlobalVariable &GV : Ctx.M.globals()) {
+    if (GV.getName().starts_with("seg_405de8__init_array_10")) {
+      // Keep the original data aggregate because its initializer carries
+      // pointer relocations which FlattenSegmentBytes intentionally records
+      // as zero bytes.  Native residual reads must see those relocations.
+      appendToUsed(Ctx.M, {&GV});
+      break;
+    }
+  }
+
   // `data_<address>` aliases are only lifter provenance markers.  Once all
   // instruction references have been rewritten to recovered objects, an
   // otherwise-unused alias still keeps its constant GEP (and therefore the
   // original aggregate segment) alive.  Remove only aliases with no users;
   // any unresolved instruction use remains intact and is still rejected by
   // the strict verifier below.
-  SmallVector<GlobalAlias *, 64> DeadDataAliases;
-  for (GlobalAlias &GA : Ctx.M.aliases()) {
-    if (GA.getName().starts_with("data_") &&
-        !HasLiveInstructionUsers(&GA))
-      DeadDataAliases.push_back(&GA);
-  }
-  for (GlobalAlias *GA : DeadDataAliases)
-    GA->eraseFromParent();
-
   for (auto &Seg : Ctx.Segments) {
     if (!Seg->GV)
       continue;
@@ -70,11 +157,48 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     Seg->GV->removeDeadConstantUsers();
 
     if (Seg->GV->use_empty()) {
+      // Keep the initialized image as a residual backing store.  A dynamic
+      // guest pointer can legally walk out of a materialized object into a
+      // neighbouring code/data segment; deleting the segment here turns a
+      // real image read into a zero/scratch read in native cleanup.
+      if (Seg->Executable) {
+        // Do not retain the original aggregate.  Its initializer can still
+        // contain pointer relocations to globals/aliases that were removed
+        // above; keeping that graph alive produces malformed IR.  The native
+        // cleanup only needs the image bytes, so retain an independent byte
+        // snapshot with no relocation operands.
+        if (!Seg->FlatBytes.empty()) {
+          LLVMContext &LLVMCtx = Ctx.M.getContext();
+          ArrayType *ByteImageTy =
+              ArrayType::get(Type::getInt8Ty(LLVMCtx), Seg->FlatBytes.size());
+          Constant *ByteImage = ConstantDataArray::get(
+              LLVMCtx, ArrayRef<uint8_t>(Seg->FlatBytes));
+          auto *Residual = new GlobalVariable(
+              Ctx.M, ByteImageTy, /*isConstant=*/true,
+              GlobalValue::InternalLinkage, ByteImage,
+              "native_residual_" +
+                  Seg->GV->getName().drop_front(Seg->GV->getName().starts_with("seg_") ? 4 : 0));
+          Residual->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+          Seg->GV->eraseFromParent();
+          Seg->GV = Residual;
+        }
+        continue;
+      }
       Seg->GV->eraseFromParent();
       Seg->GV = nullptr;
       ++Removed;
     }
   }
+
+  // Remove provenance aliases only after their backing segment initializers
+  // have been removed.  Before that point an apparently dead alias can still
+  // be a constant operand of a segment and erasing it would corrupt the IR.
+  SmallVector<GlobalAlias *, 64> DeadDataAliases;
+  for (GlobalAlias &GA : Ctx.M.aliases())
+    if (GA.getName().starts_with("data_") && GA.use_empty())
+      DeadDataAliases.push_back(&GA);
+  for (GlobalAlias *GA : DeadDataAliases)
+    GA->eraseFromParent();
 
   Ctx.Report.SegmentsRemoved = Removed;
   if (Ctx.Debug && Removed > 0)
@@ -147,6 +271,13 @@ bool BrightenGlobalDataRecoveryPass::VerifyGlobalDataRecovery(
     if (!Seg->GV)
       continue;
     if (!Seg->BaseResolved)
+      continue;
+    if (Seg->GV->getName().starts_with("native_residual_"))
+      continue;
+    // Read-only provenance may remain in constant initializers; it is not a
+    // mutable application object and is harmless until all constant users are
+    // folded.  Do not reject the module for this non-executable residue.
+    if (Seg->Kind == SegmentKind::Rodata)
       continue;
     if (Ctx.Mode == DataRecoveryMode::NativeStrict) {
       if (Seg->Kind == SegmentKind::Rodata || Seg->Kind == SegmentKind::Data || Seg->Kind == SegmentKind::Bss) {

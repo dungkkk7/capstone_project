@@ -83,7 +83,7 @@ PLUGINS = [
     "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,jump-threading,simplifycfg,adce,verify"
 )
 class Color:
     BLUE = '\033[94m'
@@ -138,6 +138,12 @@ def parse_native_contract_reports(stderr):
     violations = final["metrics"].get("native_contract_violations")
     final["is_fully_native"] = violations == 0 if violations is not None else False
     final["status"] = "compliant" if final["is_fully_native"] else "non_compliant"
+    # Structural status is intentionally separate from behavioral evidence.
+    # A runnable compatibility output must never be mislabeled as native just
+    # because LLVM verification succeeded.
+    final["output_class"] = (
+        "native_candidate" if final["is_fully_native"] else "compat_runnable"
+    )
     final["report_count"] = len(reports)
     return final
 
@@ -299,6 +305,9 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         cmd.append("-brighten-native-strict")
     if os.environ.get("BRIGHTEN_SAVE_CHECKPOINTS", "0") == "1":
         cmd.append("-print-after-all")
+    print_after = os.environ.get("BRIGHTEN_PRINT_AFTER")
+    if print_after:
+        cmd.extend(["-print-after", print_after])
     # Native ABI lowering is part of the production pipeline.  Keep an
     # explicit opt-out for debugging old lifted IR, but do not make the
     # dataset path depend on a hidden environment variable.
@@ -308,8 +317,13 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         cmd.append("-brighten-native-state-ssa")
 
     # Thiết lập pipeline pass và file input/output
+    pipeline = os.environ.get("BRIGHTEN_PASS_PIPELINE", PASS_PIPELINE)
+    for skipped in os.environ.get("BRIGHTEN_SKIP_PASSES", "").split(","):
+        skipped = skipped.strip()
+        if skipped:
+            pipeline = ",".join(p for p in pipeline.split(",") if p != skipped)
     cmd.extend([
-        "-passes", PASS_PIPELINE,
+        "-passes", pipeline,
         input_path,
         "-o", output_path
     ])
@@ -323,6 +337,11 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         try:
             res = subprocess.run(cmd, capture_output=True, text=True,
                                  env=env, timeout=opt_timeout)
+            dump_path = os.environ.get("BRIGHTEN_DUMP_OPT_LOG")
+            if dump_path:
+                with open(dump_path, "w", encoding="utf-8") as dump:
+                    dump.write(res.stdout or "")
+                    dump.write(res.stderr or "")
         except subprocess.TimeoutExpired as exc:
             print(f"{Color.RED}[✗] opt timeout sau {opt_timeout:.1f}s; bỏ qua module để tránh treo batch.{Color.END}")
             if exc.stderr:

@@ -244,9 +244,10 @@ def run_command(cmd, step_name, timeout_env="LIFT_STEP_TIMEOUT"):
     
     start_time = time.time()
     try:
-        # Keep the historical 180s budget for CFG recovery; callers running a
-        # bounded pilot can override it with LIFT_DISASS_TIMEOUT explicitly.
-        default_timeout = "180"
+        # CFG recovery can be substantially slower for BCF binaries. Keep a
+        # longer default for disassembly while retaining the shorter budget
+        # for the actual lift/LLVM conversion steps.
+        default_timeout = "600" if timeout_env == "LIFT_DISASS_TIMEOUT" else "180"
         timeout = float(
             os.environ.get(timeout_env, os.environ.get("LIFT_STEP_TIMEOUT", default_timeout))
         )

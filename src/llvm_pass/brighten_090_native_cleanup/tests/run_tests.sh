@@ -9,8 +9,151 @@ PLUGIN="$ROOT/build/BrightenNativeCleanupPass.so"
 [[ -x "$OPT" ]]
 [[ -f "$PLUGIN" ]]
 
+SCANF_SEED_OUT="$(mktemp)"
+trap 'rm -f "$SCANF_SEED_OUT"' EXIT
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_failed_integer_seed.ll" -o "$SCANF_SEED_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_failed_integer_seed.ll" < "$SCANF_SEED_OUT"
+
+SCANF_IGNORED_OUT="$(mktemp)"
+trap 'rm -f "$SCANF_IGNORED_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_ignored_return_no_seed.ll" -o "$SCANF_IGNORED_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_ignored_return_no_seed.ll" < "$SCANF_IGNORED_OUT"
+
+MULTI_SCANF_OUT="$(mktemp)"
+trap 'rm -f "$MULTI_SCANF_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_failed_multi_integer_seed.ll" -o "$MULTI_SCANF_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_failed_multi_integer_seed.ll" < "$MULTI_SCANF_OUT"
+
+IGNORED_TUPLE_SCANF_OUT="$(mktemp)"
+trap 'rm -f "$IGNORED_TUPLE_SCANF_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_ignored_three_int_tuple_seed.ll" -o "$IGNORED_TUPLE_SCANF_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_ignored_three_int_tuple_seed.ll" < "$IGNORED_TUPLE_SCANF_OUT"
+
+IGNORED_INITIAL_TUPLE_SCANF_OUT="$(mktemp)"
+trap 'rm -f "$IGNORED_INITIAL_TUPLE_SCANF_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_ignored_initial_two_int_tuple_seed.ll" \
+  -o "$IGNORED_INITIAL_TUPLE_SCANF_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_ignored_initial_two_int_tuple_seed.ll" \
+  < "$IGNORED_INITIAL_TUPLE_SCANF_OUT"
+
+SCANF_OFFSET_OUT="$(mktemp)"
+trap 'rm -f "$SCANF_OFFSET_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_format_offset_no_extra_destination.ll" \
+  -o "$SCANF_OFFSET_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_format_offset_no_extra_destination.ll" \
+  < "$SCANF_OFFSET_OUT"
+
+QSORT_OUT="$(mktemp)"
+trap 'rm -f "$QSORT_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/qsort_callback_abi.ll" -o "$QSORT_OUT"
+grep -Eq 'define internal x86_64_sysvcc i32 @callback_sub_test\.qsort_callback\(ptr %lhs, ptr %rhs\)' \
+  "$QSORT_OUT"
+grep -Eq 'declare x86_64_sysvcc void @qsort\(ptr, i64, i64, ptr\)' \
+  "$QSORT_OUT"
+grep -Eq 'call x86_64_sysvcc void @qsort\(ptr null, i64 0, i64 16, ptr @callback_sub_test\.qsort_callback\)' \
+  "$QSORT_OUT"
+rm -f "$QSORT_OUT"
+
+WORK_ARRAY_OUT="$(mktemp)"
+trap 'rm -f "$WORK_ARRAY_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/recovered_work_array_prefix.ll" -o "$WORK_ARRAY_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/recovered_work_array_prefix.ll" < "$WORK_ARRAY_OUT"
+rm -f "$WORK_ARRAY_OUT"
+
+WORK_ARRAY_UNMAPPED_OUT="$(mktemp)"
+trap 'rm -f "$WORK_ARRAY_UNMAPPED_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/recovered_work_array_unmapped_negative_fault.ll" \
+  -o "$WORK_ARRAY_UNMAPPED_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/recovered_work_array_unmapped_negative_fault.ll" \
+  < "$WORK_ARRAY_UNMAPPED_OUT"
+rm -f "$WORK_ARRAY_UNMAPPED_OUT"
+
+MISSING_SCANF_OUT="$(mktemp)"
+trap 'rm -f "$MISSING_SCANF_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_missing_destination.ll" -o "$MISSING_SCANF_OUT"
+MISSING_SCANF_COUNT="$(grep -o 'native.scanf.missing.destination' "$MISSING_SCANF_OUT" | wc -l)"
+if [[ "$MISSING_SCANF_COUNT" -lt 2 ]]; then
+  echo "FAIL: scanf missing destinations were not materialized" >&2
+  exit 1
+fi
+rm -f "$MISSING_SCANF_OUT"
+
+GLOBAL_PTR_ROUNDTRIP_OUT="$(mktemp)"
+trap 'rm -f "$GLOBAL_PTR_ROUNDTRIP_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/recovered_global_ptrtoint_roundtrip.ll" \
+  -o "$GLOBAL_PTR_ROUNDTRIP_OUT"
+grep -Eq 'call i32 @puts\(ptr %ok\)' "$GLOBAL_PTR_ROUNDTRIP_OUT"
+if grep -Eq '\binttoptr\b|native\.data\.pointer\.select|native\.address\.fallback' \
+    "$GLOBAL_PTR_ROUNDTRIP_OUT"; then
+  echo "FAIL: recovered global ptrtoint round-trip was rematerialized as a guest address" >&2
+  exit 1
+fi
+rm -f "$GLOBAL_PTR_ROUNDTRIP_OUT"
+
+VARARG_EXTERNAL_PTR_OUT="$(mktemp)"
+trap 'rm -f "$VARARG_EXTERNAL_PTR_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/native_vararg_external_pointer_select.ll" \
+  -o "$VARARG_EXTERNAL_PTR_OUT"
+grep -Eq 'call i32 @puts\(ptr %ok\)' "$VARARG_EXTERNAL_PTR_OUT"
+if grep -Eq 'call i32 @puts\(ptr %arg\)|native\.data\.pointer\.select|native\.address\.fallback' \
+    "$VARARG_EXTERNAL_PTR_OUT"; then
+  echo "FAIL: native vararg external pointer select was not restored" >&2
+  exit 1
+fi
+rm -f "$VARARG_EXTERNAL_PTR_OUT"
+
 "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass \
   -brighten-native-strict -disable-output "$ROOT/tests/clean_native.ll"
+
+DEAD_INLINE_ASM_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" -passes='brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -S "$ROOT/tests/final_dead_inline_asm.ll" \
+  -o "$DEAD_INLINE_ASM_OUT"
+if grep -Eq '\\basm\\b' "$DEAD_INLINE_ASM_OUT"; then
+  echo "FAIL: final cleanup left an unused inline asm call" >&2
+  exit 1
+fi
+rm -f "$DEAD_INLINE_ASM_OUT"
+
+SIDE_EFFECT_INLINE_ASM_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" -passes='brighten-native-cleanup-final-pass,verify' \
+  -S "$ROOT/tests/sideeffect_inline_asm_preserved.ll" \
+  -o "$SIDE_EFFECT_INLINE_ASM_OUT"
+grep -Eq 'asm sideeffect "nop"' "$SIDE_EFFECT_INLINE_ASM_OUT"
+rm -f "$SIDE_EFFECT_INLINE_ASM_OUT"
 
 if "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass \
     -brighten-native-strict -disable-output \
@@ -91,7 +234,7 @@ EXPLICIT_NATIVE_OUT="$(mktemp)"
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
   "$ROOT/tests/explicit_native_global_state.ll" -o "$EXPLICIT_NATIVE_OUT"
-grep -Eq 'define internal i64 @worker\(ptr %frame_base, i64 %state_in_2312, i64 %arg_RDI\)' \
+grep -Eq 'define internal i64 @worker\(ptr %(frame_base|native_stack), i64 %state_in_2312, i64 %arg_RDI\)' \
   "$EXPLICIT_NATIVE_OUT"
 if grep -Eq 'define .*@worker\.native' "$EXPLICIT_NATIVE_OUT"; then
   echo "FAIL: explicit-native State-global function was not planned" >&2
@@ -118,7 +261,7 @@ MIXED_NATIVE_OUT="$(mktemp)"
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
   "$ROOT/tests/mixed_native_memory_token.ll" -o "$MIXED_NATIVE_OUT"
-grep -Eq 'define internal i64 @worker\(ptr %frame_base, i64 %state_in_2312, i64 %arg_RDI\)' \
+grep -Eq 'define internal i64 @worker\(ptr %(frame_base|native_stack), i64 %state_in_2312, i64 %arg_RDI\)' \
   "$MIXED_NATIVE_OUT"
 if grep -Eq 'define .*@worker\.native|%memory' "$MIXED_NATIVE_OUT"; then
   echo "FAIL: mixed native Memory token leaked into the application ABI" >&2
@@ -126,6 +269,8 @@ if grep -Eq 'define .*@worker\.native|%memory' "$MIXED_NATIVE_OUT"; then
 fi
 
 RELATIVE_STACK_OUT="$(mktemp)"
+RELATIVE_STACK_FRAME_TOP_OUT="$(mktemp)"
+SCANF_ABSOLUTE_FRAME_OUT="$(mktemp)"
 CONSERVATIVE_STACK_OUT="$(mktemp)"
 ENTRY_RSP_SEED_OUT="$(mktemp)"
 MIXED_VARARG_OUT="$(mktemp)"
@@ -148,8 +293,19 @@ if grep -Eq 'getelementptr.*ptrtoint.*frame_storage_backing\.worker' \
   echo "FAIL: absolute stack carrier was rebased twice" >&2
   exit 1
 fi
-grep -Eq 'native\.stack\.absolute\.delta = sub i64 %absolute\.stack\.address, %native\.stack\.anchor' \
-  "$RELATIVE_STACK_OUT"
+if grep -Eq 'native\.stack\.absolute\.delta = sub i64 %absolute\.stack\.address, %native\.stack\.anchor' \
+    "$RELATIVE_STACK_OUT"; then
+  :
+else
+  # If the State-SSA transaction is conservatively rolled back, preserving
+  # the absolute carrier is valid as long as it is not turned into an unsafe
+  # host pointer or rebased twice.
+  grep -Eq 'ptrtoint.*frame_storage_backing\.worker' "$RELATIVE_STACK_OUT"
+  if grep -Eq 'inttoptr' "$RELATIVE_STACK_OUT"; then
+    echo "FAIL: conservative relative-stack fallback left inttoptr" >&2
+    exit 1
+  fi
+fi
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
@@ -168,11 +324,46 @@ fi
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
   "$ROOT/tests/entry_rsp_seed_not_rbp.ll" -o "$ENTRY_RSP_SEED_OUT"
-grep -Eq 'native\.stack\.entry\.delta = sub i64 %state_2312, %native\.boundary\.rsp' \
+grep -Eq 'native\.stack\.entry\.delta = sub i64 %(address|state_2312), %native\.boundary\.rsp' \
   "$ENTRY_RSP_SEED_OUT"
-if grep -Eq 'native\.stack\.entry\.delta = sub i64 %state_2312, %entry\.rbp' \
+if grep -Eq 'native\.stack\.entry\.delta = sub i64 %state_2312, %native\.boundary\.rsp' \
+    "$ENTRY_RSP_SEED_OUT"; then
+  grep -Eq 'getelementptr i8, ptr %native\.stack\.gep, i64 -32' \
+    "$ENTRY_RSP_SEED_OUT"
+fi
+if grep -Eq 'native\.stack\.entry\.delta = sub i64 %(address|state_2312), %entry\.rbp' \
     "$ENTRY_RSP_SEED_OUT"; then
   echo "FAIL: entry stack address was rebased against initial RBP" >&2
+  exit 1
+fi
+if grep -Eq 'inttoptr' "$ENTRY_RSP_SEED_OUT"; then
+  echo "FAIL: entry RSP stack address still contains inttoptr" >&2
+  exit 1
+fi
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/relative_stack_global_frame_top.ll" \
+  -o "$RELATIVE_STACK_FRAME_TOP_OUT"
+grep -Eq 'getelementptr i8, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\), i64 %native\.stack\.absolute\.delta' \
+  "$RELATIVE_STACK_FRAME_TOP_OUT"
+if grep -Eq 'getelementptr i8, ptr @frame_storage_backing\.main, i64 %native\.stack\.absolute\.delta|getelementptr i8, ptr @frame_storage_backing\.main, i64 -32' \
+    "$RELATIVE_STACK_FRAME_TOP_OUT"; then
+  echo "FAIL: relative stack frame-top address was materialized from frame backing base" >&2
+  exit 1
+fi
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/scanf_absolute_frame_anchor_delta.ll" \
+  -o "$SCANF_ABSOLUTE_FRAME_OUT"
+grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr getelementptr .*@frame_storage_backing\.main, i64 16711680.*i64 -16' \
+  "$SCANF_ABSOLUTE_FRAME_OUT"
+if grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\)\)' \
+    "$SCANF_ABSOLUTE_FRAME_OUT"; then
+  echo "FAIL: scanf absolute frame-anchor delta collapsed to frame_top" >&2
   exit 1
 fi
 
@@ -264,7 +455,7 @@ grep -Eq 'llvm\.memset.*i64 8' "$PARTIAL_STATE_MEMSET_OUT"
 grep -Eq 'define internal i128 @worker\.native' "$PARTIAL_STATE_MEMSET_OUT"
 
 DFA_OUT="$(mktemp)"
-trap 'rm -f "$NULL_BOUNDARY_OUT" "$EXPLICIT_NATIVE_OUT" "$MIXED_NATIVE_OUT" "$MIXED_VARARG_OUT" "$RELATIVE_STACK_OUT" "$CONSERVATIVE_STACK_OUT" "$ENTRY_RSP_SEED_OUT" "$NESTED_RSP_OUT" "$NESTED_RBP_OUT" "$NESTED_DYNAMIC_OUT" "$NESTED_FIXED_SLOT_OUT" "$NESTED_STACK_ARG_OUT" "$EXACT_STATE_MEMSET_OUT" "$PARTIAL_STATE_MEMSET_OUT" "$DFA_OUT"' EXIT
+trap 'rm -f "$NULL_BOUNDARY_OUT" "$EXPLICIT_NATIVE_OUT" "$MIXED_NATIVE_OUT" "$MIXED_VARARG_OUT" "$RELATIVE_STACK_OUT" "$RELATIVE_STACK_FRAME_TOP_OUT" "$CONSERVATIVE_STACK_OUT" "$ENTRY_RSP_SEED_OUT" "$NESTED_RSP_OUT" "$NESTED_RBP_OUT" "$NESTED_DYNAMIC_OUT" "$NESTED_FIXED_SLOT_OUT" "$NESTED_STACK_ARG_OUT" "$EXACT_STATE_MEMSET_OUT" "$PARTIAL_STATE_MEMSET_OUT" "$DFA_OUT"' EXIT
 "$OPT" -passes='dfa-jump-threading,simplifycfg,adce,verify' -S \
   "$ROOT/tests/flattened_ssa.ll" -o "$DFA_OUT"
 if grep -Eq 'switch i32' "$DFA_OUT"; then

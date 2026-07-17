@@ -90,6 +90,9 @@ void LibcSignatureDB::initialize(LLVMContext &Ctx) {
   addEntry({"sqrt", PK::Double,
             {{PK::Double, "x", false}},
             false, false, false, false, false, false, false, SK::None});
+  addEntry({"round", PK::Double,
+            {{PK::Double, "x", false}},
+            false, false, false, false, false, false, false, SK::None});
   addEntry({"hypot", PK::Double,
             {{PK::Double, "x", false}, {PK::Double, "y", false}},
             false, false, false, false, false, false, false, SK::None});

@@ -95,7 +95,12 @@ bool BrightenRepairPass::StripPoisonDrivingFlags(Module &M) {
 
   for (Function &F : M) {
     StringRef Name = F.getName();
-    if (!Name.starts_with("sub_") && !Name.starts_with("__remill_") && !Name.starts_with("__mcsema_"))
+    // This repair is only for raw lifted machine functions.  Native clones,
+    // runtime helpers and recovered compatibility wrappers have their own
+    // LLVM semantics; stripping their flags without provenance is unsound.
+    if ((!Name.starts_with("sub_") && !Name.starts_with("auto_sub_")) ||
+        Name.contains(".native") || Name.contains(".compat") ||
+        Name.contains(".wrapper"))
       continue;
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
@@ -126,19 +131,10 @@ bool BrightenRepairPass::StripPoisonDrivingFlags(Module &M) {
     }
   }
 
-  DenseMap<Constant *, Constant *> Cache;
-  // Đồng bộ xử lý inbounds trong global initializers (constant expressions).
-  for (GlobalVariable &GV : M.globals()) {
-    if (!GV.hasInitializer()) {
-      continue;
-    }
-    Constant *Init = GV.getInitializer();
-    Constant *NewInit = DropInBoundsFromConstantExpr(Init, Cache);
-    if (NewInit != Init) {
-      GV.setInitializer(NewInit);
-      Changed = true;
-    }
-  }
+  // Do not rewrite global constant expressions here.  Their inbounds and
+  // relocation/layout facts are not proven to be lifter artifacts; global
+  // recovery owns those transformations and can apply a byte/relocation
+  // proof before committing them.
 
   return Changed;
 }

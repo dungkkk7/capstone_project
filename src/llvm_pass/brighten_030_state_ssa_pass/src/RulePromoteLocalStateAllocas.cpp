@@ -191,6 +191,18 @@ bool BrightenStateSSAPass::PromoteLocalStateAllocas(Module &M) {
       if (!Safe)
         continue;
 
+      // Every collected load must have a materialized slot.  If recovery is
+      // incomplete, preserve the original alloca/load instead of replacing a
+      // live value with a fabricated zero.
+      for (const Access &A : Accesses) {
+        if (isa<LoadInst>(A.Inst) && !SlotTypes.count(A.Offset)) {
+          Safe = false;
+          break;
+        }
+      }
+      if (!Safe)
+        continue;
+
       IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
       DenseMap<uint64_t, AllocaInst *> Slots;
       for (auto &Entry : SlotTypes) {
@@ -205,8 +217,9 @@ bool BrightenStateSSAPass::PromoteLocalStateAllocas(Module &M) {
           if (Slots.count(A.Offset)) {
             LI->setOperand(0, Slots[A.Offset]);
           } else {
-            LI->replaceAllUsesWith(Constant::getNullValue(LI->getType()));
-            LI->eraseFromParent();
+            // Guarded by the preflight above; keep this branch fail-closed if
+            // the access model changes in the future.
+            continue;
           }
         } else {
           if (Slots.count(A.Offset))

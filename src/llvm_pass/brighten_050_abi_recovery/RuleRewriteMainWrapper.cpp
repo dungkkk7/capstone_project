@@ -2,8 +2,6 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <functional>
-
 namespace brighten_abi {
 
 using namespace llvm;
@@ -35,66 +33,6 @@ static Value *BuildEntrypointRegisterArg(IRBuilder<> &B, Function &Main,
   return BuildArgLoad(B, State, Arg);
 }
 
-static Value *MaterializeLocalState(ABIRecoveryContext &Ctx, Function &Main,
-                                    GlobalVariable *State) {
-  if (!State || Main.empty()) {
-    return nullptr;
-  }
-
-  uint64_t StateBytes =
-      Ctx.DL.getTypeAllocSize(State->getValueType()).getFixedValue();
-  if (StateBytes == 0) {
-    return nullptr;
-  }
-
-  IRBuilder<> B(&Main.getEntryBlock(), Main.getEntryBlock().begin());
-  AllocaInst *Local =
-      B.CreateAlloca(B.getInt8Ty(), B.getInt64(StateBytes), "native_state");
-  Local->setAlignment(Align(16));
-  B.CreateMemSet(Local, B.getInt8(0), B.getInt64(StateBytes), Align(1));
-
-  std::function<Value *(Value *, Instruction *)> Materialize =
-      [&](Value *V, Instruction *Before) -> Value * {
-    if (V == State) {
-      return Local;
-    }
-    auto *CE = dyn_cast<ConstantExpr>(V);
-    if (!CE) {
-      return V;
-    }
-
-    Instruction *Clone = CE->getAsInstruction();
-    bool Changed = false;
-    for (unsigned I = 0; I < Clone->getNumOperands(); ++I) {
-      Value *OldOp = Clone->getOperand(I);
-      Value *NewOp = Materialize(OldOp, Before);
-      if (NewOp != OldOp) {
-        Clone->setOperand(I, NewOp);
-        Changed = true;
-      }
-    }
-    if (!Changed) {
-      Clone->deleteValue();
-      return V;
-    }
-    Clone->insertBefore(Before);
-    return Clone;
-  };
-
-  for (BasicBlock &BB : Main) {
-    for (Instruction &I : BB) {
-      for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
-        Value *OldOp = I.getOperand(Op);
-        Value *NewOp = Materialize(OldOp, &I);
-        if (NewOp != OldOp) {
-          I.setOperand(Op, NewOp);
-        }
-      }
-    }
-  }
-  return Local;
-}
-
 // Replace the McSema-generated main -> main_wrapper edge with a direct call
 // to the recovered native function.  Keeping the wrapper alive as the only
 // entry edge would preserve the State ABI even when its body is native.
@@ -123,22 +61,28 @@ static bool RewriteNativeMainEntrypoint(ABIRecoveryContext &Ctx,
     return false;
   }
 
-  Value *LocalState = MaterializeLocalState(Ctx, *Main, State);
-  if (!LocalState) {
+  if ((S.HiddenState && WrapperCall->arg_size() < 1) ||
+      (S.HiddenPC && WrapperCall->arg_size() < 2) ||
+      (S.HiddenMemory && WrapperCall->arg_size() < 3)) {
+    errs() << "[brighten-abi] entrypoint direct rewrite skipped: incomplete "
+              "hidden ABI operands\n";
     return false;
   }
 
   IRBuilder<> B(WrapperCall);
   SmallVector<Value *, 12> Args;
-  if (S.HiddenState)
-    Args.push_back(LocalState);
+  Value *EntryState = State;
+  if (S.HiddenState) {
+    EntryState = WrapperCall->getArgOperand(0);
+    Args.push_back(EntryState);
+  }
   if (S.HiddenPC)
-    Args.push_back(B.getInt64(0));
+    Args.push_back(WrapperCall->getArgOperand(1));
   if (S.HiddenMemory)
-    Args.push_back(ConstantPointerNull::get(B.getPtrTy()));
+    Args.push_back(WrapperCall->getArgOperand(2));
   for (const ABIArgInfo &Arg : S.Args) {
     Value *V =
-        BuildEntrypointRegisterArg(B, *Main, LocalState, Arg.Reg, Arg.Ty);
+        BuildEntrypointRegisterArg(B, *Main, EntryState, Arg.Reg, Arg.Ty);
     if (!V) {
       return false;
     }
@@ -158,14 +102,17 @@ static bool RewriteNativeMainEntrypoint(ABIRecoveryContext &Ctx,
       S.RetKind == ReturnKind::Void ? "" : "main.native");
   NativeCall->setCallingConv(S.NativeFn->getCallingConv());
   if (S.RetKind != ReturnKind::Void) {
-    Value *RAX = BuildStateRegisterPointer(B, LocalState, ABIReg::RAX);
+    Value *RAX = BuildStateRegisterPointer(B, EntryState, ABIReg::RAX);
     Value *Ret = CoerceValue(B, NativeCall, B.getInt64Ty(), "main.ret.i64");
     if (RAX && Ret)
       B.CreateStore(Ret, RAX);
   }
 
-  if (!WrapperCall->use_empty())
-    WrapperCall->replaceAllUsesWith(ConstantPointerNull::get(B.getPtrTy()));
+  if (!WrapperCall->use_empty()) {
+    if (!S.HiddenMemory || WrapperCall->arg_size() < 3)
+      return false;
+    WrapperCall->replaceAllUsesWith(WrapperCall->getArgOperand(2));
+  }
   WrapperCall->eraseFromParent();
   errs() << "[brighten-abi] entrypoint rewritten: main -> "
          << S.NativeFn->getName() << "\n";
@@ -240,19 +187,26 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
   if (!MainCall || !MainS || !MainS->NativeFn)
     return EntrypointChanged;
 
+  if ((MainS->HiddenState && MainCall->arg_size() < 1) ||
+      (MainS->HiddenPC && MainCall->arg_size() < 2) ||
+      (MainS->HiddenMemory && MainCall->arg_size() < 3) ||
+      (!MainS->Args.empty() && MainCall->arg_size() < 1)) {
+    errs() << "[brighten-abi] callsite rewrite skipped: incomplete hidden "
+              "ABI operands\n";
+    return EntrypointChanged;
+  }
+
   bool Changed = false;
   IRBuilder<> B(MainCall);
   SmallVector<Value *, 12> Args;
   if (MainS->HiddenState) {
-    Args.push_back(MainCall->arg_size() > 0 ? MainCall->getArgOperand(0) :
-                   Constant::getNullValue(B.getPtrTy()));
+    Args.push_back(MainCall->getArgOperand(0));
   }
   if (MainS->HiddenPC) {
-    Args.push_back(MainCall->arg_size() > 1 ? MainCall->getArgOperand(1) : B.getInt64(0));
+    Args.push_back(MainCall->getArgOperand(1));
   }
   if (MainS->HiddenMemory) {
-    Args.push_back(MainCall->arg_size() > 2 ? MainCall->getArgOperand(2) :
-                   Constant::getNullValue(B.getPtrTy()));
+    Args.push_back(MainCall->getArgOperand(2));
   }
   for (ABIArgInfo &Arg : MainS->Args) {
     Value *StatePtr = MainCall->arg_size() > 0 ? MainCall->getArgOperand(0) : MW->getArg(0);
@@ -278,9 +232,13 @@ bool BrightenABIRecoveryPass::RewriteMainWrapper(ABIRecoveryContext &Ctx) {
     }
   }
 
-  if (!MainCall->use_empty()) {
-    Value *MemVal = MainCall->arg_size() > 2 ? MainCall->getArgOperand(2) : MW->getArg(2);
+  if (!MainCall->use_empty() && MainCall->arg_size() > 2) {
+    Value *MemVal = MainCall->getArgOperand(2);
     MainCall->replaceAllUsesWith(MemVal);
+  } else if (!MainCall->use_empty()) {
+    // The wrapper result is live but there is no proven memory-token source;
+    // retain the wrapper rather than replacing it with null.
+    return EntrypointChanged;
   }
   MainCall->eraseFromParent();
   Changed = true;

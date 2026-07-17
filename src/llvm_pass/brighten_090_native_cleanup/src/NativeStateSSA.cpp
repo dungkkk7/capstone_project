@@ -98,6 +98,21 @@ static bool IsXMMStateSlotOffset(uint64_t Offset) {
   return false;
 }
 
+static bool IsGPR64StateSlotOffset(uint64_t Offset) {
+  static constexpr uint64_t GPRSlots[] = {
+      2216, // RAX
+      2248, // RCX
+      2264, // RDX
+      2280, // RSI
+      2296, // RDI
+      2312, // RSP
+      2328, // RBP
+      2344, // R8
+      2360, // R9
+  };
+  return llvm::is_contained(GPRSlots, Offset);
+}
+
 static Value *LocalSlotPointer(IRBuilder<> &B, Plan &P, uint64_t Offset) {
   auto Canonical = CanonicalStateSlotOffset(Offset);
   if (!Canonical)
@@ -988,9 +1003,13 @@ static bool ClonePlan(Plan &P, Module &M) {
       Value *V = SI->getValueOperand();
       unsigned SrcBits = ScalarBits(V->getType());
       unsigned SlotBits = ScalarBits(SlotTy);
+      bool IsLow32GPRWrite =
+          *Offset == *Canonical && SrcBits == 32 && SlotBits == 64 &&
+          V->getType()->isIntegerTy() && SlotTy->isIntegerTy() &&
+          IsGPR64StateSlotOffset(*Canonical);
       if (V->getType() != SlotTy && SlotTy->isIntegerTy() &&
           SrcBits && SlotBits && SrcBits < SlotBits &&
-          IsBitPatternType(V->getType())) {
+          IsBitPatternType(V->getType()) && !IsLow32GPRWrite) {
         // A narrow store updates only the low bytes of a wider overlapping
         // state slot.  Preserve the untouched high bytes instead of turning
         // it into a zero-extending whole-slot store.
@@ -1644,39 +1663,10 @@ static bool lowerNativeMainStateBufferImpl(Module &M) {
         HasRBP |= Offset && *Offset == 2328 && !IsZeroInitialization;
       }
       if (!HasRSP || !HasRBP) {
-        constexpr uint64_t NativeStackBytes = 2 * 1024 * 1024;
-        constexpr uint64_t NativeStackTop = NativeStackBytes - 256;
-        IRBuilder<> B(StateCall);
-        auto *StorageTy = ArrayType::get(B.getInt8Ty(), NativeStackBytes);
-        AllocaInst *Storage = nullptr;
-        for (Instruction &I : StateCall->getFunction()->getEntryBlock()) {
-          auto *AI = dyn_cast<AllocaInst>(&I);
-          if (AI && AI->getName().starts_with("native_stack_storage")) {
-            Storage = AI;
-            break;
-          }
-        }
-        if (!Storage) {
-          IRBuilder<> EntryB(
-              &*StateCall->getFunction()->getEntryBlock().getFirstInsertionPt());
-          Storage = EntryB.CreateAlloca(StorageTy, nullptr,
-                                         "native_stack_storage");
-          Storage->setAlignment(Align(16));
-        }
-        Value *Top = B.CreateConstGEP1_64(B.getInt8Ty(), Storage,
-                                           NativeStackTop,
-                                           "native_stack_top");
-        Value *TopInt = B.CreatePtrToInt(Top, B.getInt64Ty(),
-                                         "native.boundary.rsp");
-        if (!HasRSP) {
-          Value *Slot = B.CreateGEP(B.getInt8Ty(), State, B.getInt64(2312));
-          B.CreateStore(TopInt, Slot);
-        }
-        if (!HasRBP) {
-          Value *Slot = B.CreateGEP(B.getInt8Ty(), State, B.getInt64(2328));
-          B.CreateStore(TopInt, Slot);
-        }
-        Changed = true;
+        // A raw State call still owns the guest stack contract.  Without
+        // proven incoming RSP/RBP values, do not invent a native stack anchor
+        // or seed the State slots from a synthetic alloca.
+        continue;
       }
       continue;
     }
@@ -1777,87 +1767,74 @@ static bool lowerNativeMainStackBufferImpl(Module &M) {
     if (!OldStack)
       continue;
 
-  // The recovered code only uses the old allocation as a temporary frame
-  // backing store.  Keep that backing separate from the host call stack: a
-  // guest RSP underflow must not be able to overwrite the return address of
-  // native_entry_impl.  The guest RSP/RBP values remain ordinary integer data
-  // until the address lowering pass turns accesses into native GEPs.
-  // Newer recovered binaries can use large but still finite stack frames
-  // (for example, a vararg scratch area around -120 KiB from RBP).  Keep the
-  // stack bounded and native while leaving enough room for those proven
-  // frame offsets.
-  // Some lifted binaries address locals more than 512 KiB below the
-  // recovered stack top. Keep this compatibility backing off the host stack:
-  // a guest underflow must not overwrite native return addresses.
-  constexpr uint64_t NativeStackBytes = 16 * 1024 * 1024;
-  constexpr uint64_t NativeStackGuard = 64 * 1024;
-  constexpr uint64_t NativeStackTop = NativeStackBytes - NativeStackGuard;
-  IRBuilder<> B(OldStack);
-  auto *StorageTy = ArrayType::get(B.getInt8Ty(), NativeStackBytes);
-  std::string StorageName = "frame_storage_backing.";
-  StorageName += FunctionName.str();
-  GlobalVariable *Storage = M.getNamedGlobal(StorageName);
-  if (!Storage) {
-    Storage = new GlobalVariable(
-        M, StorageTy, false, GlobalValue::InternalLinkage,
-        ConstantAggregateZero::get(StorageTy), StorageName);
-    Storage->setAlignment(Align(16));
-  }
-  SmallVector<Value *, 2> StorageIndices = {B.getInt32(0), B.getInt32(0)};
-  // Do not let IRBuilder fold this to a ConstantExpr: later stack-address
-  // recovery needs a named, entry-dominating SSA anchor for this backing.
-  Value *NewStack = GetElementPtrInst::CreateInBounds(
-      StorageTy, Storage, StorageIndices, "native_stack_storage",
-      OldStack->getIterator());
+    // Keep the guest frame off the host stack, but preserve the established
+    // compatibility representation until a complete per-invocation frame
+    // proof exists.  The semantic baseline relies on this backing for deep
+    // negative guest offsets and callback re-entry.
+    constexpr uint64_t NativeStackBytes = 16 * 1024 * 1024;
+    constexpr uint64_t NativeStackGuard = 64 * 1024;
+    constexpr uint64_t NativeStackTop = NativeStackBytes - NativeStackGuard;
+    IRBuilder<> B(OldStack);
+    auto *StorageTy = ArrayType::get(B.getInt8Ty(), NativeStackBytes);
+    std::string StorageName = "frame_storage_backing.";
+    StorageName += FunctionName.str();
+    GlobalVariable *Storage = M.getNamedGlobal(StorageName);
+    if (!Storage) {
+      Storage = new GlobalVariable(
+          M, StorageTy, false, GlobalValue::InternalLinkage,
+          ConstantAggregateZero::get(StorageTy), StorageName);
+      Storage->setAlignment(Align(16));
+    }
+    SmallVector<Value *, 2> StorageIndices = {B.getInt32(0), B.getInt32(0)};
+    Value *NewStack = GetElementPtrInst::CreateInBounds(
+        StorageTy, Storage, StorageIndices, "native_stack_storage",
+        OldStack->getIterator());
 
-  SmallVector<Instruction *, 4> StackUsers;
-  for (User *U : OldStack->users()) {
-    auto *GEP = dyn_cast<GetElementPtrInst>(U);
-    if (!GEP)
-      return false;
-    StackUsers.push_back(GEP);
-  }
-  for (Instruction *I : StackUsers) {
-    auto *GEP = cast<GetElementPtrInst>(I);
-    IRBuilder<> GB(GEP);
-    Value *Top = GB.CreateConstGEP1_64(B.getInt8Ty(), NewStack,
-                                       NativeStackTop, "native_stack_top");
-    GEP->replaceAllUsesWith(Top);
-    GEP->eraseFromParent();
-  }
+    SmallVector<Instruction *, 4> StackUsers;
+    for (User *U : OldStack->users()) {
+      auto *GEP = dyn_cast<GetElementPtrInst>(U);
+      if (!GEP)
+        return false;
+      StackUsers.push_back(GEP);
+    }
+    for (Instruction *I : StackUsers) {
+      auto *GEP = cast<GetElementPtrInst>(I);
+      IRBuilder<> GB(GEP);
+      Value *Top = GB.CreateConstGEP1_64(B.getInt8Ty(), NewStack,
+                                         NativeStackTop, "native_stack_top");
+      GEP->replaceAllUsesWith(Top);
+      GEP->eraseFromParent();
+    }
 
-  // Some lifted address expressions are materialized after the direct stack
-  // users above and still use the allocation base with a signed negative
-  // offset.  The guest RSP is represented by native_stack_top, so rebase
-  // those expressions on the top anchor before they escape to libc/scanf.
-  SmallVector<GetElementPtrInst *, 32> NegativeFrameGEPs;
-  for (User *U : NewStack->users()) {
-    auto *GEP = dyn_cast<GetElementPtrInst>(U);
-    if (!GEP || GEP->getNumIndices() == 0)
+    SmallVector<GetElementPtrInst *, 32> NegativeFrameGEPs;
+    for (User *U : NewStack->users()) {
+      auto *GEP = dyn_cast<GetElementPtrInst>(U);
+      if (!GEP || GEP->getNumIndices() == 0)
+        continue;
+      auto It = GEP->idx_end();
+      --It;
+      auto *CI = dyn_cast<ConstantInt>(*It);
+      if (CI && CI->getValue().isNegative())
+        NegativeFrameGEPs.push_back(GEP);
+    }
+    for (GetElementPtrInst *GEP : NegativeFrameGEPs) {
+      auto It = GEP->idx_end();
+      --It;
+      int64_t Offset = cast<ConstantInt>(*It)->getSExtValue();
+      IRBuilder<> GB(GEP);
+      Value *Top = GB.CreateConstGEP1_64(B.getInt8Ty(), NewStack,
+                                         NativeStackTop, "native_stack_top");
+      Value *Rebased = GB.CreateGEP(B.getInt8Ty(), Top,
+                                    GB.getInt64(Offset), "native_stack_rebased");
+      GEP->replaceAllUsesWith(Rebased);
+      GEP->eraseFromParent();
+      Changed = true;
+    }
+    if (!OldStack->use_empty())
       continue;
-    auto It = GEP->idx_end();
-    --It;
-    auto *CI = dyn_cast<ConstantInt>(*It);
-    if (CI && CI->getValue().isNegative())
-      NegativeFrameGEPs.push_back(GEP);
-  }
-  for (GetElementPtrInst *GEP : NegativeFrameGEPs) {
-    auto It = GEP->idx_end();
-    --It;
-    int64_t Offset = cast<ConstantInt>(*It)->getSExtValue();
-    IRBuilder<> GB(GEP);
-    Value *Top = GB.CreateConstGEP1_64(B.getInt8Ty(), NewStack,
-                                       NativeStackTop, "native_stack_top");
-    Value *Rebased = GB.CreateGEP(B.getInt8Ty(), Top,
-                                  GB.getInt64(Offset), "native_stack_rebased");
-    GEP->replaceAllUsesWith(Rebased);
-    GEP->eraseFromParent();
+    OldStack->eraseFromParent();
     Changed = true;
-  }
-  if (!OldStack->use_empty())
-    continue;
-  OldStack->eraseFromParent();
-    Changed = true;
+
   }
   return Changed;
 }
