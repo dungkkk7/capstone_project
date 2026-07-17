@@ -24,6 +24,19 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Any, Optional, Dict, List, Tuple
 
+try:
+    from .input_contracts import (
+        generate_contract_inputs,
+        resolve_input_contract,
+        validate_contract_payload,
+    )
+except ImportError:  # pragma: no cover - supports direct CLI execution
+    from input_contracts import (
+        generate_contract_inputs,
+        resolve_input_contract,
+        validate_contract_payload,
+    )
+
 
 DEFAULT_EXECUTION_TIMEOUT = 0.5
 
@@ -518,49 +531,6 @@ class TemplateEvaluator:
         return argv, stdin_bytes
 
 # -----------------------------------------------------------------------------
-# Embedded Default Templates for Project Benchmarks
-# -----------------------------------------------------------------------------
-DEFAULT_TEMPLATES = {
-    "hash": """N = int(5, 15)
-M = int(10, 20)
-S = int(1, N)
-T = int(1, N)
-K = int(2, 5)
-{N} {M}
-{S} {T}
-{K}
-{repeat(K, "int(1, N)", " ")}
-{repeat(M, "int(1, N) int(1, N) int(1, 100)", "\\n")}""",
-
-    "maze": """N = int(4, 30)
-{N}""",
-
-    "cpu": """N = int(1, 20)
-{N}""",
-
-    "crackme": """[ARGV]
-string(alnum, 10, 30)
-int(-3, 3)""",
-
-    "keybox": """[ARGV]
-string(print, 8, 14)""",
-
-    "md5": """[ARGV]
--s
-string(alnum, 10, 100)""",
-
-    "command_io": """Q = int(5, 15)
-{Q}
-{repeat(Q, "choice('ADD name cat 10 99.99', 'REMOVE name', 'RESTOCK name 5', 'LIST', 'SORT name asc', 'REPORT')", "\\n")}""",
-
-    "smart_shop": """6
-
-1
-
-0"""
-}
-
-# -----------------------------------------------------------------------------
 # Program Runner & Differential Comparator
 # -----------------------------------------------------------------------------
 def _core_dump_signal(pid: int) -> Optional[int]:
@@ -958,6 +928,7 @@ class SemanticFuzzer:
         seed_inputs: Optional[List[bytes]] = None,
         seed_dir: Optional[str] = None,
         seed_paths: Optional[List[str]] = None,
+        input_contract: Optional[Dict[str, Any]] = None,
     ):
         self.file1 = file1
         self.file2 = file2
@@ -969,6 +940,11 @@ class SemanticFuzzer:
         # Paths inside the project root for execution
         src_dir = os.path.dirname(os.path.abspath(__file__))
         self.project_root = os.path.abspath(os.path.join(src_dir, "..", ".."))
+        self.input_contract = (
+            input_contract
+            or resolve_input_contract(self.project_root, file1)
+            or resolve_input_contract(self.project_root, file2)
+        )
         self.tmp_dir = os.path.join(self.project_root, "result", f".tmp_fuzz_{int(time.time())}_{random.randint(1000, 9999)}")
         
         self.bin1: Optional[str] = None
@@ -1081,20 +1057,37 @@ class SemanticFuzzer:
         
         # Prepare all inputs beforehand
         seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
+        input_contract = getattr(self, "input_contract", None)
+        contract_mode = input_contract is not None
         # A semantic gate must exercise more than the one recorded seed.  The
         # Raw AFL mutation is the requested fuzzing mode.  Structured mutation
         # remains available explicitly for grammar-sensitive regression cases.
         seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "raw").lower()
         structured_mutation = seed_mutation_mode in {"structured", "local", "safe"}
+        if contract_mode:
+            seed_mutation_mode = "contract-differential"
         report["fuzz_config"] = {
-            "engine": "fallback",
+            "engine": "contract-guided-differential" if contract_mode else "fallback",
             "seed_mutation_mode": seed_mutation_mode,
             "timeout_seconds": timeout,
         }
+        if contract_mode:
+            report["fuzz_config"]["contract_case"] = input_contract.get("case_id")
+            report["fuzz_config"]["contract_kind"] = input_contract.get("kind")
+            report["fuzz_config"]["contract_filter_enabled"] = True
+            report["fuzz_config"]["raw_mutation_disabled"] = False
         print(f"{Color.BLUE}[*] Fuzzing {iterations} iterations (timeout={timeout}s, "
               f"workers={num_workers})...{Color.END}")
         exact_seed_replay = seed_mutation_mode in {"0", "false", "off", "no"}
-        if seed_inputs and structured_mutation:
+        if contract_mode:
+            structured_inputs, contract_stats = generate_contract_inputs(
+                input_contract, seed_inputs, iterations
+            )
+            report["fuzz_config"]["contract_inputs_accepted"] = contract_stats["accepted"]
+            report["fuzz_config"]["contract_inputs_rejected"] = contract_stats["rejected"]
+            iterations = len(structured_inputs)
+            report["total_runs"] = iterations
+        elif seed_inputs and structured_mutation:
             structured_inputs = generate_structured_seed_inputs(
                 seed_inputs, iterations
             )
@@ -1114,7 +1107,7 @@ class SemanticFuzzer:
                     payload = b"0"
                 test_inputs.append(([], payload))
                 test_payloads.append(payload)
-        while len(test_inputs) < iterations:
+        while len(test_inputs) < iterations and not contract_mode:
             args, stdin_data = generator()
             if not stdin_data:
                 stdin_data = b"0"
@@ -1226,9 +1219,27 @@ class SemanticFuzzer:
         # BRIGHTEN_MUTATE_SEEDS=structured only for grammar-sensitive tests;
         # use `off` for explicit exact-seed replay.
         seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "raw").lower()
+        input_contract = getattr(self, "input_contract", None)
+        if input_contract is not None:
+            # Canonical name for the new contract-guided AFL mode.  The
+            # environment variable may still be set to raw for compatibility,
+            # but the report and execution mode must not be ambiguous.
+            seed_mutation_mode = "contract-afl"
+            print(
+                f"{Color.BLUE}[*] Using source-derived input contract "
+                f"{input_contract.get('case_id')} "
+                f"({input_contract.get('kind')}) as the AFL++ corpus/filter "
+                f"for differential fuzzing.{Color.END}"
+            )
         seed_mutation_enabled = seed_mutation_mode in {
-            "1", "true", "yes", "on", "raw", "structured", "local", "safe"
+            "1", "true", "yes", "on", "raw", "structured", "local", "safe",
+            "contract", "contract-afl"
         }
+        # A listed contract remains a fuzzing case.  BRIGHTEN_USE_AFL=0 may
+        # select the bounded contract-guided differential fallback, but an
+        # unrelated exact-replay setting must not disable mutation here.
+        if input_contract is not None:
+            seed_mutation_enabled = True
         if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
             use_afl = False
         has_afl = (
@@ -1355,6 +1366,17 @@ int main(int argc, char** argv) {
             os.makedirs(seeds_dir, exist_ok=True)
 
             afl_seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
+            contract_corpus_stats = None
+            if input_contract is not None and afl_seed_inputs:
+                # AFL++ remains the coverage-guided mutator.  Expand the
+                # initial corpus with valid contract mutations first so AFL
+                # starts from more than one recorded example.
+                contract_corpus, contract_corpus_stats = generate_contract_inputs(
+                    input_contract,
+                    afl_seed_inputs,
+                    max(1, min(iterations, 50)),
+                )
+                afl_seed_inputs = _dedupe_bytes(afl_seed_inputs + contract_corpus)
             if afl_seed_inputs:
                 print(f"{Color.BLUE}[*] Sử dụng seed ngoại lệ ({len(afl_seed_inputs)} mẫu).{Color.END}")
                 for i, payload in enumerate(afl_seed_inputs):
@@ -1422,12 +1444,48 @@ int main(int argc, char** argv) {
                     seen.add(inp)
                     unique_inputs.append(inp)
             generated_inputs = unique_inputs
+            afl_candidate_count = len(generated_inputs)
+            afl_accepted_count = 0
+            afl_stage_input_count = 0
+            contract_supplement_count = 0
 
             # Preserve the old AFL++ coverage-guided pipeline, but discard byte
             # mutations that no longer look like any valid input seed. Exact
             # seeds are always tested first.
             afl_filter_stats = None
-            if afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
+            if input_contract is not None:
+                compatible_inputs = []
+                rejected_inputs = []
+                candidate_count = len(generated_inputs)
+                for payload in generated_inputs:
+                    valid, reason = validate_contract_payload(
+                        input_contract, payload, afl_seed_inputs
+                    )
+                    if valid:
+                        compatible_inputs.append(payload)
+                    else:
+                        rejected_inputs.append((payload, reason))
+                generated_inputs = _dedupe_bytes(afl_seed_inputs + compatible_inputs)
+                afl_accepted_count = len(compatible_inputs)
+                afl_filter_stats = {
+                    "enabled": True,
+                    "candidate_count": candidate_count,
+                    "accepted_count": afl_accepted_count,
+                    "rejected_count": len(rejected_inputs),
+                    "rejected_examples": [
+                        {
+                            "payload_base64": base64.b64encode(payload).decode("ascii"),
+                            "reason": reason,
+                        }
+                        for payload, reason in rejected_inputs[:20]
+                    ],
+                }
+                print(
+                    f"{Color.BLUE}[*] Contract filter accepted "
+                    f"{len(compatible_inputs)}/{candidate_count} AFL++ candidate(s); "
+                    f"rejected {len(rejected_inputs)} malformed mutation(s).{Color.END}"
+                )
+            elif afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
                 compatible_inputs = []
                 rejected_inputs = []
                 for payload in generated_inputs:
@@ -1453,10 +1511,42 @@ int main(int argc, char** argv) {
                         f"{Color.YELLOW}[!] Filtered {dropped} AFL mutation(s) that broke seed structure."
                         f"{Color.END}"
                     )
+
+            # Inputs present at this point came from the AFL++ stage (including
+            # the valid initial corpus). Anything appended below is an explicit
+            # contract-guided supplement used to reach -n/--iterations.
+            afl_stage_input_count = len(generated_inputs)
             
             # Supplement with random generator inputs if AFL++ generated fewer than requested iterations
             if len(generated_inputs) < iterations:
-                if afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
+                if input_contract is not None:
+                    supplement, supplement_stats = generate_contract_inputs(
+                        input_contract,
+                        afl_seed_inputs,
+                        iterations,
+                    )
+                    generated_inputs = _dedupe_bytes(generated_inputs + supplement)
+                    if contract_corpus_stats is None:
+                        contract_corpus_stats = supplement_stats
+                    # This path is mainly for contracts without a seed file.
+                    # Even generator-produced candidates must pass the same
+                    # contract before reaching differential execution.
+                    attempts = 0
+                    while len(generated_inputs) < iterations and attempts < iterations * 20:
+                        attempts += 1
+                        args, stdin_data = generator()
+                        payload = (
+                            "\n".join(args).encode("utf-8")
+                            if uses_argv else stdin_data
+                        )
+                        if not payload:
+                            continue
+                        valid, _ = validate_contract_payload(
+                            input_contract, payload, afl_seed_inputs
+                        )
+                        if valid and payload not in generated_inputs:
+                            generated_inputs.append(payload)
+                elif afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
                     generated_inputs = _dedupe_bytes(
                         generated_inputs + generate_structured_seed_inputs(afl_seed_inputs, iterations)
                     )
@@ -1473,6 +1563,10 @@ int main(int argc, char** argv) {
                         if payload not in seen:
                             seen.add(payload)
                             generated_inputs.append(payload)
+
+            contract_supplement_count = max(
+                0, len(generated_inputs) - afl_stage_input_count
+            )
             
             total_inputs = len(generated_inputs)
             max_runs = min(total_inputs, 500)
@@ -1508,9 +1602,37 @@ int main(int argc, char** argv) {
             }
             report["fuzz_config"] = {
                 "engine": "afl++",
-                "seed_mutation_mode": seed_mutation_mode,
+                "seed_mutation_mode": "contract-afl" if input_contract else seed_mutation_mode,
                 "timeout_seconds": timeout,
             }
+            if input_contract is not None:
+                report["fuzz_config"].update({
+                    "contract_case": input_contract.get("case_id"),
+                    "contract_kind": input_contract.get("kind"),
+                    "contract_filter_enabled": True,
+                    "raw_mutation_disabled": False,
+                    "contract_corpus_inputs": len(afl_seed_inputs),
+                    "contract_corpus_accepted": (
+                        contract_corpus_stats.get("accepted", 0)
+                        if contract_corpus_stats else 0
+                    ),
+                    "contract_corpus_rejected": (
+                        contract_corpus_stats.get("rejected", 0)
+                        if contract_corpus_stats else 0
+                    ),
+                    "contract_inputs_accepted": len(run_inputs),
+                    "contract_inputs_rejected": (
+                        afl_filter_stats.get("rejected_count", 0)
+                        if afl_filter_stats else 0
+                    ),
+                    "afl_candidates": afl_candidate_count,
+                    "afl_accepted": afl_accepted_count,
+                    "afl_stage_inputs": min(afl_stage_input_count, len(run_inputs)),
+                    "contract_supplement_inputs": min(
+                        contract_supplement_count,
+                        max(0, len(run_inputs) - min(afl_stage_input_count, len(run_inputs))),
+                    ),
+                })
             if afl_stats:
                 report["afl_stats"] = {
                     "paths_total": afl_stats.get("paths_total", "N/A"),
@@ -1521,7 +1643,18 @@ int main(int argc, char** argv) {
             if afl_filter_stats is not None:
                 report["afl_seed_filter"] = afl_filter_stats
             
-            print(f"{Color.BLUE}[*] Running differential execution on {len(run_inputs)} inputs generated by AFL++...{Color.END}")
+            if input_contract is not None:
+                afl_run_count = min(afl_stage_input_count, len(run_inputs))
+                supplement_run_count = max(0, len(run_inputs) - afl_run_count)
+                print(
+                    f"{Color.BLUE}[*] Running differential execution on {len(run_inputs)} inputs "
+                    f"({afl_run_count} AFL++ accepted + {supplement_run_count} contract supplement)...{Color.END}"
+                )
+            else:
+                print(
+                    f"{Color.BLUE}[*] Running differential execution on "
+                    f"{len(run_inputs)} inputs generated by AFL++...{Color.END}"
+                )
             
             def run_iteration(idx: int, payload: bytes) -> Dict[str, Any]:
                 if uses_argv:
@@ -1705,17 +1838,9 @@ def main():
         elif args.template_str:
             template_content = args.template_str
         else:
-            # Check path to auto-detect a matching built-in benchmark template
-            for key in DEFAULT_TEMPLATES.keys():
-                if key in args.file1.lower() or key in args.file2.lower():
-                    template_content = DEFAULT_TEMPLATES[key]
-                    print(f"{Color.YELLOW}[!] Auto-detected benchmark '{key}', using built-in generator template.{Color.END}")
-                    break
-            
-            if not template_content:
-                print(f"{Color.RED}[✗] Error: 'template' generator selected but no template specified, and no project match found.{Color.END}")
-                fuzzer.cleanup()
-                sys.exit(1)
+            print(f"{Color.RED}[✗] Error: 'template' generator requires --template-file or --template-str.{Color.END}")
+            fuzzer.cleanup()
+            sys.exit(1)
                 
         gen_func = TemplateEvaluator(template_content)
     elif args.generator == "integers":

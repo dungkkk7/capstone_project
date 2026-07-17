@@ -29,11 +29,10 @@ from fuzzing_equi_check.fuzzing import (
     DEFAULT_EXECUTION_TIMEOUT,
     SemanticFuzzer,
     compile_to_binary,
-    TemplateEvaluator,
     make_bytes_generator,
     make_integers_generator,
-    DEFAULT_TEMPLATES,
 )
+from fuzzing_equi_check.input_contracts import resolve_input_contract
 
 class Color:
     BLUE = '\033[94m'
@@ -172,11 +171,8 @@ def _find_reference_source(project_root, binary_path):
     return None
 
 
-def _select_generator(project_root, binary_path, template_content):
-    """Select a valid input domain for the benchmark instead of raw bytes."""
-    if template_content:
-        return TemplateEvaluator(template_content), "template"
-
+def _select_generator(project_root, binary_path):
+    """Select the best available non-template input generator."""
     source = _find_reference_source(project_root, binary_path)
     if source:
         try:
@@ -406,29 +402,30 @@ def _run_llm_recovery_mode(list_path, project_root, use_cache=True, force_relift
             print(f"{Color.BLUE}    IR input: {ir_path} ({len(ir_text)} chars){Color.END}")
 
             def _build_fuzzer():
-                template_content = None
-                for key in DEFAULT_TEMPLATES.keys():
-                    if key in original_binary.lower():
-                        template_content = DEFAULT_TEMPLATES[key]
-                        break
-                generator, generator_reason = _select_generator(
-                    project_root, original_binary, template_content
-                )
+                generator, generator_reason = _select_generator(project_root, original_binary)
                 seed_paths, seed_dir = _resolve_seed_paths(project_root, original_binary)
-                return generator, generator_reason, seed_paths, seed_dir
+                input_contract = resolve_input_contract(project_root, original_binary)
+                return generator, generator_reason, seed_paths, seed_dir, input_contract
 
             fuzzer_callback = None
             if original_binary and os.path.isfile(original_binary):
-                generator, generator_reason, seed_paths, seed_dir = _build_fuzzer()
+                generator, generator_reason, seed_paths, seed_dir, input_contract = _build_fuzzer()
                 print(f"{Color.BLUE}    Fuzzer input generator: {generator_reason}{Color.END}")
+                if input_contract:
+                    print(
+                        f"{Color.BLUE}    Input contract: {input_contract['case_id']} "
+                        f"({input_contract['kind']}){Color.END}"
+                    )
 
                 def run_fuzz(candidate_path, _binary=original_binary, _generator=generator,
-                             _seed_paths=seed_paths, _seed_dir=seed_dir):
+                             _seed_paths=seed_paths, _seed_dir=seed_dir,
+                             _input_contract=input_contract):
                     fuzzer = SemanticFuzzer(
                         candidate_path,
                         _binary,
                         seed_paths=_seed_paths,
                         seed_dir=_seed_dir,
+                        input_contract=_input_contract,
                     )
                     return _run_fuzzer_sync(
                         fuzzer,
@@ -689,26 +686,20 @@ def main(argv=None):
                     # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
                     print(f"{Color.BLUE}{Color.BOLD}    → Bắt đầu kiểm tra Semantic Equivalence cho: {path}...{Color.END}")
                     try:
-                        # Tìm template phù hợp cho benchmark
-                        template_content = None
-                        for key in DEFAULT_TEMPLATES.keys():
-                            if key in path.lower():
-                                template_content = DEFAULT_TEMPLATES[key]
-                                break
-
-                        generator, generator_reason = _select_generator(
-                            project_root, path, template_content
-                        )
-                        if template_content:
-                            print(f"{Color.YELLOW}      [!] Phát hiện benchmark, sử dụng template generator.{Color.END}")
-                        else:
-                            print(f"{Color.BLUE}      [*] Input generator: {generator_reason}.{Color.END}")
+                        generator, generator_reason = _select_generator(project_root, path)
+                        print(f"{Color.BLUE}      [*] Input generator: {generator_reason}.{Color.END}")
 
                         seed_paths, seed_dir = _resolve_seed_paths(project_root, path)
+                        input_contract = resolve_input_contract(project_root, path)
                         if seed_paths:
                             print(f"{Color.BLUE}    [*] Tìm thấy seed corpus riêng cho binary: {seed_paths[0]}{Color.END}")
                         elif seed_dir:
                             print(f"{Color.BLUE}    [*] Tìm thấy seed directory cho case: {seed_dir}{Color.END}")
+                        if input_contract:
+                            print(
+                                f"{Color.BLUE}    [*] Input contract: "
+                                f"{input_contract['case_id']} ({input_contract['kind']}){Color.END}"
+                            )
 
                         # Ưu tiên dùng bản binary được biên dịch từ brightened IR
                         # (đang là file1 của baseline semantic check) cho khâu Ghidra + recovery.
@@ -731,6 +722,7 @@ def main(argv=None):
                                 path,
                                 seed_paths=seed_paths,
                                 seed_dir=seed_dir,
+                                input_contract=input_contract,
                             )
                             return _run_fuzzer_sync(
                                 fuzzer,
@@ -829,6 +821,7 @@ def main(argv=None):
                                     recovery_compare_target,
                                     seed_paths=seed_paths,
                                     seed_dir=seed_dir,
+                                    input_contract=input_contract,
                                 )
                                 return _run_fuzzer_sync(
                                     candidate_fuzzer,
