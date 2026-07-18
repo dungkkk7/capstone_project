@@ -571,6 +571,30 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
     if (!brighten_state_ssa::IsLiftedFunction(F)) continue;
     VisitedFunctions++;
 
+    // Dispatcher functions carrying undef/poison operands do not have a
+    // trustworthy stack data-flow graph.  Rewriting their frame accesses can
+    // turn an already-opaque lifted path into a concrete SIGSEGV; preserve the
+    // original function and let later passes report the unresolved contract.
+    bool HasUnresolvedValue = false;
+    for (BasicBlock &CheckBB : F) {
+      for (Instruction &I : CheckBB) {
+        for (Value *Op : I.operands()) {
+          if (isa<UndefValue>(Op) || isa<PoisonValue>(Op)) {
+            HasUnresolvedValue = true;
+            break;
+          }
+        }
+        if (HasUnresolvedValue)
+          break;
+      }
+      if (HasUnresolvedValue)
+        break;
+    }
+    if (HasUnresolvedValue) {
+      ++UnsafeCount;
+      continue;
+    }
+
     DenseMap<Value *, StackExpr> ExprMap;
     DenseMap<BasicBlock *, BlockState> BlockEntryState;
     DenseMap<BasicBlock *, BlockState> BlockExitState;
@@ -845,12 +869,7 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
           // across an ABI boundary while keeping independent compiler-created
           // control-flow or arithmetic temporaries in the same physical
           // frame.  Dynamic addresses remain a base-wide rejection below.
-          int64_t End = 0;
-          if (AddNoSignedOverflow(E.Offset, 8, End)) {
-            EscapedRanges[Key].push_back({E.Offset, End});
-          } else {
-            addSkipReason(BaseReasons, Key, SkipBaseEscaped);
-          }
+          addSkipReason(BaseReasons, Key, SkipBaseEscaped);
         }
       } else if (E.K == StackExpr::Kind::StackDynamic) {
         BaseKey Key{E.Base.V, E.Base.Kind, E.Base.Epoch};

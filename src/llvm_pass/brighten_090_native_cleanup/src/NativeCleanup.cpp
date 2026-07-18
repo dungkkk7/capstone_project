@@ -684,27 +684,39 @@ static Value *findNativeVarargAddressCarrier(Value *V,
       return ValidateCarrier(CE->getOperand(0));
   }
 
-  Value *Found = nullptr;
-  auto VisitOperand = [&](Value *Op) -> bool {
-    Value *Candidate = findNativeVarargAddressCarrier(Op, Seen);
-    if (!Candidate)
-      return true;
-    if (Found && Found != Candidate)
-      return false;
-    Found = Candidate;
-    return true;
-  };
-
-  if (auto *I = dyn_cast<Instruction>(V)) {
-    for (Value *Op : I->operands())
-      if (!VisitOperand(Op))
-        return nullptr;
-  } else if (auto *CE = dyn_cast<ConstantExpr>(V)) {
-    for (Value *Op : CE->operands())
-      if (!VisitOperand(Op))
-        return nullptr;
+  // A carrier may be hidden behind representation-only casts.  Do not walk
+  // arbitrary arithmetic/GEP/load operands: finding ptrtoint(@global) inside
+  //   inttoptr(base + index * stride + field_offset)
+  // does not make @global equivalent to the complete address.  The previous
+  // recursive search dropped the dynamic and field offsets from such libc
+  // arguments (notably ryou[i].dim passed to memcmp).
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    return findNativeVarargAddressCarrier(Cast->getOperand(0), Seen);
+  if (auto *Freeze = dyn_cast<FreezeInst>(V))
+    return findNativeVarargAddressCarrier(Freeze->getOperand(0), Seen);
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->isCast())
+      return findNativeVarargAddressCarrier(CE->getOperand(0), Seen);
+    return nullptr;
   }
-  return Found;
+
+  auto FindCommonCarrier = [&](auto Values) -> Value * {
+    Value *Common = nullptr;
+    for (Value *Arm : Values) {
+      Value *Candidate = findNativeVarargAddressCarrier(Arm, Seen);
+      if (!Candidate || (Common && Common != Candidate))
+        return nullptr;
+      Common = Candidate;
+    }
+    return Common;
+  };
+  if (auto *PN = dyn_cast<PHINode>(V))
+    return FindCommonCarrier(PN->incoming_values());
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    SmallVector<Value *, 2> Arms{Sel->getTrueValue(), Sel->getFalseValue()};
+    return FindCommonCarrier(Arms);
+  }
+  return nullptr;
 }
 
 static std::optional<std::pair<GlobalVariable *, uint64_t>>
@@ -1905,6 +1917,116 @@ getGuestRange(GlobalVariable &GV) {
   return std::make_pair(Begin->getZExtValue(), End->getZExtValue());
 }
 
+static std::optional<uint64_t> getConstantGuestPointer(Value *V) {
+  if (!V)
+    return std::nullopt;
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->getOpcode() == Instruction::IntToPtr)
+      if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+        return CI->getZExtValue();
+  }
+  if (auto *ITP = dyn_cast<IntToPtrInst>(V))
+    if (auto *CI = dyn_cast<ConstantInt>(ITP->getOperand(0)))
+      return CI->getZExtValue();
+  return std::nullopt;
+}
+
+// Convert residual guest-address format arguments into native string globals
+// while guest-range metadata and segment initializers are still available.
+// This fixes calls such as vscanf(inttoptr(0x408004), ...): that address is
+// valid in the guest image but is unmapped in the ASLR native executable.
+static unsigned materializeResidualLibcFormats(Module &M, bool &Changed) {
+  const DataLayout &DL = M.getDataLayout();
+  SmallVector<std::pair<CallBase *, unsigned>, 16> Work;
+  for (Function &F : M) {
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+        if (!Callee)
+          continue;
+        StringRef Name = Callee->getName();
+        unsigned FormatIndex = 0;
+        if (Name == "fprintf" || Name == "sprintf" || Name == "sscanf" ||
+            Name == "vfprintf" || Name == "vsprintf" || Name == "vsscanf")
+          FormatIndex = 1;
+        else if (Name == "snprintf")
+          FormatIndex = 2;
+        else if (Name != "printf" && Name != "scanf" &&
+                 Name != "__isoc99_scanf" && Name != "vprintf" &&
+                 Name != "vscanf" && Name != "__isoc99_vscanf")
+          continue;
+        if (CB->arg_size() > FormatIndex &&
+            getConstantGuestPointer(CB->getArgOperand(FormatIndex)))
+          Work.push_back({CB, FormatIndex});
+      }
+    }
+  }
+
+  unsigned Rewritten = 0;
+  for (auto [CB, FormatIndex] : Work) {
+    auto GuestAddr = getConstantGuestPointer(CB->getArgOperand(FormatIndex));
+    if (!GuestAddr)
+      continue;
+    GlobalVariable *Source = nullptr;
+    uint64_t Offset = 0;
+    for (GlobalVariable &GV : M.globals()) {
+      auto Range = getGuestRange(GV);
+      if (Range && *GuestAddr >= Range->first && *GuestAddr < Range->second &&
+          GV.hasInitializer()) {
+        Source = &GV;
+        Offset = *GuestAddr - Range->first;
+        break;
+      }
+    }
+    if (!Source)
+      continue;
+    SmallVector<uint8_t, 128> Bytes;
+    for (uint64_t I = Offset; I < Offset + 4096; ++I) {
+      uint8_t Byte = 0;
+      if (!readConstantByte(Source->getInitializer(), DL, I, Byte)) {
+        Bytes.clear();
+        break;
+      }
+      Bytes.push_back(Byte);
+      if (Byte == 0)
+        break;
+    }
+    if (Bytes.empty() || Bytes.back() != 0)
+      continue;
+    auto *Init = ConstantDataArray::get(M.getContext(), Bytes);
+    auto *Native = new GlobalVariable(
+        M, Init->getType(), true, GlobalValue::PrivateLinkage, Init,
+        "native.libc.format");
+    Native->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    Native->setAlignment(Align(1));
+    CB->setArgOperand(FormatIndex, Native);
+    ++Rewritten;
+    Changed = true;
+  }
+  return Rewritten;
+}
+
+static void preserveRecoveredGlobalsAcrossOptimization(Module &M) {
+  if (M.getNamedMetadata("brighten.globals.preserved"))
+    return;
+  SmallVector<GlobalValue *, 32> RecoveredGlobals;
+  for (GlobalVariable &GV : M.globals()) {
+    // Cleanup deliberately converts native ptrtoint carriers back to their
+    // stable guest integer identity before O3.  The second cleanup sweep then
+    // needs this object and its range metadata to turn scanf/libc pointer
+    // slots back into native pointers.  Keeping only format strings lets O3
+    // delete writable arrays whose remaining carrier is temporarily numeric.
+    if (getGuestRange(GV) && GV.hasInitializer())
+      RecoveredGlobals.push_back(&GV);
+  }
+  if (RecoveredGlobals.empty())
+    return;
+  appendToCompilerUsed(M, RecoveredGlobals);
+  M.getOrInsertNamedMetadata("brighten.globals.preserved")
+      ->addOperand(MDNode::get(M.getContext(), {}));
+}
+
 static void setGuestRangeMetadata(Module &M, GlobalVariable &GV,
                                   uint64_t Begin, uint64_t End) {
   LLVMContext &Ctx = M.getContext();
@@ -2455,7 +2577,12 @@ evaluateConstantGuestInteger(Module &M, Constant *C, unsigned Depth = 0) {
   unsigned BitWidth = C->getType()->getIntegerBitWidth();
   auto GuestAddress = findConstantRecoveredGuestAddress(M, CE);
   if (GuestAddress)
-    return Make(APInt(BitWidth, *GuestAddress), true);
+    // APInt's single-word constructor asserts when a narrow destination type
+    // cannot represent the full guest address.  Constant expressions such as
+    // trunc(ptrtoint(@recovered_global)) are expected to discard those high
+    // bits, so construct at the address width first and apply the LLVM integer
+    // cast semantics explicitly.
+    return Make(APInt(64, *GuestAddress).zextOrTrunc(BitWidth), true);
 
   auto EvalOperand = [&](unsigned Index) {
     return evaluateConstantGuestInteger(M, dyn_cast<Constant>(CE->getOperand(Index)),
@@ -2673,14 +2800,28 @@ findGuestAddressExpression(Module &M, Value *V, IRBuilder<> &B,
 
   auto Left = findGuestAddressExpression(M, BO->getOperand(0), B, Depth + 1);
   auto Right = findGuestAddressExpression(M, BO->getOperand(1), B, Depth + 1);
+  auto CoerceOffset = [&](Value *Offset, Type *TargetTy) -> Value * {
+    if (!Offset || Offset->getType() == TargetTy)
+      return Offset;
+    if (!Offset->getType()->isIntegerTy() || !TargetTy->isIntegerTy())
+      return nullptr;
+    return B.CreateSExtOrTrunc(Offset, TargetTy,
+                              "native.scanf.address.offset.cast");
+  };
   if (Left && !Right) {
-    Value *Extra = BO->getOperand(1);
+    Value *Extra = CoerceOffset(BO->getOperand(1),
+                                Left->DynamicOffset->getType());
+    if (!Extra)
+      return std::nullopt;
     Left->DynamicOffset = B.CreateAdd(Left->DynamicOffset, Extra,
                                       "native.scanf.address.offset");
     return Left;
   }
   if (Right && !Left) {
-    Value *Extra = BO->getOperand(0);
+    Value *Extra = CoerceOffset(BO->getOperand(0),
+                                Right->DynamicOffset->getType());
+    if (!Extra)
+      return std::nullopt;
     Right->DynamicOffset = B.CreateAdd(Right->DynamicOffset, Extra,
                                        "native.scanf.address.offset");
     return Right;
@@ -2716,15 +2857,16 @@ static unsigned rewriteNativeScanfVarargAddresses(Module &M,
     auto Address = findGuestAddressExpression(M, SI->getValueOperand(), B);
     if (!Address || !Address->Segment || !Address->DynamicOffset)
       continue;
-    Value *Offset = Address->DynamicOffset;
-    if (Address->SegmentOffset != 0)
-      Offset = B.CreateAdd(Offset, B.getInt64(Address->SegmentOffset),
-                           "native.vararg.offset");
-    if (!Offset->getType()->isIntegerTy(64))
-      Offset = B.CreateZExtOrTrunc(Offset, B.getInt64Ty(),
-                                   "native.vararg.offset.ext");
-    Value *NativePtr = B.CreateGEP(B.getInt8Ty(), Address->Segment, Offset,
-                                   "native.vararg.ptr");
+    // The matched constant proves that this is guest-data address
+    // arithmetic, but it does not prove that every dynamic result remains in
+    // that one recovered object.  Adjacent scanf destinations often cross
+    // typed-object boundaries (base, base+4, ...), and anchoring all of them
+    // on Address->Segment creates pointers such as @g_arr_0 + 0x405xxx.
+    // Dispatch the complete address through all proven guest ranges instead.
+    Value *NativePtr =
+        materializeRecoveredDataPointer(M, B, SI->getValueOperand());
+    if (!NativePtr)
+      continue;
     Value *NativeAddr = B.CreatePtrToInt(NativePtr,
                                          SI->getValueOperand()->getType(),
                                          "native.vararg.addr");
@@ -2978,6 +3120,16 @@ static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
 
   LLVMContext &Ctx = M.getContext();
   if (Value *NativeCarrier = getDirectNativePointerCarrier(Address)) {
+    // Range dispatches produced by this function are already the complete
+    // guest-or-native mapping.  Their fallback intentionally remains a raw
+    // inttoptr so an address outside every proven object keeps its original
+    // fault behavior; that fallback makes the generic native-pointer
+    // classifier reject the select and used to cause a second range rebase.
+    // Recognize our own generated carrier explicitly to make lowering
+    // idempotent across repeated cleanup sweeps.
+    if (NativeCarrier->hasName() &&
+        NativeCarrier->getName().starts_with("native.data.pointer.select"))
+      return NativeCarrier;
     SmallPtrSet<Value *, 16> Seen;
     if (isNativePointerValue(NativeCarrier, Seen))
       return NativeCarrier;
@@ -3379,6 +3531,18 @@ static unsigned rewriteRecoveredExternalPointerArguments(Module &M,
             Arg = CB->getArgOperand(Index);
             if (!Arg || !Arg->getType()->isPointerTy())
               continue;
+            // LowerStackPointerArms has already reconstructed this argument
+            // from the recovered frame.  Do not subsequently search through
+            // its integer index expression for a vararg carrier: a lifted
+            // RBP/RSP PHI may also carry unrelated function-pointer values on
+            // other dispatcher edges.  Peeling one of those nested carriers
+            // replaces a correct scanf destination with (for example) a
+            // callback address.
+            SmallPtrSet<Value *, 16> StackArgSeen;
+            if (isNativeStackPointer(Arg, StackArgSeen)) {
+              ++Rewritten;
+              continue;
+            }
             SmallPtrSet<Value *, 32> VarargSeen;
             if (Value *NativeCarrier =
                     findNativeVarargAddressCarrier(Arg, VarargSeen)) {
@@ -3464,6 +3628,13 @@ static unsigned rewriteNativeVarargExternalPointerArguments(Module &M,
             continue;
           Value *Arg = CB->getArgOperand(Index);
           if (!Arg || !Arg->getType()->isPointerTy())
+            continue;
+          // A preceding stack-address sweep may already have replaced the
+          // raw inttoptr with a recovered-frame GEP.  Searching inside that
+          // GEP can reach unrelated native.vararg.address values through a
+          // dispatcher PHI and incorrectly peel out a callback/global arm.
+          SmallPtrSet<Value *, 16> StackSeen;
+          if (isNativeStackPointer(Arg, StackSeen))
             continue;
           SmallPtrSet<Value *, 32> Seen;
           Value *NativeCarrier = findNativeVarargAddressCarrier(Arg, Seen);
@@ -3888,6 +4059,20 @@ static FunctionType *nativeExternalType(Module &M, StringRef Name) {
     return Fixed(Ptr, {Ptr, Ptr});
   if (Name == "strncmp")
     return Fixed(I32, {Ptr, Ptr, I64});
+  if (Name == "strcpy" || Name == "strcat")
+    return Fixed(Ptr, {Ptr, Ptr});
+  if (Name == "strncpy" || Name == "strncat")
+    return Fixed(Ptr, {Ptr, Ptr, I64});
+  if (Name == "strchr" || Name == "strrchr")
+    return Fixed(Ptr, {Ptr, I32});
+  if (Name == "memcmp")
+    return Fixed(I32, {Ptr, Ptr, I64});
+  if (Name == "setjmp" || Name == "_setjmp")
+    return Fixed(I32, {Ptr});
+  if (Name == "sigsetjmp" || Name == "__sigsetjmp")
+    return Fixed(I32, {Ptr, I32});
+  if (Name == "longjmp" || Name == "siglongjmp")
+    return Fixed(Type::getVoidTy(Ctx), {Ptr, I32});
   if (Name == "getchar")
     return Fixed(I32, {});
   if (Name == "gets")
@@ -4112,7 +4297,18 @@ static unsigned normalizeNativeExternalABIs(Module &M, bool &Changed,
       continue;
     StringRef Canonical =
         F.getName().drop_back(StringRef(".lifted_abi").size());
-    if (Function *Native = M.getFunction(Canonical))
+    if (!HasOnlyGlobalConstantUsers(&F))
+      continue;
+    FunctionType *Expected = nativeExternalType(M, Canonical);
+    if (!Expected)
+      continue;
+    Function *Native = M.getFunction(Canonical);
+    if (!Native) {
+      Native = Function::Create(Expected, GlobalValue::ExternalLinkage,
+                                Canonical, &M);
+      Native->setCallingConv(CallingConv::C);
+    }
+    if (Native->getFunctionType() == Expected)
       LiftedDeclarations.emplace_back(&F, Native);
   }
   for (auto [Lifted, Native] : LiftedDeclarations) {
@@ -7023,7 +7219,7 @@ static uint64_t getRecoveredWorkArrayGuestBase(GlobalVariable &GV) {
       return Range->first - 4;
     return Range->first;
   }
-  return 0x406040;
+  return 0;
 }
 
 static unsigned guardRecoveredGlobalBounds(Module &M, bool &Changed) {
@@ -7422,6 +7618,10 @@ static unsigned guardRecoveredGlobalBounds(Module &M, bool &Changed) {
       AccessSize = DL.getTypeStoreSize(SI->getValueOperand()->getType())
                        .getFixedValue();
     else
+      continue;
+    // Without guest-range provenance the recovered global may denote an
+    // unrelated object; leave its access untouched.
+    if (!getGuestRange(*Info.GV))
       continue;
     uint64_t ObjectSize = DL.getTypeAllocSize(Info.GV->getValueType());
     if (!AccessSize || AccessSize > ObjectSize ||
@@ -7862,11 +8062,7 @@ static unsigned rewriteResidualQsortArrayArguments(Module &M, bool &Changed) {
         bool AlreadyRecovered = false;
         GlobalVariable *CurrentRoot =
             findRecoveredArrayRoot(CI->getArgOperand(0), AlreadyRecovered);
-        if (CurrentRoot == ArrayRoot)
-          continue;
-        if (CurrentRoot && !CurrentRoot->getName().starts_with("g_arr_0"))
-          continue;
-        if (!CurrentRoot && !isResidualConstantPointer(CI->getArgOperand(0)))
+        if (CurrentRoot != ArrayRoot)
           continue;
         CI->setArgOperand(0, ArrayRoot);
         Work.push_back(CI);
@@ -7907,6 +8103,7 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (DeadInlineAsm)
       errs() << "  final unused inline-asm calls erased: " << DeadInlineAsm
              << "\n";
+    stripRemillMetadata(M, Changed);
     reportNativeContract(M, 0, 0, true);
     return Changed;
   }
@@ -7925,6 +8122,12 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   // Recovered guest ranges are required by the later scanf/external-pointer
   // lowering.  Strip them only after every such use has been materialized.
   stripRemillMetadata(M, Changed, false);
+
+  unsigned ResidualLibcFormats = materializeResidualLibcFormats(M, Changed);
+  if (ResidualLibcFormats)
+    errs() << "  residual guest libc formats materialized: "
+           << ResidualLibcFormats << "\n";
+  preserveRecoveredGlobalsAcrossOptimization(M);
 
   unsigned WidenedRecoveredScalars =
       widenOverNarrowRecoveredScalars(M, Changed);
@@ -8332,11 +8535,7 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   if (LateMissingScanfDestinations)
     errs() << "  late missing scanf destinations materialized: "
            << LateMissingScanfDestinations << "\n";
-  unsigned FailedScanfSeeds =
-      seedFailedIntegerScanfDestinations(M, Changed);
-  if (FailedScanfSeeds)
-    errs() << "  failed integer scanf destinations seeded: "
-           << FailedScanfSeeds << "\n";
+  // Preserve scanf failure semantics; do not seed or trap destinations.
   unsigned PromotedDispatchers = promoteStackDispatcherStateSlots(M, Changed);
   if (PromotedDispatchers)
     errs() << "  stack dispatcher state slots promoted to SSA: "
@@ -8351,11 +8550,10 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   if (IsolatedWorkArray)
     errs() << "  recovered work-array invalid prefix isolated: "
            << IsolatedWorkArray << "\n";
-  unsigned GuardedRecoveredGlobals =
-      guardRecoveredGlobalBounds(M, Changed);
-  if (GuardedRecoveredGlobals)
-    errs() << "  recovered global out-of-bounds accesses trapped: "
-           << GuardedRecoveredGlobals << "\n";
+  // Do not synthesize null-pointer stores for recovered global bounds.  The
+  // lifted image-backed address space can legitimately use negative offsets
+  // into adjacent mapped segments; trapping here caused SIGSEGVs on valid
+  // contract inputs.  Keep the original access unless provenance is proven.
   unsigned LatePointerIntegers =
       rewriteRecoveredPointerIntegerIdentities(M, Changed);
   if (LatePointerIntegers)
@@ -8363,7 +8561,11 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
            << LatePointerIntegers << "\n";
   // No recovery step below this point consumes guest-range provenance; remove
   // it now so the final NativeStrict contract remains metadata-free.
-  stripRemillMetadata(M, Changed);
+  // Keep guest-range provenance across the intervening O3 pipeline.  A later
+  // cleanup invocation still needs it to materialize libc format constants
+  // after translator calls have folded to raw guest addresses.  The final
+  // strict verifier strips it once all rewrites are complete.
+  stripRemillMetadata(M, Changed, false);
   foldExactPointerRoundTrips(M, Changed);
   reportNativeContract(M, RemovedFunctions, RemovedGlobals, false);
 

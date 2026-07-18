@@ -61,7 +61,7 @@ class TimeoutSemanticsTests(unittest.TestCase):
             "status": "crash", "returncode": -signal.SIGSEGV,
             "signal": signal.SIGSEGV, "stdout": b"", "stderr": b"",
         }
-        with patch.dict("os.environ", {"BRIGHTEN_MUTATE_SEEDS": "raw"}):
+        with patch.dict("os.environ", {"BRIGHTEN_MUTATE_SEEDS": "contract-afl"}):
             self.assertFalse(is_inconclusive_pair(recovered, native_timeout))
             self.assertFalse(is_inconclusive_pair(recovered, native_crash))
 
@@ -78,7 +78,7 @@ class TimeoutSemanticsTests(unittest.TestCase):
             "early_stopped": False,
         }
 
-        with patch.dict("os.environ", {"BRIGHTEN_MUTATE_SEEDS": "raw"}):
+        with patch.dict("os.environ", {"BRIGHTEN_MUTATE_SEEDS": "contract-afl"}):
             finalize_equivalence_report(report)
 
         self.assertFalse(report["is_fully_equivalent"])
@@ -90,18 +90,18 @@ class StructuredSeedMutationTests(unittest.TestCase):
         fuzzer = SemanticFuzzer.__new__(SemanticFuzzer)
         fuzzer.cleanup()
 
-    def test_case_seed_disables_afl_mutation_by_default(self):
+    def test_case_seed_uses_contract_afl_fuzzing_by_default(self):
         fuzzer = SemanticFuzzer.__new__(SemanticFuzzer)
         fuzzer.seed_inputs = [b"3\n1 2\n"]
         fuzzer.afl_cc = "/bin/true"
         fuzzer.afl_fuzz = "/bin/true"
-        sentinel = {"mode": "exact-seed"}
+        sentinel = {"mode": "fallback-sentinel"}
 
         def fallback(*args, **kwargs):
             return sentinel
 
         fuzzer.run_differential_test_fallback = fallback
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"BRIGHTEN_USE_AFL": "0"}, clear=True):
             result = fuzzer.run_differential_test(
                 iterations=100,
                 generator=lambda: ([], b"random"),
@@ -154,7 +154,7 @@ class StructuredSeedMutationTests(unittest.TestCase):
 
         with patch.dict(
             "os.environ",
-            {"BRIGHTEN_MUTATE_SEEDS": "raw"},
+            {"BRIGHTEN_MUTATE_SEEDS": "contract-afl"},
             clear=True,
         ), patch("fuzzing_equi_check.fuzzing.run_binary", mock_execution):
             report = fuzzer.run_differential_test_fallback(
@@ -296,7 +296,7 @@ class AsymmetricCrashReportTests(unittest.TestCase):
             completed = subprocess.CompletedProcess([], 0, b"", b"")
             with patch.dict(
                 "os.environ",
-                {"BRIGHTEN_USE_AFL": "1", "BRIGHTEN_MUTATE_SEEDS": "raw"},
+                {"BRIGHTEN_USE_AFL": "1", "BRIGHTEN_MUTATE_SEEDS": "contract-afl"},
                 clear=True,
             ), patch(
                 "fuzzing_equi_check.fuzzing.subprocess.run",
@@ -313,7 +313,7 @@ class AsymmetricCrashReportTests(unittest.TestCase):
 
         self._assert_complete_crash_report(report)
         self.assertEqual(report["fuzz_config"]["engine"], "afl++")
-        self.assertEqual(report["fuzz_config"]["seed_mutation_mode"], "raw")
+        self.assertEqual(report["fuzz_config"]["seed_mutation_mode"], "contract-afl")
         self.assertEqual(report["fuzz_config"]["timeout_seconds"], 0.1)
 
 
@@ -391,7 +391,7 @@ class UnstableOracleTests(unittest.TestCase):
             completed = subprocess.CompletedProcess([], 0, b"", b"")
             with patch.dict(
                 "os.environ",
-                {"BRIGHTEN_USE_AFL": "1", "BRIGHTEN_MUTATE_SEEDS": "raw"},
+                {"BRIGHTEN_USE_AFL": "1", "BRIGHTEN_MUTATE_SEEDS": "contract-afl"},
                 clear=True,
             ), patch(
                 "fuzzing_equi_check.fuzzing.subprocess.run",

@@ -1465,9 +1465,12 @@ static bool RewriteExternalNativeCalls(
                                 "memcpy.src");
       Value *Len = B.CreateLoad(B.getInt64Ty(), BuildStateGEP(B, State, 2264),
                                 "memcpy.len");
+      auto *PtrTy = cast<PointerType>(Memcpy->getFunctionType()->getParamType(0));
+      Dst = B.CreateIntToPtr(Dst, PtrTy, "memcpy.dst.ptr");
+      Src = B.CreateIntToPtr(Src, PtrTy, "memcpy.src.ptr");
       CallInst *Direct = B.CreateCall(Memcpy, {Dst, Src, Len}, "memcpy.direct");
       Direct->setCallingConv(Memcpy->getCallingConv());
-      Value *Ret = B.CreateIntToPtr(Direct, B.getPtrTy(), "memcpy.ret");
+      Value *Ret = Direct;
       if (!OldCall->getType()->isVoidTy())
         OldCall->replaceAllUsesWith(Ret);
       OldCall->eraseFromParent();

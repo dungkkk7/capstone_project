@@ -1059,9 +1059,6 @@ class SemanticFuzzer:
         seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
         input_contract = getattr(self, "input_contract", None)
         contract_mode = input_contract is not None
-        # A semantic gate must exercise more than the one recorded seed.  The
-        # Raw AFL mutation is the requested fuzzing mode.  Structured mutation
-        # remains available explicitly for grammar-sensitive regression cases.
         seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "raw").lower()
         structured_mutation = seed_mutation_mode in {"structured", "local", "safe"}
         if contract_mode:
@@ -1183,10 +1180,12 @@ class SemanticFuzzer:
                 except Exception as ex:
                     print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
         finally:
-            # On timeout, do not let the executor context wait for already
-            # queued cases. At most the currently running workers remain, each
-            # protected by run_binary's hard deadline.
-            executor.shutdown(wait=not early_stop, cancel_futures=early_stop)
+            # Cancel queued work after fail-fast, but join the workers that
+            # have already started.  Returning while they still call the
+            # process oracle leaks executions into the next case (and can
+            # race temporary-directory cleanup).  Each running worker is
+            # already bounded by run_binary's hard deadline.
+            executor.shutdown(wait=True, cancel_futures=early_stop)
         report["tested_payloads"] = _encode_payloads_for_report(test_payloads[:iterations])
         finalize_equivalence_report(report)
         return report
@@ -1201,29 +1200,14 @@ class SemanticFuzzer:
         seed_inputs: Optional[List[bytes]] = None
     ) -> Dict[str, Any]:
         """Runs the differential testing loops using AFL++ if available, else falls back to default fuzzer."""
-        # AFL++ is enabled for coverage-guided fuzzing by default.  Set
-        # BRIGHTEN_USE_AFL=0 to use only the bounded differential runner when
-        # debugging a case or when AFL++ is unavailable.
         use_afl = os.environ.get("BRIGHTEN_USE_AFL", "1").lower() in {
             "1", "true", "yes", "on"
         }
-        # Some focused unit tests construct a lightweight SemanticFuzzer via
-        # __new__ and replace the fallback runner.  Do not enter the AFL path
-        # unless the object has the context that AFL materialization requires;
-        # otherwise the broad exception handler below logs a misleading
-        # infrastructure failure before doing the intended fallback.
         if not getattr(self, "file1", None) or not getattr(self, "tmp_dir", None):
             use_afl = False
-        # A case-specific seed is an executable input contract.  Raw AFL byte
-        # Raw AFL mutation is the default fuzzing contract.  Use
-        # BRIGHTEN_MUTATE_SEEDS=structured only for grammar-sensitive tests;
-        # use `off` for explicit exact-seed replay.
         seed_mutation_mode = os.environ.get("BRIGHTEN_MUTATE_SEEDS", "raw").lower()
         input_contract = getattr(self, "input_contract", None)
         if input_contract is not None:
-            # Canonical name for the new contract-guided AFL mode.  The
-            # environment variable may still be set to raw for compatibility,
-            # but the report and execution mode must not be ambiguous.
             seed_mutation_mode = "contract-afl"
             print(
                 f"{Color.BLUE}[*] Using source-derived input contract "
@@ -1235,9 +1219,6 @@ class SemanticFuzzer:
             "1", "true", "yes", "on", "raw", "structured", "local", "safe",
             "contract", "contract-afl"
         }
-        # A listed contract remains a fuzzing case.  BRIGHTEN_USE_AFL=0 may
-        # select the bounded contract-guided differential fallback, but an
-        # unrelated exact-replay setting must not disable mutation here.
         if input_contract is not None:
             seed_mutation_enabled = True
         if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
@@ -1250,8 +1231,9 @@ class SemanticFuzzer:
         
         if not has_afl:
             if (self.seed_inputs or seed_inputs) and not seed_mutation_enabled:
-                print(f"{Color.BLUE}[*] Using exact case seeds (mutation disabled by default).{Color.END}")
-            elif (self.seed_inputs or seed_inputs) and seed_mutation_mode in {"structured", "local", "safe"}:
+                print(f"{Color.BLUE}[*] Using exact case seeds (mutation disabled).{Color.END}")
+            elif ((self.seed_inputs or seed_inputs) and
+                  seed_mutation_mode in {"structured", "local", "safe"}):
                 print(f"{Color.BLUE}[*] Using structure-preserving seed mutations (raw AFL mutation disabled).{Color.END}")
             else:
                 print(f"{Color.YELLOW}[!] AFL++ unavailable or disabled. Falling back to bounded generator.{Color.END}")
@@ -1494,23 +1476,14 @@ int main(int argc, char** argv) {
                         compatible_inputs.append(payload)
                     else:
                         rejected_inputs.append((payload, reasons[0] or "unknown"))
-                dropped = len(rejected_inputs)
-                afl_filter_stats = {
-                    "rejected_count": dropped,
-                    "rejected_examples": [
-                        {
-                            "payload_base64": base64.b64encode(payload).decode("ascii"),
-                            "reason": reason,
-                        }
-                        for payload, reason in rejected_inputs[:20]
-                    ],
-                }
                 generated_inputs = _dedupe_bytes(afl_seed_inputs + compatible_inputs)
-                if dropped:
-                    print(
-                        f"{Color.YELLOW}[!] Filtered {dropped} AFL mutation(s) that broke seed structure."
-                        f"{Color.END}"
-                    )
+                afl_filter_stats = {
+                    "enabled": True,
+                    "candidate_count": len(generated_inputs),
+                    "accepted_count": len(compatible_inputs),
+                    "rejected_count": len(rejected_inputs),
+                    "rejected_examples": [],
+                }
 
             # Inputs present at this point came from the AFL++ stage (including
             # the valid initial corpus). Anything appended below is an explicit
@@ -1528,6 +1501,10 @@ int main(int argc, char** argv) {
                     generated_inputs = _dedupe_bytes(generated_inputs + supplement)
                     if contract_corpus_stats is None:
                         contract_corpus_stats = supplement_stats
+                elif afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
+                    generated_inputs = _dedupe_bytes(
+                        generated_inputs + generate_structured_seed_inputs(afl_seed_inputs, iterations)
+                    )
                     # This path is mainly for contracts without a seed file.
                     # Even generator-produced candidates must pass the same
                     # contract before reaching differential execution.
@@ -1546,10 +1523,6 @@ int main(int argc, char** argv) {
                         )
                         if valid and payload not in generated_inputs:
                             generated_inputs.append(payload)
-                elif afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
-                    generated_inputs = _dedupe_bytes(
-                        generated_inputs + generate_structured_seed_inputs(afl_seed_inputs, iterations)
-                    )
                 else:
                     needed = iterations - len(generated_inputs)
                     for _ in range(needed):
@@ -1737,7 +1710,10 @@ int main(int argc, char** argv) {
                     except Exception as ex:
                         print(f"{Color.RED}[!] Worker execution error: {ex}{Color.END}")
             finally:
-                executor.shutdown(wait=not early_stop, cancel_futures=early_stop)
+                # Do not let fail-fast workers escape into the next binary's
+                # oracle. Pending cases are cancelled; active cases are
+                # bounded by run_binary and are joined before returning.
+                executor.shutdown(wait=True, cancel_futures=early_stop)
                         
             finalize_equivalence_report(report)
             return report

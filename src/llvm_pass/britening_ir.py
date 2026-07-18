@@ -85,6 +85,13 @@ PLUGINS = [
 PASS_PIPELINE = (
     "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,jump-threading,simplifycfg,adce,verify"
 )
+if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
+    PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
+if os.environ.get("BRIGHTEN_DISABLE_ABI_RECOVERY", "").lower() in {"1", "true", "yes"}:
+    PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-abi-recovery-pass", "")
+if os.environ.get("BRIGHTEN_DISABLE_EXTERN_BRIDGE", "").lower() in {"1", "true", "yes"}:
+    PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-extern-call-bridge", "")
+PASS_PIPELINE = os.environ.get("BRIGHTEN_PASS_PIPELINE", PASS_PIPELINE)
 class Color:
     BLUE = '\033[94m'
     GREEN = '\033[92m'

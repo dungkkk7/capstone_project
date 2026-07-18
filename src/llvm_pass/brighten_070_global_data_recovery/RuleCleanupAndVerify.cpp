@@ -113,6 +113,21 @@ static bool HasLiveInstructionUsers(Value *V) {
   return false;
 }
 
+static bool IsExplicitlyPreservedByUsedList(
+    Value *V, SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return false;
+  for (User *U : V->users()) {
+    if (auto *GV = dyn_cast<GlobalVariable>(U))
+      if (GV->getName() == "llvm.used" ||
+          GV->getName() == "llvm.compiler.used")
+        return true;
+    if (isa<Constant>(U) && IsExplicitlyPreservedByUsedList(U, Seen))
+      return true;
+  }
+  return false;
+}
+
 bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     GlobalDataContext &Ctx) {
   unsigned Removed = 0;
@@ -138,6 +153,19 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
       break;
     }
   }
+
+  // Drop unused provenance aliases before deciding whether their backing
+  // segment is dead.  An alias' aliasee GEP otherwise keeps the segment's
+  // constant-use chain alive and creates a circular cleanup dependency.  An
+  // alias referenced by an initializer or instruction is not use_empty().
+  SmallVector<GlobalAlias *, 64> InitiallyDeadDataAliases;
+  for (GlobalAlias &GA : Ctx.M.aliases()) {
+    GA.removeDeadConstantUsers();
+    if (GA.getName().starts_with("data_") && GA.use_empty())
+      InitiallyDeadDataAliases.push_back(&GA);
+  }
+  for (GlobalAlias *GA : InitiallyDeadDataAliases)
+    GA->eraseFromParent();
 
   // `data_<address>` aliases are only lifter provenance markers.  Once all
   // instruction references have been rewritten to recovered objects, an
@@ -190,13 +218,14 @@ bool BrightenGlobalDataRecoveryPass::CleanupDeadSegmentArtifacts(
     }
   }
 
-  // Remove provenance aliases only after their backing segment initializers
-  // have been removed.  Before that point an apparently dead alias can still
-  // be a constant operand of a segment and erasing it would corrupt the IR.
+  // Recheck after segment cleanup because deleting a residual constant graph
+  // can release additional provenance aliases.
   SmallVector<GlobalAlias *, 64> DeadDataAliases;
-  for (GlobalAlias &GA : Ctx.M.aliases())
+  for (GlobalAlias &GA : Ctx.M.aliases()) {
+    GA.removeDeadConstantUsers();
     if (GA.getName().starts_with("data_") && GA.use_empty())
       DeadDataAliases.push_back(&GA);
+  }
   for (GlobalAlias *GA : DeadDataAliases)
     GA->eraseFromParent();
 
@@ -300,6 +329,11 @@ bool BrightenGlobalDataRecoveryPass::VerifyGlobalDataRecovery(
               }
             }
           }
+        }
+        if (!AllowedToBeLive) {
+          SmallPtrSet<Value *, 16> UsedSeen;
+          AllowedToBeLive =
+              IsExplicitlyPreservedByUsedList(Seg->GV, UsedSeen);
         }
         if (!AllowedToBeLive && !Seg->GV->use_empty()) {
           errs() << "[brighten-global-data] VERIFY ERROR: segment " << Seg->GV->getName() << " still live without preserved uses:\n";

@@ -97,6 +97,11 @@ static bool CanonicalizeStatePointers(Function &F) {
           OldPtr = SI->getPointerOperand();
         }
         if (OldPtr) {
+          // A global McSema state base is not proven identical to the explicit
+          // State argument; preserve it unless alias analysis establishes that
+          // identity.
+          if (IsMcsemaStateBase(OldPtr->stripPointerCasts()))
+            continue;
           IRBuilder<> B(&I);
           if (Value *NewPtr = NativeStatePointer(B, State, RA->Offset)) {
             if (auto *LI = dyn_cast<LoadInst>(&I)) {

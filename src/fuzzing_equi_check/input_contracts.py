@@ -9,6 +9,7 @@ payload before it reaches either program.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 from pathlib import Path
@@ -192,6 +193,643 @@ def _validate_grid(payload: bytes, kind: str, contract: Dict[str, Any]) -> Tuple
     return True, ""
 
 
+def _valid_dimension_expression(formula: bytes, variables: set[bytes]) -> bool:
+    """Recognize the expression subset consumed recursively by p00672."""
+    if not formula or len(formula) > 100:
+        return False
+    tokens = re.findall(rb"[A-Za-z_][A-Za-z0-9_]*|[()+*/-]", formula)
+    if b"".join(tokens) != formula:
+        return False
+    cursor = 0
+
+    def parse_factor() -> bool:
+        nonlocal cursor
+        if cursor >= len(tokens):
+            return False
+        token = tokens[cursor]
+        if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", token):
+            cursor += 1
+            return token in variables
+        if token != b"(":
+            return False
+        cursor += 1
+        if not parse_expression() or cursor >= len(tokens) or tokens[cursor] != b")":
+            return False
+        cursor += 1
+        return True
+
+    def parse_term() -> bool:
+        nonlocal cursor
+        if not parse_factor():
+            return False
+        while cursor < len(tokens) and tokens[cursor] in {b"*", b"/"}:
+            cursor += 1
+            if not parse_factor():
+                return False
+        return True
+
+    def parse_expression() -> bool:
+        nonlocal cursor
+        if not parse_term():
+            return False
+        while cursor < len(tokens) and tokens[cursor] in {b"+", b"-"}:
+            cursor += 1
+            if not parse_term():
+                return False
+        return True
+
+    return parse_expression() and cursor == len(tokens)
+
+
+def _validate_dimension_expression_batches(payload: bytes) -> Tuple[bool, str]:
+    tokens = payload.split()
+    cursor = 0
+    saw_batch = False
+    identifier = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{0,19}")
+
+    def take_int() -> Optional[int]:
+        nonlocal cursor
+        if cursor >= len(tokens) or not _INT_RE.fullmatch(tokens[cursor]):
+            return None
+        value = int(tokens[cursor])
+        cursor += 1
+        return value
+
+    while cursor < len(tokens):
+        n, m, p = take_int(), take_int(), take_int()
+        if n is None or m is None or p is None:
+            return False, "dimension_expression_header"
+        if (n, m, p) == (0, 0, 0):
+            return (True, "") if saw_batch and cursor == len(tokens) else (
+                False,
+                "dimension_expression_terminator",
+            )
+        # These are the concrete bounds of dim[5], ryou[10], and var[15].
+        if not (1 <= n <= 5 and 1 <= m <= 10 and 0 <= p <= 15):
+            return False, "dimension_expression_bounds"
+        saw_batch = True
+        units: set[bytes] = set()
+        for _ in range(m):
+            if cursor >= len(tokens) or not identifier.fullmatch(tokens[cursor]):
+                return False, "dimension_expression_unit_name"
+            name = tokens[cursor]
+            cursor += 1
+            if name in units:
+                return False, "dimension_expression_duplicate_unit"
+            units.add(name)
+            for _ in range(n):
+                if take_int() is None:
+                    return False, "dimension_expression_vector"
+        if cursor >= len(tokens):
+            return False, "dimension_expression_formula"
+        formula = tokens[cursor]
+        cursor += 1
+        variables: set[bytes] = set()
+        bindings: List[Tuple[bytes, bytes]] = []
+        for _ in range(p):
+            if cursor + 1 >= len(tokens):
+                return False, "dimension_expression_binding"
+            variable, unit = tokens[cursor], tokens[cursor + 1]
+            cursor += 2
+            if not identifier.fullmatch(variable) or not identifier.fullmatch(unit):
+                return False, "dimension_expression_binding_name"
+            if variable in variables or unit not in units:
+                return False, "dimension_expression_binding_reference"
+            variables.add(variable)
+            bindings.append((variable, unit))
+        if not _valid_dimension_expression(formula, variables):
+            return False, "dimension_expression_formula"
+    return False, "dimension_expression_terminator"
+
+
+def _integer_tokens(payload: bytes) -> Optional[List[int]]:
+    tokens = payload.split()
+    if not tokens or any(not _INT_RE.fullmatch(token) for token in tokens):
+        return None
+    return [int(token) for token in tokens]
+
+
+def _validate_graph_query_batches(payload: bytes) -> Tuple[bool, str]:
+    values = _integer_tokens(payload)
+    if values is None:
+        return False, "graph_query_integer"
+    cursor = 0
+    while cursor + 2 <= len(values):
+        edges, nodes = values[cursor : cursor + 2]
+        cursor += 2
+        if (edges, nodes) == (0, 0):
+            return (True, "") if cursor == len(values) else (False, "graph_query_trailing")
+        if not (0 <= edges <= 10000 and 1 <= nodes <= 100):
+            return False, "graph_query_bounds"
+        for _ in range(edges):
+            if cursor + 4 > len(values):
+                return False, "graph_query_edges"
+            a, b, cost, time = values[cursor : cursor + 4]
+            cursor += 4
+            if not (1 <= a <= nodes and 1 <= b <= nodes and cost >= 0 and time >= 0):
+                return False, "graph_query_edge_value"
+        if cursor >= len(values):
+            return False, "graph_query_count"
+        queries = values[cursor]
+        cursor += 1
+        if not (0 <= queries <= 10000):
+            return False, "graph_query_count"
+        for _ in range(queries):
+            if cursor + 3 > len(values):
+                return False, "graph_query_queries"
+            start, goal, metric = values[cursor : cursor + 3]
+            cursor += 3
+            if not (1 <= start <= nodes and 1 <= goal <= nodes and metric in (0, 1)):
+                return False, "graph_query_query_value"
+    return False, "graph_query_terminator"
+
+
+def _validate_three_group_block(payload: bytes) -> Tuple[bool, str]:
+    values = _integer_tokens(payload)
+    if values is None:
+        return False, "three_group_integer"
+    n, cursor = values[0], 1
+    if not 1 <= n <= 100:
+        return False, "three_group_n"
+    for _ in range(3):
+        if cursor >= len(values):
+            return False, "three_group_count"
+        count = values[cursor]
+        cursor += 1
+        if not 0 <= count <= n or cursor + count > len(values):
+            return False, "three_group_count"
+        if any(not 1 <= member <= n for member in values[cursor : cursor + count]):
+            return False, "three_group_member"
+        cursor += count
+    return ((True, "") if cursor == len(values) else (False, "three_group_trailing"))
+
+
+def _validate_header_and_list(payload: bytes) -> Tuple[bool, str]:
+    values = _integer_tokens(payload)
+    if values is None or len(values) < 6:
+        return False, "header_list_integer"
+    n, k, duration, slow_speed, fast_speed, length = values[:6]
+    if len(values) != 6 + n:
+        return False, "header_list_size"
+    if not (0 <= n <= 10000 and k >= 0 and duration >= 0):
+        return False, "header_list_count"
+    if slow_speed <= 0 or fast_speed <= 0 or not 0 <= length <= 10000:
+        return False, "header_list_bounds"
+    if any(not 1 <= position <= length for position in values[6:]):
+        return False, "header_list_position"
+    return True, ""
+
+
+def _validate_fixed_vector_block(payload: bytes) -> Tuple[bool, str]:
+    values = _integer_tokens(payload)
+    if values is None or len(values) != 9:
+        return False, "fixed_vector_size"
+    target, *vectors = values
+    prices, amounts = vectors[:4], vectors[4:]
+    if not 1 <= target <= 500 or any(price < 0 for price in prices):
+        return False, "fixed_vector_value"
+    # dp has 505 elements and the implementation stores the first overshoot
+    # before testing whether it reached N.
+    if any(amount <= 0 or target + amount - 1 >= 505 for amount in amounts):
+        return False, "fixed_vector_index"
+    return True, ""
+
+
+def _validate_weighted_graph_batches(payload: bytes) -> Tuple[bool, str]:
+    values = _integer_tokens(payload)
+    if values is None:
+        return False, "weighted_graph_integer"
+    cursor = 0
+    while cursor + 5 <= len(values):
+        tickets, cities, edges, start, goal = values[cursor : cursor + 5]
+        cursor += 5
+        if tickets == 0:
+            return (True, "") if (cities, edges, start, goal) == (0, 0, 0, 0) and cursor == len(values) else (
+                False,
+                "weighted_graph_terminator",
+            )
+        if not (1 <= tickets <= 9 and 1 <= cities <= 100 and 0 <= edges <= 501):
+            return False, "weighted_graph_bounds"
+        if not (1 <= start <= cities and 1 <= goal <= cities):
+            return False, "weighted_graph_endpoint"
+        for _ in range(edges):
+            if cursor + 3 > len(values):
+                return False, "weighted_graph_edges"
+            a, b, cost = values[cursor : cursor + 3]
+            cursor += 3
+            if not (1 <= a <= cities and 1 <= b <= cities and 0 <= cost <= 10000000):
+                return False, "weighted_graph_edge_value"
+    return False, "weighted_graph_terminator"
+
+
+def _validate_bit_vectors(payload: bytes) -> Tuple[bool, str]:
+    values = _integer_tokens(payload)
+    if values is None or len(values) < 2:
+        return False, "bit_vector_integer"
+    n, runs = values[:2]
+    if not (1 <= n <= 15 and 1 <= runs <= 15) or len(values) != 2 + n + runs:
+        return False, "bit_vector_size"
+    bits = values[2 : 2 + n]
+    targets = values[2 + n :]
+    if any(bit not in (0, 1) for bit in bits):
+        return False, "bit_vector_bit"
+    if any(length <= 0 for length in targets) or sum(targets) != n:
+        return False, "bit_vector_runs"
+    return True, ""
+
+
+def _validate_circle_batches(payload: bytes) -> Tuple[bool, str]:
+    tokens = payload.split()
+    cursor = 0
+    while cursor < len(tokens):
+        if not _INT_RE.fullmatch(tokens[cursor]):
+            return False, "circle_batch_count"
+        count = int(tokens[cursor])
+        cursor += 1
+        if count == 0:
+            return (True, "") if cursor == len(tokens) else (False, "circle_batch_trailing")
+        if not 1 <= count <= 100 or cursor + 3 * count > len(tokens):
+            return False, "circle_batch_size"
+        for _ in range(count):
+            try:
+                x, y, radius = map(float, tokens[cursor : cursor + 3])
+            except (ValueError, OverflowError):
+                return False, "circle_batch_number"
+            cursor += 3
+            if not all(math.isfinite(value) for value in (x, y, radius)) or radius < 0:
+                return False, "circle_batch_value"
+    return False, "circle_batch_terminator"
+
+
+def _integer_values(payload: bytes, reason: str) -> Tuple[Optional[List[int]], str]:
+    tokens = payload.split()
+    if not tokens or any(not _INT_RE.fullmatch(token) for token in tokens):
+        return None, reason
+    return [int(token) for token in tokens], ""
+
+
+def _validate_two_row_integer_batches(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "two_row_integer")
+    if values is None:
+        return False, reason
+    cursor = 0
+    while cursor < len(values):
+        count = values[cursor]
+        cursor += 1
+        if count == 0:
+            return (True, "") if cursor == len(values) else (False, "two_row_trailing")
+        # biru[2][102] is indexed from 1 and the scan loops also inspect i + 1.
+        if not 1 <= count <= 100 or cursor + 2 * count > len(values):
+            return False, "two_row_count"
+        rows = values[cursor : cursor + 2 * count]
+        if any(value not in (0, 1, 2) for value in rows):
+            return False, "two_row_value"
+        cursor += 2 * count
+    return False, "two_row_terminator"
+
+
+def _validate_two_matrix_batches(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "two_matrix_integer")
+    if values is None:
+        return False, reason
+    cursor = 0
+    while cursor < len(values):
+        if cursor + 4 > len(values):
+            return False, "two_matrix_header"
+        rows, cols, width, extras = values[cursor : cursor + 4]
+        cursor += 4
+        if (rows, cols, width, extras) == (0, 0, 0, 0):
+            return (True, "") if cursor == len(values) else (False, "two_matrix_trailing")
+        if not (1 <= rows <= 15 and 1 <= cols <= 30 and 0 <= width <= 50 and 0 <= extras <= 5):
+            return False, "two_matrix_bounds"
+        cell_count = 2 * rows * cols
+        if cursor + cell_count > len(values):
+            return False, "two_matrix_size"
+        first = values[cursor : cursor + rows * cols]
+        second = values[cursor + rows * cols : cursor + cell_count]
+        # Negative rewards or costs can turn the DP's checked upper bound into
+        # an unchecked negative array index.
+        if any(value < 0 for value in first) or any(value < 0 for value in second):
+            return False, "two_matrix_cell"
+        cursor += cell_count
+    return False, "two_matrix_terminator"
+
+
+def _validate_segment_tree_batches(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "segment_tree_integer")
+    if values is None:
+        return False, reason
+    if len(values) < 2:
+        return False, "segment_tree_header"
+    count, queries = values[0], values[1]
+    if not 1 <= count <= 200000 or not 0 <= queries <= 200000:
+        return False, "segment_tree_bounds"
+    if len(values) != 2 + count + 3 * queries:
+        return False, "segment_tree_size"
+    cursor = 2 + count
+    for _ in range(queries):
+        operation, left, right_or_value = values[cursor : cursor + 3]
+        cursor += 3
+        if operation == 1:
+            if not 0 <= left <= right_or_value <= count:
+                return False, "segment_tree_query_range"
+        elif operation == 0:
+            if not 0 <= left < count:
+                return False, "segment_tree_update_index"
+        else:
+            return False, "segment_tree_operation"
+    return True, ""
+
+
+def _validate_interval_query_block(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "interval_query_integer")
+    if values is None:
+        return False, reason
+    if len(values) < 2:
+        return False, "interval_query_header"
+    length, queries = values[0], values[1]
+    if length < 1 or not 1 <= queries <= 16:
+        return False, "interval_query_bounds"
+    if len(values) != 2 + 2 * queries:
+        return False, "interval_query_size"
+    for index in range(2, len(values), 2):
+        left, right = values[index : index + 2]
+        if not 1 <= left <= right <= length:
+            return False, "interval_query_range"
+    return True, ""
+
+
+def _validate_counted_integer_batches(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "counted_integer")
+    if values is None:
+        return False, reason
+    cursor = 0
+    while cursor < len(values):
+        if cursor + 2 > len(values):
+            return False, "counted_integer_header"
+        count, limit = values[cursor : cursor + 2]
+        cursor += 2
+        if count == 0:
+            return (True, "") if cursor == len(values) else (False, "counted_integer_trailing")
+        if not 1 <= count <= 1000 or limit < 0 or cursor + count > len(values):
+            return False, "counted_integer_bounds"
+        cursor += count
+    return False, "counted_integer_terminator"
+
+
+def _validate_repeated_int(payload: bytes, constraints: Dict[str, Any], *, single: bool = False) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "repeated_int_integer")
+    if values is None:
+        return False, reason
+    if single and len(values) != 1:
+        return False, "single_int_count"
+    low = int(constraints.get("min", -(2**63)))
+    high = int(constraints.get("max", 2**63 - 1))
+    if any(not low <= value <= high for value in values):
+        return False, "repeated_int_bounds"
+    return True, ""
+
+
+def _validate_repeated_tuple(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    if not lines:
+        return False, "repeated_tuple_lines"
+    constraints = contract.get("constraints", {})
+    fields = constraints.get("fields", 0)
+    if isinstance(fields, list):
+        # p00016 consumes int, one delimiter byte, int and stops at 0,0.
+        saw_terminator = False
+        for index, line in enumerate(lines):
+            match = re.fullmatch(r"([+-]?\d+)(.)([+-]?\d+)", line)
+            if not match or match.group(2).isspace():
+                return False, "repeated_tuple_shape"
+            left, right = int(match.group(1)), int(match.group(3))
+            if (left, right) == (0, 0):
+                saw_terminator = index == len(lines) - 1
+                break
+        return (True, "") if saw_terminator else (False, "repeated_tuple_terminator")
+    expected = int(fields)
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) != expected:
+            return False, "repeated_tuple_fields"
+        try:
+            values = [float(part) for part in parts]
+        except ValueError:
+            return False, "repeated_tuple_number"
+        if any(not math.isfinite(value) for value in values):
+            return False, "repeated_tuple_finite"
+    return True, ""
+
+
+def _validate_counted_batches(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "counted_batch_integer")
+    if values is None:
+        return False, reason
+    constraints = contract.get("constraints", {})
+    fields = int(constraints.get("record_fields", 1))
+    minimum = int(constraints.get("n_min", constraints.get("datac_min", 1)))
+    maximum = int(constraints.get("n_max", 100000))
+    cursor = 0
+    while cursor < len(values):
+        count = values[cursor]
+        cursor += 1
+        if count == 0:
+            return (True, "") if cursor == len(values) else (False, "counted_batch_trailing")
+        if not minimum <= count <= maximum or cursor + count * fields > len(values):
+            return False, "counted_batch_size"
+        cursor += count * fields
+    return False, "counted_batch_terminator"
+
+
+def _validate_fixed_records(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "fixed_record_integer")
+    if values is None:
+        return False, reason
+    fields = int(contract.get("constraints", {}).get("fields", 1))
+    records = int(contract.get("constraints", {}).get("records_per_case", 1))
+    cursor = 0
+    termination = str(contract.get("termination", ""))
+    while cursor < len(values):
+        if "all four" in termination:
+            if cursor + fields > len(values):
+                return False, "fixed_record_header"
+            header = values[cursor : cursor + fields]
+            if all(value == 0 for value in header):
+                return (True, "") if cursor + fields == len(values) else (False, "fixed_record_trailing")
+            size = fields * records
+        else:
+            if values[cursor] == 0:
+                return (True, "") if cursor + 1 == len(values) else (False, "fixed_record_trailing")
+            size = fields
+        if cursor + size > len(values):
+            return False, "fixed_record_size"
+        cursor += size
+    return False, "fixed_record_terminator"
+
+
+def _validate_tree_edge_batches(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "tree_edge_integer")
+    if values is None:
+        return False, reason
+    cursor = 0
+    while cursor < len(values):
+        nodes = values[cursor]
+        cursor += 1
+        if nodes == 0:
+            return (True, "") if cursor == len(values) else (False, "tree_edge_trailing")
+        if not 2 <= nodes <= 20 or cursor + 3 * (nodes - 1) > len(values):
+            return False, "tree_edge_size"
+        for _ in range(nodes - 1):
+            left, right, weight = values[cursor : cursor + 3]
+            cursor += 3
+            if not (1 <= left <= nodes and 1 <= right <= nodes and weight > 0):
+                return False, "tree_edge_value"
+    return False, "tree_edge_terminator"
+
+
+def _validate_interval_batches(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "interval_batch_integer")
+    if values is None:
+        return False, reason
+    cursor = 0
+    while cursor < len(values):
+        target = values[cursor]
+        cursor += 1
+        if target == 0:
+            return (True, "") if cursor == len(values) else (False, "interval_batch_trailing")
+        if target < 0 or cursor >= len(values):
+            return False, "interval_batch_header"
+        count = values[cursor]
+        cursor += 1
+        if count < 0 or cursor + 2 * count > len(values):
+            return False, "interval_batch_size"
+        for _ in range(count):
+            start, finish = values[cursor : cursor + 2]
+            cursor += 2
+            if finish < start:
+                return False, "interval_batch_range"
+    return False, "interval_batch_terminator"
+
+
+def _validate_range_marking_block(payload: bytes) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "range_marking_integer")
+    if values is None:
+        return False, reason
+    if len(values) < 3:
+        return False, "range_marking_header"
+    begin, end, count = values[:3]
+    if not (0 <= begin < end <= 10000 and 0 <= count <= 10000):
+        return False, "range_marking_bounds"
+    if len(values) != 3 + 2 * count:
+        return False, "range_marking_size"
+    for index in range(3, len(values), 2):
+        left, right = values[index : index + 2]
+        if not 0 <= left <= right <= 10000:
+            return False, "range_marking_range"
+    return True, ""
+
+
+def _validate_dimension_batches(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "dimension_batch_integer")
+    if values is None or len(values) % 2:
+        return False, reason or "dimension_batch_fields"
+    constraints = contract.get("constraints", {})
+    for index in range(0, len(values), 2):
+        width, height = values[index : index + 2]
+        if (width, height) == (0, 0):
+            return (True, "") if index + 2 == len(values) else (False, "dimension_batch_trailing")
+        if not (int(constraints.get("w_min", 1)) <= width <= int(constraints.get("w_max", 128)) and
+                int(constraints.get("h_min", 1)) <= height <= int(constraints.get("h_max", 128))):
+            return False, "dimension_batch_bounds"
+    return False, "dimension_batch_terminator"
+
+
+def _validate_browser_event_batches(payload: bytes) -> Tuple[bool, str]:
+    tokens = payload.split()
+    cursor = 0
+
+    def integer() -> Optional[int]:
+        nonlocal cursor
+        if cursor >= len(tokens) or not _INT_RE.fullmatch(tokens[cursor]):
+            return None
+        value = int(tokens[cursor])
+        cursor += 1
+        return value
+
+    while cursor < len(tokens):
+        pages = integer()
+        if pages is None:
+            return False, "browser_page_count"
+        if pages == 0:
+            return (True, "") if cursor == len(tokens) else (False, "browser_trailing")
+        width, height = integer(), integer()
+        if not 1 <= pages <= 100 or width is None or height is None or width <= 0 or height <= 0:
+            return False, "browser_dimensions"
+        names: set[bytes] = set()
+        links: List[bytes] = []
+        for _ in range(pages):
+            if cursor >= len(tokens) or len(tokens[cursor]) > 20:
+                return False, "browser_page_name"
+            names.add(tokens[cursor])
+            cursor += 1
+            buttons = integer()
+            if buttons is None or not 0 <= buttons <= 100:
+                return False, "browser_button_count"
+            for _ in range(buttons):
+                x1, y1, x2, y2 = integer(), integer(), integer(), integer()
+                if None in (x1, y1, x2, y2) or cursor >= len(tokens) or len(tokens[cursor]) > 20:
+                    return False, "browser_button_shape"
+                if not (0 <= x1 <= x2 <= width and 0 <= y1 <= y2 <= height):
+                    return False, "browser_button_bounds"
+                links.append(tokens[cursor])
+                cursor += 1
+        if any(link not in names for link in links):
+            return False, "browser_unknown_link"
+        commands = integer()
+        if commands is None or not 0 <= commands < 100000:
+            return False, "browser_command_count"
+        for _ in range(commands):
+            if cursor >= len(tokens) or tokens[cursor] not in {b"click", b"back", b"forward", b"show"}:
+                return False, "browser_command"
+            command = tokens[cursor]
+            cursor += 1
+            if command == b"click":
+                x, y = integer(), integer()
+                if x is None or y is None or not (0 <= x <= width and 0 <= y <= height):
+                    return False, "browser_click"
+    return False, "browser_terminator"
+
+
+def _validate_word_pair_cases(payload: bytes) -> Tuple[bool, str]:
+    tokens = payload.split()
+    cursor = 0
+    while cursor < len(tokens):
+        if tokens[cursor] == b"#":
+            return (True, "") if cursor + 1 == len(tokens) else (False, "word_pair_trailing")
+        if cursor + 6 > len(tokens):
+            return False, "word_pair_size"
+        first, second = tokens[cursor], tokens[cursor + 1]
+        flags = tokens[cursor + 2 : cursor + 6]
+        if not first or not second or any(not _INT_RE.fullmatch(flag) for flag in flags):
+            return False, "word_pair_fields"
+        cursor += 6
+    return False, "word_pair_terminator"
+
+
+def _validate_triangular_integer_stream(payload: bytes) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    if not lines or len(lines) % 2 == 0:
+        return False, "triangular_integer_rows"
+    peak = len(lines) // 2 + 1
+    expected = list(range(1, peak + 1)) + list(range(peak - 1, 0, -1))
+    for line, width in zip(lines, expected):
+        fields = line.split(",")
+        if len(fields) != width or any(not re.fullmatch(r"[+-]?\d+", field) for field in fields):
+            return False, "triangular_integer_shape"
+    return True, ""
+
+
 def validate_contract_payload(
     contract: Dict[str, Any], payload: bytes, seed_inputs: Optional[List[bytes]] = None
 ) -> Tuple[bool, str]:
@@ -265,6 +903,122 @@ def validate_contract_payload(
         alphabet = set(str(constraints.get("string_alphabet", "")))
         if len(lines[1]) != length or (alphabet and any(char not in alphabet for char in lines[1])):
             return False, "length_string_shape"
+        return True, ""
+    if kind == "counted_long_list":
+        tokens = payload.split()
+        if not tokens or any(not _INT_RE.fullmatch(token) for token in tokens):
+            return False, "counted_long_list_integer"
+        minimum = int(constraints.get("n_min", 0))
+        maximum = int(constraints.get("n_max", 2**31 - 1))
+        values_per_count = int(constraints.get("values_per_count", 1))
+        count_offset = int(constraints.get("count_offset", 0))
+        if "n=0" not in str(contract.get("termination", "")):
+            count = int(tokens[0])
+            if count < minimum or count > maximum:
+                return False, "counted_long_list_count"
+            if len(tokens) != 1 + count * values_per_count + count_offset:
+                return False, "counted_long_list_size"
+            return True, ""
+        cursor = 0
+        while cursor < len(tokens):
+            count = int(tokens[cursor])
+            cursor += 1
+            if count == 0:
+                return (True, "") if cursor == len(tokens) else (
+                    False,
+                    "counted_long_list_trailing",
+                )
+            if count < minimum or count > maximum:
+                return False, "counted_long_list_count"
+            cursor += count * values_per_count + count_offset
+            if cursor > len(tokens):
+                return False, "counted_long_list_size"
+        return False, "counted_long_list_terminator"
+    if kind == "dimension_expression_batches":
+        return _validate_dimension_expression_batches(payload)
+    if kind == "graph_query_batches":
+        return _validate_graph_query_batches(payload)
+    if kind == "three_group_block":
+        return _validate_three_group_block(payload)
+    if kind == "header_and_list":
+        return _validate_header_and_list(payload)
+    if kind == "fixed_vector_block":
+        return _validate_fixed_vector_block(payload)
+    if kind == "weighted_graph_batches":
+        return _validate_weighted_graph_batches(payload)
+    if kind == "bit_vectors":
+        return _validate_bit_vectors(payload)
+    if kind == "circle_batches":
+        return _validate_circle_batches(payload)
+    if kind == "two_row_integer_batches":
+        return _validate_two_row_integer_batches(payload)
+    if kind == "two_matrix_batches":
+        return _validate_two_matrix_batches(payload)
+    if kind == "segment_tree_batches":
+        return _validate_segment_tree_batches(payload)
+    if kind == "interval_query_block":
+        return _validate_interval_query_block(payload)
+    if kind == "counted_integer_batches":
+        return _validate_counted_integer_batches(payload)
+    if kind == "repeated_int":
+        return _validate_repeated_int(payload, constraints)
+    if kind == "single_int":
+        return _validate_repeated_int(payload, constraints, single=True)
+    if kind == "repeated_tuple":
+        return _validate_repeated_tuple(payload, contract)
+    if kind == "counted_batches":
+        return _validate_counted_batches(payload, contract)
+    if kind == "fixed_records_until_sentinel":
+        return _validate_fixed_records(payload, contract)
+    if kind == "tree_edge_batches":
+        return _validate_tree_edge_batches(payload)
+    if kind == "interval_batches":
+        return _validate_interval_batches(payload)
+    if kind == "range_marking_block":
+        return _validate_range_marking_block(payload)
+    if kind == "dimension_batches":
+        return _validate_dimension_batches(payload, contract)
+    if kind == "browser_event_batches":
+        return _validate_browser_event_batches(payload)
+    if kind == "word_pair_cases":
+        return _validate_word_pair_cases(payload)
+    if kind == "triangular_integer_stream":
+        return _validate_triangular_integer_stream(payload)
+    if kind == "fixed_tuple_block":
+        values, reason = _integer_values(payload, "fixed_tuple_integer")
+        records = int(constraints.get("records", 1))
+        fields = int(constraints.get("fields", 1))
+        if values is None or len(values) != records * fields:
+            return False, reason or "fixed_tuple_size"
+        return True, ""
+    if kind == "line_variable_arity":
+        lines = _lines(payload)
+        if not lines:
+            return False, "line_variable_rows"
+        for line in lines:
+            fields = line.split()
+            if len(fields) < int(constraints.get("min_values", 1)) + 1 or len(fields) > 1001:
+                return False, "line_variable_arity"
+            if any(not re.fullmatch(r"[+-]?\d+", field) for field in fields):
+                return False, "line_variable_integer"
+        return True, ""
+    if kind == "encoded_line_stream":
+        lines = payload.splitlines()
+        if not lines or (constraints.get("newline_required") and not payload.endswith(b"\n")):
+            return False, "encoded_line_newline"
+        maximum = int(constraints.get("max_line_length", 9999))
+        if any(not line or len(line) > maximum or any(byte < 32 or byte > 126 for byte in line) for line in lines):
+            return False, "encoded_line_shape"
+        return True, ""
+    if kind == "sentinel_int_lines":
+        lines = _lines(payload)
+        if not lines or lines[-1] != "0":
+            return False, "sentinel_int_terminator"
+        if any(not re.fullmatch(r"[1-9]\d*", line) for line in lines[:-1]):
+            return False, "sentinel_int_line"
+        maximum = int(constraints.get("max", 50000))
+        if any(int(line) > maximum for line in lines[:-1]):
+            return False, "sentinel_int_bounds"
         return True, ""
     if kind == "named_edge_query_batches":
         lines = _lines(payload)
@@ -474,10 +1228,26 @@ def _mutate_numeric(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
     matches = list(_TOKEN_RE.finditer(seed))
     if not matches:
         return None
-    preserve_counts = "preserve_counts" in str(contract.get("mutation", ""))
+    mutation = str(contract.get("mutation", ""))
+    preserve_counts = "preserve_counts" in mutation
+    preserve_leading_count = "preserve_count" in mutation
     termination = str(contract.get("termination", ""))
     lines = seed.splitlines(keepends=True)
     protected = set()
+    if preserve_leading_count and contract.get("kind") == "counted_long_list":
+        constraints = contract.get("constraints", {})
+        values_per_count = int(constraints.get("values_per_count", 1))
+        count_offset = int(constraints.get("count_offset", 0))
+        cursor = 0
+        while cursor < len(matches):
+            if not _INT_RE.fullmatch(matches[cursor].group(0)):
+                break
+            protected.add(cursor)
+            count = int(matches[cursor].group(0))
+            cursor += 1
+            if count == 0:
+                break
+            cursor += count * values_per_count + count_offset
     offset = 0
     for line in lines:
         tokens = list(_TOKEN_RE.finditer(line))
@@ -488,6 +1258,12 @@ def _mutate_numeric(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
             if is_zero_line and termination != "eof":
                 protected.add(absolute)
             elif preserve_counts and local_index == 0:
+                protected.add(absolute)
+            elif (
+                preserve_leading_count
+                and contract.get("kind") == "counted_long_list"
+                and absolute == 0
+            ):
                 protected.add(absolute)
             elif contract.get("kind") == "fixed_integer_grid" and line is lines[0]:
                 protected.add(absolute)
@@ -596,6 +1372,165 @@ def _random_valid_payload(contract: Dict[str, Any]) -> Optional[bytes]:
         alphabet = str(constraints.get("string_alphabet", "o+."))
         value = "".join(random.choice(alphabet) for _ in range(length))
         return f"{length} {random.randint(1, 6)}\n{value}\n".encode()
+    if kind == "bit_vectors":
+        n = random.randint(1, 15)
+        runs = random.randint(1, n)
+        cuts = sorted(random.sample(range(1, n), runs - 1))
+        endpoints = [0, *cuts, n]
+        targets = [endpoints[index + 1] - endpoints[index] for index in range(runs)]
+        bits = [random.randint(0, 1) for _ in range(n)]
+        return (
+            f"{n} {runs}\n"
+            + " ".join(map(str, bits))
+            + "\n"
+            + " ".join(map(str, targets))
+            + "\n"
+        ).encode()
+    if kind == "sentinel_int_lines":
+        maximum = int(constraints.get("max", 50000))
+        count = random.randint(1, 4)
+        return ("\n".join(str(random.randint(1, maximum)) for _ in range(count)) + "\n0\n").encode()
+    if kind == "three_group_block":
+        n = random.randint(1, 100)
+        output = [str(n)]
+        for _ in range(3):
+            count = random.randint(0, min(n, 12))
+            members = [random.randint(1, n) for _ in range(count)]
+            output.append(" ".join(map(str, [count, *members])))
+        return ("\n".join(output) + "\n").encode()
+    if kind == "header_and_list":
+        length = random.randint(1, 10000)
+        n = random.randint(0, min(length, 20))
+        header = [n, random.randint(0, 20), random.randint(0, 20),
+                  random.randint(1, 100), random.randint(1, 100), length]
+        positions = [random.randint(1, length) for _ in range(n)]
+        return (" ".join(map(str, header)) + "\n" + " ".join(map(str, positions)) + "\n").encode()
+    if kind == "fixed_vector_block":
+        target = random.randint(1, 500)
+        prices = [random.randint(0, 10000) for _ in range(4)]
+        max_amount = 505 - target
+        amounts = [random.randint(1, max_amount) for _ in range(4)]
+        return (
+            f"{target}\n"
+            + " ".join(map(str, prices))
+            + "\n"
+            + " ".join(map(str, amounts))
+            + "\n"
+        ).encode()
+    if kind == "graph_query_batches":
+        nodes = random.randint(1, 12)
+        edges = random.randint(0, min(20, nodes * nodes))
+        output = [f"{edges} {nodes}"]
+        for _ in range(edges):
+            output.append(
+                f"{random.randint(1, nodes)} {random.randint(1, nodes)} "
+                f"{random.randint(0, 10000)} {random.randint(0, 10000)}"
+            )
+        queries = random.randint(0, 10)
+        output.append(str(queries))
+        for _ in range(queries):
+            output.append(
+                f"{random.randint(1, nodes)} {random.randint(1, nodes)} {random.randint(0, 1)}"
+            )
+        output.append("0 0")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "weighted_graph_batches":
+        cities = random.randint(1, 12)
+        edges = random.randint(0, min(20, cities * cities))
+        output = [
+            f"{random.randint(1, 9)} {cities} {edges} "
+            f"{random.randint(1, cities)} {random.randint(1, cities)}"
+        ]
+        for _ in range(edges):
+            output.append(
+                f"{random.randint(1, cities)} {random.randint(1, cities)} {random.randint(0, 100000)}"
+            )
+        output.append("0 0 0 0 0")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "two_row_integer_batches":
+        count = random.randint(1, 20)
+        first = " ".join(str(random.randint(0, 2)) for _ in range(count))
+        second = " ".join(str(random.randint(0, 2)) for _ in range(count))
+        return f"{count}\n{first}\n{second}\n0\n".encode()
+    if kind == "two_matrix_batches":
+        rows = random.randint(1, 5)
+        cols = random.randint(1, 8)
+        width = random.randint(0, 20)
+        extras = random.randint(0, 3)
+        rewards = [random.randint(0, 10) for _ in range(rows * cols)]
+        costs = [random.randint(0, max(1, width)) for _ in range(rows * cols)]
+        output = [f"{rows} {cols} {width} {extras}"]
+        for row in range(rows):
+            output.append(" ".join(map(str, rewards[row * cols : (row + 1) * cols])))
+        for row in range(rows):
+            output.append(" ".join(map(str, costs[row * cols : (row + 1) * cols])))
+        output.append("0 0 0 0")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "segment_tree_batches":
+        count = random.randint(1, 20)
+        queries = random.randint(0, 20)
+        output = [f"{count} {queries}", " ".join(str(random.randint(-20, 20)) for _ in range(count))]
+        for _ in range(queries):
+            if random.randint(0, 1):
+                left = random.randint(0, count)
+                right = random.randint(left, count)
+                output.append(f"1 {left} {right}")
+            else:
+                output.append(f"0 {random.randrange(count)} {random.randint(-20, 20)}")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "interval_query_block":
+        length = random.randint(1, 100)
+        queries = random.randint(1, 8)
+        output = [f"{length} {queries}"]
+        for _ in range(queries):
+            left = random.randint(1, length)
+            output.append(f"{left} {random.randint(left, length)}")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "counted_integer_batches":
+        count = random.randint(2, 20)
+        limit = random.randint(1, 100)
+        values = " ".join(str(random.randint(0, limit)) for _ in range(count))
+        return f"{count} {limit}\n{values}\n0 0\n".encode()
+    if kind == "range_marking_block":
+        begin = random.randint(0, 100)
+        end = random.randint(begin + 1, min(10000, begin + 100))
+        count = random.randint(0, 12)
+        output = [f"{begin} {end}", str(count)]
+        for _ in range(count):
+            left = random.randint(0, 10000)
+            output.append(f"{left} {random.randint(left, 10000)}")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "dimension_batches":
+        cases = random.randint(1, 4)
+        output = [
+            f"{random.randint(int(constraints.get('w_min', 1)), int(constraints.get('w_max', 128)))} "
+            f"{random.randint(int(constraints.get('h_min', 1)), int(constraints.get('h_max', 128)))}"
+            for _ in range(cases)
+        ]
+        output.append("0 0")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "browser_event_batches":
+        pages = random.randint(1, 5)
+        width, height = random.randint(10, 1000), random.randint(10, 1000)
+        names = [f"page{index}" for index in range(pages)]
+        output = [str(pages), f"{width} {height}"]
+        for name in names:
+            buttons = random.randint(0, 3)
+            output.append(f"{name} {buttons}")
+            for _ in range(buttons):
+                x1, y1 = random.randint(0, width), random.randint(0, height)
+                x2, y2 = random.randint(x1, width), random.randint(y1, height)
+                output.append(f"{x1} {y1} {x2} {y2} {random.choice(names)}")
+        commands = random.randint(0, 12)
+        output.append(str(commands))
+        for _ in range(commands):
+            command = random.choice(["click", "back", "forward", "show"])
+            if command == "click":
+                output.append(f"click {random.randint(0, width)} {random.randint(0, height)}")
+            else:
+                output.append(command)
+        output.append("0")
+        return ("\n".join(output) + "\n").encode()
     return None
 
 

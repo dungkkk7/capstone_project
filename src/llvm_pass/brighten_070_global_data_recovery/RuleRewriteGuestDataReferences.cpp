@@ -117,6 +117,11 @@ static bool HasGuestAddressIdentityUse(Value *V,
     return false;
   if (isa<ICmpInst>(V) || isa<SwitchInst>(V))
     return true;
+  // ConstantData (notably ConstantInt guest addresses) has no LLVM use-list;
+  // asking for users() asserts in debug builds.  Its identity observation is
+  // classified at the consuming instruction instead.
+  if (isa<ConstantData>(V))
+    return false;
 
   for (User *U : V->users()) {
     if (isa<ICmpInst>(U) || isa<SwitchInst>(U))
@@ -236,8 +241,14 @@ static bool IsAddressIdentitySensitive(GuestAddressRef *Ref) {
   // intermediate GEP/cast nodes; rewriting an intermediate segment operand
   // would still mutate the comparison even if its own GuestAddressRef is
   // skipped.  This test is intentionally spelling-independent.
+  // Start from the address operand, not from the consuming instruction.  A
+  // load is a data boundary: comparisons of the loaded value observe the
+  // object contents, not the numeric identity of the pointer used by the
+  // load.  Starting at UserInst incorrectly preserves essentially every
+  // global scalar whose value later participates in a comparison, leaving
+  // its lifted data_<addr> alias disconnected from the recovered object.
   SmallPtrSet<Value *, 32> DirectIdentitySeen;
-  if (HasGuestAddressIdentityUse(Ref->UserInst, DirectIdentitySeen))
+  if (HasGuestAddressIdentityUse(Ref->OriginalValue, DirectIdentitySeen))
     return true;
   // McSema also represents an integer immediate as ptrtoint(data_<addr>)
   // whenever it falls inside a broad BSS mapping.  That symbolic form is not

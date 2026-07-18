@@ -755,15 +755,16 @@ def main(argv=None):
                         else:
                             semantic_unchecked_count += 1
                             case_record["semantic"] = "unchecked"
-                        # Raw AFL is intentionally allowed to produce malformed
-                        # byte streams.  Keep that robustness result visible,
-                        # but run a separate grammar-preserving gate so a raw
-                        # crash/timeout is not mistaken for a pass regression.
+                        # Raw AFL is useful robustness evidence, but without a
+                        # source-derived contract it can leave the program's
+                        # valid input domain.  Do not let such malformed cases
+                        # become the authoritative semantic recovery gate.
                         valid_domain_report = None
                         raw_mode = os.environ.get(
                             "BRIGHTEN_MUTATE_SEEDS", "raw"
                         ).lower()
                         run_valid_domain_gate = (
+                            input_contract is None and
                             raw_mode == "raw" and
                             not fuzz_report.get("is_fully_equivalent", False) and
                             os.environ.get("BRIGHTEN_VALID_DOMAIN_GATE", "1").lower()
@@ -780,9 +781,9 @@ def main(argv=None):
                                 if previous_mutation_mode is None:
                                     os.environ.pop("BRIGHTEN_MUTATE_SEEDS", None)
                                 else:
-                                    os.environ[
-                                        "BRIGHTEN_MUTATE_SEEDS"
-                                    ] = previous_mutation_mode
+                                    os.environ["BRIGHTEN_MUTATE_SEEDS"] = (
+                                        previous_mutation_mode
+                                    )
                             valid_domain_report_path = os.path.join(
                                 case_output_dir,
                                 f"{base_name}_valid_domain_semantic_report.json",

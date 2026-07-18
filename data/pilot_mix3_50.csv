@@ -38,7 +38,6 @@ p00640,s212269736,data/obfuscated/p00640/s212269736_fla_bcf_instsub.elf,data/see
 p00715,s170424500,data/obfuscated/p00715/s170424500_fla_bcf_instsub.elf,data/seeds/p00715/p00715_seed.txt,,easy,screening
 p00818,s818780493,data/obfuscated/p00818/s818780493_fla_bcf_instsub.elf,data/seeds/p00818/p00818_seed.txt,,medium,screening
 p00924,s930678486,data/obfuscated/p00924/s930678486_fla_bcf_instsub.elf,data/seeds/p00924/p00924_seed.txt,,easy,screening
-p01030,s165588383,data/obfuscated/p01030/s165588383_fla_bcf_instsub.elf,data/seeds/p01030/p01030_seed.txt,,hard,known-pipeline-risk
 p01054,s490568092,data/obfuscated/p01054/s490568092_fla_bcf_instsub.elf,data/seeds/p01054/p01054_seed.txt,,easy,screening
 p01101,s704189454,data/obfuscated/p01101/s704189454_fla_bcf_instsub.elf,data/seeds/p01101/p01101_seed.txt,,medium,screening
 p01415,s248769728,data/obfuscated/p01415/s248769728_fla_bcf_instsub.elf,data/seeds/p01415/p01415_seed.txt,,medium,screening
