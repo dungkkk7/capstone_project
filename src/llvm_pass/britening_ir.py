@@ -157,6 +157,29 @@ def _emit_ll_artifact(source_path, artifact_path, llvm_dis=None):
     return True
 
 
+def _resolve_before_brightening_artifact(input_path, fallback_path, llvm_dis=None):
+    """Reuse the lifted .ll when available instead of creating a duplicate."""
+    input_path = os.path.abspath(input_path)
+    fallback_path = os.path.abspath(fallback_path)
+    if os.path.splitext(input_path)[1].lower() == ".ll":
+        artifact_path = input_path
+    else:
+        lifted_ll = f"{os.path.splitext(input_path)[0]}.ll"
+        artifact_path = lifted_ll if os.path.isfile(lifted_ll) else fallback_path
+
+    if artifact_path != fallback_path:
+        # Remove only the redundant snapshot name created by older versions of
+        # this pipeline.  The canonical lifted .ll remains untouched.
+        try:
+            os.unlink(fallback_path)
+        except FileNotFoundError:
+            pass
+        return artifact_path
+    return artifact_path if _emit_ll_artifact(
+        input_path, artifact_path, llvm_dis
+    ) else None
+
+
 def _env_enabled(name, default=True):
     value = os.environ.get(name)
     if value is None:
@@ -599,10 +622,12 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
 
     artifacts = optimization_artifact_paths(output_path)
     llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
-    if not _emit_ll_artifact(
+    before_brightening = _resolve_before_brightening_artifact(
         input_path, artifacts["before_brightening"], llvm_dis
-    ):
+    )
+    if not before_brightening:
         return False
+    artifacts["before_brightening"] = before_brightening
     print(f"{Color.BLUE}[*] IR trước brightening: "
           f"{artifacts['before_brightening']}{Color.END}")
 

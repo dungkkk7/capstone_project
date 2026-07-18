@@ -50,11 +50,14 @@ Các runtime artifact được đóng gói trong `dependency/souper/`:
 
 Output chỉ thay thế bitcode brightened sau khi Souper chạy thành công và pass
 `verify` chấp nhận module. Mỗi case sinh thêm `<name>_souper_report.json`.
-Pipeline cũng giữ ba IR snapshot để so sánh:
+Pipeline giữ ba mốc IR để so sánh nhưng không copy trùng file lifting:
 
-- `<name>_before_brightening.ll`
+- `<name>.ll`: IR có sẵn từ lifting, dùng trực tiếp làm before-brightening.
 - `<name>_before_souper.ll`
 - `<name>_after_souper.ll`
+
+Nếu input `.bc` standalone không có file `.ll` cùng tên, pipeline mới tạo
+`<name>_before_brightening.ll` làm fallback.
 
 Mặc định dùng mode `maximum`: CEGIS synthesis, tối đa bốn component,
 arithmetic/bitwise/comparison/select components, operand harvesting và block

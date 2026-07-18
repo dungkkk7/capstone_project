@@ -29,6 +29,19 @@ assert "-souper-use-cegis" in maximum_flags
 assert any(flag.startswith("-souper-synthesis-comps=") for flag in maximum_flags)
 assert "-souper-harvest-uses" in maximum_flags
 
+with tempfile.TemporaryDirectory() as directory:
+    lifted_bc = Path(directory) / "lifted.bc"
+    lifted_ll = Path(directory) / "lifted.ll"
+    redundant_ll = Path(directory) / "brightened_before_brightening.ll"
+    lifted_bc.write_bytes(b"dummy")
+    lifted_ll.write_text("; canonical lifted IR\n", encoding="utf-8")
+    redundant_ll.write_text("; redundant old snapshot\n", encoding="utf-8")
+    resolved = module._resolve_before_brightening_artifact(
+        str(lifted_bc), str(redundant_ll)
+    )
+    assert Path(resolved) == lifted_ll
+    assert not redundant_ll.exists()
+
 source = """
 define i32 @foo(i32 %x) {
 entry:
