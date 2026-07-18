@@ -54,7 +54,7 @@ Pipeline giữ ba mốc IR để so sánh nhưng không copy trùng file lifting
 
 - `<name>.ll`: IR có sẵn từ lifting, dùng trực tiếp làm before-brightening.
 - `<name>_before_souper.ll`
-- `<name>_after_souper.ll`
+- `<name>_brightened.ll`: IR sau Souper và cũng là input canonical cho LLM.
 
 Nếu input `.bc` standalone không có file `.ll` cùng tên, pipeline mới tạo
 `<name>_before_brightening.ll` làm fallback.

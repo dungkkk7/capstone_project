@@ -28,6 +28,9 @@ assert maximum_mode == "maximum"
 assert "-souper-use-cegis" in maximum_flags
 assert any(flag.startswith("-souper-synthesis-comps=") for flag in maximum_flags)
 assert "-souper-harvest-uses" in maximum_flags
+artifact_names = module.optimization_artifact_paths("case_brightened.bc")
+assert artifact_names["after_souper"] == "case_brightened.ll"
+assert artifact_names["before_souper"] == "case_brightened_before_souper.ll"
 
 with tempfile.TemporaryDirectory() as directory:
     lifted_bc = Path(directory) / "lifted.bc"

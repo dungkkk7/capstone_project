@@ -128,7 +128,9 @@ def optimization_artifact_paths(output_path):
     return {
         "before_brightening": f"{stem}_before_brightening.ll",
         "before_souper": f"{stem}_before_souper.ll",
-        "after_souper": f"{stem}_after_souper.ll",
+        # This is also the long-standing LLM input path.  Reuse it instead of
+        # keeping an identical *_after_souper.ll copy.
+        "after_souper": f"{stem}.ll",
     }
 
 
@@ -622,6 +624,14 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
 
     artifacts = optimization_artifact_paths(output_path)
     llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
+    legacy_after_souper = (
+        f"{os.path.splitext(output_path)[0]}_after_souper.ll"
+    )
+    if legacy_after_souper != artifacts["after_souper"]:
+        try:
+            os.unlink(legacy_after_souper)
+        except FileNotFoundError:
+            pass
     before_brightening = _resolve_before_brightening_artifact(
         input_path, artifacts["before_brightening"], llvm_dis
     )
