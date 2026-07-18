@@ -14,9 +14,6 @@ entry:
   ret i32 %vx
 }
 
-; Failed raw query scans with ignored return must fail closed.  Successful
-; conversions overwrite these seeds.
-; CHECK: %native.scanf.tuple.seed = select i1 %native.scanf.tuple.had_success.pre, i32 %native.scanf.tuple.current, i32 -2147483648
-; CHECK: store i32 %native.scanf.tuple.seed, ptr %t
-; CHECK: store i32 {{.*}}, ptr %x
-; CHECK: store i32 {{.*}}, ptr %y
+; Ignoring scanf's return does not authorize pre-seeding its destinations.
+; CHECK-NOT: native.scanf.tuple.seed
+; CHECK-NOT: store i32 -2147483648

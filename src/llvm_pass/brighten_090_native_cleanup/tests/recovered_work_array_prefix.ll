@@ -19,14 +19,13 @@ entry:
   ret ptr %p
 }
 
-; Invalid dynamic indices must be isolated from neighbouring recovered globals
-; without replacing g_arr_2 by a padded global.  Constant ptrtoint expressions
-; still have to lower to the recovered guest address, not a host pointer.
+; Without a dereference/use-site proof, retain the guest arithmetic and its raw
+; fault behavior rather than silently redirecting an out-of-range value to a
+; synthetic scratch object.
 ; CHECK-NOT: @g_arr_2_with_invalid_prefix
-; CHECK: @native.recovered.oob.scratch = internal global [1048576 x i8] zeroinitializer
-; CHECK: native.bounds.scratch.guest.address = add i64 %index, 4096
-; CHECK: native.bounds.pointer = select i1 %native.bounds.scratch.invalid
+; CHECK-NOT: @native.recovered.oob.scratch
 ; CHECK-NOT: ptrtoint (ptr getelementptr
 ; CHECK: add i64 4136, %index
+; CHECK: %p = inttoptr i64 %addr to ptr
 
 !0 = !{i64 4096, i64 4496}

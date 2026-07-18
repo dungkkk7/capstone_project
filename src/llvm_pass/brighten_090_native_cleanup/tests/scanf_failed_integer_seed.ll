@@ -17,5 +17,5 @@ read:
   ret i32 %value
 }
 
-; Failed single 32-bit destinations receive a deterministic fail-closed seed.
-; CHECK: store i32 -2147483648, ptr %native_stack_storage
+; A failed conversion leaves the destination unchanged.
+; CHECK-NOT: store i32 -2147483648, ptr %native_stack_storage

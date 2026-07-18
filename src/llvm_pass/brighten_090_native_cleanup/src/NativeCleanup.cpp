@@ -719,6 +719,51 @@ static Value *findNativeVarargAddressCarrier(Value *V,
   return nullptr;
 }
 
+// O3 can fold a translated variadic pointer into the guest-range dispatch
+// that materializeRecoveredDataPointer created.  The resulting select no
+// longer has a representation-only path from the call argument to
+// native.vararg.address, so the deliberately shallow search above cannot
+// recover it.  A deep search is safe only for one of our own dispatch trees:
+// require the OOB scratch artifact and exactly one marked native carrier.
+static Value *findNativeVarargCarrierInRecoveredDispatch(Value *V) {
+  SmallPtrSet<Value *, 32> Seen;
+  Value *UniqueCarrier = nullptr;
+  bool HasRecoveredScratch = false;
+  bool Ambiguous = false;
+
+  std::function<void(Value *)> Visit = [&](Value *Current) {
+    if (!Current || Ambiguous || !Seen.insert(Current).second)
+      return;
+    if (auto *GV = dyn_cast<GlobalVariable>(Current->stripPointerCasts())) {
+      if (GV->getName() == "native.recovered.oob.scratch")
+        HasRecoveredScratch = true;
+    }
+    if (auto *PTI = dyn_cast<PtrToIntInst>(Current)) {
+      if (PTI->getName().starts_with("native.vararg.address")) {
+        Value *Candidate = PTI->getPointerOperand();
+        SmallPtrSet<Value *, 16> StackSeen;
+        SmallPtrSet<Value *, 16> NativeSeen;
+        if (!isNativeStackPointer(Candidate, StackSeen) &&
+            isNativePointerValue(Candidate, NativeSeen)) {
+          if (UniqueCarrier && UniqueCarrier != Candidate)
+            Ambiguous = true;
+          else
+            UniqueCarrier = Candidate;
+        }
+      }
+    }
+    if (auto *I = dyn_cast<Instruction>(Current)) {
+      for (Value *Operand : I->operands())
+        Visit(Operand);
+    } else if (auto *CE = dyn_cast<ConstantExpr>(Current)) {
+      for (Value *Operand : CE->operands())
+        Visit(Operand);
+    }
+  };
+  Visit(V);
+  return HasRecoveredScratch && !Ambiguous ? UniqueCarrier : nullptr;
+}
+
 static std::optional<std::pair<GlobalVariable *, uint64_t>>
 FindRecoveredGlobalForGuestAddress(Module &M, uint64_t Address);
 
@@ -2231,6 +2276,24 @@ static unsigned rewriteRemainingDataAliasesToNativeSegments(Module &M,
     APInt ByteOffset(M.getDataLayout().getIndexSizeInBits(0), 0);
     if (!GEP->accumulateConstantOffset(M.getDataLayout(), ByteOffset))
       continue;
+    // NativeStrict global recovery can conservatively preserve a whole ELF
+    // segment when one address carrier is ambiguous.  Its data_<addr> alias,
+    // physical GEP offset, and allocation size still prove the segment's
+    // exact guest range.  Retain that range as metadata before removing the
+    // alias so later cleanup sweeps can translate dynamic scanf/libc
+    // destinations instead of emitting raw guest-address inttoptrs.
+    if (!Segment->getMetadata("brighten.guest.range")) {
+      uint64_t PhysicalOffset = ByteOffset.getZExtValue();
+      TypeSize AllocSize =
+          M.getDataLayout().getTypeAllocSize(Segment->getValueType());
+      if (GuestAddress >= PhysicalOffset && !AllocSize.isScalable()) {
+        uint64_t GuestBase = GuestAddress - PhysicalOffset;
+        if (AllocSize.getFixedValue() <=
+            std::numeric_limits<uint64_t>::max() - GuestBase)
+          setGuestRangeMetadata(M, *Segment, GuestBase,
+                                GuestBase + AllocSize.getFixedValue());
+      }
+    }
     if (Segment->getName().starts_with("seg_")) {
       std::string NativeName =
           ("native_residual_" + Segment->getName().drop_front(4)).str();
@@ -2381,6 +2444,45 @@ static unsigned rewriteDeadRIPDataAliases(Module &M, bool &Changed) {
 // not rebase it through a recovered object: replace it with the original guest
 // integer so the old alias and segment can disappear without changing control
 // flow under ASLR.
+static bool isProvenScalarLibcCallArgument(Value *V, CallBase &CB) {
+  Function *Callee = CB.getCalledFunction();
+  if (!V || !Callee)
+    return false;
+
+  StringRef Name = Callee->getName();
+  if (Name.ends_with(".lifted_abi"))
+    Name = Name.drop_back(StringRef(".lifted_abi").size());
+
+  auto IsScalarPosition = [&](unsigned Index) {
+    if (Name == "memset" || Name.starts_with("llvm.memset."))
+      return Index == 1 || Index == 2;
+    if (Name == "memcpy" || Name == "memmove" || Name == "memcmp" ||
+        Name == "strncpy" || Name == "strncat" || Name == "strncmp" ||
+        Name.starts_with("llvm.memcpy.") ||
+        Name.starts_with("llvm.memmove."))
+      return Index == 2;
+    if (Name == "bzero")
+      return Index == 1;
+    if (Name == "malloc")
+      return Index == 0;
+    if (Name == "calloc")
+      return Index == 0 || Index == 1;
+    if (Name == "realloc")
+      return Index == 1;
+    return false;
+  };
+
+  bool Found = false;
+  for (unsigned Index = 0; Index < CB.arg_size(); ++Index) {
+    if (CB.getArgOperand(Index) != V)
+      continue;
+    Found = true;
+    if (!IsScalarPosition(Index))
+      return false;
+  }
+  return Found;
+}
+
 static unsigned rewriteGuestAddressIdentityAliasIntegers(Module &M,
                                                          bool &Changed) {
   unsigned Rewritten = 0;
@@ -2413,8 +2515,11 @@ static unsigned rewriteGuestAddressIdentityAliasIntegers(Module &M,
             // boundary and are converted back to pointers in the callee.
             // Without interprocedural proof, treating such an argument as a
             // numeric identity leaks fixed guest addresses into PIE code.
-            if (isa<CallBase>(U))
-              return true;
+            if (auto *CB = dyn_cast<CallBase>(U)) {
+              if (!isProvenScalarLibcCallArgument(V, *CB))
+                return true;
+              continue;
+            }
             if (isa<IntToPtrInst>(U))
               return true;
             if (auto *CE = dyn_cast<ConstantExpr>(U)) {
@@ -2441,6 +2546,9 @@ static unsigned rewriteGuestAddressIdentityAliasIntegers(Module &M,
                                  isa<BinaryOperator>(Consumer) ||
                                  isa<ICmpInst>(Consumer) ||
                                  isa<SwitchInst>(Consumer);
+        if (auto *CB = dyn_cast<CallBase>(Consumer))
+          IsIdentityCarrier =
+              isProvenScalarLibcCallArgument(AliasInteger, *CB);
         if (auto *Nested = dyn_cast<ConstantExpr>(Consumer)) {
           IsIdentityCarrier = Nested->getType()->isIntegerTy() ||
                               Nested->getOpcode() ==
@@ -3638,6 +3746,8 @@ static unsigned rewriteNativeVarargExternalPointerArguments(Module &M,
             continue;
           SmallPtrSet<Value *, 32> Seen;
           Value *NativeCarrier = findNativeVarargAddressCarrier(Arg, Seen);
+          if (!NativeCarrier)
+            NativeCarrier = findNativeVarargCarrierInRecoveredDispatch(Arg);
           if (!NativeCarrier || NativeCarrier == Arg)
             continue;
           IRBuilder<> B(CB);
@@ -8380,6 +8490,26 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   unsigned DataAliases = rewriteRemainingDataAliasesToNativeSegments(M, Changed);
   if (DataAliases)
     errs() << "  remaining guest data aliases lowered: " << DataAliases << "\n";
+
+  // Conservatively preserved residual segments acquire their exact guest
+  // range while the final data_<addr> aliases are removed above.  Revisit
+  // dynamic inttoptrs now: the earlier State-SSA-dependent sweep could not
+  // prove their mapping before that provenance existed (and a later cleanup
+  // sweep may legitimately roll its State transaction back).
+  unsigned FinalDynamicGuestPointers = 0;
+  unsigned FinalResidualGuestPointers = 0;
+  if (DataAliases) {
+    FinalDynamicGuestPointers =
+        rewriteDynamicGuestAddressIntToPtr(M, Changed);
+    FinalResidualGuestPointers =
+        rewriteResidualRecoveredDataIntToPtrs(M, Changed);
+  }
+  if (FinalDynamicGuestPointers)
+    errs() << "  final dynamic guest pointers lowered: "
+           << FinalDynamicGuestPointers << "\n";
+  if (FinalResidualGuestPointers)
+    errs() << "  final residual guest data inttoptrs lowered: "
+           << FinalResidualGuestPointers << "\n";
 
   unsigned ConstantGuestPointers =
       rewriteConstantGuestPointerOperands(M, Changed);

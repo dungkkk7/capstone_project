@@ -19,7 +19,6 @@ read:
   ret i32 %sum
 }
 
-; Multi-destination integer scans use the fail-closed sentinel.  A single
-; destination remains untouched because its native stack value is undefined.
-; CHECK: store i32 -2147483648, ptr %native_stack_storage_a
-; CHECK: store i32 -2147483648, ptr %native_stack_storage_b
+; A short or failed conversion preserves every destination it did not assign.
+; CHECK-NOT: store i32 -2147483648, ptr %native_stack_storage_a
+; CHECK-NOT: store i32 -2147483648, ptr %native_stack_storage_b

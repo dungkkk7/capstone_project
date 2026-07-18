@@ -9,6 +9,14 @@ PLUGIN="$ROOT/build/BrightenNativeCleanupPass.so"
 [[ -x "$OPT" ]]
 [[ -f "$PLUGIN" ]]
 
+MEMSET_SIZE_OUT="$(mktemp)"
+trap 'rm -f "$MEMSET_SIZE_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/memset_size_guest_identity.ll" -o "$MEMSET_SIZE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/memset_size_guest_identity.ll" < "$MEMSET_SIZE_OUT"
+
 SCANF_SEED_OUT="$(mktemp)"
 trap 'rm -f "$SCANF_SEED_OUT"' EXIT
 

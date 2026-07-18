@@ -14,7 +14,8 @@ entry:
   ret i32 %v
 }
 
-; Negative work-array accesses that do not resolve into a retained residual
-; image must fault like the native binary, not silently read scratch.
-; CHECK: native.bounds.nested.unmapped.fault
-; CHECK: store volatile i8 0, ptr null
+; Without guest-range provenance, cleanup must not attach binary-specific
+; bounds or redirect this ordinal-named object.  Preserve the original access.
+; CHECK: %p0 = getelementptr i8, ptr @g_arr_2_with_invalid_prefix, i64 4
+; CHECK-NOT: native.bounds.nested.unmapped.fault
+; CHECK-NOT: store volatile i8 0, ptr null
