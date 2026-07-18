@@ -63,6 +63,7 @@ import subprocess
 import shutil
 import re
 import json
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -103,11 +104,318 @@ class Color:
 
 
 NATIVE_CONTRACT_REPORT_SUFFIX = "_native_contract_report.json"
+SOUPER_REPORT_SUFFIX = "_souper_report.json"
+SOUPER_PASS_PIPELINE = "function(souper),dce,instcombine,simplifycfg,verify"
+SOUPER_MAXIMUM_COMPONENTS = (
+    "and,or,xor,add,sub,mul,shl,lshr,ashr,"
+    "eq,ne,ult,slt,ule,sle,select,const"
+)
 
 
 def native_contract_report_path(output_path):
     """Return the machine-readable native-contract report beside an output."""
     return f"{os.path.splitext(output_path)[0]}{NATIVE_CONTRACT_REPORT_SUFFIX}"
+
+
+def souper_report_path(output_path):
+    """Return the machine-readable Souper report beside an output."""
+    return f"{os.path.splitext(output_path)[0]}{SOUPER_REPORT_SUFFIX}"
+
+
+def optimization_artifact_paths(output_path):
+    """Return explicit IR snapshots used to compare pipeline stages."""
+    stem = os.path.splitext(output_path)[0]
+    return {
+        "before_brightening": f"{stem}_before_brightening.ll",
+        "before_souper": f"{stem}_before_souper.ll",
+        "after_souper": f"{stem}_after_souper.ll",
+    }
+
+
+def _emit_ll_artifact(source_path, artifact_path, llvm_dis=None):
+    """Materialize one textual LLVM IR snapshot without rewriting its IR."""
+    source_path = os.path.abspath(source_path)
+    artifact_path = os.path.abspath(artifact_path)
+    if os.path.splitext(source_path)[1].lower() == ".ll":
+        if source_path != artifact_path:
+            shutil.copy2(source_path, artifact_path)
+        return True
+    llvm_dis = llvm_dis or shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
+    if not llvm_dis:
+        print(f"{Color.RED}[✗] Không tìm thấy llvm-dis-21/llvm-dis để tạo "
+              f"artifact {artifact_path}.{Color.END}")
+        return False
+    result = subprocess.run(
+        [llvm_dis, source_path, "-o", artifact_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"{Color.RED}[✗] Không thể tạo artifact {artifact_path}: "
+              f"{result.stderr}{Color.END}")
+        return False
+    return True
+
+
+def _env_enabled(name, default=True):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
+def souper_mode_flags(mode):
+    """Return solver/synthesis flags for a named Souper strength preset."""
+    normalized = (mode or "maximum").strip().lower()
+    if normalized in {"safe", "default"}:
+        return "safe", []
+    if normalized in {"maximum", "max", "aggressive"}:
+        return "maximum", [
+            "-souper-use-cegis",
+            f"-souper-synthesis-comps={SOUPER_MAXIMUM_COMPONENTS}",
+            "-souper-synthesis-comp-num=4",
+            "-souper-synthesis-wiring-iterations=30",
+            "-souper-exploit-blockpcs",
+            "-souper-harvest-uses",
+            "-souper-max-constant-synthesis-tries=100",
+            "-souper-max-lhs-size=4096",
+        ]
+    raise ValueError(
+        f"unsupported BRIGHTEN_SOUPER_MODE={mode!r}; use safe or maximum"
+    )
+
+
+def resolve_souper_plugin():
+    """Find the project-local LLVM 21 Souper pass plugin."""
+    configured = os.environ.get("BRIGHTEN_SOUPER_PLUGIN")
+    candidates = [configured] if configured else [
+        os.path.join(
+            PROJECT_ROOT, "dependency", "souper", "build-llvm21",
+            "libsouperPass.so",
+        ),
+        os.path.join(PROJECT_ROOT, "dependency", "souper", "libsouperPass.so"),
+    ]
+    return next((os.path.abspath(path) for path in candidates
+                 if path and os.path.isfile(path)), None)
+
+
+def _write_souper_report(output_path, payload):
+    report_path = souper_report_path(output_path)
+    tmp_path = report_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump({"schema_version": 1, **payload}, handle, indent=2,
+                  ensure_ascii=False)
+    os.replace(tmp_path, report_path)
+    return report_path
+
+
+def optimize_with_souper(input_path, output_path=None, _mode_override=None):
+    """Run Souper after brightening and atomically publish verified output.
+
+    The original bitcode is never replaced until Souper and LLVM's verifier
+    both succeed.  This prevents a timeout or solver/plugin failure from
+    leaving a partially written pipeline artifact.
+    """
+    input_path = os.path.abspath(input_path)
+    output_path = os.path.abspath(output_path or input_path)
+    started = time.monotonic()
+    if not _env_enabled("BRIGHTEN_SOUPER", True):
+        if input_path != output_path:
+            shutil.copy2(input_path, output_path)
+        report_path = _write_souper_report(output_path, {
+            "status": "disabled",
+            "input": os.path.abspath(input_path),
+            "output": os.path.abspath(output_path),
+        })
+        print(f"{Color.YELLOW}[*] Souper optimization disabled; report: "
+              f"{report_path}{Color.END}")
+        return True
+
+    plugin_path = resolve_souper_plugin()
+    opt_bin = shutil.which("opt-21") or shutil.which("opt")
+    if not plugin_path or not opt_bin:
+        missing = "Souper plugin" if not plugin_path else "opt-21/opt"
+        report_path = _write_souper_report(output_path, {
+            "status": "unavailable",
+            "input": os.path.abspath(input_path),
+            "output": os.path.abspath(output_path),
+            "error": f"missing {missing}",
+        })
+        print(f"{Color.RED}[✗] Không thể chạy Souper: thiếu {missing}. "
+              f"Report: {report_path}{Color.END}")
+        return False
+
+    output_ext = os.path.splitext(output_path)[1].lower()
+    temp_output = f"{output_path}.souper.tmp.{os.getpid()}{output_ext or '.bc'}"
+    pipeline = os.environ.get("BRIGHTEN_SOUPER_PIPELINE", SOUPER_PASS_PIPELINE)
+    try:
+        mode, mode_flags = souper_mode_flags(
+            _mode_override or os.environ.get("BRIGHTEN_SOUPER_MODE", "maximum")
+        )
+    except ValueError as exc:
+        report_path = _write_souper_report(output_path, {
+            "status": "failed",
+            "input": input_path,
+            "output": output_path,
+            "error": str(exc),
+        })
+        print(f"{Color.RED}[✗] {exc}. Report: {report_path}{Color.END}")
+        return False
+    default_solver_timeout = "60" if mode == "maximum" else "15"
+    solver_timeout = int(os.environ.get(
+        "BRIGHTEN_SOUPER_SOLVER_TIMEOUT", default_solver_timeout
+    ))
+    cmd = [
+        opt_bin,
+        "-load-pass-plugin", plugin_path,
+        "-souper-debug-level=0",
+        f"-solver-timeout={solver_timeout}",
+        *mode_flags,
+        "-passes", pipeline,
+        input_path,
+        "-o", temp_output,
+    ]
+    if output_ext == ".ll":
+        cmd.insert(-2, "-S")
+
+    env = os.environ.copy()
+    bundled_z3 = os.path.join(PROJECT_ROOT, "dependency", "souper", "lib")
+    old_library_path = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = (
+        bundled_z3 if not old_library_path
+        else bundled_z3 + os.pathsep + old_library_path
+    )
+    default_module_timeout = "900" if mode == "maximum" else "120"
+    timeout = float(os.environ.get(
+        "BRIGHTEN_SOUPER_TIMEOUT", default_module_timeout
+    ))
+    input_size = os.path.getsize(input_path)
+
+    def fallback_to_safe(maximum_failure):
+        if mode != "maximum":
+            return False
+        try:
+            os.unlink(temp_output)
+        except FileNotFoundError:
+            pass
+        print(f"{Color.YELLOW}[!] Souper maximum không xử lý an toàn module "
+              f"này; tự động fallback sang safe.{Color.END}")
+        if not optimize_with_souper(
+            input_path, output_path, _mode_override="safe"
+        ):
+            return False
+        fallback_path = souper_report_path(output_path)
+        try:
+            with open(fallback_path, "r", encoding="utf-8") as handle:
+                fallback_report = json.load(handle)
+        except (OSError, ValueError):
+            fallback_report = {
+                "status": "pass",
+                "input": input_path,
+                "output": output_path,
+                "mode": "safe",
+            }
+        fallback_report.pop("schema_version", None)
+        fallback_report.update({
+            "status": "pass_with_fallback",
+            "requested_mode": "maximum",
+            "effective_mode": "safe",
+            "maximum_failure": maximum_failure,
+        })
+        report_path = _write_souper_report(output_path, fallback_report)
+        print(f"{Color.GREEN}[✓] Souper safe fallback hoàn tất. Report: "
+              f"{report_path}{Color.END}")
+        return True
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, env=env, timeout=timeout,
+            cwd=PROJECT_ROOT,
+        )
+        if result.returncode != 0 or not os.path.isfile(temp_output):
+            error = (result.stderr or result.stdout or
+                     f"opt exited with {result.returncode}")[-8000:]
+            report_path = _write_souper_report(output_path, {
+                "status": "failed",
+                "input": os.path.abspath(input_path),
+                "output": os.path.abspath(output_path),
+                "plugin": plugin_path,
+                "mode": mode,
+                "mode_flags": mode_flags,
+                "pipeline": pipeline,
+                "returncode": result.returncode,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "error": error,
+            })
+            failure_color = Color.YELLOW if mode == "maximum" else Color.RED
+            failure_mark = "[!]" if mode == "maximum" else "[✗]"
+            print(f"{failure_color}{failure_mark} Souper {mode} failed "
+                  f"(code={result.returncode}). Report: {report_path}{Color.END}")
+            return fallback_to_safe({
+                "status": "failed",
+                "returncode": result.returncode,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "error": error,
+            })
+        output_size = os.path.getsize(temp_output)
+        os.replace(temp_output, output_path)
+        report_path = _write_souper_report(output_path, {
+            "status": "pass",
+            "input": os.path.abspath(input_path),
+            "output": os.path.abspath(output_path),
+            "plugin": plugin_path,
+            "mode": mode,
+            "mode_flags": mode_flags,
+            "pipeline": pipeline,
+            "solver_timeout_seconds": solver_timeout,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "input_bytes": input_size,
+            "output_bytes": output_size,
+        })
+        print(f"{Color.GREEN}[✓] Souper optimization hoàn tất: "
+              f"{input_size} -> {output_size} bytes. "
+              f"Report: {report_path}{Color.END}")
+        return True
+    except subprocess.TimeoutExpired:
+        report_path = _write_souper_report(output_path, {
+            "status": "timeout",
+            "input": os.path.abspath(input_path),
+            "output": os.path.abspath(output_path),
+            "plugin": plugin_path,
+            "mode": mode,
+            "mode_flags": mode_flags,
+            "pipeline": pipeline,
+            "timeout_seconds": timeout,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        })
+        timeout_color = Color.YELLOW if mode == "maximum" else Color.RED
+        timeout_mark = "[!]" if mode == "maximum" else "[✗]"
+        print(f"{timeout_color}{timeout_mark} Souper {mode} timeout sau "
+              f"{timeout:.1f}s. Report: {report_path}{Color.END}")
+        return fallback_to_safe({
+            "status": "timeout",
+            "timeout_seconds": timeout,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        })
+    except OSError as exc:
+        report_path = _write_souper_report(output_path, {
+            "status": "failed",
+            "input": os.path.abspath(input_path),
+            "output": os.path.abspath(output_path),
+            "plugin": plugin_path,
+            "mode": mode,
+            "mode_flags": mode_flags,
+            "pipeline": pipeline,
+            "error": str(exc),
+        })
+        print(f"{Color.RED}[✗] Souper execution error: {exc}. "
+              f"Report: {report_path}{Color.END}")
+        return False
+    finally:
+        try:
+            os.unlink(temp_output)
+        except FileNotFoundError:
+            pass
 
 
 def parse_native_contract_reports(stderr):
@@ -289,10 +597,23 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_brightened{ext}"
 
+    artifacts = optimization_artifact_paths(output_path)
+    llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
+    if not _emit_ll_artifact(
+        input_path, artifacts["before_brightening"], llvm_dis
+    ):
+        return False
+    print(f"{Color.BLUE}[*] IR trước brightening: "
+          f"{artifacts['before_brightening']}{Color.END}")
+
     # A repeated CLI invocation must never inherit a stale compliance result
     # from an older output if opt fails before producing a new report.
     try:
         os.unlink(native_contract_report_path(output_path))
+    except FileNotFoundError:
+        pass
+    try:
+        os.unlink(souper_report_path(output_path))
     except FileNotFoundError:
         pass
 
@@ -370,11 +691,25 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                 )
                 print(f"  contract status: {native_report.get('status')}")
             print(f"{Color.BLUE}[*] Native contract report: {report_path}{Color.END}")
+            if not _emit_ll_artifact(
+                output_path, artifacts["before_souper"], llvm_dis
+            ):
+                return False
+            print(f"{Color.BLUE}[*] IR sau brightening / trước Souper: "
+                  f"{artifacts['before_souper']}{Color.END}")
+            print(f"{Color.BLUE}[*] Chạy Souper trên IR sau brightening...{Color.END}")
+            if not optimize_with_souper(output_path):
+                return False
+            if not _emit_ll_artifact(
+                output_path, artifacts["after_souper"], llvm_dis
+            ):
+                return False
+            print(f"{Color.BLUE}[*] IR sau Souper: "
+                  f"{artifacts['after_souper']}{Color.END}")
             print(f"{Color.GREEN}[✓] Brightening hoàn tất! Kết quả đã ghi ra: {output_path}{Color.END}")
             
             # Chạy llvm-dis để sinh file .ll cho dễ đọc nếu file output là .bc
             if output_path.endswith(".bc"):
-                llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
                 if llvm_dis:
                     output_ll = f"{os.path.splitext(output_path)[0]}.ll"
                     dis = subprocess.run([llvm_dis, output_path, "-o", output_ll],

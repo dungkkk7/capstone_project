@@ -14,3 +14,8 @@ data/test.csv
 # Ngoại lệ: cho phép commit binaries của AFL++ trong dependency/
 !dependency/AFLplusplus/
 !dependency/AFLplusplus/**
+
+# Souper is consumed as a prebuilt LLVM 21 plugin/toolchain.  Keep only the
+# runtime artifacts needed by the post-brightening optimizer, not its source.
+!dependency/souper/
+!dependency/souper/**

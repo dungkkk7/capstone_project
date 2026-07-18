@@ -377,6 +377,7 @@ fi
 
 python3 "$ROOT/tests/test_pipeline_order.py"
 python3 "$ROOT/tests/test_native_contract_report.py"
+python3 "$ROOT/tests/test_souper_pipeline.py"
 
 NESTED_RSP_OUT="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" \
