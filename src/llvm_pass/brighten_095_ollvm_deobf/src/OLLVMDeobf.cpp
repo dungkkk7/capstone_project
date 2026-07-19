@@ -1468,6 +1468,22 @@ static bool rewriteMultiRootAffineBVRegions(
   return false;
 }
 
+static bool feedsSyntheticNativePointerSelect(Value *V, unsigned Depth = 0) {
+  if (!V || Depth > 4) return false;
+  for (User *U : V->users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I) continue;
+    if (auto *SI = dyn_cast<SelectInst>(I);
+        SI && SI->hasName() &&
+        SI->getName().starts_with("native.data.pointer.select"))
+      return true;
+    if ((isa<ICmpInst>(I) || isa<BinaryOperator>(I) || isa<CastInst>(I)) &&
+        feedsSyntheticNativePointerSelect(I, Depth + 1))
+      return true;
+  }
+  return false;
+}
+
 static bool rewriteAffineBVRegions(Function &F, Metrics &M,
                                    SmallVectorImpl<ProofRecord> &Proofs) {
   SmallVector<WeakTrackingVH, 64> Work;
@@ -1480,6 +1496,11 @@ static bool rewriteAffineBVRegions(Function &F, Metrics &M,
   for (WeakTrackingVH &Handle : Work) {
     auto *Root = dyn_cast_or_null<BinaryOperator>(Handle);
     if (!Root) continue;
+    // These affine bounds are emitted by native data-pointer recovery, not by
+    // OLLVM.  Treating them as MBA candidates creates false mandatory
+    // residuals when the speculative cheaper form is (correctly) rejected by
+    // Z3.  The native cleanup owns this synthetic cone.
+    if (feedsSyntheticNativePointerSelect(Root)) continue;
     unsigned Width = Root->getType()->getIntegerBitWidth();
     unsigned Budget = 40;
     auto Expr = parseAffineBV(Root, Width, Budget);
@@ -4563,13 +4584,16 @@ static bool tryRecoverMultiIncomingSSADispatcher(
 // private stack slots, then clone the exact latch+header plumbing on every
 // proved edge.  This is an SSA-preserving form of the P24 update step and does
 // not infer or discard any side effect.
+static StoreInst *findReachingStateStore(BasicBlock *Source,
+                                         Value *StatePointer,
+                                         unsigned Depth = 0,
+                                         bool *HitBarrier = nullptr);
+
 static bool tryRecoverSSAPlumbingDispatcher(
     SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
-  auto Reject = [](StringRef) {
-    return false;
-  };
   BasicBlock *Header = SI.getParent();
   Function *F = Header->getParent();
+  auto Reject = [](StringRef) { return false; };
   PHINode *State = findStateRoot(SI.getCondition());
   if (!State || State->getParent() != Header ||
       State->getNumIncomingValues() != 2)
@@ -4579,6 +4603,7 @@ static bool tryRecoverSSAPlumbingDispatcher(
     return Reject("single-header-phi");
 
   PHINode *LatchState = nullptr;
+  LoadInst *LatchStateLoad = nullptr;
   ConstantInt *Initial = nullptr;
   BasicBlock *EntryPred = nullptr, *Latch = nullptr;
   for (unsigned I = 0; I != 2; ++I) {
@@ -4589,6 +4614,67 @@ static bool tryRecoverSSAPlumbingDispatcher(
     } else if (auto *PN = dyn_cast<PHINode>(V)) {
       LatchState = PN;
       Latch = State->getIncomingBlock(I);
+    } else if (auto *LI = dyn_cast<LoadInst>(V)) {
+      LatchStateLoad = LI;
+      Latch = State->getIncomingBlock(I);
+    }
+  }
+  // Late pointer canonicalization can expose a complete memory recurrence
+  // only after the broad State-SSA sweep has run. Promote that exact join load
+  // to a latch PHI. The dispatcher default edge carries the current state;
+  // every other predecessor must have one exact reaching store.
+  if (Initial && !LatchState && LatchStateLoad && Latch &&
+      LatchStateLoad->getParent() == Latch &&
+      !LatchStateLoad->isAtomic() && !LatchStateLoad->isVolatile()) {
+    bool Safe = true;
+    for (Instruction &I : *Latch) {
+      if (&I == LatchStateLoad) break;
+      if (!isa<PHINode>(I) && !isa<DbgInfoIntrinsic>(I) &&
+          I.mayWriteToMemory()) {
+        Safe = false;
+        break;
+      }
+    }
+    SmallVector<std::pair<Value *, BasicBlock *>, 64> Incoming;
+    for (BasicBlock *Pred : predecessors(Latch)) {
+      unsigned EdgeCount = 0;
+      for (BasicBlock *Succ : successors(Pred)) EdgeCount += Succ == Latch;
+      if (EdgeCount != 1) {
+        Safe = false;
+        break;
+      }
+      bool HitBarrier = false;
+      StoreInst *Store = findReachingStateStore(
+          Pred, LatchStateLoad->getPointerOperand(), 0, &HitBarrier);
+      if (Pred == Header && !Store && !HitBarrier) {
+        Incoming.push_back({State, Pred});
+        continue;
+      }
+      if (!Store || HitBarrier || Store->isAtomic() || Store->isVolatile() ||
+          Store->getValueOperand()->getType() != LatchStateLoad->getType() ||
+          !sameFrameAddress(Store->getPointerOperand(),
+                            LatchStateLoad->getPointerOperand())) {
+        Safe = false;
+        break;
+      }
+      Incoming.push_back({Store->getValueOperand(), Pred});
+    }
+    if (Safe && Incoming.size() == pred_size(Latch)) {
+      LatchState = PHINode::Create(
+          LatchStateLoad->getType(), Incoming.size(),
+          "deobf.memory.latch.state", LatchStateLoad->getIterator());
+      for (const auto &[IncomingValue, Pred] : Incoming)
+        LatchState->addIncoming(IncomingValue, Pred);
+      LatchStateLoad->replaceAllUsesWith(LatchState);
+      LatchStateLoad->eraseFromParent();
+      ++M.MemorySSAPhisResolved;
+      ProofRecord Promotion{F->getName().str(), "cff_state_promotion",
+                            Header->getName().str(),
+                            "exact_memory_join_to_latch_phi", "proved"};
+      Promotion.Dependencies.push_back("complete_predecessor_coverage");
+      Promotion.Dependencies.push_back("exact_reaching_state_stores");
+      Promotion.Dependencies.push_back("default_self_edge_state_passthrough");
+      Proofs.push_back(std::move(Promotion));
     }
   }
   if (!Initial || !LatchState || LatchState->getParent() != Latch ||
@@ -4656,10 +4742,29 @@ static bool tryRecoverSSAPlumbingDispatcher(
     ReturningRoots.insert(Root);
   }
   if (ReturningCases.empty()) return Reject("no-returning-cases");
-  for (BasicBlock *CaseEntry : CaseEntries)
-    if (!ReturningRoots.contains(CaseEntry) &&
-        isPotentiallyReachable(CaseEntry, Header))
-      return Reject("unclassified-returning-case");
+  // Whole-function reachability is too broad here: a genuine nested-CFF exit
+  // can reach this header again only after returning to an outer dispatcher
+  // and starting a later invocation.  It is a returning case for this loop
+  // only when it reaches the latch without first crossing the header.
+  auto ReachesLatchLocally = [&](BasicBlock *Start) -> std::optional<bool> {
+    SmallVector<BasicBlock *, 32> Work{Start};
+    SmallPtrSet<BasicBlock *, 32> Seen;
+    while (!Work.empty()) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (!Seen.insert(BB).second) continue;
+      if (Seen.size() > 256) return std::nullopt;
+      for (BasicBlock *Succ : successors(BB)) {
+        if (Succ == Latch) return true;
+        if (Succ != Header) Work.push_back(Succ);
+      }
+    }
+    return false;
+  };
+  for (BasicBlock *CaseEntry : CaseEntries) {
+    if (ReturningRoots.contains(CaseEntry)) continue;
+    std::optional<bool> Reaches = ReachesLatchLocally(CaseEntry);
+    if (!Reaches || *Reaches) return Reject("unclassified-returning-case");
+  }
   for (PHINode *LP : LatchPhis)
     for (BasicBlock *CaseBB : ReturningCases)
       if (LP->getBasicBlockIndex(CaseBB) < 0) return Reject("latch-input");
@@ -4997,8 +5102,8 @@ struct MemoryJoinEdge {
 
 static StoreInst *findReachingStateStore(BasicBlock *Source,
                                          Value *StatePointer,
-                                         unsigned Depth = 0,
-                                         bool *HitBarrier = nullptr) {
+                                         unsigned Depth,
+                                         bool *HitBarrier) {
   if (Depth > 8) return nullptr;
   for (auto It = Source->rbegin(), End = Source->rend(); It != End; ++It) {
     auto *SI = dyn_cast<StoreInst>(&*It);

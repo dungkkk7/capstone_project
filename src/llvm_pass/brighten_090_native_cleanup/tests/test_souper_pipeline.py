@@ -24,9 +24,12 @@ assert b"dependency/souper/bin/z3" in Path(plugin).read_bytes(), (
     "Souper plugin must use the bundled project-relative Z3 executable"
 )
 maximum_mode, maximum_flags = module.souper_mode_flags("maximum")
+default_mode, default_flags = module.souper_mode_flags(None)
 assert module.SOUPER_CASE_BUDGET_SECONDS == 1800
 assert module.SOUPER_SAFE_FALLBACK_RESERVE_SECONDS == 120
 assert maximum_mode == "maximum"
+assert default_mode == "safe"
+assert default_flags == []
 assert "-souper-use-cegis" in maximum_flags
 assert any(flag.startswith("-souper-synthesis-comps=") for flag in maximum_flags)
 assert "-souper-harvest-uses" in maximum_flags
@@ -37,6 +40,7 @@ assert "brighten-ollvm-deobf-pass" not in module.PASS_PIPELINE
 assert module.DEOBF_ROUND_PIPELINE.count("brighten-ollvm-deobf-pass") == 1
 assert module.DEOBF_ROUND_PIPELINE.endswith("verify")
 assert module.DEOBF_FIXED_POINT_MAX_ROUNDS == 8
+assert "instcombine<no-verify-fixpoint>" in module.SOUPER_PASS_PIPELINE
 assert module.deobf_proof_ledger_path("case_brightened.bc").endswith(
     "case_brightened_deobf_proof_ledger.json"
 )
@@ -175,11 +179,8 @@ with tempfile.TemporaryDirectory() as directory:
     input_path = Path(directory) / "input.ll"
     output_path = Path(directory) / "output.ll"
     input_path.write_text(source, encoding="utf-8")
-    os.environ["BRIGHTEN_SOUPER_MODE"] = "safe"
-    try:
-        assert module.optimize_with_souper(str(input_path), str(output_path))
-    finally:
-        os.environ.pop("BRIGHTEN_SOUPER_MODE", None)
+    assert "BRIGHTEN_SOUPER_MODE" not in os.environ
+    assert module.optimize_with_souper(str(input_path), str(output_path))
     optimized = output_path.read_text(encoding="utf-8")
     assert "ret i32 1" in optimized, optimized
 
@@ -222,9 +223,11 @@ with tempfile.TemporaryDirectory() as directory:
         return subprocess.CompletedProcess(command, 0, "", "")
 
     module.subprocess.run = fake_run
+    os.environ["BRIGHTEN_SOUPER_MODE"] = "maximum"
     try:
         assert module.optimize_with_souper(str(input_path), str(output_path))
     finally:
+        os.environ.pop("BRIGHTEN_SOUPER_MODE", None)
         module.subprocess.run = real_run
     fallback_report = json.loads(
         Path(module.souper_report_path(str(output_path))).read_text(

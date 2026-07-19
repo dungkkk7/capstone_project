@@ -115,7 +115,8 @@ DEOBF_PROOF_LEDGER_SUFFIX = "_deobf_proof_ledger.json"
 SOUPER_REPORT_SUFFIX = "_souper_report.json"
 SOUPER_LOG_SUFFIX = "_souper_{mode}.log"
 SOUPER_PASS_PIPELINE = (
-    "function(souper),memcpyopt,dse,dce,instcombine,simplifycfg,verify"
+    "function(souper),memcpyopt,dse,dce,"
+    "instcombine<no-verify-fixpoint>,simplifycfg,verify"
 )
 SOUPER_MAXIMUM_COMPONENTS = (
     "and,or,xor,add,sub,mul,shl,lshr,ashr,"
@@ -394,7 +395,7 @@ def _env_enabled(name, default=True):
 
 def souper_mode_flags(mode):
     """Return solver/synthesis flags for a named Souper strength preset."""
-    normalized = (mode or "maximum").strip().lower()
+    normalized = (mode or "safe").strip().lower()
     if normalized in {"safe", "default"}:
         return "safe", []
     if normalized in {"maximum", "max", "aggressive"}:
@@ -478,7 +479,7 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
     pipeline = os.environ.get("BRIGHTEN_SOUPER_PIPELINE", SOUPER_PASS_PIPELINE)
     try:
         mode, mode_flags = souper_mode_flags(
-            _mode_override or os.environ.get("BRIGHTEN_SOUPER_MODE", "maximum")
+            _mode_override or os.environ.get("BRIGHTEN_SOUPER_MODE", "safe")
         )
     except ValueError as exc:
         report_path = _write_souper_report(output_path, {

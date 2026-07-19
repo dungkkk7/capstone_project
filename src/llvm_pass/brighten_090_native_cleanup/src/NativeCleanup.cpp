@@ -18,6 +18,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Support/CommandLine.h"
@@ -6955,6 +6956,70 @@ static unsigned canonicalizeFrameBackingAffinePointers(Module &M,
   return Rewritten;
 }
 
+// Data-pointer recovery is intentionally skipped for stack-provenant integer
+// addresses.  Some earlier cleanup orders expose that provenance only after
+// the synthetic guest-range select chain has already been built: its raw
+// fallback is then canonicalized to frame_storage_backing, while the now
+// impossible guest-data arms remain around the store.  Collapse only chains
+// created by materializeRecoveredDataPointer, and only when their terminal
+// fallback has an exact frame offset.  This restores the classifier's
+// original stack-first decision without making any alias assumption about an
+// arbitrary user select.
+static unsigned collapseFrameProvenantDataPointerSelects(Module &M,
+                                                          bool &Changed) {
+  SmallVector<SelectInst *, 32> Candidates;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *SI = dyn_cast<SelectInst>(&I);
+              SI && SI->getType()->isPointerTy() && SI->hasName() &&
+              SI->getName().starts_with("native.data.pointer.select")) {
+            bool FeedsGeneratedSelect = llvm::any_of(SI->users(), [](User *U) {
+              auto *UserSelect = dyn_cast<SelectInst>(U);
+              return UserSelect && UserSelect->hasName() &&
+                     UserSelect->getName().starts_with(
+                         "native.data.pointer.select");
+            });
+            if (!FeedsGeneratedSelect) Candidates.push_back(SI);
+          }
+
+  const DataLayout &DL = M.getDataLayout();
+  unsigned Collapsed = 0;
+  for (SelectInst *Outer : Candidates) {
+    if (!Outer->getParent() || Outer->use_empty()) continue;
+    Value *Fallback = Outer;
+    unsigned Depth = 0;
+    while (auto *SI = dyn_cast<SelectInst>(Fallback)) {
+      if (!SI->hasName() ||
+          !SI->getName().starts_with("native.data.pointer.select") ||
+          ++Depth > 64) {
+        Fallback = nullptr;
+        break;
+      }
+      Fallback = SI->getFalseValue();
+    }
+    if (!Fallback) continue;
+
+    bool ExactFrameFallback = false;
+    for (GlobalVariable &Backing : M.globals()) {
+      if (!Backing.getName().starts_with("frame_storage_backing.")) continue;
+      SmallPtrSet<Value *, 32> Seen;
+      if (evaluateFramePointerOffset(Fallback, Backing, DL, Seen)) {
+        ExactFrameFallback = true;
+        break;
+      }
+    }
+    if (!ExactFrameFallback) continue;
+
+    Outer->replaceAllUsesWith(Fallback);
+    RecursivelyDeleteTriviallyDeadInstructions(Outer);
+    ++Collapsed;
+    Changed = true;
+  }
+  return Collapsed;
+}
+
 static std::optional<uint64_t>
 getScanfDestinationSize(CallBase &CB, unsigned ArgNo,
                         const DataLayout &DL) {
@@ -8652,6 +8717,11 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
       if (FinalAffineFramePointers)
         errs() << "  post-Souper affine frame pointers canonicalized: "
                << FinalAffineFramePointers << "\n";
+      unsigned FinalStackDataSelects =
+          collapseFrameProvenantDataPointerSelects(M, Changed);
+      if (FinalStackDataSelects)
+        errs() << "  post-Souper stack-provenant data selects collapsed: "
+               << FinalStackDataSelects << "\n";
       unsigned FinalScanfShadows =
           isolateRecoveredScanfDestinations(M, Changed);
       if (FinalScanfShadows)
@@ -9061,6 +9131,11 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
   if (AffineFramePointers)
     errs() << "  affine frame pointers canonicalized: "
            << AffineFramePointers << "\n";
+  unsigned StackDataSelects =
+      collapseFrameProvenantDataPointerSelects(M, Changed);
+  if (StackDataSelects)
+    errs() << "  stack-provenant data selects collapsed: "
+           << StackDataSelects << "\n";
   unsigned CompactedFrames = compactProvenConstantFrameBackings(M, Changed);
   if (CompactedFrames)
     errs() << "  proven fake stack backings converted to native frames: "

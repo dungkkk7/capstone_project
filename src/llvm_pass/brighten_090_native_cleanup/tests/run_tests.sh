@@ -17,6 +17,19 @@ trap 'rm -f "$MEMSET_SIZE_OUT"' EXIT
 "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
   "$ROOT/tests/memset_size_guest_identity.ll" < "$MEMSET_SIZE_OUT"
 
+STACK_DATA_SELECT_OUT="$(mktemp)"
+trap 'rm -f "$STACK_DATA_SELECT_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/stack_provenant_data_select.ll" -o "$STACK_DATA_SELECT_OUT"
+if grep -Eq 'native\.data\.pointer\.select|store i32 7, ptr %guest\.pointer' \
+    "$STACK_DATA_SELECT_OUT"; then
+  echo "FAIL: stack-provenant generated data select survived" >&2
+  exit 1
+fi
+grep -Eq 'store i32 7, ptr (%frame\.slot|%native\.frame\.slot|getelementptr .*@frame_storage_backing\.main)' \
+  "$STACK_DATA_SELECT_OUT"
+
 SCANF_SEED_OUT="$(mktemp)"
 trap 'rm -f "$SCANF_SEED_OUT"' EXIT
 
