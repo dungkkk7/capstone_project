@@ -38,7 +38,7 @@ cleanup hoàn tất. Lệnh tương đương:
 ```bash
 opt-21 \
   -load-pass-plugin dependency/souper/build-llvm21/libsouperPass.so \
-  -passes='function(souper),dce,instcombine,simplifycfg,verify' \
+  -passes='function(souper),memcpyopt,dse,dce,instcombine<no-verify-fixpoint>,simplifycfg,verify' \
   input_brightened.bc -o output.bc
 ```
 
@@ -49,7 +49,19 @@ Các runtime artifact được đóng gói trong `dependency/souper/`:
 - `bin/z3` và `lib/libz3.so.4.13`: solver/runtime đúng phiên bản của build.
 
 Output chỉ thay thế bitcode brightened sau khi Souper chạy thành công và pass
-`verify` chấp nhận module. Mỗi case sinh thêm `<name>_souper_report.json`.
+`verify` chấp nhận module. Mỗi case sinh thêm:
+
+- `<name>_souper_report.json`: trạng thái, mode, timeout, kích thước và phần
+  `diagnostics` tổng hợp candidate/rewrite.
+- `<name>_souper_maximum.log`: diagnostic thô của lần maximum.
+- `<name>_souper_safe.log`: diagnostic thô của safe hoặc safe fallback.
+
+Hai log dùng tên riêng nên safe fallback không ghi đè nguyên nhân maximum
+timeout/crash. `replacements_found` trong report phản ánh rewrite do chính
+Souper tìm được khi debug level 2 được bật. Các pass LLVM `memcpyopt` và `dse`
+chạy ngay sau Souper để gom lại aggregate initialization mà Souper scalarize
+thành hàng trăm store/GEP; sau đó `dce`, `instcombine` và `simplifycfg`
+canonicalize IR cuối.
 Pipeline giữ ba mốc IR để so sánh nhưng không copy trùng file lifting:
 
 - `<name>.ll`: IR có sẵn từ lifting, dùng trực tiếp làm before-brightening.
@@ -64,6 +76,12 @@ arithmetic/bitwise/comparison/select components, operand harvesting và block
 path conditions. Mode này mạnh nhưng có thể chậm hơn rất nhiều so với mode
 `safe`.
 
+Mode `safe` dùng enumerative synthesis mặc định; `maximum` chuyển sang CEGIS
+và mở thêm operand harvesting, block path conditions, kích thước LHS và không
+gian component. Vì hai mode dùng thuật toán synthesis khác nhau, `maximum`
+không phải superset toán học tuyệt đối của `safe`. Pipeline thử maximum trước
+và chỉ dùng safe khi maximum không hoàn tất an toàn.
+
 Souper CEGIS hiện có upstream bug trên một số lifted IR mixed-width. Pipeline
 luôn thử `maximum` trước; nếu process abort, verifier fail hoặc timeout thì tự
 động chạy lại bằng `safe`. Report ghi `status=pass_with_fallback`,
@@ -75,7 +93,19 @@ Biến môi trường:
 
 - `BRIGHTEN_SOUPER=0`: tắt bước Souper để debug.
 - `BRIGHTEN_SOUPER_MODE=maximum|safe`: chọn CEGIS mạnh nhất hoặc inference mặc định.
-- `BRIGHTEN_SOUPER_TIMEOUT=...`: timeout toàn module; mặc định maximum=900s, safe=120s.
-- `BRIGHTEN_SOUPER_SOLVER_TIMEOUT=...`: timeout mỗi query; mặc định maximum=60s, safe=15s.
+- Ngân sách mặc định là 1800 giây mỗi case: maximum dùng tối đa 1680 giây,
+  giữ 120 giây cho safe fallback.
+- `BRIGHTEN_SOUPER_MAXIMUM_TIMEOUT=...`: override ngân sách maximum.
+- `BRIGHTEN_SOUPER_SAFE_TIMEOUT=...`: override ngân sách safe/fallback.
+- `BRIGHTEN_SOUPER_MAXIMUM_SOLVER_TIMEOUT=...`: timeout mỗi maximum query;
+  mặc định 60 giây.
+- `BRIGHTEN_SOUPER_SAFE_SOLVER_TIMEOUT=...`: timeout mỗi safe query; mặc định
+  15 giây.
+- `BRIGHTEN_SOUPER_TIMEOUT=...` và `BRIGHTEN_SOUPER_SOLVER_TIMEOUT=...`:
+  override tương thích cũ áp dụng cho cả hai mode; mode-specific override được
+  ưu tiên nếu cùng tồn tại.
+- `BRIGHTEN_SOUPER_DEBUG_LEVEL=...`: độ chi tiết log Souper; mặc định `1` để
+  tránh log cực lớn. Dùng `2` khi cần ghi từng candidate, no-solution,
+  replacement và expensive guess.
 - `BRIGHTEN_SOUPER_PLUGIN=/path/libsouperPass.so`: override plugin.
 - `BRIGHTEN_SOUPER_PIPELINE=...`: override pass pipeline của Souper.
