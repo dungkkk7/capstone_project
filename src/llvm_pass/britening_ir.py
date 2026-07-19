@@ -64,6 +64,8 @@ import shutil
 import re
 import json
 import time
+import hashlib
+import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -81,10 +83,11 @@ PLUGINS = [
     "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
     "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
     "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so",
-    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
+    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so",
+    "brighten_095_ollvm_deobf/build/BrightenOLLVMDeobfPass.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,jump-threading,simplifycfg,adce,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,verify"
 )
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
@@ -93,6 +96,10 @@ if os.environ.get("BRIGHTEN_DISABLE_ABI_RECOVERY", "").lower() in {"1", "true", 
 if os.environ.get("BRIGHTEN_DISABLE_EXTERN_BRIDGE", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-extern-call-bridge", "")
 PASS_PIPELINE = os.environ.get("BRIGHTEN_PASS_PIPELINE", PASS_PIPELINE)
+DEOBF_ROUND_PIPELINE = (
+    "brighten-ollvm-deobf-pass,jump-threading,simplifycfg,adce,verify"
+)
+DEOBF_FIXED_POINT_MAX_ROUNDS = 8
 class Color:
     BLUE = '\033[94m'
     GREEN = '\033[92m'
@@ -104,12 +111,18 @@ class Color:
 
 
 NATIVE_CONTRACT_REPORT_SUFFIX = "_native_contract_report.json"
+DEOBF_PROOF_LEDGER_SUFFIX = "_deobf_proof_ledger.json"
 SOUPER_REPORT_SUFFIX = "_souper_report.json"
-SOUPER_PASS_PIPELINE = "function(souper),dce,instcombine,simplifycfg,verify"
+SOUPER_LOG_SUFFIX = "_souper_{mode}.log"
+SOUPER_PASS_PIPELINE = (
+    "function(souper),memcpyopt,dse,dce,instcombine,simplifycfg,verify"
+)
 SOUPER_MAXIMUM_COMPONENTS = (
     "and,or,xor,add,sub,mul,shl,lshr,ashr,"
     "eq,ne,ult,slt,ule,sle,select,const"
 )
+SOUPER_CASE_BUDGET_SECONDS = 1800
+SOUPER_SAFE_FALLBACK_RESERVE_SECONDS = 120
 
 
 def native_contract_report_path(output_path):
@@ -117,9 +130,199 @@ def native_contract_report_path(output_path):
     return f"{os.path.splitext(output_path)[0]}{NATIVE_CONTRACT_REPORT_SUFFIX}"
 
 
+def deobf_proof_ledger_path(output_path):
+    """Return the proof ledger emitted before Souper runs."""
+    return f"{os.path.splitext(output_path)[0]}{DEOBF_PROOF_LEDGER_SUFFIX}"
+
+
+def _semantic_ir_hash(path):
+    """Hash canonical textual IR, excluding the reader-assigned ModuleID."""
+    if str(path).endswith(".ll"):
+        with open(path, "r", encoding="utf-8") as handle:
+            text_ir = handle.read()
+    else:
+        llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
+        if not llvm_dis:
+            raise RuntimeError("llvm-dis is required for fixed-point hashing")
+        result = subprocess.run(
+            [llvm_dis, path, "-o", "-"], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or "llvm-dis failed")
+        text_ir = result.stdout
+    canonical = "\n".join(
+        line for line in text_ir.splitlines()
+        if not line.startswith("; ModuleID = ")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def run_deobf_fixed_point(bitcode_path, opt_bin=None):
+    """Run proof-backed deobfuscation to byte-stable convergence.
+
+    Every round verifies the module. A hard cap is only a safety boundary; a
+    cap hit is persisted as a residual and never reported as success.
+    """
+    if os.environ.get("BRIGHTEN_DEOBF", "1").lower() in {
+        "0", "false", "off", "no"
+    }:
+        return True
+    opt_bin = opt_bin or shutil.which("opt-21") or shutil.which("opt")
+    plugin_path = os.path.abspath(os.path.join(SCRIPT_DIR, PLUGINS[-1]))
+    if not opt_bin or not os.path.isfile(plugin_path):
+        return False
+    max_rounds = int(os.environ.get(
+        "BRIGHTEN_DEOBF_MAX_ROUNDS", DEOBF_FIXED_POINT_MAX_ROUNDS
+    ))
+    if max_rounds < 1:
+        raise ValueError("BRIGHTEN_DEOBF_MAX_ROUNDS must be positive")
+    timeout = float(os.environ.get("BRIGHTEN_DEOBF_ROUND_TIMEOUT", "180"))
+    report_path = deobf_proof_ledger_path(bitcode_path)
+    pipeline = os.environ.get("BRIGHTEN_DEOBF_PIPELINE", DEOBF_ROUND_PIPELINE)
+    converged = False
+    rounds = 0
+    textual_output = str(bitcode_path).endswith(".ll")
+    for round_index in range(1, max_rounds + 1):
+        rounds = round_index
+        before_hash = _semantic_ir_hash(bitcode_path)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".ollvm-deobf-", suffix=".ll" if textual_output else ".bc",
+            dir=os.path.dirname(os.path.abspath(bitcode_path)),
+        )
+        os.close(descriptor)
+        command = [
+            opt_bin,
+            "-load-pass-plugin", plugin_path,
+            f"-ollvm-deobf-report={report_path}",
+            "-passes", pipeline,
+            bitcode_path,
+            "-o", temporary,
+        ]
+        if textual_output:
+            command.insert(-2, "-S")
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=timeout
+            )
+            if result.returncode != 0:
+                print(f"{Color.RED}[✗] Deobf fixed-point round "
+                      f"{round_index} failed: {result.stderr}{Color.END}")
+                return False
+            os.replace(temporary, bitcode_path)
+        except subprocess.TimeoutExpired:
+            print(f"{Color.RED}[✗] Deobf fixed-point round {round_index} "
+                  f"timeout after {timeout:.1f}s.{Color.END}")
+            return False
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        if _semantic_ir_hash(bitcode_path) == before_hash:
+            converged = True
+            break
+
+    try:
+        with open(report_path, "r", encoding="utf-8") as handle:
+            ledger = json.load(handle)
+        ledger["fixed_point"] = {
+            "rounds": rounds,
+            "max_rounds": max_rounds,
+            "converged": converged,
+            "residual_reason": None if converged else "fixed_point_cap_reached",
+        }
+        if not converged:
+            ledger["status"] = "partial_with_residuals"
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(ledger, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"{Color.RED}[✗] Cannot finalize deobf ledger: {exc}{Color.END}")
+        return False
+    if not converged:
+        print(f"{Color.RED}[✗] Deobf did not converge within "
+              f"{max_rounds} rounds; Souper is not run.{Color.END}")
+        return False
+    if ledger.get("status") != "pass_detected_scope" and os.environ.get(
+        "BRIGHTEN_DEOBF_ALLOW_RESIDUALS", "0"
+    ).lower() not in {"1", "true", "yes", "on"}:
+        print(f"{Color.RED}[✗] Deobf converged but mandatory residuals remain; "
+              f"Souper is not run. Ledger: {report_path}{Color.END}")
+        return False
+    print(f"{Color.GREEN}[✓] Deobf fixed point after {rounds} rounds. "
+          f"Ledger: {report_path}{Color.END}")
+    return True
+
+
 def souper_report_path(output_path):
     """Return the machine-readable Souper report beside an output."""
     return f"{os.path.splitext(output_path)[0]}{SOUPER_REPORT_SUFFIX}"
+
+
+def souper_log_path(output_path, mode):
+    """Return a mode-specific raw Souper diagnostic log path."""
+    stem = os.path.splitext(output_path)[0]
+    return f"{stem}{SOUPER_LOG_SUFFIX.format(mode=mode)}"
+
+
+def summarize_souper_log(log_path):
+    """Extract stable, useful counters from Souper's verbose diagnostics."""
+    counters = {
+        "functions_processed": 0,
+        "lhs_attempts": 0,
+        "lhs_without_solution": 0,
+        "replacements_found": 0,
+        "replacements_skipped": 0,
+        "replacements_without_benefit": 0,
+        "replacement_failures": 0,
+        "query_errors": 0,
+        "candidate_groups": 0,
+        "candidates_considered": 0,
+        "too_expensive_guesses": 0,
+    }
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "entering Souper's runOnFunction()" in line:
+                    counters["functions_processed"] += 1
+                if "================= LHS number" in line:
+                    counters["lhs_attempts"] += 1
+                if "no solutions for LHS number" in line:
+                    counters["lhs_without_solution"] += 1
+                if ("found replacement:" in line or
+                        "after doing a replacement" in line):
+                    counters["replacements_found"] += 1
+                if "Skipping this replacement" in line:
+                    counters["replacements_skipped"] += 1
+                if "candidate has no benefit" in line:
+                    counters["replacements_without_benefit"] += 1
+                if "replacement failed" in line:
+                    counters["replacement_failures"] += 1
+                if "query error for LHS number" in line:
+                    counters["query_errors"] += 1
+                match = re.search(r"got ([0-9]+) candidates from LHS$", line)
+                if match:
+                    counters["candidate_groups"] += 1
+                    counters["candidates_considered"] += int(match.group(1))
+                match = re.search(
+                    r"\(([0-9]+) guesses were too expensive\)", line
+                )
+                if match:
+                    counters["too_expensive_guesses"] += int(match.group(1))
+    except OSError:
+        return counters
+    return counters
+
+
+def _tail_text(path, limit=8000):
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def optimization_artifact_paths(output_path):
@@ -287,13 +490,19 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
         print(f"{Color.RED}[✗] {exc}. Report: {report_path}{Color.END}")
         return False
     default_solver_timeout = "60" if mode == "maximum" else "15"
+    solver_timeout_env = (
+        "BRIGHTEN_SOUPER_MAXIMUM_SOLVER_TIMEOUT"
+        if mode == "maximum" else "BRIGHTEN_SOUPER_SAFE_SOLVER_TIMEOUT"
+    )
     solver_timeout = int(os.environ.get(
-        "BRIGHTEN_SOUPER_SOLVER_TIMEOUT", default_solver_timeout
+        solver_timeout_env,
+        os.environ.get("BRIGHTEN_SOUPER_SOLVER_TIMEOUT", default_solver_timeout),
     ))
+    debug_level = int(os.environ.get("BRIGHTEN_SOUPER_DEBUG_LEVEL", "1"))
     cmd = [
         opt_bin,
         "-load-pass-plugin", plugin_path,
-        "-souper-debug-level=0",
+        f"-souper-debug-level={debug_level}",
         f"-solver-timeout={solver_timeout}",
         *mode_flags,
         "-passes", pipeline,
@@ -310,11 +519,22 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
         bundled_z3 if not old_library_path
         else bundled_z3 + os.pathsep + old_library_path
     )
-    default_module_timeout = "900" if mode == "maximum" else "120"
+    default_module_timeout = str(
+        SOUPER_CASE_BUDGET_SECONDS - SOUPER_SAFE_FALLBACK_RESERVE_SECONDS
+        if mode == "maximum" else SOUPER_SAFE_FALLBACK_RESERVE_SECONDS
+    )
+    module_timeout_env = (
+        "BRIGHTEN_SOUPER_MAXIMUM_TIMEOUT"
+        if mode == "maximum" else "BRIGHTEN_SOUPER_SAFE_TIMEOUT"
+    )
     timeout = float(os.environ.get(
-        "BRIGHTEN_SOUPER_TIMEOUT", default_module_timeout
+        module_timeout_env,
+        os.environ.get("BRIGHTEN_SOUPER_TIMEOUT", default_module_timeout),
     ))
     input_size = os.path.getsize(input_path)
+    log_path = souper_log_path(output_path, mode)
+    print(f"{Color.BLUE}[*] Souper {mode} budget: module={timeout:.0f}s, "
+          f"solver-query={solver_timeout}s.{Color.END}")
 
     def fallback_to_safe(maximum_failure):
         if mode != "maximum":
@@ -353,12 +573,17 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
         return True
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=timeout,
-            cwd=PROJECT_ROOT,
-        )
+        with open(log_path, "w", encoding="utf-8") as log_handle:
+            result = subprocess.run(
+                cmd, stdout=log_handle, stderr=subprocess.STDOUT, text=True,
+                env=env, timeout=timeout, cwd=PROJECT_ROOT,
+            )
+        diagnostics = summarize_souper_log(log_path)
         if result.returncode != 0 or not os.path.isfile(temp_output):
-            error = (result.stderr or result.stdout or
+            captured = getattr(result, "stderr", None) or getattr(
+                result, "stdout", None
+            )
+            error = (captured or _tail_text(log_path) or
                      f"opt exited with {result.returncode}")[-8000:]
             report_path = _write_souper_report(output_path, {
                 "status": "failed",
@@ -368,8 +593,14 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
                 "mode": mode,
                 "mode_flags": mode_flags,
                 "pipeline": pipeline,
+                "module_timeout_seconds": timeout,
+                "solver_timeout_seconds": solver_timeout,
                 "returncode": result.returncode,
                 "duration_seconds": round(time.monotonic() - started, 3),
+                "log": log_path,
+                "debug_level": debug_level,
+                "detailed_diagnostics": debug_level >= 2,
+                "diagnostics": diagnostics,
                 "error": error,
             })
             failure_color = Color.YELLOW if mode == "maximum" else Color.RED
@@ -379,7 +610,13 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
             return fallback_to_safe({
                 "status": "failed",
                 "returncode": result.returncode,
+                "module_timeout_seconds": timeout,
+                "solver_timeout_seconds": solver_timeout,
                 "duration_seconds": round(time.monotonic() - started, 3),
+                "log": log_path,
+                "debug_level": debug_level,
+                "detailed_diagnostics": debug_level >= 2,
+                "diagnostics": diagnostics,
                 "error": error,
             })
         output_size = os.path.getsize(temp_output)
@@ -392,16 +629,32 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
             "mode": mode,
             "mode_flags": mode_flags,
             "pipeline": pipeline,
+            "module_timeout_seconds": timeout,
             "solver_timeout_seconds": solver_timeout,
             "duration_seconds": round(time.monotonic() - started, 3),
             "input_bytes": input_size,
             "output_bytes": output_size,
+            "log": log_path,
+            "debug_level": debug_level,
+            "detailed_diagnostics": debug_level >= 2,
+            "diagnostics": diagnostics,
         })
         print(f"{Color.GREEN}[✓] Souper optimization hoàn tất: "
               f"{input_size} -> {output_size} bytes. "
               f"Report: {report_path}{Color.END}")
+        if debug_level >= 2:
+            print(f"{Color.BLUE}[*] Souper diagnostics: "
+                  f"LHS={diagnostics['lhs_attempts']}, "
+                  f"replacements={diagnostics['replacements_found']}, "
+                  f"no-solution={diagnostics['lhs_without_solution']}. "
+                  f"Log: {log_path}{Color.END}")
+        else:
+            print(f"{Color.BLUE}[*] Souper log: {log_path} "
+                  f"(set BRIGHTEN_SOUPER_DEBUG_LEVEL=2 for candidate and "
+                  f"replacement details).{Color.END}")
         return True
     except subprocess.TimeoutExpired:
+        diagnostics = summarize_souper_log(log_path)
         report_path = _write_souper_report(output_path, {
             "status": "timeout",
             "input": os.path.abspath(input_path),
@@ -410,8 +663,14 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
             "mode": mode,
             "mode_flags": mode_flags,
             "pipeline": pipeline,
+            "module_timeout_seconds": timeout,
+            "solver_timeout_seconds": solver_timeout,
             "timeout_seconds": timeout,
             "duration_seconds": round(time.monotonic() - started, 3),
+            "log": log_path,
+            "debug_level": debug_level,
+            "detailed_diagnostics": debug_level >= 2,
+            "diagnostics": diagnostics,
         })
         timeout_color = Color.YELLOW if mode == "maximum" else Color.RED
         timeout_mark = "[!]" if mode == "maximum" else "[✗]"
@@ -420,7 +679,13 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
         return fallback_to_safe({
             "status": "timeout",
             "timeout_seconds": timeout,
+            "module_timeout_seconds": timeout,
+            "solver_timeout_seconds": solver_timeout,
             "duration_seconds": round(time.monotonic() - started, 3),
+            "log": log_path,
+            "debug_level": debug_level,
+            "detailed_diagnostics": debug_level >= 2,
+            "diagnostics": diagnostics,
         })
     except OSError as exc:
         report_path = _write_souper_report(output_path, {
@@ -517,6 +782,76 @@ def read_native_contract_report(output_path):
             return json.load(handle)
     except (OSError, ValueError):
         return None
+
+
+def run_final_native_audit(output_path, opt_bin):
+    """Canonicalize and audit the actual post-Souper module atomically.
+
+    The report emitted by the main brightening pipeline predates both the
+    OLLVM fixed point and Souper.  It is therefore evidence about an
+    intermediate module only.  Re-run the mutation-limited final verifier on
+    the file that will actually be published and replace both output and
+    report only after LLVM verification succeeds.
+    """
+    output_path = os.path.abspath(output_path)
+    plugin_path = os.path.abspath(os.path.join(
+        SCRIPT_DIR,
+        "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so",
+    ))
+    if not os.path.isfile(plugin_path):
+        print(f"{Color.RED}[✗] Thiếu native cleanup plugin cho kiểm định cuối: "
+              f"{plugin_path}{Color.END}")
+        return False
+    extension = os.path.splitext(output_path)[1].lower()
+    temporary = f"{output_path}.native-audit.tmp.{os.getpid()}{extension or '.bc'}"
+    command = [
+        opt_bin,
+        "-load-pass-plugin", plugin_path,
+    ]
+    strict = os.environ.get("BRIGHTEN_NATIVE_STRICT", "0") == "1"
+    if strict:
+        command.append("-brighten-native-strict")
+    command.extend([
+        "-passes", "brighten-native-cleanup-post-souper-pass,verify",
+        output_path,
+        "-o", temporary,
+    ])
+    if extension == ".ll":
+        command.insert(-2, "-S")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.isfile(temporary):
+            diagnostic = (result.stderr or result.stdout or "")[-8000:]
+            print(f"{Color.RED}[✗] Kiểm định native cuối sau Souper thất bại "
+                  f"(code={result.returncode}).{Color.END}")
+            if diagnostic:
+                print(f"{Color.RED}{diagnostic}{Color.END}")
+            return False
+        report = parse_native_contract_reports(result.stderr)
+        if report is None:
+            print(f"{Color.RED}[✗] Native verifier không phát hành report cho "
+                  f"output sau Souper.{Color.END}")
+            return False
+        os.replace(temporary, output_path)
+        report_path = write_native_contract_report(
+            output_path, report, strict_enforced=strict
+        )
+        violations = report.get("metrics", {}).get(
+            "native_contract_violations", "unknown"
+        )
+        print(f"{Color.BLUE}[*] Native contract cuối sau Souper: "
+              f"violations={violations}, status={report.get('status')}. "
+              f"Report: {report_path}{Color.END}")
+        return True
+    except OSError as exc:
+        print(f"{Color.RED}[✗] Không thể chạy native audit cuối: "
+              f"{exc}{Color.END}")
+        return False
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 def clean_unused_types_and_globals(content):
     # 1. Skip function stripping (keep all defined functions to avoid undefined reference errors)
@@ -651,6 +986,10 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         os.unlink(souper_report_path(output_path))
     except FileNotFoundError:
         pass
+    try:
+        os.unlink(deobf_proof_ledger_path(output_path))
+    except FileNotFoundError:
+        pass
 
     # Build command
     cmd = [opt_bin]
@@ -663,9 +1002,10 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
             return False
         cmd.extend(["-load-pass-plugin", plugin_path])
 
-    if os.environ.get("BRIGHTEN_NATIVE_STRICT", "0") == "1":
-        # The plugin must be loaded before opt parses its pass-specific flag.
-        cmd.append("-brighten-native-strict")
+    # Native strictness is authoritative only on the actual post-Souper
+    # artifact.  Enforcing it here would reject guest-frame/state structures
+    # that the following proof-guided deobfuscation rounds still consume.
+    cmd.append(f"-ollvm-deobf-report={deobf_proof_ledger_path(output_path)}")
     if os.environ.get("BRIGHTEN_SAVE_CHECKPOINTS", "0") == "1":
         cmd.append("-print-after-all")
     print_after = os.environ.get("BRIGHTEN_PRINT_AFTER")
@@ -715,7 +1055,7 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
             report_path = write_native_contract_report(
                 output_path,
                 native_report,
-                strict_enforced=os.environ.get("BRIGHTEN_NATIVE_STRICT", "0") == "1",
+                strict_enforced=False,
             )
             if native_report:
                 metrics = native_report.get("metrics", {})
@@ -726,6 +1066,10 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                 )
                 print(f"  contract status: {native_report.get('status')}")
             print(f"{Color.BLUE}[*] Native contract report: {report_path}{Color.END}")
+            print(f"{Color.BLUE}[*] Chạy OLLVM deobfuscation fixed-point "
+                  f"trước Souper...{Color.END}")
+            if not run_deobf_fixed_point(output_path, opt_bin):
+                return False
             if not _emit_ll_artifact(
                 output_path, artifacts["before_souper"], llvm_dis
             ):
@@ -734,6 +1078,10 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                   f"{artifacts['before_souper']}{Color.END}")
             print(f"{Color.BLUE}[*] Chạy Souper trên IR sau brightening...{Color.END}")
             if not optimize_with_souper(output_path):
+                return False
+            print(f"{Color.BLUE}[*] Kiểm định native contract trên output cuối "
+                  f"sau Souper...{Color.END}")
+            if not run_final_native_audit(output_path, opt_bin):
                 return False
             if not _emit_ll_artifact(
                 output_path, artifacts["after_souper"], llvm_dis

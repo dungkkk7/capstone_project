@@ -3,7 +3,9 @@
 import importlib.util
 import json
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
+from unittest import mock
 
 
 pipeline_file = Path(__file__).resolve().parents[2] / "britening_ir.py"
@@ -42,5 +44,32 @@ with tempfile.TemporaryDirectory() as directory:
     assert Path(path).name == "case_brightened_native_contract_report.json"
     assert payload["status"] == "non_compliant"
     assert payload["output"] == str(output.resolve())
+
+with tempfile.TemporaryDirectory() as directory:
+    output = Path(directory) / "post_souper.bc"
+    output.write_bytes(b"before-audit")
+
+    def fake_run(command, **_kwargs):
+        assert "brighten-native-cleanup-post-souper-pass,verify" in command
+        Path(command[-1]).write_bytes(b"verified-final")
+        return SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr=(
+                "brighten-native-cleanup report:\n"
+                "  remaining State globals/aliases: 0\n"
+                "  ptrtoint/inttoptr: 0/0\n"
+                "  native contract violations: 0\n"
+            ),
+        )
+
+    with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+        assert module.run_final_native_audit(str(output), "/usr/bin/opt-21")
+    assert output.read_bytes() == b"verified-final"
+    final_report = json.loads(Path(
+        module.native_contract_report_path(str(output))
+    ).read_text(encoding="utf-8"))
+    assert final_report["status"] == "compliant"
+    assert final_report["metrics"]["native_contract_violations"] == 0
 
 print("Native contract report tests: PASS")

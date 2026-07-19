@@ -217,6 +217,71 @@ if "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass
   exit 1
 fi
 
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -disable-output \
+  "$ROOT/tests/native_named_cfg.ll"
+
+AFFINE_SCANF_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' \
+  -brighten-native-strict -S \
+  "$ROOT/tests/affine_scanf_frame_compaction.ll" -o "$AFFINE_SCANF_OUT"
+if grep -q '@frame_storage_backing\.main' "$AFFINE_SCANF_OUT"; then
+  echo "FAIL: affine scanf frame backing was not compacted" >&2
+  exit 1
+fi
+grep -Eq 'alloca \[4 x i8\]' "$AFFINE_SCANF_OUT"
+grep -Eq '@llvm\.memset.*i64 4' "$AFFINE_SCANF_OUT"
+grep -Eq 'native\.scanf\.shadow = alloca i32' "$AFFINE_SCANF_OUT"
+grep -Eq 'load volatile i32, ptr %native\.scanf\.shadow' "$AFFINE_SCANF_OUT"
+AFFINE_CLANG="${CLANG:-$(command -v clang-21 || command -v clang)}"
+AFFINE_ORIGINAL_BIN="$(mktemp)"
+AFFINE_COMPACT_BIN="$(mktemp)"
+"$AFFINE_CLANG" -x ir -O2 \
+  "$ROOT/tests/affine_scanf_frame_compaction.ll" -o "$AFFINE_ORIGINAL_BIN"
+"$AFFINE_CLANG" -x ir -O2 "$AFFINE_SCANF_OUT" -o "$AFFINE_COMPACT_BIN"
+for INPUT in 17 invalid; do
+  set +e
+  printf '%s\n' "$INPUT" | "$AFFINE_ORIGINAL_BIN" >/dev/null 2>&1
+  ORIGINAL_STATUS=$?
+  printf '%s\n' "$INPUT" | "$AFFINE_COMPACT_BIN" >/dev/null 2>&1
+  COMPACT_STATUS=$?
+  set -e
+  if [[ "$ORIGINAL_STATUS" -ne "$COMPACT_STATUS" ]]; then
+    echo "FAIL: affine scanf frame compaction changed $INPUT semantics" >&2
+    exit 1
+  fi
+done
+
+AFFINE_MEMSET_OUT="$(mktemp)"
+AFFINE_MEMSET_ORIGINAL_BIN="$(mktemp)"
+AFFINE_MEMSET_COMPACT_BIN="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' \
+  -brighten-native-strict -S \
+  "$ROOT/tests/affine_memset_frame_compaction.ll" -o "$AFFINE_MEMSET_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/affine_memset_frame_compaction.ll" < "$AFFINE_MEMSET_OUT"
+"$AFFINE_CLANG" -x ir -O2 \
+  "$ROOT/tests/affine_memset_frame_compaction.ll" \
+  -o "$AFFINE_MEMSET_ORIGINAL_BIN"
+"$AFFINE_CLANG" -x ir -O2 "$AFFINE_MEMSET_OUT" \
+  -o "$AFFINE_MEMSET_COMPACT_BIN"
+set +e
+"$AFFINE_MEMSET_ORIGINAL_BIN" >/dev/null 2>&1
+AFFINE_MEMSET_ORIGINAL_STATUS=$?
+"$AFFINE_MEMSET_COMPACT_BIN" >/dev/null 2>&1
+AFFINE_MEMSET_COMPACT_STATUS=$?
+set -e
+if [[ "$AFFINE_MEMSET_ORIGINAL_STATUS" -ne \
+      "$AFFINE_MEMSET_COMPACT_STATUS" ]]; then
+  echo "FAIL: affine memset frame compaction changed semantics" >&2
+  exit 1
+fi
+rm -f "$AFFINE_MEMSET_OUT" "$AFFINE_MEMSET_ORIGINAL_BIN" \
+  "$AFFINE_MEMSET_COMPACT_BIN"
+
 echo "Native cleanup tests: PASS"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -320,7 +385,7 @@ fi
   -brighten-native-state-ssa -S \
   "$ROOT/tests/conservative_stack_relativization.ll" \
   -o "$CONSERVATIVE_STACK_OUT"
-grep -Eq 'ptrtoint ptr %(native_stack_top|frame_top) to i64' \
+grep -Eq 'ptrtoint ptr (%(native_stack_top|frame_top)|getelementptr.*@frame_storage_backing.*) to i64' \
   "$CONSERVATIVE_STACK_OUT"
 if grep -Eq 'attributes .*brighten\.relative-stack' \
     "$CONSERVATIVE_STACK_OUT"; then
@@ -367,7 +432,7 @@ fi
   -brighten-native-state-ssa -S \
   "$ROOT/tests/scanf_absolute_frame_anchor_delta.ll" \
   -o "$SCANF_ABSOLUTE_FRAME_OUT"
-grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr getelementptr .*@frame_storage_backing\.main, i64 16711680.*i64 -16' \
+grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr (getelementptr .*@frame_storage_backing\.main, i64 16711680.*i64 -16|%native\.frame\.slot)' \
   "$SCANF_ABSOLUTE_FRAME_OUT"
 if grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\)\)' \
     "$SCANF_ABSOLUTE_FRAME_OUT"; then
@@ -492,11 +557,12 @@ grep -Eq 'alloca \[4 x i8\]' "$FRAME_COMPACT_OUT"
   -brighten-native-state-ssa -S \
   "$ROOT/tests/uninitialized_frame_compaction_refused.ll" \
   -o "$FRAME_REFUSE_OUT"
-grep -Eq '@frame_storage_backing\.main.*zeroinitializer' "$FRAME_REFUSE_OUT"
-if grep -Eq 'native_frame = alloca' "$FRAME_REFUSE_OUT"; then
-  echo "FAIL: zero-initialized read was unsafely changed to uninitialized stack" >&2
+if grep -Eq '@frame_storage_backing\.main' "$FRAME_REFUSE_OUT"; then
+  echo "FAIL: zero-initialized entry frame backing was not compacted" >&2
   exit 1
 fi
+grep -Eq 'native_frame\.compact = alloca \[4 x i8\]' "$FRAME_REFUSE_OUT"
+grep -Eq '@llvm\.memset.*i64 4' "$FRAME_REFUSE_OUT"
 
 CLANG="${CLANG:-$(command -v clang-21 || command -v clang)}"
 "$CLANG" -x ir "$FRAME_COMPACT_OUT" -o "$FRAME_POS_BIN"

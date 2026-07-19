@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.16)
+project(BrightenOLLVMDeobfPass LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+find_package(LLVM REQUIRED CONFIG)
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(AddLLVM)
+find_library(Z3_LIBRARY z3 REQUIRED)
+
+add_llvm_pass_plugin(BrightenOLLVMDeobfPass
+  src/main.cpp
+  src/OLLVMDeobf.cpp
+)
+target_link_libraries(BrightenOLLVMDeobfPass PRIVATE ${Z3_LIBRARY})
+target_compile_options(BrightenOLLVMDeobfPass PRIVATE -fexceptions)

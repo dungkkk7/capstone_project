@@ -12,6 +12,7 @@
 
 #include <optional>
 #include <limits>
+#include <algorithm>
 
 namespace brighten_state_ssa {
 
@@ -65,6 +66,25 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
     bool MixedStateBases = false;
     bool UnsupportedStateAccess = false;
 
+    auto IsStateRootedPointer = [&](Value *Ptr) {
+      Value *Root = Ptr;
+      while (true) {
+        Root = Root->stripPointerCasts();
+        if (auto *GEP = dyn_cast<GEPOperator>(Root)) {
+          Root = GEP->getPointerOperand();
+          continue;
+        }
+        if (auto *GA = dyn_cast<GlobalAlias>(Root)) {
+          Root = GA->getAliasee();
+          continue;
+        }
+        break;
+      }
+      if (StateGV && Root == StateGV)
+        return true;
+      return F.arg_size() && Root == F.getArg(0);
+    };
+
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -87,7 +107,8 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
               info.type = LI->getType();
             }
             info.loads.push_back(LI);
-          }
+          } else if (IsStateRootedPointer(LI->getPointerOperand()))
+            UnsupportedStateAccess = true;
         } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
           auto Resolved = ResolveStateOffset(SI->getPointerOperand(), DL, F, StateGV);
           if (Resolved &&
@@ -108,29 +129,83 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
               info.type = SI->getValueOperand()->getType();
             }
             info.stores.push_back(SI);
-          }
+          } else if (IsStateRootedPointer(SI->getPointerOperand()))
+            UnsupportedStateAccess = true;
         }
       }
     }
 
     if (MixedStateBases || UnsupportedStateAccess || !FunctionBase) continue;
 
-    // Exact-offset slots may be accessed at several widths, but independently
-    // promoting partially-overlapping slots makes writes incoherent.  Keep
-    // every ambiguous interval in State for a later byte-accurate recovery.
-    for (auto A = fields.begin(); A != fields.end(); ++A) {
-      uint64_t AEnd = uint64_t(A->first) + A->second.max_access_size;
-      for (auto B = std::next(A); B != fields.end(); ++B) {
-        uint64_t BEnd = uint64_t(B->first) + B->second.max_access_size;
-        if (uint64_t(A->first) < BEnd && uint64_t(B->first) < AEnd) {
-          unsupported_fields.insert(A->first);
-          unsupported_fields.insert(B->first);
-        }
-      }
-    }
+    // Build connected byte-interval components.  Every overlapping view in a
+    // component shares one integer backing object, so a partial write remains
+    // coherent with every wider/narrower alias.
     for (unsigned Offset : unsupported_fields)
       fields.erase(Offset);
     if (fields.empty()) continue;
+
+    SmallVector<unsigned, 32> OrderedOffsets;
+    for (const auto &Pair : fields)
+      OrderedOffsets.push_back(Pair.first);
+    llvm::sort(OrderedOffsets);
+    DenseMap<unsigned, FieldInfo> MergedFields;
+    bool InvalidComponent = false;
+    for (unsigned Offset : OrderedOffsets) {
+      FieldInfo &Source = fields[Offset];
+      uint64_t SourceEnd = uint64_t(Offset) + Source.max_access_size;
+      if (Source.max_access_size == 0) {
+        InvalidComponent = true;
+        break;
+      }
+      unsigned ComponentBegin = Offset;
+      if (!MergedFields.empty()) {
+        unsigned PreviousBegin = 0;
+        bool FoundPrevious = false;
+        for (const auto &Pair : MergedFields)
+          if (!FoundPrevious || Pair.first > PreviousBegin) {
+            PreviousBegin = Pair.first;
+            FoundPrevious = true;
+          }
+        FieldInfo &Previous = MergedFields[PreviousBegin];
+        uint64_t PreviousEnd = uint64_t(Previous.offset) +
+                               Previous.max_access_size;
+        if (uint64_t(Offset) < PreviousEnd)
+          ComponentBegin = PreviousBegin;
+      }
+      FieldInfo &Target = MergedFields[ComponentBegin];
+      if (Target.max_access_size == 0)
+        Target.offset = ComponentBegin;
+      uint64_t TargetEnd = std::max(
+          uint64_t(Target.offset) + Target.max_access_size, SourceEnd);
+      if (TargetEnd - Target.offset > 4096) {
+        InvalidComponent = true;
+        break;
+      }
+      Target.max_access_size = unsigned(TargetEnd - Target.offset);
+      Target.loads.append(Source.loads.begin(), Source.loads.end());
+      Target.stores.append(Source.stores.begin(), Source.stores.end());
+    }
+    if (InvalidComponent) continue;
+    fields = std::move(MergedFields);
+    if (fields.empty()) continue;
+
+    bool InvalidAccessType = false;
+    auto ValidateType = [&](Type *Ty) {
+      TypeSize StoreSize = DL.getTypeStoreSize(Ty);
+      TypeSize BitSize = DL.getTypeSizeInBits(Ty);
+      return Ty->isFirstClassType() && !Ty->isAggregateType() &&
+             !StoreSize.isScalable() && !BitSize.isScalable() &&
+             StoreSize.getFixedValue() != 0 &&
+             StoreSize.getFixedValue() <= 4096 &&
+             BitSize.getFixedValue() == StoreSize.getFixedValue() * 8;
+    };
+    for (const auto &Pair : fields) {
+      for (LoadInst *LI : Pair.second.loads)
+        InvalidAccessType |= !ValidateType(LI->getType());
+      for (StoreInst *SI : Pair.second.stores)
+        InvalidAccessType |= !ValidateType(SI->getValueOperand()->getType());
+    }
+    if (InvalidAccessType) continue;
 
     Value *StatePtr = *FunctionBase == StateBaseKind::Arg0
                           ? static_cast<Value *>(F.getArg(0))
@@ -159,7 +234,8 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
       // Initialize alloca from state
       IRBuilder<> B(Alloca->getNextNode());
       Value *GEP = buildStateFieldGEP(B, StatePtr, offset, AllocaTy);
-      Value *InitVal = B.CreateLoad(AllocaTy, GEP, "state_init");
+      Value *InitVal = B.CreateAlignedLoad(AllocaTy, GEP, Align(1),
+                                           "state_init");
       B.CreateStore(InitVal, Alloca);
     }
 
@@ -172,19 +248,31 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
       for (LoadInst *LI : info.loads) {
         IRBuilder<> B(LI);
         Value *Loaded = B.CreateLoad(info.type, Alloca);
-        
+        auto Resolved = ResolveStateOffset(LI->getPointerOperand(), DL, F,
+                                           StateGV);
+        if (!Resolved || Resolved->Offset < offset)
+          report_fatal_error("validated State load lost byte offset");
         Type *LITy = LI->getType();
+        unsigned AccessBits = unsigned(DL.getTypeStoreSize(LITy) * 8);
+        unsigned StorageBits = info.max_access_size * 8;
+        uint64_t RelativeByte = DL.isLittleEndian()
+                                    ? Resolved->Offset - offset
+                                    : uint64_t(offset) + info.max_access_size -
+                                          (Resolved->Offset + AccessBits / 8);
+        unsigned Shift = unsigned(RelativeByte * 8);
+        Value *Bits = Loaded;
+        if (Shift)
+          Bits = B.CreateLShr(Bits, Shift, "state.extract.shift");
+        if (AccessBits != StorageBits)
+          Bits = B.CreateTrunc(Bits, Type::getIntNTy(Ctx, AccessBits),
+                               "state.extract");
         Value *Replacement = nullptr;
-        if (LITy == info.type) {
-          Replacement = Loaded;
+        if (LITy->isIntegerTy()) {
+          Replacement = Bits;
         } else if (LITy->isPointerTy()) {
-          Replacement = B.CreateIntToPtr(Loaded, LITy);
-        } else if (LITy->isIntegerTy()) {
-          Replacement = B.CreateTrunc(Loaded, LITy);
+          Replacement = B.CreateIntToPtr(Bits, LITy);
         } else {
-          // bitcast for floats or vectors
-          Value *IntVal = B.CreateTrunc(Loaded, Type::getIntNTy(Ctx, DL.getTypeStoreSize(LITy) * 8));
-          Replacement = B.CreateBitCast(IntVal, LITy);
+          Replacement = B.CreateBitCast(Bits, LITy);
         }
 
         LI->replaceAllUsesWith(Replacement);
@@ -202,6 +290,10 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
         IRBuilder<> B(SI);
         Value *StoredVal = SI->getValueOperand();
         Type *SITy = StoredVal->getType();
+        auto Resolved = ResolveStateOffset(SI->getPointerOperand(), DL, F,
+                                           StateGV);
+        if (!Resolved || Resolved->Offset < offset)
+          report_fatal_error("validated State store lost byte offset");
 
         Value *IntStoredVal = nullptr;
         if (SITy->isIntegerTy()) {
@@ -215,16 +307,26 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
 
         unsigned val_bits = DL.getTypeStoreSize(SITy) * 8;
         unsigned alloca_bits = info.max_access_size * 8;
+        uint64_t RelativeByte = DL.isLittleEndian()
+                                    ? Resolved->Offset - offset
+                                    : uint64_t(offset) + info.max_access_size -
+                                          (Resolved->Offset + val_bits / 8);
+        unsigned Shift = unsigned(RelativeByte * 8);
 
-        if (val_bits == alloca_bits) {
+        if (val_bits == alloca_bits && Shift == 0) {
           B.CreateStore(IntStoredVal, Alloca);
         } else {
-          // Sub-register write (masking)
           Value *Curr = B.CreateLoad(info.type, Alloca);
-          APInt MaskValue = ~APInt::getLowBitsSet(alloca_bits, val_bits);
+          APInt FieldMask = APInt::getBitsSet(alloca_bits, Shift,
+                                             Shift + val_bits);
+          APInt MaskValue = ~FieldMask;
           Value *Mask = ConstantInt::get(info.type, MaskValue);
           Value *Cleared = B.CreateAnd(Curr, Mask);
-          Value *ZextVal = B.CreateZExt(IntStoredVal, info.type);
+          Value *ZextVal = val_bits == alloca_bits
+                               ? IntStoredVal
+                               : B.CreateZExt(IntStoredVal, info.type);
+          if (Shift)
+            ZextVal = B.CreateShl(ZextVal, Shift);
           Value *NewVal = B.CreateOr(Cleared, ZextVal);
           B.CreateStore(NewVal, Alloca);
         }
@@ -262,7 +364,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
             AllocaInst *Alloca = field_allocas[offset];
             Value *Val = B.CreateLoad(info.type, Alloca);
             Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
-            B.CreateStore(Val, GEP);
+            B.CreateAlignedStore(Val, GEP, Align(1));
           }
         }
 
@@ -274,7 +376,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
             auto &info = pair.second;
             AllocaInst *Alloca = field_allocas[offset];
             Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
-            Value *Val = B.CreateLoad(info.type, GEP);
+            Value *Val = B.CreateAlignedLoad(info.type, GEP, Align(1));
             B.CreateStore(Val, Alloca);
           }
         }
@@ -292,7 +394,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
           AllocaInst *Alloca = field_allocas[offset];
           Value *Val = B.CreateLoad(info.type, Alloca);
           Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
-          B.CreateStore(Val, GEP);
+          B.CreateAlignedStore(Val, GEP, Align(1));
         }
       }
     }

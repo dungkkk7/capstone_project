@@ -7,7 +7,7 @@ namespace brighten_native_cleanup {
 using namespace llvm;
 
 PreservedAnalyses NativeCleanupPass::run(Module &M, ModuleAnalysisManager &) {
-  bool Changed = cleanupModule(M, EnforceStrict);
+  bool Changed = cleanupModule(M, EnforceStrict, PostSouper);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
@@ -30,6 +30,11 @@ llvmGetPassPluginInfo() {
                   if (Name == "brighten-native-cleanup-final-pass") {
                     MPM.addPass(
                         brighten_native_cleanup::NativeCleanupPass(true));
+                    return true;
+                  }
+                  if (Name == "brighten-native-cleanup-post-souper-pass") {
+                    MPM.addPass(brighten_native_cleanup::NativeCleanupPass(
+                        true, true));
                     return true;
                   }
                   return false;
