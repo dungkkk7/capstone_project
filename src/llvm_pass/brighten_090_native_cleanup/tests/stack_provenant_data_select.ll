@@ -21,3 +21,33 @@ entry:
   call void @observe(ptr %frame.slot)
   ret i32 %value
 }
+
+define i32 @local_frame_select() {
+entry:
+  %frame_storage = alloca [256 x i8], align 16
+  %local.frame.slot = getelementptr i8, ptr %frame_storage, i64 112
+  %local.frame.address = ptrtoint ptr %local.frame.slot to i64
+  %local.in.guest.range = icmp ult i64 %local.frame.address, 16
+  %local.guest.offset = and i64 %local.frame.address, 15
+  %local.guest.pointer = getelementptr i8, ptr @g_scalar_0, i64 %local.guest.offset
+  %native.data.pointer.select.local = select i1 %local.in.guest.range, ptr %local.guest.pointer, ptr %local.frame.slot
+  store i32 9, ptr %native.data.pointer.select.local, align 4
+  %value = load i32, ptr %local.frame.slot, align 4
+  ret i32 %value
+}
+
+; Cloned/recovered functions receive the native frame as an argument instead
+; of referring to the original backing object directly.  That provenance is
+; just as strong and must not be hidden behind the guest-data mapper.
+define i32 @argument_frame_select(ptr %frame_base, i64 %offset) {
+entry:
+  %argument.frame.slot = getelementptr i8, ptr %frame_base, i64 %offset
+  %argument.frame.address = ptrtoint ptr %argument.frame.slot to i64
+  %argument.in.guest.range = icmp ult i64 %argument.frame.address, 16
+  %argument.guest.offset = and i64 %argument.frame.address, 15
+  %argument.guest.pointer = getelementptr i8, ptr @g_scalar_0, i64 %argument.guest.offset
+  %native.data.pointer.select.argument = select i1 %argument.in.guest.range, ptr %argument.guest.pointer, ptr %argument.frame.slot
+  store i32 11, ptr %native.data.pointer.select.argument, align 4
+  %value = load i32, ptr %argument.frame.slot, align 4
+  ret i32 %value
+}

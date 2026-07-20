@@ -1031,6 +1031,13 @@ static bool containsNativeStackInteger(
     P = P->stripPointerCasts();
     if (auto *GV = dyn_cast<GlobalVariable>(P))
       return GV->getName().starts_with("frame_storage_backing.");
+    if (auto *AI = dyn_cast<AllocaInst>(P)) {
+      auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType());
+      StringRef Name = AI->getName();
+      return AT && AT->getElementType()->isIntegerTy(8) &&
+             (Name.starts_with("frame_storage") ||
+              Name.starts_with("native_stack_storage"));
+    }
     if (auto *GEP = dyn_cast<GEPOperator>(P))
       return Self(GEP->getPointerOperand(), Self);
     return false;
@@ -1238,6 +1245,47 @@ static Value *findInitialStateStackInteger(Function &F) {
   return nullptr;
 }
 
+// Entry stack seeds can be algebraic instructions placed after an earlier
+// inttoptr that cleanup is currently lowering.  Reusing that later SSA value
+// creates invalid dominance.  Materialize only its pure integer expression
+// cone at the current insertion point; memory reads, PHIs and side effects
+// remain hard barriers.
+static Value *materializeEntryIntegerAt(
+    Value *V, IRBuilder<> &B, Function &F,
+    DenseMap<Value *, Value *> &Mapped,
+    SmallVectorImpl<Instruction *> &Created, unsigned Depth = 0) {
+  if (!V || Depth > 24) return nullptr;
+  if (isa<Constant>(V) || isa<Argument>(V)) return V;
+  auto It = Mapped.find(V);
+  if (It != Mapped.end()) return It->second;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || I->getFunction() != &F || I->getParent() != &F.getEntryBlock())
+    return nullptr;
+  BasicBlock *InsertBlock = B.GetInsertBlock();
+  auto InsertPoint = B.GetInsertPoint();
+  if (InsertBlock != I->getParent() || InsertPoint == InsertBlock->end() ||
+      I->comesBefore(&*InsertPoint))
+    return V;
+  if (isa<PHINode>(I) || I->isTerminator() || I->mayReadOrWriteMemory() ||
+      I->mayHaveSideEffects() || !I->getType()->isIntegerTy())
+    return nullptr;
+  Instruction *Clone = I->clone();
+  for (unsigned O = 0; O != Clone->getNumOperands(); ++O) {
+    Value *Operand = materializeEntryIntegerAt(
+        Clone->getOperand(O), B, F, Mapped, Created, Depth + 1);
+    if (!Operand) {
+      Clone->deleteValue();
+      return nullptr;
+    }
+    Clone->setOperand(O, Operand);
+  }
+  Clone->setName(I->getName() + ".native.entry");
+  Clone->insertBefore(B.GetInsertPoint());
+  Created.push_back(Clone);
+  Mapped[V] = Clone;
+  return Clone;
+}
+
 static bool isNativeStackPointer(Value *V,
                                  SmallPtrSetImpl<Value *> &Seen) {
   if (!V || !Seen.insert(V).second)
@@ -1373,13 +1421,22 @@ static Value *lowerNativeStackInteger(IRBuilder<> &B, Value *Integer,
   // and loses the recovered frame provenance before entrypoint seeding.
   if (!findNativeStackArgument(F)) {
     if (Value *InitialStack = findInitialStateStackInteger(F)) {
+      DenseMap<Value *, Value *> Mapped;
+      SmallVector<Instruction *, 8> Created;
+      Value *AvailableInitial = materializeEntryIntegerAt(
+          InitialStack, B, F, Mapped, Created);
+      if (!AvailableInitial) {
+        for (Instruction *Clone : llvm::reverse(Created))
+          if (Clone->use_empty()) Clone->eraseFromParent();
+      } else {
       Value *FrameTop = getNativeStackFrameTop(B, F, NativeStack);
       if (!FrameTop)
         FrameTop = NativeStack;
-      Value *Delta = B.CreateSub(Address, InitialStack,
+      Value *Delta = B.CreateSub(Address, AvailableInitial,
                                  "native.stack.entry.delta");
       return B.CreateGEP(B.getInt8Ty(), FrameTop, Delta,
                          "native.stack.gep");
+      }
     }
   }
   // A frame_storage_backing global represents the full recovered guest stack,
@@ -2166,7 +2223,7 @@ static unsigned widenOverNarrowRecoveredScalars(Module &M, bool &Changed) {
 // A recovered object and the byte-preserving native segment must not become
 // two different host allocations for the same guest address range.  This is
 // especially important when a fixed access uses the recovered object while a
-// dynamic access uses the full segment (e.g. the p00009 scanf/primes case).
+// dynamic access uses the full segment.
 static unsigned rewriteRecoveredGlobalsToNativeSegments(Module &M,
                                                          bool &Changed) {
   SmallVector<std::pair<GlobalVariable *, GlobalVariable *>, 32> Replacements;
@@ -6003,9 +6060,20 @@ static bool normalizeNativeEntrypoint(Module &M, bool &Changed) {
     return false;
 
   LLVMContext &Ctx = M.getContext();
-  constexpr uint64_t NativeStackBytes = 16 * 1024 * 1024;
-  constexpr uint64_t NativeStackTop = NativeStackBytes - 64 * 1024;
-  auto *StorageTy = ArrayType::get(Type::getInt8Ty(Ctx), NativeStackBytes);
+  auto *StorageTy = dyn_cast<ArrayType>(Storage->getValueType());
+  if (!StorageTy || !StorageTy->getElementType()->isIntegerTy(8))
+    return false;
+  uint64_t NativeStackBytes = StorageTy->getNumElements();
+  uint64_t NativeStackTop = NativeStackBytes > 64 * 1024
+                                ? NativeStackBytes - 64 * 1024
+                                : NativeStackBytes;
+  if (MDNode *TopMD = Storage->getMetadata("brighten.stack.top")) {
+    if (TopMD->getNumOperands() == 1)
+      if (auto *CAM = dyn_cast<ConstantAsMetadata>(TopMD->getOperand(0)))
+        if (auto *Top = dyn_cast<ConstantInt>(CAM->getValue()))
+          if (Top->getZExtValue() <= NativeStackBytes)
+            NativeStackTop = Top->getZExtValue();
+  }
   GlobalVariable *CanonicalState = nullptr;
   for (GlobalVariable &GV : M.globals())
     if (GV.getName().contains("__mcsema_reg_state")) {
@@ -6974,15 +7042,8 @@ static unsigned collapseFrameProvenantDataPointerSelects(Module &M,
         for (Instruction &I : BB)
           if (auto *SI = dyn_cast<SelectInst>(&I);
               SI && SI->getType()->isPointerTy() && SI->hasName() &&
-              SI->getName().starts_with("native.data.pointer.select")) {
-            bool FeedsGeneratedSelect = llvm::any_of(SI->users(), [](User *U) {
-              auto *UserSelect = dyn_cast<SelectInst>(U);
-              return UserSelect && UserSelect->hasName() &&
-                     UserSelect->getName().starts_with(
-                         "native.data.pointer.select");
-            });
-            if (!FeedsGeneratedSelect) Candidates.push_back(SI);
-          }
+              SI->getName().starts_with("native.data.pointer.select"))
+            Candidates.push_back(SI);
 
   const DataLayout &DL = M.getDataLayout();
   unsigned Collapsed = 0;
@@ -7009,6 +7070,36 @@ static unsigned collapseFrameProvenantDataPointerSelects(Module &M,
         ExactFrameFallback = true;
         break;
       }
+    }
+    if (!ExactFrameFallback) {
+      auto PointsAtLocalFrame = [&](Value *P, auto &&Self) -> bool {
+        if (!P)
+          return false;
+        P = P->stripPointerCasts();
+        // NativeStateSSA carries the same private frame through an explicit
+        // pointer argument after cloning a lifted function.  At that point
+        // the fallback is a GEP rooted at `frame_base`, not at the wrapper's
+        // original alloca/global.  Retaining guest-data select arms around
+        // this proven frame pointer destroys stack-cell alias precision and
+        // hides memory-form CFF recurrences from the deobfuscator.
+        if (auto *Arg = dyn_cast<Argument>(P))
+          return Arg->getParent() == Outer->getFunction() &&
+                 Arg->getType()->isPointerTy() &&
+                 (Arg->getName() == "frame_base" ||
+                  Arg->getName() == "native_stack");
+        if (auto *AI = dyn_cast<AllocaInst>(P)) {
+          auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType());
+          StringRef Name = AI->getName();
+          return AI->getFunction() == Outer->getFunction() && AT &&
+                 AT->getElementType()->isIntegerTy(8) &&
+                 (Name.starts_with("frame_storage") ||
+                  Name.starts_with("native_stack_storage"));
+        }
+        if (auto *GEP = dyn_cast<GEPOperator>(P))
+          return Self(GEP->getPointerOperand(), Self);
+        return false;
+      };
+      ExactFrameFallback = PointsAtLocalFrame(Fallback, PointsAtLocalFrame);
     }
     if (!ExactFrameFallback) continue;
 
@@ -7831,10 +7922,9 @@ static uint64_t getRecoveredWorkArrayGuestBase(GlobalVariable &GV) {
 
 static unsigned guardRecoveredGlobalBounds(Module &M, bool &Changed) {
   const DataLayout &DL = M.getDataLayout();
-  // p00212's recovered work-array view is rooted at guest 0x4071b0 while the
-  // image-backed address space remains reachable down to the 0x400000 image
-  // base.  Keep that existing alias interval reachable; only offsets below
-  // it are treated as genuine native faults.
+  // This compatibility interval models the retained image-backed address
+  // range below a recovered work-array view.  Only offsets below the mapped
+  // interval are treated as genuine native faults.
   constexpr int64_t WorkArrayMappedLowerOffset = -0x71b0;
   SmallVector<Instruction *, 128> Accesses;
   struct DynamicGlobalAccess {
@@ -8741,15 +8831,6 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
 
   bool Changed = false;
   SmallVector<std::string, 32> Violations;
-  if (GlobalVariable *StackStorage = ensureNativeEntrypointStackStorage(M)) {
-    if (StackStorage->getName() == "frame_storage_backing.main" &&
-        StackStorage->getMetadata("brighten.stack.ensured") == nullptr) {
-      StackStorage->setMetadata("brighten.stack.ensured",
-                                MDNode::get(M.getContext(), {}));
-      Changed = true;
-      errs() << "  residual native stack backing ensured for entrypoint\n";
-    }
-  }
   // Recovered guest ranges are required by the later scanf/external-pointer
   // lowering.  Strip them only after every such use has been materialized.
   stripRemillMetadata(M, Changed, false);

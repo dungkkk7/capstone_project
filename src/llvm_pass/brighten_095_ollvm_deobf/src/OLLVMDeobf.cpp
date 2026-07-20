@@ -1,6 +1,8 @@
 #include "OLLVMDeobf.h"
 
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
@@ -22,6 +24,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/Transforms/Utils/SSAUpdater.h"
 #include <z3++.h>
 
 #include <algorithm>
@@ -191,15 +195,21 @@ static bool containsLiftMarker(StringRef S) {
          S.contains_insensitive("struct.State");
 }
 
-static bool valueContainsLiftMarker(const Value *V, unsigned Depth = 0) {
-  if (!V || Depth > 12) return false;
-  if (const auto *GV = dyn_cast<GlobalValue>(V))
-    return containsLiftMarker(GV->getName());
-  if (V->hasName() && containsLiftMarker(V->getName())) return true;
-  const auto *U = dyn_cast<User>(V);
-  if (!U) return false;
-  for (const Use &Op : U->operands())
-    if (valueContainsLiftMarker(Op.get(), Depth + 1)) return true;
+static bool valueContainsLiftMarker(
+    const Value *Root, SmallPtrSetImpl<const Value *> &Seen) {
+  SmallVector<const Value *, 32> Work;
+  if (Root) Work.push_back(Root);
+  while (!Work.empty()) {
+    const Value *V = Work.pop_back_val();
+    if (!Seen.insert(V).second) continue;
+    if (const auto *GV = dyn_cast<GlobalValue>(V);
+        GV && containsLiftMarker(GV->getName()))
+      return true;
+    if (V->hasName() && containsLiftMarker(V->getName())) return true;
+    if (const auto *U = dyn_cast<User>(V))
+      for (const Use &Op : U->operands())
+        Work.push_back(Op.get());
+  }
   return false;
 }
 
@@ -210,9 +220,13 @@ static bool isLiftedFunction(const Function &F) {
     if (A.hasName() && containsLiftMarker(A.getName()))
       return true;
   }
+  // Share visited state across the complete function.  The lifted SSA graph
+  // is highly reconvergent (thousands of selects can share the same cones),
+  // so independent depth-limited recursion is exponential on valid modules.
+  SmallPtrSet<const Value *, 32> Seen;
   for (const Instruction &I : instructions(F)) {
     for (const Use &U : I.operands())
-      if (valueContainsLiftMarker(U.get())) return true;
+      if (valueContainsLiftMarker(U.get(), Seen)) return true;
   }
   return false;
 }
@@ -794,8 +808,17 @@ public:
       auto F = translate(Sel->getFalseValue());
       if (C && T && F && C->is_bool()) Result = z3::ite(*C, *T, *F);
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
-      auto Op = translate(Cast->getOperand(0));
-      if (Op && Cast->getType()->isIntegerTy() &&
+      // Pointer provenance is outside the bit-vector theory used here.  A
+      // ptrtoint SSA value is nevertheless a stable shared leaf: model that
+      // exact value symbolically so affine identities around native frame
+      // addresses can be proved without inventing pointer arithmetic facts.
+      if (Cast->getOpcode() == Instruction::PtrToInt &&
+          Cast->getType()->isIntegerTy()) {
+        Result = makeLeaf(V);
+      }
+      auto Op = Result ? std::optional<z3::expr>()
+                       : translate(Cast->getOperand(0));
+      if (!Result && Op && Cast->getType()->isIntegerTy() &&
           Cast->getSrcTy()->isIntegerTy()) {
         unsigned DstW = Cast->getType()->getIntegerBitWidth();
         unsigned SrcW = Cast->getSrcTy()->getIntegerBitWidth();
@@ -1035,6 +1058,15 @@ proveBooleanCyclicInduction(Value *Condition) {
 }
 
 static bool sameFrameAddress(Value *A, Value *B);
+static bool sameFrameAddressAlongUniquePath(Value *A, Value *B,
+                                            BasicBlock *Source,
+                                            BasicBlock *Header);
+static bool frameAccessesProvablyDisjoint(Value *A, Type *ATy, Value *B,
+                                          Type *BTy,
+                                          const DataLayout &DL);
+static bool promoteExactPredecessorJoinStateLoad(
+    LoadInst &LI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs);
+static PHINode *findStateRoot(Value *V, unsigned Depth = 0);
 
 static Value *resolveMemorySSAValue(
     MemoryAccess *Access, LoadInst &LI, MemorySSA &MSSA,
@@ -1104,25 +1136,293 @@ buildMemorySSAReachingValues(Function &F, MemorySSA &MSSA, Metrics &M) {
   return Reaching;
 }
 
-static bool proveEquivalentSMT(Value *Old, Value *Replacement) {
-  if (!Old || !Replacement || Old->getType() != Replacement->getType())
+// A flattened state cell is sometimes funneled through several switch shards
+// before its sole loop load.  Requiring stores to be direct predecessors of
+// that load makes promotion depend on the CFG layout.  Instead, use MemorySSA
+// to prove that every clobber reaching the load is an exact, same-width store
+// to the same frame cell.  MemoryPhi cycles are accepted only as graph edges;
+// every concrete definition still has to pass the exact-store check.  A
+// LiveOnEntry arm is accepted only when promotion can seed the shadow state
+// on every external loop-entry edge before the first dispatcher iteration.
+static bool proveExactStateCellDefinitions(LoadInst &LI, MemorySSA &MSSA,
+                                           bool *HasLiveIn = nullptr,
+                                           std::string *Rejection = nullptr) {
+  if (LI.isAtomic() || LI.isVolatile() ||
+      !LI.getType()->isIntegerTy()) {
+    if (Rejection) *Rejection = "non_plain_integer_load";
     return false;
+  }
+  MemorySSAWalker *Walker = MSSA.getWalker();
+  MemoryAccess *Root = Walker->getClobberingMemoryAccess(&LI);
+  MemoryLocation Location = MemoryLocation::get(&LI);
+  SmallPtrSet<MemoryAccess *, 32> Seen;
+  bool SawStore = false;
+  bool SawLiveIn = false;
+  std::function<bool(MemoryAccess *)> Visit = [&](MemoryAccess *Access) {
+    if (!Access) {
+      if (Rejection) *Rejection = "missing_memoryssa_access";
+      return false;
+    }
+    if (MSSA.isLiveOnEntryDef(Access)) {
+      SawLiveIn = true;
+      return true;
+    }
+    if (!Seen.insert(Access).second) return true;
+    if (Seen.size() > 2048) return false;
+    if (auto *Def = dyn_cast<MemoryDef>(Access)) {
+      auto *Store = dyn_cast_or_null<StoreInst>(Def->getMemoryInst());
+      if (!Store || Store->isAtomic() || Store->isVolatile()) {
+        if (Rejection) {
+          if (!Store) *Rejection = "reaching_definition_is_not_store";
+          else *Rejection = "atomic_or_volatile_reaching_store";
+        }
+        return false;
+      }
+      bool SameAddress = sameFrameAddress(Store->getPointerOperand(),
+                                          LI.getPointerOperand());
+      bool EntryEquivalent =
+          !SameAddress && sameFrameAddressAlongUniquePath(
+                              Store->getPointerOperand(),
+                              LI.getPointerOperand(), Store->getParent(),
+                              LI.getParent());
+      if (!SameAddress && !EntryEquivalent) {
+        if (!frameAccessesProvablyDisjoint(
+                Store->getPointerOperand(), Store->getValueOperand()->getType(),
+                LI.getPointerOperand(), LI.getType(),
+                LI.getModule()->getDataLayout())) {
+          if (Rejection)
+            *Rejection = "reaching_store_address_mismatch:store=" +
+                         valueName(*Store->getPointerOperand()) +
+                         ";load=" + valueName(*LI.getPointerOperand());
+          return false;
+        }
+        MemoryAccess *Prior = Walker->getClobberingMemoryAccess(
+            Def->getDefiningAccess(), Location);
+        return Visit(Prior);
+      }
+      if (Store->getValueOperand()->getType() != LI.getType()) {
+        if (Rejection) *Rejection = "reaching_store_width_mismatch";
+        return false;
+      }
+      SawStore = true;
+      SawLiveIn |= EntryEquivalent;
+      return true;
+    }
+    auto *Phi = dyn_cast<MemoryPhi>(Access);
+    if (!Phi || Phi->getNumIncomingValues() == 0) {
+      if (Rejection) *Rejection = "unsupported_memoryssa_node";
+      return false;
+    }
+    for (Use &IncomingUse : Phi->incoming_values()) {
+      auto *Incoming = cast<MemoryAccess>(IncomingUse.get());
+      if (!Visit(Walker->getClobberingMemoryAccess(Incoming, Location)))
+        return false;
+    }
+    return true;
+  };
+  bool Exact = Visit(Root) && SawStore;
+  if (!Exact && Rejection && Rejection->empty())
+    *Rejection = SawLiveIn ? "live_in_without_visible_exact_store"
+                           : "no_exact_reaching_store";
+  if (HasLiveIn) *HasLiveIn = Exact && SawLiveIn;
+  return Exact;
+}
+
+// Clone only the pure address-expression cone needed to evaluate a dispatcher
+// cell on an incoming edge.  Header PHIs are substituted with that edge's
+// incoming values.  This provides the dynamic live-in seed without hoisting a
+// potentially trapping load onto paths that never enter the dispatcher.
+static Value *materializeAddressOnEntryEdge(
+    Value *V, BasicBlock *Header, BasicBlock *Pred, Instruction *Before,
+    DominatorTree &DT, DenseMap<Value *, Value *> &Mapped,
+    unsigned Depth = 0) {
+  if (!V || Depth > 32) return nullptr;
+  auto It = Mapped.find(V);
+  if (It != Mapped.end()) return It->second;
+  if (isa<Constant>(V) || isa<Argument>(V)) return V;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I) return nullptr;
+  if (I->getParent() != Header)
+    return DT.dominates(I, Before) ? V : nullptr;
+  if (auto *Phi = dyn_cast<PHINode>(I)) {
+    int Index = Phi->getBasicBlockIndex(Pred);
+    if (Index < 0) return nullptr;
+    Value *Incoming = Phi->getIncomingValue(Index);
+    Value *Result = materializeAddressOnEntryEdge(
+        Incoming, Header, Pred, Before, DT, Mapped, Depth + 1);
+    if (Result) Mapped[V] = Result;
+    return Result;
+  }
+  if (I->isTerminator() || I->mayReadOrWriteMemory() || I->mayHaveSideEffects())
+    return nullptr;
+  Instruction *Copy = I->clone();
+  for (unsigned O = 0; O != Copy->getNumOperands(); ++O) {
+    Value *Operand = materializeAddressOnEntryEdge(
+        Copy->getOperand(O), Header, Pred, Before, DT, Mapped, Depth + 1);
+    if (!Operand) {
+      Copy->deleteValue();
+      return nullptr;
+    }
+    Copy->setOperand(O, Operand);
+  }
+  Copy->setName(I->getName() + ".deobf.entry");
+  Copy->insertBefore(Before->getIterator());
+  Mapped[V] = Copy;
+  return Copy;
+}
+
+// Mirror exact stores into a private alloca and let LLVM's standard mem2reg
+// construct the complete cyclic SSA recurrence.  Original frame stores stay
+// in place, so this transformation changes only the proved dispatcher load
+// and cannot hide memory from other consumers.
+static bool promoteExactStateCellLoad(
+    LoadInst &LI, bool HasLiveIn, Metrics &M,
+    SmallVectorImpl<ProofRecord> &Proofs) {
+  Function &F = *LI.getFunction();
+  SmallVector<StoreInst *, 256> Stores;
+  for (Instruction &I : instructions(F)) {
+    auto *Store = dyn_cast<StoreInst>(&I);
+    if (!Store || Store->isAtomic() || Store->isVolatile() ||
+        Store->getValueOperand()->getType() != LI.getType() ||
+        (!sameFrameAddress(Store->getPointerOperand(),
+                           LI.getPointerOperand()) &&
+         !sameFrameAddressAlongUniquePath(
+             Store->getPointerOperand(), LI.getPointerOperand(),
+             Store->getParent(), LI.getParent())))
+      continue;
+    Stores.push_back(Store);
+  }
+  if (Stores.empty()) return false;
+
+  DominatorTree DT(F);
+  LoopInfo Loops(DT);
+  Loop *DispatcherLoop = Loops.getLoopFor(LI.getParent());
+  if (!DispatcherLoop || DispatcherLoop->getHeader() != LI.getParent())
+    return false;
+
+  SmallVector<BasicBlock *, 4> EntryPreds;
+  for (BasicBlock *Pred : predecessors(LI.getParent()))
+    if (!DispatcherLoop->contains(Pred)) {
+      auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
+      if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != LI.getParent())
+        return false;
+      EntryPreds.push_back(Pred);
+    }
+  if (EntryPreds.empty() || (!HasLiveIn && EntryPreds.size() > 1)) return false;
+
+  IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *Shadow = EntryBuilder.CreateAlloca(
+      LI.getType(), nullptr, "deobf.dispatch.state.cell");
+
+  if (HasLiveIn) {
+    for (BasicBlock *Pred : EntryPreds) {
+      Instruction *Before = Pred->getTerminator();
+      DenseMap<Value *, Value *> Mapped;
+      Value *EntryPointer = materializeAddressOnEntryEdge(
+          LI.getPointerOperand(), LI.getParent(), Pred, Before, DT, Mapped);
+      if (!EntryPointer) {
+        Shadow->eraseFromParent();
+        for (auto &[Original, Clone] : Mapped)
+          if (auto *CloneI = dyn_cast<Instruction>(Clone);
+              CloneI && CloneI != Original && CloneI->use_empty())
+            RecursivelyDeleteTriviallyDeadInstructions(CloneI);
+        return false;
+      }
+      IRBuilder<> B(Before);
+      LoadInst *Seed = B.CreateLoad(LI.getType(), EntryPointer,
+                                    "deobf.dispatch.state.livein");
+      Seed->setAlignment(LI.getAlign());
+      B.CreateStore(Seed, Shadow);
+    }
+  }
+  for (StoreInst *Store : Stores) {
+    IRBuilder<> B(Store->getParent());
+    B.SetInsertPoint(Store->getParent(), std::next(Store->getIterator()));
+    B.CreateStore(Store->getValueOperand(), Shadow);
+  }
+  std::string Origin = valueName(LI);
+  LI.setOperand(0, Shadow);
+  DT.recalculate(F);
+  SmallVector<AllocaInst *, 1> Allocas{Shadow};
+  PromoteMemToReg(Allocas, DT);
+  ++M.MemorySSAPhisResolved;
+  ProofRecord Record{F.getName().str(), "cff_state_promotion", Origin,
+                     "memoryssa_exact_cell_mem2reg", "proved"};
+  Record.Dependencies.push_back("all_reaching_defs_exact_same_cell_stores");
+  Record.Dependencies.push_back(HasLiveIn
+                                    ? "dynamic_live_in_seeded_on_all_loop_entries"
+                                    : "no_live_on_entry_or_unknown_clobber");
+  Record.Dependencies.push_back("original_memory_stores_preserved");
+  Proofs.push_back(std::move(Record));
+  return true;
+}
+
+static bool eliminatePredecessorEquivalentPHIs(Function &F) {
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    SmallVector<PHINode *, 16> Phis;
+    for (PHINode &Phi : BB.phis()) Phis.push_back(&Phi);
+    for (unsigned I = 0; I != Phis.size(); ++I) {
+      PHINode *Representative = Phis[I];
+      if (!Representative) continue;
+      for (unsigned J = I + 1; J != Phis.size(); ++J) {
+        PHINode *Candidate = Phis[J];
+        if (!Candidate || Candidate->getType() != Representative->getType() ||
+            Candidate->getNumIncomingValues() !=
+                Representative->getNumIncomingValues())
+          continue;
+        bool Equal = true;
+        for (unsigned K = 0; K != Representative->getNumIncomingValues(); ++K) {
+          BasicBlock *Pred = Representative->getIncomingBlock(K);
+          int CandidateIndex = Candidate->getBasicBlockIndex(Pred);
+          if (CandidateIndex < 0 ||
+              Candidate->getIncomingValue(CandidateIndex) !=
+                  Representative->getIncomingValue(K)) {
+            Equal = false;
+            break;
+          }
+        }
+        if (!Equal) continue;
+        Candidate->replaceAllUsesWith(Representative);
+        Candidate->eraseFromParent();
+        Phis[J] = nullptr;
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
+enum class SMTEquivalenceResult { Proved, Disproved, Unknown };
+
+static SMTEquivalenceResult checkEquivalentSMT(Value *Old,
+                                                Value *Replacement) {
+  if (!Old || !Replacement || Old->getType() != Replacement->getType())
+    return SMTEquivalenceResult::Disproved;
   try {
     z3::context Ctx;
     Z3BVTranslator Translator(Ctx);
     auto L = Translator.translate(Old);
     auto R = Translator.translate(Replacement);
     if (!L || !R || L->is_bool() != R->is_bool() || L->is_bv() != R->is_bv())
-      return false;
+      return SMTEquivalenceResult::Unknown;
     z3::params Params(Ctx);
     Params.set("timeout", 500u);
     z3::solver Solver(Ctx);
     Solver.set(Params);
     Solver.add(*L != *R);
-    return Solver.check() == z3::unsat;
+    z3::check_result Result = Solver.check();
+    if (Result == z3::unsat) return SMTEquivalenceResult::Proved;
+    if (Result == z3::sat) return SMTEquivalenceResult::Disproved;
+    return SMTEquivalenceResult::Unknown;
   } catch (const z3::exception &) {
-    return false;
+    return SMTEquivalenceResult::Unknown;
   }
+}
+
+static bool proveEquivalentSMT(Value *Old, Value *Replacement) {
+  return checkEquivalentSMT(Old, Replacement) ==
+         SMTEquivalenceResult::Proved;
 }
 
 static bool proveTupleEquivalentSMT(ArrayRef<Value *> OldRoots,
@@ -1473,6 +1773,10 @@ static bool feedsSyntheticNativePointerSelect(Value *V, unsigned Depth = 0) {
   for (User *U : V->users()) {
     auto *I = dyn_cast<Instruction>(U);
     if (!I) continue;
+    // Integer expressions used as GEP indices belong to recovered native
+    // address formation.  This structural provenance is independent of case
+    // names, concrete addresses, or generated SSA names.
+    if (isa<GetElementPtrInst>(I)) return true;
     if (auto *SI = dyn_cast<SelectInst>(I);
         SI && SI->hasName() &&
         SI->getName().starts_with("native.data.pointer.select"))
@@ -1519,16 +1823,23 @@ static bool rewriteAffineBVRegions(Function &F, Metrics &M,
         RecursivelyDeleteTriviallyDeadInstructions(RI);
       continue;
     }
-    if (!proveEquivalentSMT(Root, Replacement)) {
+    SMTEquivalenceResult Equivalence =
+        checkEquivalentSMT(Root, Replacement);
+    if (Equivalence != SMTEquivalenceResult::Proved) {
       if (auto *RI = dyn_cast<Instruction>(Replacement); RI && RI->use_empty())
         RecursivelyDeleteTriviallyDeadInstructions(RI);
-      ProofRecord Record{F.getName().str(), "bv_egraph_candidate",
-                         valueName(*Root), "z3_bv_equivalence", "unresolved",
-                         "affine_extraction_equivalence_not_unsat"};
-      Record.OldHash = hashText(OldText);
-      Record.NewHash = hashText(NewText);
-      Record.ProofQueryHash = hashText(OldText + "\n!=\n" + NewText);
-      Proofs.push_back(std::move(Record));
+      // SAT proves that the cheaper affine extraction is simply not an
+      // identity; it is a rejected speculative candidate, not unresolved
+      // obfuscation.  Only an unsupported/timeout query remains an obligation.
+      if (Equivalence == SMTEquivalenceResult::Unknown) {
+        ProofRecord Record{F.getName().str(), "bv_egraph_candidate",
+                           valueName(*Root), "z3_bv_equivalence", "unresolved",
+                           "affine_extraction_equivalence_unknown"};
+        Record.OldHash = hashText(OldText);
+        Record.NewHash = hashText(NewText);
+        Record.ProofQueryHash = hashText(OldText + "\n!=\n" + NewText);
+        Proofs.push_back(std::move(Record));
+      }
       continue;
     }
     std::string Origin = valueName(*Root);
@@ -3345,7 +3656,19 @@ static bool rewriteFunction(Function &F, MemorySSA &MSSA, Metrics &M,
           RecursivelyDeleteTriviallyDeadInstructions(RI);
         continue;
       }
-      if (!proveEquivalentSMT(BO, Replacement)) {
+      SimplifyQuery SQ(F.getParent()->getDataLayout());
+      bool LLVMProvedIdentity = simplifyInstruction(BO, SQ) == Replacement;
+      if (!LLVMProvedIdentity && !proveEquivalentSMT(BO, Replacement)) {
+        // Address reconstruction deliberately introduces integer affine
+        // expressions feeding GEP/native pointer-selection cones.  Z3's BV
+        // translator cannot model LLVM pointer constants in those candidates,
+        // so an unknown query is not evidence of residual OLLVM MBA.
+        if (feedsSyntheticNativePointerSelect(BO)) {
+          if (auto *RI = dyn_cast<Instruction>(Replacement);
+              RI->getParent() && RI->use_empty())
+            RecursivelyDeleteTriviallyDeadInstructions(RI);
+          continue;
+        }
         ProofRecord Record{F.getName().str(), "rewrite_candidate", Origin,
                            "z3_bv_equivalence", "unresolved",
                            "equivalence_query_not_unsat"};
@@ -3365,7 +3688,10 @@ static bool rewriteFunction(Function &F, MemorySSA &MSSA, Metrics &M,
       if (InstSub) ++M.InstSubRewrites;
       ProofRecord Record{F.getName().str(),
                          InstSub ? "instsub_rewrite" : "bv_canonicalize",
-                         Origin, "z3_bv_equivalence_unsat", "proved"};
+                         Origin,
+                         LLVMProvedIdentity ? "llvm_instruction_simplify"
+                                            : "z3_bv_equivalence_unsat",
+                         "proved"};
       Record.OldHash = hashText(OldText);
       Record.NewHash = hashText(NewText);
       Record.ProofQueryHash = QueryHash;
@@ -3388,6 +3714,50 @@ static bool rewriteFunction(Function &F, MemorySSA &MSSA, Metrics &M,
   DominatorTree DT(F);
   DenseMap<const LoadInst *, Value *> ReachingLoadValues =
       buildMemorySSAReachingValues(F, MSSA, M);
+  struct ProvenStateLoad {
+    WeakTrackingVH Handle;
+    bool HasLiveIn = false;
+  };
+  SmallVector<ProvenStateLoad, 8> ProvenStateLoads;
+  SmallVector<WeakTrackingVH, 8> PredecessorJoinStateLoads;
+  SmallPtrSet<LoadInst *, 8> SeenStateLoads;
+  DenseMap<PHINode *, unsigned> LargeSwitchesPerState;
+  SmallPtrSet<PHINode *, 8> SelfLoopDispatchStates;
+  for (BasicBlock &BB : F) {
+    auto *Switch = dyn_cast<SwitchInst>(BB.getTerminator());
+    if (!Switch || Switch->getNumCases() < 4) continue;
+    // Before generic O3/mem2reg, lifted CFF commonly dispatches directly on
+    // one frame-cell load.  Normalize that exact memory recurrence here,
+    // while the original loop has not yet been peeled or duplicated.  The
+    // proof requires every reaching definition to be an exact same-cell store
+    // and rejects live-on-entry or unknown clobbers.
+    if (auto *Load = dyn_cast<LoadInst>(Switch->getCondition());
+        Load && SeenStateLoads.insert(Load).second) {
+      bool HasLiveIn = false;
+      if (proveExactStateCellDefinitions(*Load, MSSA, &HasLiveIn))
+        ProvenStateLoads.push_back({WeakTrackingVH(Load), HasLiveIn});
+      if (Switch->getDefaultDest() == Switch->getParent())
+        PredecessorJoinStateLoads.push_back(WeakTrackingVH(Load));
+    }
+    PHINode *State = findStateRoot(Switch->getCondition());
+    if (State) {
+      ++LargeSwitchesPerState[State];
+      if (Switch->getDefaultDest() == Switch->getParent())
+        SelfLoopDispatchStates.insert(State);
+    }
+  }
+  for (const auto &[State, Count] : LargeSwitchesPerState) {
+    if (Count < 2 && !SelfLoopDispatchStates.contains(State)) continue;
+    for (Value *Incoming : State->incoming_values()) {
+      auto *Load = dyn_cast<LoadInst>(Incoming);
+      if (!Load || !SeenStateLoads.insert(Load).second) continue;
+      bool HasLiveIn = false;
+      if (proveExactStateCellDefinitions(*Load, MSSA, &HasLiveIn))
+        ProvenStateLoads.push_back({WeakTrackingVH(Load), HasLiveIn});
+      if (SelfLoopDispatchStates.contains(State))
+        PredecessorJoinStateLoads.push_back(WeakTrackingVH(Load));
+    }
+  }
   struct ProvenBranch {
     BranchInst *BI = nullptr;
     bool TakenTrue = false;
@@ -3541,10 +3911,24 @@ static bool rewriteFunction(Function &F, MemorySSA &MSSA, Metrics &M,
     Proofs.push_back(std::move(Record));
     Changed = true;
   }
+  bool PromotedStateCell = false;
+  for (ProvenStateLoad &Candidate : ProvenStateLoads)
+    if (auto *Load = dyn_cast_or_null<LoadInst>(Candidate.Handle))
+      PromotedStateCell |= promoteExactStateCellLoad(
+          *Load, Candidate.HasLiveIn, M, Proofs);
+  for (WeakTrackingVH &Candidate : PredecessorJoinStateLoads)
+    if (auto *Load = dyn_cast_or_null<LoadInst>(Candidate))
+      PromotedStateCell |=
+          promoteExactPredecessorJoinStateLoad(*Load, M, Proofs);
+  if (PromotedStateCell)
+    for (BasicBlock &BB : F)
+      EliminateDuplicatePHINodes(&BB);
+  Changed |= eliminatePredecessorEquivalentPHIs(F);
+  Changed |= PromotedStateCell;
   return Changed;
 }
 
-static PHINode *findStateRoot(Value *V, unsigned Depth = 0) {
+static PHINode *findStateRoot(Value *V, unsigned Depth) {
   if (Depth > 8) return nullptr;
   if (auto *PN = dyn_cast<PHINode>(V)) return PN;
   if (auto *II = dyn_cast<IntrinsicInst>(V)) {
@@ -3734,33 +4118,92 @@ struct ProvenTransition {
   Value *Condition = nullptr;
   BasicBlock *TrueTarget = nullptr;
   BasicBlock *FalseTarget = nullptr;
+  bool TrueViaDefault = false;
+  bool FalseViaDefault = false;
+  Value *FiniteState = nullptr;
+  SmallVector<APInt, 8> FiniteRawValues;
+  SmallVector<BasicBlock *, 8> FiniteTargets;
+  SmallVector<bool, 8> FiniteViaDefault;
 };
 
 struct IntAffine {
-  const GlobalValue *Base = nullptr;
-  int Coeff = 0;
+  // Keep every symbolic term instead of accepting only GlobalValue roots.
+  // Native cleanup spells stack addresses as
+  //   frame_base + (dynamic_rsp - ptrtoint(frame_base)) + constant
+  // so the pointer-base terms cancel and the surviving root is commonly an
+  // Argument or PHI.  The old single-GlobalValue representation rejected
+  // those exact addresses and made dispatcher recovery accidentally depend
+  // on a later O3/GVN run.
+  DenseMap<const Value *, int64_t> Terms;
   APInt Offset = APInt(64, 0);
   bool Valid = false;
 };
 
-static IntAffine parsePointerAffine(Value *V, unsigned Depth = 0);
+static IntAffine parsePointerAffine(Value *V, unsigned Depth = 0,
+                                    BasicBlock *Header = nullptr,
+                                    BasicBlock *Pred = nullptr,
+                                    const DenseMap<BasicBlock *, BasicBlock *>
+                                        *PathPreds = nullptr);
 
 static IntAffine combineAffine(const IntAffine &L, const IntAffine &R,
                                bool Subtract) {
-  if (!L.Valid || !R.Valid) return {};
-  if (L.Base && R.Base && L.Base != R.Base) return {};
-  IntAffine Out;
+  if (!L.Valid || !R.Valid) return IntAffine();
+  IntAffine Out = L;
   Out.Valid = true;
-  Out.Base = L.Base ? L.Base : R.Base;
-  int RCoeff = Subtract ? -R.Coeff : R.Coeff;
-  Out.Coeff = L.Coeff + RCoeff;
   Out.Offset = Subtract ? L.Offset - R.Offset : L.Offset + R.Offset;
-  if (Out.Coeff == 0) Out.Base = nullptr;
+  for (const auto &[Term, Coeff] : R.Terms) {
+    int64_t Delta = Subtract ? -Coeff : Coeff;
+    int64_t &Combined = Out.Terms[Term];
+    if ((Delta > 0 && Combined > std::numeric_limits<int64_t>::max() - Delta) ||
+        (Delta < 0 && Combined < std::numeric_limits<int64_t>::min() - Delta))
+      return IntAffine();
+    Combined += Delta;
+    if (Combined == 0) Out.Terms.erase(Term);
+  }
   return Out;
 }
 
-static IntAffine parseIntegerAffine(Value *V, unsigned Depth = 0) {
-  if (Depth > 24) return {};
+static bool sameAffineTerms(const IntAffine &L, const IntAffine &R) {
+  if (!L.Valid || !R.Valid || L.Terms.size() != R.Terms.size()) return false;
+  for (const auto &[Term, Coeff] : L.Terms) {
+    auto It = R.Terms.find(Term);
+    if (It == R.Terms.end() || It->second != Coeff) return false;
+  }
+  return true;
+}
+
+static const Value *unitAffineRoot(const IntAffine &A) {
+  if (!A.Valid || A.Terms.size() != 1) return nullptr;
+  const auto &Only = *A.Terms.begin();
+  return Only.second == 1 ? Only.first : nullptr;
+}
+
+static bool definitelyDistinctAffineObjects(const IntAffine &L,
+                                             const IntAffine &R) {
+  const Value *LB = unitAffineRoot(L), *RB = unitAffineRoot(R);
+  if (!LB || !RB || LB == RB) return false;
+  return (isa<GlobalValue>(LB) && isa<GlobalValue>(RB)) ||
+         (isa<AllocaInst>(LB) && isa<AllocaInst>(RB));
+}
+
+static IntAffine parseIntegerAffine(Value *V, unsigned Depth = 0,
+                                    BasicBlock *Header = nullptr,
+                                    BasicBlock *Pred = nullptr,
+                                    const DenseMap<BasicBlock *, BasicBlock *>
+                                        *PathPreds = nullptr) {
+  if (Depth > 24) return IntAffine();
+  if (auto *Phi = dyn_cast<PHINode>(V)) {
+    BasicBlock *IncomingPred = nullptr;
+    if (PathPreds) IncomingPred = PathPreds->lookup(Phi->getParent());
+    if (!IncomingPred && Header && Pred && Phi->getParent() == Header)
+      IncomingPred = Pred;
+    if (IncomingPred) {
+      int Index = Phi->getBasicBlockIndex(IncomingPred);
+      if (Index < 0) return IntAffine();
+      return parseIntegerAffine(Phi->getIncomingValue(Index), Depth + 1,
+                                Header, Pred, PathPreds);
+    }
+  }
   if (auto *CI = dyn_cast<ConstantInt>(V)) {
     IntAffine Out;
     Out.Valid = true;
@@ -3768,49 +4211,124 @@ static IntAffine parseIntegerAffine(Value *V, unsigned Depth = 0) {
     return Out;
   }
   auto *Op = dyn_cast<Operator>(V);
-  if (!Op) return {};
+  if (!Op) {
+    if (!V->getType()->isIntegerTy()) return IntAffine();
+    IntAffine Out;
+    Out.Valid = true;
+    Out.Terms[V] = 1;
+    return Out;
+  }
   if (Op->getOpcode() == Instruction::PtrToInt) {
-    IntAffine Out = parsePointerAffine(Op->getOperand(0), Depth + 1);
-    if (!Out.Valid) return {};
+    IntAffine Out = parsePointerAffine(Op->getOperand(0), Depth + 1,
+                                       Header, Pred, PathPreds);
+    if (!Out.Valid) return IntAffine();
     Out.Offset = Out.Offset.sextOrTrunc(64);
     return Out;
   }
   if (Op->getOpcode() != Instruction::Add &&
-      Op->getOpcode() != Instruction::Sub)
-    return {};
-  IntAffine L = parseIntegerAffine(Op->getOperand(0), Depth + 1);
-  IntAffine R = parseIntegerAffine(Op->getOperand(1), Depth + 1);
+      Op->getOpcode() != Instruction::Sub) {
+    if (!V->getType()->isIntegerTy()) return IntAffine();
+    IntAffine Out;
+    Out.Valid = true;
+    Out.Terms[V] = 1;
+    return Out;
+  }
+  IntAffine L = parseIntegerAffine(Op->getOperand(0), Depth + 1,
+                                   Header, Pred, PathPreds);
+  IntAffine R = parseIntegerAffine(Op->getOperand(1), Depth + 1,
+                                   Header, Pred, PathPreds);
   return combineAffine(L, R, Op->getOpcode() == Instruction::Sub);
 }
 
-static IntAffine parsePointerAffine(Value *V, unsigned Depth) {
-  if (Depth > 24) return {};
-  if (auto *GV = dyn_cast<GlobalValue>(V)) {
+static IntAffine parsePointerAffine(Value *V, unsigned Depth,
+                                    BasicBlock *Header, BasicBlock *Pred,
+                                    const DenseMap<BasicBlock *, BasicBlock *>
+                                        *PathPreds) {
+  if (Depth > 24) return IntAffine();
+  if (auto *Phi = dyn_cast<PHINode>(V)) {
+    BasicBlock *IncomingPred = nullptr;
+    if (PathPreds) IncomingPred = PathPreds->lookup(Phi->getParent());
+    if (!IncomingPred && Header && Pred && Phi->getParent() == Header)
+      IncomingPred = Pred;
+    if (IncomingPred) {
+      int Index = Phi->getBasicBlockIndex(IncomingPred);
+      if (Index < 0) return IntAffine();
+      return parsePointerAffine(Phi->getIncomingValue(Index), Depth + 1,
+                                Header, Pred, PathPreds);
+    }
+  }
+  V = V->stripPointerCasts();
+  if (isa<GlobalValue>(V) || isa<Argument>(V) || isa<AllocaInst>(V)) {
     IntAffine Out;
-    Out.Base = GV;
-    Out.Coeff = 1;
+    Out.Terms[V] = 1;
     Out.Valid = true;
     return Out;
   }
   if (auto *GEP = dyn_cast<GEPOperator>(V)) {
     if (!GEP->getSourceElementType()->isIntegerTy(8) ||
         GEP->getNumIndices() != 1)
-      return {};
-    IntAffine Base = parsePointerAffine(GEP->getPointerOperand(), Depth + 1);
-    IntAffine Index = parseIntegerAffine(*GEP->idx_begin(), Depth + 1);
+      return IntAffine();
+    IntAffine Base = parsePointerAffine(GEP->getPointerOperand(), Depth + 1,
+                                        Header, Pred, PathPreds);
+    IntAffine Index = parseIntegerAffine(*GEP->idx_begin(), Depth + 1,
+                                         Header, Pred, PathPreds);
     return combineAffine(Base, Index, false);
   }
   auto *Op = dyn_cast<Operator>(V);
   if (Op && Op->getOpcode() == Instruction::IntToPtr)
-    return parseIntegerAffine(Op->getOperand(0), Depth + 1);
-  return {};
+    return parseIntegerAffine(Op->getOperand(0), Depth + 1, Header, Pred,
+                              PathPreds);
+  return IntAffine();
 }
 
 static bool sameFrameAddress(Value *A, Value *B) {
   if (A == B) return true;
   IntAffine PA = parsePointerAffine(A), PB = parsePointerAffine(B);
-  return PA.Valid && PB.Valid && PA.Base && PA.Base == PB.Base &&
-         PA.Coeff == 1 && PB.Coeff == 1 && PA.Offset == PB.Offset;
+  return sameAffineTerms(PA, PB) && !PA.Terms.empty() &&
+         PA.Offset == PB.Offset;
+}
+
+static bool sameFrameAddressAlongUniquePath(Value *A, Value *B,
+                                            BasicBlock *Source,
+                                            BasicBlock *Header) {
+  if (!Source || !Header) return false;
+  DenseMap<BasicBlock *, BasicBlock *> PathPreds;
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  BasicBlock *Current = Source;
+  while (Current != Header && Seen.insert(Current).second && Seen.size() <= 64) {
+    auto *Br = dyn_cast<BranchInst>(Current->getTerminator());
+    if (!Br || !Br->isUnconditional()) return false;
+    BasicBlock *Next = Br->getSuccessor(0);
+    PathPreds[Next] = Current;
+    Current = Next;
+  }
+  if (Current != Header) return false;
+  IntAffine PA = parsePointerAffine(A, 0, nullptr, nullptr, &PathPreds);
+  IntAffine PB = parsePointerAffine(B, 0, nullptr, nullptr, &PathPreds);
+  return sameAffineTerms(PA, PB) && !PA.Terms.empty() &&
+         PA.Offset == PB.Offset;
+}
+
+static bool frameAccessesProvablyDisjoint(Value *A, Type *ATy, Value *B,
+                                          Type *BTy,
+                                          const DataLayout &DL) {
+  IntAffine PA = parsePointerAffine(A), PB = parsePointerAffine(B);
+  if (!PA.Valid || !PB.Valid || PA.Terms.empty() || PB.Terms.empty())
+    return false;
+  if (definitelyDistinctAffineObjects(PA, PB)) return true;
+  if (!sameAffineTerms(PA, PB)) return false;
+  TypeSize AS = DL.getTypeStoreSize(ATy), BS = DL.getTypeStoreSize(BTy);
+  if (AS.isScalable() || BS.isScalable()) return false;
+  uint64_t ABytes = AS.getFixedValue(), BBytes = BS.getFixedValue();
+  if (ABytes > uint64_t(std::numeric_limits<int64_t>::max()) ||
+      BBytes > uint64_t(std::numeric_limits<int64_t>::max()))
+    return false;
+  int64_t ABegin = PA.Offset.getSExtValue(), BBegin = PB.Offset.getSExtValue();
+  if (ABegin > std::numeric_limits<int64_t>::max() - int64_t(ABytes) ||
+      BBegin > std::numeric_limits<int64_t>::max() - int64_t(BBytes))
+    return false;
+  return ABegin + int64_t(ABytes) <= BBegin ||
+         BBegin + int64_t(BBytes) <= ABegin;
 }
 
 static std::optional<APInt> evalTransitionExpr(Value *V, Value *StatePointer,
@@ -3832,7 +4350,7 @@ static std::optional<APInt> evalTransitionExpr(Value *V, Value *StatePointer,
                                  : std::optional<APInt>(It->second);
   }
   if (auto *LI = dyn_cast<LoadInst>(V)) {
-    if (!LI->isAtomic() && !LI->isVolatile() &&
+    if (StatePointer && !LI->isAtomic() && !LI->isVolatile() &&
         sameFrameAddress(LI->getPointerOperand(), StatePointer))
       return EntryState;
     if (LI->isAtomic() || LI->isVolatile()) return std::nullopt;
@@ -3849,8 +4367,7 @@ static std::optional<APInt> evalTransitionExpr(Value *V, Value *StatePointer,
     const DataLayout &DL = LI->getModule()->getDataLayout();
     IntAffine LoadAddress = parsePointerAffine(LI->getPointerOperand());
     TypeSize LoadSize = DL.getTypeStoreSize(LI->getType());
-    if (!LoadAddress.Valid || !LoadAddress.Base || LoadAddress.Coeff != 1 ||
-        LoadSize.isScalable())
+    if (!unitAffineRoot(LoadAddress) || LoadSize.isScalable())
       return std::nullopt;
     for (auto It = LI->getIterator(); It != LI->getParent()->begin();) {
       --It;
@@ -3871,10 +4388,14 @@ static std::optional<APInt> evalTransitionExpr(Value *V, Value *StatePointer,
                                   EntryState, Depth + 1, Bindings);
       }
       IntAffine StoreAddress = parsePointerAffine(SI->getPointerOperand());
-      if (!StoreAddress.Valid || !StoreAddress.Base ||
-          StoreAddress.Coeff != 1 || StoreSize.isScalable())
+      if (!StoreAddress.Valid || StoreAddress.Terms.empty() ||
+          StoreSize.isScalable())
         return std::nullopt;
-      if (StoreAddress.Base != LoadAddress.Base) continue;
+      if (!sameAffineTerms(StoreAddress, LoadAddress)) {
+        if (definitelyDistinctAffineObjects(StoreAddress, LoadAddress))
+          continue;
+        return std::nullopt;
+      }
       uint64_t LoadBytes = LoadSize.getFixedValue();
       uint64_t StoreBytes = StoreSize.getFixedValue();
       if (LoadBytes > uint64_t(std::numeric_limits<int64_t>::max()) ||
@@ -3921,10 +4442,14 @@ static std::optional<APInt> evalTransitionExpr(Value *V, Value *StatePointer,
                                     EntryState, Depth + 1, Bindings);
         }
         IntAffine StoreAddress = parsePointerAffine(SI->getPointerOperand());
-        if (!StoreAddress.Valid || !StoreAddress.Base ||
-            StoreAddress.Coeff != 1 || StoreSize.isScalable())
+        if (!StoreAddress.Valid || StoreAddress.Terms.empty() ||
+            StoreSize.isScalable())
           return std::nullopt;
-        if (StoreAddress.Base != LoadAddress.Base) continue;
+        if (!sameAffineTerms(StoreAddress, LoadAddress)) {
+          if (definitelyDistinctAffineObjects(StoreAddress, LoadAddress))
+            continue;
+          return std::nullopt;
+        }
         uint64_t LoadBytes = LoadSize.getFixedValue();
         uint64_t StoreBytes = StoreSize.getFixedValue();
         if (LoadBytes > uint64_t(std::numeric_limits<int64_t>::max()) ||
@@ -4277,6 +4802,1373 @@ static void clonePlumbingStage(const PlumbingStage &Stage,
   }
 }
 
+static void cloneBlockPlumbing(ArrayRef<Instruction *> Body,
+                               Instruction *InsertBefore,
+                               DenseMap<const Value *, Value *> &Map);
+
+// Recover a dispatcher as one cyclic lookup region rather than assigning an
+// entry/latch role to each switch independently.  Native cleanup is free to
+// split one flattened lookup table into several default-linked switches and
+// to insert forwarding PHIs between them.  In that form there is no single
+// canonical "header": external seeds may enter any shard and all case tails
+// may return through a many-way PHI funnel into another shard.
+//
+// This engine proves the following transaction before changing the CFG:
+//   * default edges form a closed ring of switch shards, or a single lookup
+//     terminates unknown states in an exact non-returning self-loop;
+//   * every shard state is the exact forwarded state of the previous shard;
+//   * every external state input is either an entry edge or an exact PHI
+//     funnel; transitions have a finite proved state set, while a genuinely
+//     acyclic external entry may retain its exact dynamic discriminator;
+//   * lookup is resolved in ring order (so duplicate keys are not guessed);
+//   * every skipped PHI and instruction has an exact value on the cloned path.
+//
+// The commit clones the complete funnel/shard plumbing into private edge
+// blocks and translates target PHIs from the original switch owner.  Thus no
+// state store, semantic PHI, or side effect is silently discarded.
+static bool tryRecoverCyclicStateFamilyDispatcher(
+    SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs,
+    std::string *Rejection = nullptr) {
+  struct Diagnostic {
+    std::string *Output = nullptr;
+    std::string Stage = "initialization";
+    bool Success = false;
+    ~Diagnostic() {
+      if (!Success && Output && Output->empty()) *Output = Stage;
+    }
+  } Diag{Rejection};
+  Function *F = SI.getFunction();
+  if (!F) return false;
+
+  struct Shard {
+    BasicBlock *Block = nullptr;
+    SwitchInst *Lookup = nullptr;
+    Value *Expression = nullptr;
+    PHINode *State = nullptr;
+    BasicBlock *Default = nullptr;
+    bool Transparent = false;
+    DenseMap<APInt, BasicBlock *> Cases;
+  };
+  SmallVector<Shard, 8> Shards;
+  SmallPtrSet<BasicBlock *, 16> ShardBlocks;
+  Diag.Stage = "lookup-region-discovery";
+  BasicBlock *Current = SI.getParent();
+  unsigned SwitchCount = 0;
+  BasicBlock *TerminalUnknownSink = nullptr;
+  for (unsigned Depth = 0; Depth != 32; ++Depth) {
+    BasicBlock *BB = Current;
+    if (!ShardBlocks.insert(BB).second) return false;
+    Shards.emplace_back();
+    Shard &S = Shards.back();
+    S.Block = BB;
+    if (auto *Lookup = dyn_cast<SwitchInst>(BB->getTerminator())) {
+      ++SwitchCount;
+      S.Lookup = Lookup;
+      S.Expression = Lookup->getCondition();
+      S.Default = Lookup->getDefaultDest();
+    } else if (auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+               Br && Br->isUnconditional()) {
+      // Optimizers place PHI-only preheaders/backedges between lookup shards.
+      // Their exact state carrier is recovered from the successor PHI after
+      // the complete ring has been collected.
+      S.Transparent = true;
+      S.Default = Br->getSuccessor(0);
+    } else {
+      auto *GuardBr = dyn_cast<BranchInst>(BB->getTerminator());
+      auto *Cmp = GuardBr && GuardBr->isConditional()
+                      ? dyn_cast<ICmpInst>(GuardBr->getCondition())
+                      : nullptr;
+      if (!Cmp || !Cmp->isEquality()) return false;
+      ConstantInt *Key = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+      S.Expression = Cmp->getOperand(0);
+      if (!Key) {
+        Key = dyn_cast<ConstantInt>(Cmp->getOperand(0));
+        S.Expression = Cmp->getOperand(1);
+      }
+      if (!Key) return false;
+      S.State = findStateRoot(S.Expression);
+      if (!S.State) return false;
+      auto Raw = decodeStateExpr(S.Expression, S.State, Key->getValue());
+      if (!Raw) return false;
+      unsigned Match = Cmp->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1;
+      S.Cases[*Raw] = GuardBr->getSuccessor(Match);
+      S.Default = GuardBr->getSuccessor(1 - Match);
+    }
+    if (!S.Transparent) {
+      if (!S.State) S.State = findStateRoot(S.Expression);
+      if (!S.State || !S.State->getType()->isIntegerTy()) return false;
+    }
+    if (S.Default == SI.getParent()) break;
+    if (Shards.size() == 1) {
+      auto *TerminalBr = dyn_cast<BranchInst>(S.Default->getTerminator());
+      if (TerminalBr && TerminalBr->isUnconditional() &&
+          TerminalBr->getSuccessor(0) == S.Default) {
+        TerminalUnknownSink = S.Default;
+        break;
+      }
+    }
+    Current = S.Default;
+  }
+  if (SwitchCount == 0 ||
+      (Shards.back().Default != SI.getParent() && !TerminalUnknownSink))
+    return false;
+
+  // Resolve transparent nodes backwards.  The next shard's state PHI names
+  // the exact value carried by the transparent predecessor, which must itself
+  // be an integer PHI defined in that predecessor.  This is structural SSA
+  // identity, not a block-name or state-number heuristic.
+  Diag.Stage = "transparent-state-carrier-resolution";
+  for (unsigned Pass = 0; Pass != Shards.size(); ++Pass) {
+    bool Progress = false;
+    for (unsigned I = 0; I != Shards.size(); ++I) {
+      Shard &S = Shards[I];
+      if (!S.Transparent || S.State) continue;
+      Shard &To = Shards[(I + 1) % Shards.size()];
+      if (!To.State || To.State->getParent() != To.Block) continue;
+      int Incoming = To.State->getBasicBlockIndex(S.Block);
+      if (Incoming < 0) return false;
+      auto *Carrier = dyn_cast<PHINode>(To.State->getIncomingValue(Incoming));
+      if (!Carrier || Carrier->getParent() != S.Block ||
+          !Carrier->getType()->isIntegerTy())
+        return false;
+      S.State = Carrier;
+      S.Expression = Carrier;
+      Progress = true;
+    }
+    if (!Progress) break;
+  }
+  for (const Shard &S : Shards)
+    if (!S.State) return false;
+
+  Diag.Stage = "state-family-forwarding-proof";
+  // The state reaching the next shard must be exactly the previous raw state.
+  // The lookup expression itself may be affine/encoded and is decoded below.
+  for (unsigned I = 0; I != Shards.size(); ++I) {
+    Shard &From = Shards[I];
+    Shard &To = Shards[(I + 1) % Shards.size()];
+    if (To.State == From.State) {
+      // Sharing one SSA state across consecutive lookup shards is valid while
+      // the definition dominates both shards.  On the wrap edge into the
+      // state PHI's own block, however, the PHI may receive a different
+      // loop-carried transition value.  Treating that edge as transparent
+      // would recover only the entry and strand the real recurrence.
+      if (To.State->getParent() == To.Block) {
+        int Incoming = To.State->getBasicBlockIndex(From.Block);
+        if (Incoming < 0 ||
+            To.State->getIncomingValue(Incoming) != From.State)
+          return false;
+      }
+      continue;
+    }
+    if (To.State->getParent() != To.Block) return false;
+    int Incoming = To.State->getBasicBlockIndex(From.Block);
+    if (Incoming < 0 ||
+        To.State->getIncomingValue(Incoming) != From.State)
+      return false;
+  }
+
+  Diag.Stage = "ordered-case-table-decoding";
+  for (Shard &S : Shards) {
+    if (!S.Lookup) continue;
+    for (auto Case : S.Lookup->cases()) {
+      auto Raw = decodeStateExpr(S.Expression, S.State,
+                                 Case.getCaseValue()->getValue());
+      if (!Raw || Raw->getBitWidth() !=
+                      S.State->getType()->getIntegerBitWidth())
+        return false;
+      auto It = S.Cases.find(*Raw);
+      if (It != S.Cases.end() && It->second != Case.getCaseSuccessor())
+        return false;
+      S.Cases[*Raw] = Case.getCaseSuccessor();
+    }
+  }
+
+  struct Funnel {
+    BasicBlock *Block = nullptr;
+    PHINode *State = nullptr;
+    unsigned StartShard = 0;
+  };
+  SmallVector<Funnel, 4> Funnels;
+  DenseMap<BasicBlock *, unsigned> FunnelByBlock;
+  struct Origin {
+    BasicBlock *Source = nullptr;
+    BasicBlock *OldSuccessor = nullptr;
+    Value *RawState = nullptr;
+    unsigned StartShard = 0;
+    BasicBlock *FunnelBlock = nullptr;
+    bool IsEntry = false;
+    unsigned SuccessorIndex = 0;
+  };
+  SmallVector<Origin, 64> Origins;
+
+  auto AddOrigin = [&](BasicBlock *Source, BasicBlock *OldSuccessor,
+                       Value *RawState, unsigned StartShard,
+                       BasicBlock *FunnelBlock, bool IsEntry) {
+    if (!Source || !OldSuccessor || !RawState) return false;
+    Instruction *Terminator = Source->getTerminator();
+    unsigned SuccessorIndex = Terminator->getNumSuccessors();
+    unsigned MatchingEdges = 0;
+    for (unsigned I = 0; I != Terminator->getNumSuccessors(); ++I)
+      if (Terminator->getSuccessor(I) == OldSuccessor) {
+        SuccessorIndex = I;
+        ++MatchingEdges;
+      }
+    if (MatchingEdges != 1) return false;
+    if (llvm::any_of(Origins, [&](const Origin &Existing) {
+          return Existing.Source == Source &&
+                 Existing.SuccessorIndex == SuccessorIndex;
+        }))
+      return false;
+    Origins.push_back({Source, OldSuccessor, RawState, StartShard,
+                       FunnelBlock, IsEntry, SuccessorIndex});
+    return true;
+  };
+
+  Diag.Stage = "external-state-frontier-discovery";
+  // Find all inputs not belonging to the lookup ring.  A PHI defined in its
+  // predecessor is an explicit return funnel; every other value is an entry
+  // seed.  Shared state PHIs are inspected only at their defining shard.
+  DominatorTree FrontierDT(*F);
+  LoopInfo FrontierLoops(FrontierDT);
+  SmallPtrSet<PHINode *, 8> SeenStates;
+  for (unsigned I = 0; I != Shards.size(); ++I) {
+    PHINode *State = Shards[I].State;
+    if (!SeenStates.insert(State).second) continue;
+
+    // SROA/loop canonicalization may place the state PHI in a dedicated
+    // pre-dispatch block instead of the switch block itself.  That block is
+    // the funnel: its PHI enumerates the exact entry and backedge states, and
+    // its sole edge enters this lookup shard.  Treating its predecessors as
+    // direct shard predecessors loses the intervening CFG edge and rejects a
+    // valid memory-to-SSA recurrence.
+    if (State->getParent() != Shards[I].Block) {
+      BasicBlock *FunnelBlock = State->getParent();
+      auto *Br = dyn_cast<BranchInst>(FunnelBlock->getTerminator());
+      if (ShardBlocks.contains(FunnelBlock) || !Br ||
+          !Br->isUnconditional() ||
+          Br->getSuccessor(0) != Shards[I].Block)
+        return false;
+      unsigned FunnelIndex = Funnels.size();
+      if (auto Existing = FunnelByBlock.find(FunnelBlock);
+          Existing != FunnelByBlock.end()) {
+        FunnelIndex = Existing->second;
+        if (Funnels[FunnelIndex].State != State ||
+            Funnels[FunnelIndex].StartShard != I)
+          return false;
+      } else {
+        FunnelByBlock[FunnelBlock] = FunnelIndex;
+        Funnels.push_back({FunnelBlock, State, I});
+      }
+      continue;
+    }
+    for (unsigned J = 0; J != State->getNumIncomingValues(); ++J) {
+      BasicBlock *Pred = State->getIncomingBlock(J);
+      if (ShardBlocks.contains(Pred)) continue;
+      Value *Incoming = State->getIncomingValue(J);
+      auto *FunnelState = dyn_cast<PHINode>(Incoming);
+      if (FunnelState && FunnelState->getParent() == Pred) {
+        auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
+        if (!Br || !Br->isUnconditional() ||
+            Br->getSuccessor(0) != Shards[I].Block)
+          return false;
+        unsigned FunnelIndex = Funnels.size();
+        if (auto Existing = FunnelByBlock.find(Pred);
+            Existing != FunnelByBlock.end()) {
+          FunnelIndex = Existing->second;
+          if (Funnels[FunnelIndex].State != FunnelState ||
+              Funnels[FunnelIndex].StartShard != I)
+            return false;
+        } else {
+          FunnelByBlock[Pred] = FunnelIndex;
+          Funnels.push_back({Pred, FunnelState, I});
+        }
+        continue;
+      }
+      bool IsEntry = !FrontierDT.dominates(Shards[I].Block, Pred);
+      if (!AddOrigin(Pred, Shards[I].Block, Incoming, I,
+                     nullptr, IsEntry))
+        return false;
+    }
+  }
+  Diag.Stage = "funnel-predecessor-expansion";
+  for (unsigned FunnelCursor = 0; FunnelCursor != Funnels.size();
+       ++FunnelCursor) {
+    Funnel CurrentFunnel = Funnels[FunnelCursor];
+    for (BasicBlock *Pred : predecessors(CurrentFunnel.Block)) {
+      if (ShardBlocks.contains(Pred)) continue;
+      Diag.Stage = (Twine("funnel-predecessor-expansion:block=") +
+                    CurrentFunnel.Block->getName() + ";pred=" + Pred->getName())
+                       .str();
+      int Index = CurrentFunnel.State->getBasicBlockIndex(Pred);
+      if (Index < 0) return false;
+      Value *Incoming = CurrentFunnel.State->getIncomingValue(Index);
+      if (auto *NestedState = dyn_cast<PHINode>(Incoming);
+          NestedState && NestedState->getParent() == Pred) {
+        auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
+        if (!Br || !Br->isUnconditional() ||
+            Br->getSuccessor(0) != CurrentFunnel.Block)
+          return false;
+        if (auto Existing = FunnelByBlock.find(Pred);
+            Existing != FunnelByBlock.end()) {
+          const Funnel &Known = Funnels[Existing->second];
+          if (Known.State != NestedState ||
+              Known.StartShard != CurrentFunnel.StartShard)
+            return false;
+        } else {
+          FunnelByBlock[Pred] = Funnels.size();
+          Funnels.push_back({Pred, NestedState, CurrentFunnel.StartShard});
+        }
+        continue;
+      }
+      bool IsEntry =
+          !FrontierDT.dominates(Shards[CurrentFunnel.StartShard].Block, Pred);
+      if (!AddOrigin(Pred, CurrentFunnel.Block, Incoming,
+                     CurrentFunnel.StartShard, CurrentFunnel.Block, IsEntry))
+        return false;
+    }
+  }
+  if (Origins.empty()) return false;
+
+  struct PathStep {
+    BasicBlock *Block = nullptr;
+    BasicBlock *IncomingBlock = nullptr;
+  };
+  struct ResolvedPath {
+    SmallVector<PathStep, 24> Steps;
+    BasicBlock *Target = nullptr;
+    BasicBlock *Owner = nullptr;
+  };
+  auto FindFunnel = [&](BasicBlock *BB) -> const Funnel * {
+    auto It = FunnelByBlock.find(BB);
+    return It == FunnelByBlock.end() ? nullptr : &Funnels[It->second];
+  };
+
+  std::function<std::optional<ResolvedPath>(const APInt &, unsigned,
+                                             BasicBlock *, BasicBlock *,
+                                             unsigned)> Resolve;
+  Resolve = [&](const APInt &Raw, unsigned StartShard,
+                BasicBlock *PrefixBlock, BasicBlock *PrefixIncoming,
+                unsigned Depth) -> std::optional<ResolvedPath> {
+    if (Depth > 12) return std::nullopt;
+    ResolvedPath Result;
+    unsigned Index = StartShard;
+    BasicBlock *Incoming = PrefixIncoming;
+    BasicBlock *Prefix = PrefixBlock;
+    SmallPtrSet<BasicBlock *, 8> SeenPrefix;
+    while (Prefix) {
+      if (!SeenPrefix.insert(Prefix).second) return std::nullopt;
+      Result.Steps.push_back({Prefix, Incoming});
+      auto *Br = dyn_cast<BranchInst>(Prefix->getTerminator());
+      if (!Br || !Br->isUnconditional()) return std::nullopt;
+      BasicBlock *Next = Br->getSuccessor(0);
+      Incoming = Prefix;
+      if (Next == Shards[StartShard].Block) break;
+      if (!FunnelByBlock.count(Next)) return std::nullopt;
+      Prefix = Next;
+    }
+    for (unsigned Visited = 0; Visited != Shards.size(); ++Visited) {
+      Shard &S = Shards[Index];
+      Result.Steps.push_back({S.Block, Incoming});
+      auto It = S.Cases.find(Raw);
+      if (It != S.Cases.end()) {
+        BasicBlock *Target = It->second;
+        if (const Funnel *NextFunnel = FindFunnel(Target)) {
+          int PhiIndex = NextFunnel->State->getBasicBlockIndex(
+              S.Block);
+          if (PhiIndex < 0) return std::nullopt;
+          ConstantInt *Next = asTransitionConstant(
+              NextFunnel->State->getIncomingValue(PhiIndex),
+              S.Block);
+          if (!Next) return std::nullopt;
+          auto Tail = Resolve(Next->getValue(), NextFunnel->StartShard,
+                              NextFunnel->Block, S.Block,
+                              Depth + 1);
+          if (!Tail) return std::nullopt;
+          Result.Steps.append(Tail->Steps.begin(), Tail->Steps.end());
+          Result.Target = Tail->Target;
+          Result.Owner = Tail->Owner;
+          return Result;
+        }
+        if (ShardBlocks.contains(Target)) return std::nullopt;
+        Result.Target = Target;
+        Result.Owner = S.Block;
+        return Result;
+      }
+      Incoming = S.Block;
+      Index = (Index + 1) % Shards.size();
+    }
+    return std::nullopt;
+  };
+
+  struct Variant {
+    APInt Raw;
+    ResolvedPath Path;
+  };
+  struct OriginPlan {
+    Origin *Input = nullptr;
+    Value *Condition = nullptr;
+    Value *FiniteState = nullptr;
+    bool DynamicEntry = false;
+    SmallVector<Variant, 2> Variants;
+  };
+  Diag.Stage = "finite-transition-preflight";
+  SmallVector<OriginPlan, 64> Plans;
+  for (Origin &O : Origins) {
+    OriginPlan Plan;
+    Plan.Input = &O;
+    SmallVector<APInt, 2> RawValues;
+    if (auto *C = asTransitionConstant(O.RawState, O.Source)) {
+      RawValues.push_back(C->getValue());
+    } else if (auto *Select = dyn_cast<SelectInst>(O.RawState)) {
+      auto *True = asTransitionConstant(Select->getTrueValue(), O.Source);
+      auto *False = asTransitionConstant(Select->getFalseValue(), O.Source);
+      if (!True || !False) {
+        Diag.Stage = (Twine("finite-select-nonconstant:source=") +
+                      O.Source->getName())
+                         .str();
+        return false;
+      }
+      Plan.Condition = Select->getCondition();
+      RawValues.push_back(True->getValue());
+      RawValues.push_back(False->getValue());
+    } else {
+      if (!O.RawState->getType()->isIntegerTy()) return false;
+      Plan.FiniteState = O.RawState;
+      DenseMap<const Value *, APInt> Bindings;
+      unsigned Budget = 512;
+      APInt Dummy(O.RawState->getType()->getIntegerBitWidth(), 0);
+      if (!enumerateTransitionValues(O.RawState, nullptr, Dummy, Bindings,
+                                     RawValues, Budget) ||
+          RawValues.empty()) {
+        // An unconstrained entry state is still recoverable exactly.  Every
+        // state named by the lookup ring is routed directly to its resolved
+        // case, while every other value retains the original infinite lookup
+        // cycle.  Dynamic transition states are not accepted here: only an
+        // external entry can use this exact-switch fallback.  In particular,
+        // never retain a value defined by the lookup/funnel region itself:
+        // deleting that region can remove its dominance over the rewritten
+        // entry even when the old incoming edge was valid SSA.
+        auto *StateDef = dyn_cast<Instruction>(O.RawState);
+        if (!O.IsEntry || FrontierLoops.getLoopFor(O.Source)) {
+          Diag.Stage = (Twine("finite-transition-unbounded:source=") +
+                        O.Source->getName())
+                           .str();
+          return false;
+        }
+        if (StateDef &&
+            (ShardBlocks.contains(StateDef->getParent()) ||
+             FunnelByBlock.count(StateDef->getParent()))) {
+          Diag.Stage =
+              (Twine("dynamic-entry-region-defined:source=") +
+               O.Source->getName() + ";def=" + StateDef->getName())
+                  .str();
+          return false;
+        }
+        Plan.DynamicEntry = true;
+        RawValues.clear();
+        for (const Shard &S : Shards)
+          for (const auto &[Raw, Target] : S.Cases)
+            if (!llvm::is_contained(RawValues, Raw)) RawValues.push_back(Raw);
+        if (RawValues.empty()) return false;
+      }
+    }
+    // A retained finite-state discriminator must survive removal of the
+    // lookup region.  A region-local PHI can dominate the old incoming edge
+    // yet stop dominating the source after direct case edges are installed.
+    // Reject that shape transactionally; a specialized complete-transition
+    // engine may still recover it without retaining the obsolete SSA value.
+    if (Plan.FiniteState)
+      if (auto *StateDef = dyn_cast<Instruction>(Plan.FiniteState);
+          StateDef &&
+          (ShardBlocks.contains(StateDef->getParent()) ||
+           FunnelByBlock.count(StateDef->getParent()))) {
+        Diag.Stage =
+            (Twine("finite-state-region-defined:source=") +
+             O.Source->getName() + ";def=" + StateDef->getName())
+                .str();
+        return false;
+      }
+    for (const APInt &Raw : RawValues) {
+      auto Path = Resolve(Raw, O.StartShard, O.FunnelBlock, O.Source, 0);
+      if (!Path || !Path->Target || !Path->Owner) {
+        Diag.Stage = (Twine("finite-transition-unresolved:source=") +
+                      O.Source->getName() + ";state=" +
+                      Twine(Raw.getLimitedValue()))
+                         .str();
+        return false;
+      }
+      // Preflight exact PHI translation for every skipped block and target.
+      for (const PathStep &Step : Path->Steps)
+        for (PHINode &Phi : Step.Block->phis())
+          if (Phi.getBasicBlockIndex(Step.IncomingBlock) < 0) {
+            Diag.Stage = (Twine("finite-step-phi-uncovered:block=") +
+                          Step.Block->getName() + ";incoming=" +
+                          Step.IncomingBlock->getName())
+                             .str();
+            return false;
+          }
+      for (PHINode &Phi : Path->Target->phis())
+        if (Phi.getBasicBlockIndex(Path->Owner) < 0) {
+          Diag.Stage = (Twine("finite-target-phi-uncovered:target=") +
+                        Path->Target->getName() + ";owner=" +
+                        Path->Owner->getName())
+                           .str();
+          return false;
+        }
+      Plan.Variants.push_back({Raw, std::move(*Path)});
+    }
+    if (Plan.Variants.empty()) return false;
+    Plans.push_back(std::move(Plan));
+  }
+
+  SmallPtrSet<BasicBlock *, 32> FinalTargets;
+  for (const OriginPlan &Plan : Plans)
+    for (const Variant &V : Plan.Variants) FinalTargets.insert(V.Path.Target);
+  SmallPtrSet<BasicBlock *, 16> RegionBlocks(ShardBlocks.begin(),
+                                             ShardBlocks.end());
+  for (const Funnel &Funnel : Funnels) RegionBlocks.insert(Funnel.Block);
+  SmallPtrSet<BasicBlock *, 32> PotentialCaseTargets(FinalTargets.begin(),
+                                                      FinalTargets.end());
+  for (const Shard &S : Shards)
+    for (const auto &[Raw, Target] : S.Cases)
+      if (!RegionBlocks.contains(Target)) PotentialCaseTargets.insert(Target);
+  DenseMap<BasicBlock *, SmallVector<Instruction *, 4>>
+      RequiredSourceLiveIns;
+  DenseMap<BasicBlock *, DenseMap<Instruction *, BasicBlock *>>
+      SourceCarrierOwners;
+  auto ReachesWithoutRegion = [&](BasicBlock *Start,
+                                  BasicBlock *Goal) -> bool {
+    SmallVector<BasicBlock *, 32> Work{Start};
+    SmallPtrSet<BasicBlock *, 32> Seen;
+    while (!Work.empty() && Seen.size() <= 512) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (!Seen.insert(BB).second) continue;
+      if (BB == Goal) return true;
+      for (BasicBlock *Succ : successors(BB))
+        if (!RegionBlocks.contains(Succ)) Work.push_back(Succ);
+    }
+    return false;
+  };
+
+  // Cloning a path is only exact when every region-local operand has already
+  // been produced by an earlier cloned step.  When the value reaches a case
+  // source through the old dispatcher, record it as an explicit source
+  // live-in; a case-entry bridge is built below and seeds the cloned path.
+  // Merely retaining the old definition is unsound because removing the
+  // dispatcher can remove its dominance and turn it into poison.
+  Diag.Stage = "path-ssa-closure-preflight";
+  DominatorTree RegionDT(*F);
+  for (const OriginPlan &Plan : Plans) {
+    Instruction *SourceTerminator = Plan.Input->Source->getTerminator();
+    for (const Variant &V : Plan.Variants) {
+      SmallPtrSet<const Value *, 32> Available;
+      if (auto It = SourceCarrierOwners.find(Plan.Input->Source);
+          It != SourceCarrierOwners.end())
+        for (auto &[Def, Owner] : It->second) Available.insert(Def);
+      auto RequireAvailable = [&](Value *Operand,
+                                  const Twine &Context) -> bool {
+        auto *Def = dyn_cast<Instruction>(Operand);
+        if (!Def || !ShardBlocks.contains(Def->getParent()) &&
+                        !FunnelByBlock.count(Def->getParent()))
+          return true;
+        if (Available.contains(Def)) return true;
+        BasicBlock *OwnerTarget = nullptr;
+        for (BasicBlock *Target : PotentialCaseTargets) {
+          if (!ReachesWithoutRegion(Target, Plan.Input->Source)) continue;
+          if (!OwnerTarget || RegionDT.dominates(OwnerTarget, Target)) {
+            OwnerTarget = Target;
+          } else if (!RegionDT.dominates(Target, OwnerTarget)) {
+            OwnerTarget = nullptr;
+            break;
+          }
+        }
+        if (OwnerTarget && RegionDT.dominates(Def, SourceTerminator)) {
+          auto &LiveIns = RequiredSourceLiveIns[OwnerTarget];
+          if (!llvm::is_contained(LiveIns, Def)) LiveIns.push_back(Def);
+          SourceCarrierOwners[Plan.Input->Source][Def] = OwnerTarget;
+          Available.insert(Def);
+          return true;
+        }
+        Diag.Stage = (Twine("path-ssa-unavailable:") + Context +
+                      ";def=" + Def->getName() +
+                      ";source=" + Plan.Input->Source->getName())
+                         .str();
+        return false;
+      };
+      for (const PathStep &Step : V.Path.Steps) {
+        for (PHINode &Phi : Step.Block->phis()) {
+          Value *Incoming =
+              Phi.getIncomingValueForBlock(Step.IncomingBlock);
+          if (!RequireAvailable(Incoming,
+                                Twine("phi=") + Phi.getName()))
+            return false;
+          Available.insert(&Phi);
+        }
+        for (Instruction &I : *Step.Block) {
+          if (isa<PHINode>(I) || I.isTerminator() ||
+              isa<DbgInfoIntrinsic>(I))
+            continue;
+          for (Value *Operand : I.operands())
+            if (!RequireAvailable(Operand,
+                                  Twine("instruction=") + I.getName()))
+              return false;
+          Available.insert(&I);
+        }
+      }
+      for (PHINode &Phi : V.Path.Target->phis()) {
+        Value *Incoming = Phi.getIncomingValueForBlock(V.Path.Owner);
+        if (!RequireAvailable(Incoming,
+                              Twine("target-phi=") + Phi.getName()))
+          return false;
+      }
+    }
+  }
+
+  // A switch-owned SSA value can be used directly in a case body because the
+  // original lookup owner dominates that body.  Direct edges remove that
+  // dominance.  Materialize an explicit case-entry PHI for every such live-in
+  // and prove its value on all old and new incoming paths.  Uses beyond the
+  // immediate case entry are rejected here rather than repaired by guessing.
+  Diag.Stage = "case-livein-preflight";
+  DenseMap<BasicBlock *, SmallVector<Instruction *, 4>> TargetLiveIns;
+  for (auto &[Target, LiveIns] : RequiredSourceLiveIns)
+    TargetLiveIns[Target].append(LiveIns.begin(), LiveIns.end());
+  DenseMap<Instruction *, SmallVector<Use *, 8>> ExternalUses;
+  auto FedOnlyByRegion = [&](BasicBlock *Start) {
+    SmallVector<BasicBlock *, 16> Work{Start};
+    SmallPtrSet<BasicBlock *, 16> Seen;
+    while (!Work.empty() && Seen.size() <= 128) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (!Seen.insert(BB).second) continue;
+      if (RegionBlocks.contains(BB)) continue;
+      if (FinalTargets.contains(BB) || pred_empty(BB)) return false;
+      for (BasicBlock *Pred : predecessors(BB)) Work.push_back(Pred);
+    }
+    return Work.empty();
+  };
+  for (BasicBlock *RegionBlock : RegionBlocks) {
+    for (Instruction &Def : *RegionBlock) {
+      if (Def.getType()->isVoidTy()) continue;
+      for (Use &OperandUse : Def.uses()) {
+        auto *UseI = dyn_cast<Instruction>(OperandUse.getUser());
+        if (!UseI || RegionBlocks.contains(UseI->getParent())) continue;
+        BasicBlock *UseBlock = UseI->getParent();
+        // An incoming owned by a region predecessor disappears together with
+        // that predecessor.  It is not live on any newly constructed edge and
+        // must not be mistaken for an uncovered downstream live-in.
+        if (auto *UsePhi = dyn_cast<PHINode>(UseI)) {
+          unsigned IncomingIndex = OperandUse.getOperandNo();
+          if (IncomingIndex < UsePhi->getNumIncomingValues() &&
+              FedOnlyByRegion(UsePhi->getIncomingBlock(IncomingIndex)))
+            continue;
+        }
+        if (!isa<PHINode>(UseI) && FedOnlyByRegion(UseBlock)) continue;
+        // A PHI in the immediate target is already translated from its exact
+        // original lookup owner for every new edge.
+        if (isa<PHINode>(UseI) && FinalTargets.contains(UseBlock)) continue;
+        SmallVector<BasicBlock *, 8> ReachingTargets;
+        for (BasicBlock *Target : FinalTargets) {
+          bool ReachesUse = false;
+          if (auto *UsePhi = dyn_cast<PHINode>(UseI)) {
+            for (unsigned I = 0; I != UsePhi->getNumIncomingValues(); ++I)
+              if (&UsePhi->getOperandUse(I) == &OperandUse &&
+                  ReachesWithoutRegion(Target,
+                                       UsePhi->getIncomingBlock(I)))
+                ReachesUse = true;
+          } else {
+            ReachesUse = ReachesWithoutRegion(Target, UseBlock);
+          }
+          if (ReachesUse) ReachingTargets.push_back(Target);
+        }
+        if (ReachingTargets.empty()) {
+          Diag.Stage = (Twine("case-livein-unproved-owner:def=") +
+                        Def.getName() + ";use=" + UseBlock->getName())
+                           .str();
+          return false;
+        }
+        for (BasicBlock *Target : ReachingTargets)
+          if (!llvm::is_contained(TargetLiveIns[Target], &Def))
+            TargetLiveIns[Target].push_back(&Def);
+        ExternalUses[&Def].push_back(&OperandUse);
+      }
+    }
+  }
+
+  // A centralized dispatcher PHI is a carrier network: a value needed by a
+  // downstream case must be present at every predecessor case that can take a
+  // newly constructed edge into it.  Propagate those requirements backwards
+  // to a fixed point over the exact transition plans.  Each propagated value
+  // becomes a case-entry bridge below, so loop-carried semantic state remains
+  // in SSA after the dispatcher ceases to dominate the case bodies.
+  //
+  // This is deliberately structural.  We only propagate a value that the old
+  // dispatcher definition proves to dominate the source terminator, and only
+  // through a source that is itself an exact case entry.  Entry paths without
+  // such a proof remain rejected rather than receiving poison/undef.
+  Diag.Stage = "case-livein-carrier-fixed-point";
+  bool CarrierChanged = true;
+  unsigned CarrierRounds = 0;
+  while (CarrierChanged) {
+    if (++CarrierRounds > 1024) {
+      Diag.Stage = "case-livein-carrier-fixed-point-budget";
+      return false;
+    }
+    CarrierChanged = false;
+    for (const OriginPlan &Plan : Plans) {
+      Instruction *SourceTerminator = Plan.Input->Source->getTerminator();
+      for (const Variant &V : Plan.Variants) {
+        auto TargetIt = TargetLiveIns.find(V.Path.Target);
+        if (TargetIt == TargetLiveIns.end()) continue;
+        SmallVector<Instruction *, 8> Needed(TargetIt->second.begin(),
+                                              TargetIt->second.end());
+        SmallPtrSet<const Value *, 32> Available;
+        if (auto It = SourceCarrierOwners.find(Plan.Input->Source);
+            It != SourceCarrierOwners.end())
+          for (auto &[Def, Owner] : It->second) Available.insert(Def);
+        for (const PathStep &Step : V.Path.Steps) {
+          for (PHINode &Phi : Step.Block->phis())
+            Available.insert(&Phi);
+          for (Instruction &I : *Step.Block)
+            if (!isa<PHINode>(I) && !I.isTerminator() &&
+                !isa<DbgInfoIntrinsic>(I))
+              Available.insert(&I);
+        }
+        for (Instruction *Def : Needed) {
+          if (Available.contains(Def) ||
+              !RegionBlocks.contains(Def->getParent()))
+            continue;
+          BasicBlock *Source = Plan.Input->Source;
+          BasicBlock *OwnerTarget = nullptr;
+          for (BasicBlock *Candidate : PotentialCaseTargets) {
+            if (!ReachesWithoutRegion(Candidate, Source)) continue;
+            if (!OwnerTarget || RegionDT.dominates(OwnerTarget, Candidate)) {
+              OwnerTarget = Candidate;
+            } else if (!RegionDT.dominates(Candidate, OwnerTarget)) {
+              OwnerTarget = nullptr;
+              break;
+            }
+          }
+          if (!OwnerTarget || RegionBlocks.contains(OwnerTarget) ||
+              !RegionDT.dominates(Def, SourceTerminator)) {
+            Diag.Stage = (Twine("case-livein-untranslated:def=") +
+                          Def->getName() + ";target=" +
+                          V.Path.Target->getName() + ";source=" +
+                          Source->getName())
+                             .str();
+            return false;
+          }
+          auto &SourceLiveIns = TargetLiveIns[OwnerTarget];
+          if (!llvm::is_contained(SourceLiveIns, Def)) {
+            SourceLiveIns.push_back(Def);
+            CarrierChanged = true;
+          }
+          SourceCarrierOwners[Source][Def] = OwnerTarget;
+        }
+      }
+    }
+  }
+
+  for (auto &[Target, LiveIns] : TargetLiveIns) {
+    for (BasicBlock *Pred : predecessors(Target)) {
+      if (!ShardBlocks.contains(Pred)) {
+        Diag.Stage = (Twine("case-livein-external-predecessor:target=") +
+                      Target->getName() + ";pred=" + Pred->getName())
+                         .str();
+        return false;
+      }
+      for (Instruction *Def : LiveIns)
+        if (!RegionDT.dominates(Def, Pred->getTerminator())) {
+          Diag.Stage = (Twine("case-livein-nondominating:def=") +
+                        Def->getName() + ";target=" + Target->getName() +
+                        ";pred=" + Pred->getName())
+                           .str();
+          return false;
+        }
+    }
+  }
+
+  // Every bridge must have an exact translated value on every new incoming
+  // edge.  Re-simulate all paths with their source bridges in scope so the
+  // commit phase never falls back to an obsolete region-local definition.
+  Diag.Stage = "case-livein-path-coverage";
+  for (const OriginPlan &Plan : Plans) {
+    for (const Variant &V : Plan.Variants) {
+      SmallPtrSet<const Value *, 32> Available;
+      if (auto It = SourceCarrierOwners.find(Plan.Input->Source);
+          It != SourceCarrierOwners.end())
+        for (auto &[Def, Owner] : It->second) Available.insert(Def);
+      auto IsAvailable = [&](Value *Input) {
+        auto *Def = dyn_cast<Instruction>(Input);
+        return !Def || !RegionBlocks.contains(Def->getParent()) ||
+               Available.contains(Def);
+      };
+      for (const PathStep &Step : V.Path.Steps) {
+        for (PHINode &Phi : Step.Block->phis()) {
+          if (!IsAvailable(
+                  Phi.getIncomingValueForBlock(Step.IncomingBlock))) {
+            Diag.Stage = (Twine("case-livein-path-phi:def=") +
+                          Phi.getName() + ";source=" +
+                          Plan.Input->Source->getName())
+                             .str();
+            return false;
+          }
+          Available.insert(&Phi);
+        }
+        for (Instruction &I : *Step.Block) {
+          if (isa<PHINode>(I) || I.isTerminator() ||
+              isa<DbgInfoIntrinsic>(I))
+            continue;
+          for (Value *Operand : I.operands())
+            if (!IsAvailable(Operand)) {
+              Diag.Stage = (Twine("case-livein-path-instruction:def=") +
+                            I.getName() + ";source=" +
+                            Plan.Input->Source->getName())
+                               .str();
+              return false;
+            }
+          Available.insert(&I);
+        }
+      }
+      if (auto It = TargetLiveIns.find(V.Path.Target);
+          It != TargetLiveIns.end())
+        for (Instruction *Def : It->second)
+          if (!IsAvailable(Def)) {
+            Diag.Stage = (Twine("case-livein-untranslated:def=") +
+                          Def->getName() + ";target=" +
+                          V.Path.Target->getName() + ";source=" +
+                          Plan.Input->Source->getName())
+                             .str();
+            return false;
+          }
+    }
+  }
+
+  auto Translate = [](Value *V, DenseMap<const Value *, Value *> &Map) {
+    auto It = Map.find(V);
+    return It == Map.end() ? V : It->second;
+  };
+  auto CloneStep = [&](const PathStep &Step, Instruction *Before,
+                       DenseMap<const Value *, Value *> &Map) {
+    for (PHINode &Phi : Step.Block->phis())
+      Map[&Phi] = Translate(
+          Phi.getIncomingValueForBlock(Step.IncomingBlock), Map);
+    for (Instruction &I : *Step.Block) {
+      if (isa<PHINode>(I) || I.isTerminator() || isa<DbgInfoIntrinsic>(I))
+        continue;
+      Instruction *Clone = I.clone();
+      for (unsigned Op = 0; Op != Clone->getNumOperands(); ++Op)
+        Clone->setOperand(Op, Translate(Clone->getOperand(Op), Map));
+      if (!Clone->getType()->isVoidTy())
+        Clone->setName(I.getName() + ".deobf.region");
+      Clone->insertBefore(Before->getIterator());
+      Map[&I] = Clone;
+    }
+  };
+
+  DenseMap<BasicBlock *, DenseMap<const Value *, PHINode *>> LiveInPhis;
+  for (auto &[Target, LiveIns] : TargetLiveIns) {
+    for (Instruction *Def : LiveIns) {
+      PHINode *Bridge = PHINode::Create(
+          Def->getType(), pred_size(Target) + 4,
+          Def->getName() + ".deobf.region.livein", Target->begin());
+      SmallVector<BasicBlock *, 4> OldPreds(predecessors(Target));
+      for (BasicBlock *Pred : OldPreds) Bridge->addIncoming(Def, Pred);
+      LiveInPhis[Target][Def] = Bridge;
+    }
+  }
+
+  Diag.Stage = "transaction-commit";
+  unsigned Serial = 0;
+  for (OriginPlan &Plan : Plans) {
+    Origin &O = *Plan.Input;
+    SmallVector<BasicBlock *, 2> Targets;
+    for (Variant &V : Plan.Variants) {
+      BasicBlock *Edge = BasicBlock::Create(
+          F->getContext(), "deobf.region.edge." + Twine(Serial++), F,
+          V.Path.Target);
+      BranchInst *EdgeBranch = BranchInst::Create(V.Path.Target, Edge);
+      DenseMap<const Value *, Value *> Map;
+      if (auto It = SourceCarrierOwners.find(O.Source);
+          It != SourceCarrierOwners.end())
+        for (auto &[Def, Owner] : It->second) {
+          auto OwnerIt = LiveInPhis.find(Owner);
+          if (OwnerIt == LiveInPhis.end() || !OwnerIt->second.count(Def))
+            report_fatal_error("missing cyclic region source carrier");
+          Map[Def] = OwnerIt->second.lookup(Def);
+        }
+      for (const PathStep &Step : V.Path.Steps)
+        CloneStep(Step, EdgeBranch, Map);
+      for (PHINode &Phi : V.Path.Target->phis()) {
+        if (Phi.getName().contains(".deobf.region.livein")) continue;
+        Value *Incoming = Phi.getIncomingValueForBlock(V.Path.Owner);
+        Value *Translated = Translate(Incoming, Map);
+        if (Translated->getType() != Phi.getType())
+          report_fatal_error("cyclic region target PHI translation type mismatch");
+        Phi.addIncoming(Translated, Edge);
+      }
+      if (auto It = LiveInPhis.find(V.Path.Target); It != LiveInPhis.end())
+        for (auto &[Def, Bridge] : It->second) {
+          Value *Translated = Translate(const_cast<Value *>(Def), Map);
+          if (Translated->getType() != Bridge->getType())
+            report_fatal_error(
+                "cyclic region live-in translation type mismatch");
+          Bridge->addIncoming(Translated, Edge);
+        }
+      Targets.push_back(Edge);
+    }
+    Instruction *Old = O.Source->getTerminator();
+    Instruction *Replace = Old;
+    bool WholeTerminator = Old->getNumSuccessors() == 1;
+    if (!WholeTerminator) {
+      BasicBlock *Dispatch = BasicBlock::Create(
+          F->getContext(), "deobf.region.dispatch." + Twine(Serial++), F,
+          Targets.front());
+      Replace = BranchInst::Create(Targets.front(), Dispatch);
+      Old->setSuccessor(O.SuccessorIndex, Dispatch);
+      // Keep one-input PHIs alive until every planned edge has been committed;
+      // later plans still reference their exact incoming values.
+      O.OldSuccessor->removePredecessor(O.Source, true);
+    } else {
+      O.OldSuccessor->removePredecessor(O.Source, true);
+    }
+    if (Plan.DynamicEntry) {
+      BasicBlock *UnknownStateLoop = BasicBlock::Create(
+          F->getContext(), "deobf.region.dynamic.unknown." + Twine(Serial++),
+          F, Targets.front());
+      BranchInst::Create(UnknownStateLoop, UnknownStateLoop);
+      auto *DynamicSwitch = SwitchInst::Create(
+          Plan.FiniteState, UnknownStateLoop, Targets.size(),
+          Replace->getIterator());
+      for (unsigned I = 0; I != Targets.size(); ++I)
+        DynamicSwitch->addCase(
+            ConstantInt::get(Plan.FiniteState->getContext(),
+                             Plan.Variants[I].Raw),
+            Targets[I]);
+    } else if (Plan.FiniteState) {
+      auto *FiniteSwitch = SwitchInst::Create(
+          Plan.FiniteState, Targets.front(), Targets.size() - 1,
+          Replace->getIterator());
+      for (unsigned I = 1; I != Targets.size(); ++I)
+        FiniteSwitch->addCase(
+            ConstantInt::get(Plan.FiniteState->getContext(),
+                             Plan.Variants[I].Raw),
+            Targets[I]);
+    } else if (Plan.Condition)
+      BranchInst::Create(Targets[0], Targets[1], Plan.Condition,
+                         Replace->getIterator());
+    else
+      BranchInst::Create(Targets[0], Replace->getIterator());
+    Replace->eraseFromParent();
+    Proofs.push_back({F->getName().str(), "cff_transition",
+                      O.Source->getName().str(),
+                      O.IsEntry ? "cyclic_state_family_entry"
+                                : "cyclic_state_family_transition",
+                      "proved"});
+  }
+
+  // Case bodies may reconverge after entering through several dispatcher
+  // targets.  Rebuild the value at those joins from all exact case-entry
+  // bridges instead of selecting one arbitrary dominating target.
+  for (auto &[Def, Uses] : ExternalUses) {
+    SmallVector<PHINode *, 8> InsertedPhis;
+    SSAUpdater Updater(&InsertedPhis);
+    std::string SSAName =
+        (Twine(Def->getName()) + ".deobf.region.ssa").str();
+    Updater.Initialize(Def->getType(), SSAName);
+    if (Def->getParent()) Updater.AddAvailableValue(Def->getParent(), Def);
+    for (auto &[Target, Values] : LiveInPhis)
+      if (PHINode *Bridge = Values.lookup(Def))
+        Updater.AddAvailableValue(Target, Bridge);
+    for (Use *OperandUse : Uses) {
+      if (!OperandUse || OperandUse->get() != Def) continue;
+      auto *UseI = dyn_cast<Instruction>(OperandUse->getUser());
+      if (!UseI || RegionBlocks.contains(UseI->getParent())) continue;
+      Updater.RewriteUseAfterInsertions(*OperandUse);
+    }
+    for (PHINode *Phi : InsertedPhis)
+      for (Value *Incoming : Phi->incoming_values())
+        if (isa<PoisonValue>(Incoming))
+          report_fatal_error(
+              "cyclic region SSAUpdater produced an uncovered path");
+  }
+
+  std::string Origin = SI.getParent()->getName().str();
+  removeUnreachableBlocks(*F);
+  ++M.DispatchersRecovered;
+  ProofRecord Record{F->getName().str(), "cff_dispatcher", Origin,
+                     "complete_cyclic_state_family_region", "proved"};
+  Record.Dependencies.push_back(
+      TerminalUnknownSink ? "exact_terminal_unknown_state_sink"
+                          : "closed_default_linked_lookup_ring");
+  Record.Dependencies.push_back("exact_forwarded_state_family");
+  Record.Dependencies.push_back("ordered_lookup_resolution");
+  Record.Dependencies.push_back("complete_external_edge_coverage");
+  Record.Dependencies.push_back("exact_phi_and_plumbing_translation");
+  Record.Dependencies.push_back("multi_entry_case_join_ssa_reconstruction");
+  if (llvm::any_of(Plans,
+                   [](const OriginPlan &Plan) { return Plan.DynamicEntry; }))
+    Record.Dependencies.push_back("dynamic_entry_exact_switch_retained");
+  Proofs.push_back(std::move(Record));
+  Diag.Success = true;
+  return true;
+}
+
+// General funnel-form CFF recovery.  Native cleanup commonly canonicalizes a
+// flattened loop as case tails -> semantic sink PHIs -> outer loop PHIs -> a
+// self-defaulting switch.  Every loop-carried component is significant; lower
+// all sink/outer/case-entry PHIs with LLVM's exact reg2mem utilities, then
+// clone the complete sink->outer->header plumbing on each proved state edge.
+// Trampoline states are preserved as additional plumbing rounds rather than
+// collapsed to a target-only shortcut.
+static bool tryRecoverGeneralFunnelPlumbingDispatcher(
+    SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
+  BasicBlock *Header = SI.getParent();
+  Function *F = Header->getParent();
+  PHINode *State = findStateRoot(SI.getCondition());
+  if (!State || State->getParent() == Header ||
+      !Header->hasNPredecessors(2))
+    return false;
+  BasicBlock *Outer = State->getParent();
+  auto *OuterBr = dyn_cast<BranchInst>(Outer->getTerminator());
+  if (!OuterBr || !OuterBr->isUnconditional() ||
+      OuterBr->getSuccessor(0) != Header ||
+      State->getNumIncomingValues() != 2)
+    return false;
+
+  BasicBlock *EntryPred = nullptr, *Sink = nullptr;
+  ConstantInt *Initial = nullptr;
+  PHINode *SinkState = nullptr;
+  for (unsigned I = 0; I != State->getNumIncomingValues(); ++I) {
+    Value *Incoming = State->getIncomingValue(I);
+    BasicBlock *Pred = State->getIncomingBlock(I);
+    if (auto *PN = dyn_cast<PHINode>(Incoming);
+        PN && PN->getParent() == Pred) {
+      SinkState = PN;
+      Sink = Pred;
+      continue;
+    }
+    Initial = asTransitionConstant(Incoming, Pred);
+    EntryPred = Pred;
+  }
+  if (!Initial || !EntryPred || !SinkState || !Sink ||
+      EntryPred == Sink)
+    return false;
+  auto *EntryBr = dyn_cast<BranchInst>(EntryPred->getTerminator());
+  auto *SinkBr = dyn_cast<BranchInst>(Sink->getTerminator());
+  if (!EntryBr || !EntryBr->isUnconditional() ||
+      EntryBr->getSuccessor(0) != Outer || !SinkBr ||
+      !SinkBr->isUnconditional() || SinkBr->getSuccessor(0) != Outer)
+    return false;
+
+  // The lookup can be one self-defaulting switch or an optimizer-partitioned
+  // ring of switch tables and peeled equality cases.  Collect the complete
+  // ring before interpreting any state.  Every intermediate lookup block is
+  // required to be semantic-free and single-entry, so bypassing it cannot
+  // discard program work.
+  SmallVector<SwitchInst *, 8> Shards;
+  SmallPtrSet<BasicBlock *, 16> LookupBlocks;
+  struct EqualityLookupCase {
+    ConstantInt *Key = nullptr;
+    BasicBlock *Target = nullptr;
+    BasicBlock *Owner = nullptr;
+  };
+  SmallVector<EqualityLookupCase, 8> EqualityCases;
+  BasicBlock *Current = Header;
+  BasicBlock *Previous = nullptr;
+  bool ClosedLookupRing = false;
+  for (unsigned Depth = 0; Depth != 32; ++Depth) {
+    if (!LookupBlocks.insert(Current).second) return false;
+    if (Previous &&
+        (!Current->hasNPredecessors(1) ||
+         *pred_begin(Current) != Previous))
+      return false;
+
+    BasicBlock *Next = nullptr;
+    if (auto *Shard = dyn_cast<SwitchInst>(Current->getTerminator())) {
+      if (Shards.size() == 8 || Shard->getCondition() != SI.getCondition())
+        return false;
+      if (Current != Header)
+        for (Instruction &I : *Current)
+          if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I)) return false;
+      Shards.push_back(Shard);
+      Next = Shard->getDefaultDest();
+    } else {
+      auto *Br = dyn_cast<BranchInst>(Current->getTerminator());
+      auto *Cmp = Br && Br->isConditional()
+                      ? dyn_cast<ICmpInst>(Br->getCondition())
+                      : nullptr;
+      if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+                   Cmp->getPredicate() != ICmpInst::ICMP_NE))
+        return false;
+      ConstantInt *EncodedKey = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+      Value *Compared = Cmp->getOperand(0);
+      if (!EncodedKey) {
+        EncodedKey = dyn_cast<ConstantInt>(Cmp->getOperand(0));
+        Compared = Cmp->getOperand(1);
+      }
+      if (!EncodedKey) return false;
+      auto RawKey = decodeStateExpr(Compared, State, EncodedKey->getValue());
+      if (!RawKey || RawKey->getBitWidth() !=
+                         cast<IntegerType>(State->getType())->getBitWidth())
+        return false;
+      ConstantInt *Key = cast<ConstantInt>(
+          ConstantInt::get(State->getType(), *RawKey));
+      for (Instruction &I : *Current)
+        if (&I != Cmp && !I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+          return false;
+      unsigned MatchIndex = Cmp->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1;
+      EqualityCases.push_back(
+          {Key, Br->getSuccessor(MatchIndex), Current});
+      Next = Br->getSuccessor(1 - MatchIndex);
+    }
+    if (Next == Header) {
+      ClosedLookupRing = true;
+      break;
+    }
+    Previous = Current;
+    Current = Next;
+  }
+  if (!ClosedLookupRing || Shards.empty()) return false;
+  bool IsPartitionedLookup = LookupBlocks.size() > 1;
+
+  SmallVector<PHINode *, 16> OuterPhis, SinkPhis;
+  SmallPtrSet<PHINode *, 16> UsedSinkPhis;
+  for (PHINode &OuterPhi : Outer->phis()) {
+    if (OuterPhi.getNumIncomingValues() != 2 ||
+        OuterPhi.getBasicBlockIndex(EntryPred) < 0 ||
+        OuterPhi.getBasicBlockIndex(Sink) < 0)
+      return false;
+    auto *SinkPhi = dyn_cast<PHINode>(
+        OuterPhi.getIncomingValueForBlock(Sink));
+    if (!SinkPhi || SinkPhi->getParent() != Sink ||
+        !UsedSinkPhis.insert(SinkPhi).second)
+      return false;
+    OuterPhis.push_back(&OuterPhi);
+    SinkPhis.push_back(SinkPhi);
+  }
+  for (PHINode &SinkPhi : Sink->phis())
+    if (!UsedSinkPhis.contains(&SinkPhi)) return false;
+  if (!UsedSinkPhis.contains(SinkState)) return false;
+
+  DenseMap<APInt, BasicBlock *> CaseMap;
+  DenseMap<APInt, BasicBlock *> CaseOwner;
+  SmallVector<PHINode *, 32> CaseEntryPhis;
+  SmallPtrSet<PHINode *, 32> SeenCaseEntryPhis;
+  auto AddCase = [&](ConstantInt *KeyValue, BasicBlock *Target,
+                     BasicBlock *Owner) {
+    APInt Key = KeyValue->getValue();
+    if (CaseMap.count(Key) || LookupBlocks.contains(Target)) return false;
+    // Sink PHIs are owned and demoted by the recurrence itself.  A lookup
+    // case targeting Sink is a trampoline, not an independent case-entry PHI
+    // set; adding it here would schedule the same PHI for demotion twice.
+    if (Target != Sink)
+      for (PHINode &TargetPhi : Target->phis()) {
+        if (TargetPhi.getBasicBlockIndex(Owner) < 0) return false;
+        if (SeenCaseEntryPhis.insert(&TargetPhi).second)
+          CaseEntryPhis.push_back(&TargetPhi);
+      }
+    CaseMap[Key] = Target;
+    CaseOwner[Key] = Owner;
+    return true;
+  };
+  for (SwitchInst *Shard : Shards)
+    for (auto Case : Shard->cases())
+      if (!AddCase(Case.getCaseValue(), Case.getCaseSuccessor(),
+                   Shard->getParent()))
+        return false;
+  for (const EqualityLookupCase &Case : EqualityCases)
+    if (!AddCase(Case.Key, Case.Target, Case.Owner)) return false;
+  if (CaseMap.size() < 4) return false;
+
+  struct ResolvedFunnelPath {
+    BasicBlock *Target = nullptr;
+    SmallVector<BasicBlock *, 8> TrampolineOwners;
+  };
+  auto Resolve = [&](ConstantInt *Raw) -> std::optional<ResolvedFunnelPath> {
+    ResolvedFunnelPath Result;
+    SmallPtrSet<BasicBlock *, 8> SeenOwners;
+    for (unsigned Depth = 0; Depth != 8; ++Depth) {
+      auto Encoded = evalStateExpr(SI.getCondition(), State, Raw->getValue());
+      if (!Encoded) return std::nullopt;
+      auto It = CaseMap.find(*Encoded);
+      if (It == CaseMap.end()) return std::nullopt;
+      BasicBlock *Target = It->second;
+      if (Target != Sink) {
+        Result.Target = Target;
+        return Result;
+      }
+      BasicBlock *Owner = CaseOwner.lookup(*Encoded);
+      if (!Owner || !SeenOwners.insert(Owner).second) return std::nullopt;
+      auto *Next = asTransitionConstant(
+          SinkState->getIncomingValueForBlock(Owner), Owner);
+      if (!Next) return std::nullopt;
+      Result.TrampolineOwners.push_back(Owner);
+      Raw = Next;
+    }
+    return std::nullopt;
+  };
+  std::optional<ResolvedFunnelPath> InitialPath = Resolve(Initial);
+  if (!InitialPath) return false;
+
+  struct FunnelTransition {
+    BasicBlock *Source = nullptr;
+    Value *Condition = nullptr;
+    ResolvedFunnelPath TruePath;
+    std::optional<ResolvedFunnelPath> FalsePath;
+  };
+  SmallVector<FunnelTransition, 64> Transitions;
+  for (BasicBlock *Source : predecessors(Sink)) {
+    if (LookupBlocks.contains(Source)) continue;
+    int Index = SinkState->getBasicBlockIndex(Source);
+    if (Index < 0) return false;
+    auto *Br = dyn_cast<BranchInst>(Source->getTerminator());
+    if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != Sink)
+      return false;
+    Value *Raw = SinkState->getIncomingValue(Index);
+    FunnelTransition Transition;
+    Transition.Source = Source;
+    if (auto *C = asTransitionConstant(Raw, Source)) {
+      auto Path = Resolve(C);
+      if (!Path) return false;
+      Transition.TruePath = *Path;
+    } else if (auto *Select = dyn_cast<SelectInst>(Raw)) {
+      auto *TC = dyn_cast<ConstantInt>(Select->getTrueValue());
+      auto *FC = dyn_cast<ConstantInt>(Select->getFalseValue());
+      if (!TC || !FC) return false;
+      auto TruePath = Resolve(TC), FalsePath = Resolve(FC);
+      if (!TruePath || !FalsePath) return false;
+      Transition.Condition = Select->getCondition();
+      Transition.TruePath = *TruePath;
+      Transition.FalsePath = *FalsePath;
+    } else {
+      return false;
+    }
+    Transitions.push_back(std::move(Transition));
+  }
+  if (Transitions.empty()) return false;
+
+  Instruction *AllocaPoint = &*F->getEntryBlock().getFirstInsertionPt();
+  for (PHINode *CasePhi : CaseEntryPhis)
+    DemotePHIToStack(CasePhi, AllocaPoint->getIterator());
+  for (PHINode *SinkPhi : SinkPhis)
+    DemotePHIToStack(SinkPhi, AllocaPoint->getIterator());
+  for (PHINode *OuterPhi : OuterPhis)
+    DemotePHIToStack(OuterPhi, AllocaPoint->getIterator());
+
+  SmallVector<Instruction *, 64> OuterBeforeLiveOutDemotion;
+  for (Instruction &I : *Outer)
+    if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+      OuterBeforeLiveOutDemotion.push_back(&I);
+  for (Instruction *I : OuterBeforeLiveOutDemotion) {
+    if (I->getType()->isVoidTy() || I->use_empty()) continue;
+    bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+      auto *UseI = dyn_cast<Instruction>(U);
+      return UseI && UseI->getParent() != Outer;
+    });
+    if (UsedOutside)
+      DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+  }
+
+  SmallVector<Instruction *, 64> SinkBody, OuterBody, HeaderBody;
+  for (Instruction &I : *Sink)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I))
+      SinkBody.push_back(&I);
+  for (Instruction &I : *Outer)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I))
+      OuterBody.push_back(&I);
+  for (Instruction &I : *Header)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I))
+      HeaderBody.push_back(&I);
+
+  auto CloneReturningRound = [&](Instruction *Before,
+                                 DenseMap<const Value *, Value *> &Map) {
+    cloneBlockPlumbing(SinkBody, Before, Map);
+    cloneBlockPlumbing(OuterBody, Before, Map);
+    cloneBlockPlumbing(HeaderBody, Before, Map);
+  };
+  auto CloneTrampolines = [&](ArrayRef<BasicBlock *> Owners,
+                              Instruction *Before,
+                              DenseMap<const Value *, Value *> &Map) {
+    for (BasicBlock *Owner : Owners) {
+      // Reg2mem inserts Sink-PHI edge stores in the owning lookup shard.  The
+      // first header body is already cloned by the surrounding round; other
+      // owners must have their newly inserted private stores cloned here.
+      if (Owner != Header) {
+        SmallVector<Instruction *, 16> OwnerBody;
+        for (Instruction &I : *Owner)
+          if (!isa<PHINode>(I) && !I.isTerminator() &&
+              !isa<DbgInfoIntrinsic>(I))
+            OwnerBody.push_back(&I);
+        cloneBlockPlumbing(OwnerBody, Before, Map);
+      }
+      CloneReturningRound(Before, Map);
+    }
+  };
+
+  {
+    Instruction *Old = EntryPred->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    cloneBlockPlumbing(OuterBody, Old, Map);
+    cloneBlockPlumbing(HeaderBody, Old, Map);
+    CloneTrampolines(InitialPath->TrampolineOwners, Old, Map);
+    BranchInst::Create(InitialPath->Target, Old->getIterator());
+    Old->eraseFromParent();
+  }
+  unsigned PathSerial = 0;
+  for (const FunnelTransition &Transition : Transitions) {
+    Instruction *Old = Transition.Source->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    CloneReturningRound(Old, Map);
+    auto Materialize = [&](const ResolvedFunnelPath &Path,
+                           StringRef Suffix) -> BasicBlock * {
+      if (Path.TrampolineOwners.empty()) return Path.Target;
+      BasicBlock *PathBlock = BasicBlock::Create(
+          F->getContext(), "deobf.funnel.plumbing." + Suffix + "." +
+                               Twine(PathSerial++),
+          F, Path.Target);
+      BranchInst *PathBranch = BranchInst::Create(Path.Target, PathBlock);
+      DenseMap<const Value *, Value *> PathMap = Map;
+      CloneTrampolines(Path.TrampolineOwners, PathBranch, PathMap);
+      return PathBlock;
+    };
+    BasicBlock *TrueTarget = Materialize(Transition.TruePath, "true");
+    if (Transition.Condition) {
+      BasicBlock *FalseTarget = Materialize(*Transition.FalsePath, "false");
+      BranchInst::Create(TrueTarget, FalseTarget, Transition.Condition,
+                         Old->getIterator());
+    } else {
+      BranchInst::Create(TrueTarget, Old->getIterator());
+    }
+    Old->eraseFromParent();
+    Proofs.push_back(
+        {F->getName().str(), "cff_transition",
+         Transition.Source->getName().str(),
+         IsPartitionedLookup ? "partitioned_general_funnel_ssa_plumbing"
+                             : "general_funnel_ssa_plumbing",
+         "proved"});
+  }
+  std::string HeaderName = Header->getName().str();
+  removeUnreachableBlocks(*F);
+  ++M.DispatchersRecovered;
+  ProofRecord Record{
+      F->getName().str(), "cff_dispatcher", HeaderName,
+      IsPartitionedLookup ? "complete_partitioned_general_funnel_ssa_plumbing"
+                          : "complete_general_funnel_ssa_plumbing",
+      "proved"};
+  if (IsPartitionedLookup)
+    Record.Dependencies.push_back("unique_cyclic_union_of_lookup_tables");
+  Record.Dependencies.push_back("complete_sink_phi_coverage");
+  Record.Dependencies.push_back("llvm_sink_outer_case_phi_demotion");
+  Record.Dependencies.push_back("exact_sink_outer_header_clone");
+  Record.Dependencies.push_back("all_state_transitions_resolved");
+  Record.Dependencies.push_back("trampoline_rounds_preserved");
+  Proofs.push_back(std::move(Record));
+  return true;
+}
+
 static bool tryRecoverFunnelDispatcher(
     SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
   BasicBlock *Header = SI.getParent();
@@ -4433,6 +6325,706 @@ static void cloneBlockPlumbing(ArrayRef<Instruction *> Body,
   }
 }
 
+// OLLVM can partition one dispatcher table into a default-linked chain of
+// switches over the same SSA state.  Case bodies from every shard reconverge
+// at one mem2reg latch PHI, while the last default returns to the first shard.
+// Recover the state machine from the union of the exact case tables.  No
+// range/order heuristic is used: keys must be unique, all returning paths must
+// reach the one latch PHI, and every initial/next value must resolve to a real
+// case before any CFG mutation is committed.
+static bool tryRecoverPartitionedSSADispatcher(
+    SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
+  BasicBlock *Header = SI.getParent();
+  Function *F = Header->getParent();
+  PHINode *State = findStateRoot(SI.getCondition());
+  if (!State || State->getParent() != Header ||
+      State->getNumIncomingValues() != 2 ||
+      std::next(Header->phis().begin()) != Header->phis().end())
+    return false;
+
+  ConstantInt *Initial = nullptr;
+  BasicBlock *EntryPred = nullptr, *Backedge = nullptr;
+  PHINode *LatchState = nullptr;
+  for (unsigned I = 0; I != 2; ++I) {
+    Value *Incoming = State->getIncomingValue(I);
+    if (auto *C = dyn_cast<ConstantInt>(Incoming)) {
+      Initial = C;
+      EntryPred = State->getIncomingBlock(I);
+    } else if (auto *PN = dyn_cast<PHINode>(Incoming)) {
+      LatchState = PN;
+      Backedge = State->getIncomingBlock(I);
+    }
+  }
+  if (!Initial || !EntryPred || !LatchState || !Backedge)
+    return false;
+  auto *EntryBr = dyn_cast<BranchInst>(EntryPred->getTerminator());
+  if (!EntryBr || !EntryBr->isUnconditional() ||
+      EntryBr->getSuccessor(0) != Header)
+    return false;
+
+  SmallVector<SwitchInst *, 8> Shards;
+  SmallPtrSet<BasicBlock *, 8> ShardBlocks;
+  SwitchInst *Current = &SI;
+  while (Current && Shards.size() != 8) {
+    BasicBlock *Block = Current->getParent();
+    if (!ShardBlocks.insert(Block).second ||
+        Current->getCondition() != SI.getCondition())
+      return false;
+    for (Instruction &I : *Block)
+      if (!isa<PHINode>(I) && !I.isTerminator() &&
+          !isa<DbgInfoIntrinsic>(I))
+        if (Block != Header) return false;
+    Shards.push_back(Current);
+    BasicBlock *Default = Current->getDefaultDest();
+    if (Default == Header) break;
+    Current = dyn_cast<SwitchInst>(Default->getTerminator());
+  }
+  BasicBlock *ReturnBlock = Shards.back()->getDefaultDest();
+  if (ReturnBlock != Header) {
+    auto *ReturnBr = dyn_cast<BranchInst>(ReturnBlock->getTerminator());
+    if (ReturnBlock != Backedge || !llvm::is_contained(
+            predecessors(ReturnBlock), Shards.back()->getParent()) || !ReturnBr ||
+        !ReturnBr->isUnconditional() || ReturnBr->getSuccessor(0) != Header)
+      return false;
+    for (Instruction &I : *ReturnBlock)
+      if (!isa<PHINode>(I) && !I.isTerminator() &&
+          !isa<DbgInfoIntrinsic>(I))
+        return false;
+  }
+  if (Shards.size() < 2 ||
+      (!ShardBlocks.contains(LatchState->getParent()) &&
+       LatchState->getParent() != ReturnBlock))
+    return false;
+  for (User *U : State->users()) {
+    auto *UseI = dyn_cast<Instruction>(U);
+    if (!UseI || (UseI != LatchState &&
+                  !ShardBlocks.contains(UseI->getParent())))
+      return false;
+  }
+  for (User *U : LatchState->users())
+    if (U != State)
+      return false;
+
+  DenseMap<APInt, BasicBlock *> CaseMap;
+  for (SwitchInst *Shard : Shards)
+    for (auto Case : Shard->cases()) {
+      APInt Key = Case.getCaseValue()->getValue();
+      if (CaseMap.count(Key)) return false;
+      BasicBlock *Target = Case.getCaseSuccessor();
+      if (!Target->phis().empty() || ShardBlocks.contains(Target))
+        return false;
+      CaseMap[Key] = Target;
+    }
+  if (CaseMap.size() < 4) return false;
+
+  BasicBlock *Join = LatchState->getParent();
+  unsigned JoinIndex = Shards.size();
+  for (unsigned I = 0; I != Shards.size(); ++I)
+    if (Shards[I]->getParent() == Join) JoinIndex = I;
+  if (Join == ReturnBlock)
+    JoinIndex = Shards.size();
+  else if (JoinIndex == 0 || JoinIndex == Shards.size())
+    return false;
+  for (unsigned I = 1; I != Shards.size(); ++I) {
+    BasicBlock *Block = Shards[I]->getParent();
+    BasicBlock *Previous = Shards[I - 1]->getParent();
+    if (I == JoinIndex) {
+      if (LatchState->getBasicBlockIndex(Previous) < 0) return false;
+      continue;
+    }
+    if (!Block->hasNPredecessors(1) || *pred_begin(Block) != Previous)
+      return false;
+  }
+
+  SmallVector<BasicBlock *, 64> ReturningSources;
+  for (BasicBlock *Source : predecessors(Join)) {
+    if (ShardBlocks.contains(Source)) continue;
+    if (LatchState->getBasicBlockIndex(Source) < 0) return false;
+    ReturningSources.push_back(Source);
+  }
+  if (ReturningSources.empty()) return false;
+
+  auto Resolve = [&](ConstantInt *Raw) -> BasicBlock * {
+    auto Encoded = evalStateExpr(SI.getCondition(), State, Raw->getValue());
+    if (!Encoded) return nullptr;
+    auto It = CaseMap.find(*Encoded);
+    return It == CaseMap.end() ? nullptr : It->second;
+  };
+  BasicBlock *InitialTarget = Resolve(Initial);
+  if (!InitialTarget) return false;
+
+  SmallVector<ProvenTransition, 64> Transitions;
+  for (BasicBlock *Source : ReturningSources) {
+    Value *Next = LatchState->getIncomingValueForBlock(Source);
+    ProvenTransition Transition;
+    Transition.Source = Source;
+    if (auto *C = dyn_cast<ConstantInt>(Next)) {
+      Transition.TrueTarget = Resolve(C);
+    } else if (auto *Select = dyn_cast<SelectInst>(Next)) {
+      auto *TC = dyn_cast<ConstantInt>(Select->getTrueValue());
+      auto *FC = dyn_cast<ConstantInt>(Select->getFalseValue());
+      if (!TC || !FC) return false;
+      Transition.Condition = Select->getCondition();
+      Transition.TrueTarget = Resolve(TC);
+      Transition.FalseTarget = Resolve(FC);
+    } else {
+      return false;
+    }
+    if (!Transition.TrueTarget ||
+        (Transition.Condition && !Transition.FalseTarget))
+      return false;
+    auto *OldBranch = dyn_cast<BranchInst>(Source->getTerminator());
+    if (!OldBranch) return false;
+    if (OldBranch->isUnconditional()) {
+      if (OldBranch->getSuccessor(0) != Join) return false;
+    } else {
+      if (!Transition.Condition) return false;
+      bool SameCondition =
+          OldBranch->getCondition() == Transition.Condition ||
+          proveEquivalentSMT(OldBranch->getCondition(), Transition.Condition);
+      bool InvertedCondition = false;
+      if (!SameCondition) {
+        auto *NotCondition = BinaryOperator::CreateNot(
+            Transition.Condition, "deobf.partition.not", OldBranch->getIterator());
+        InvertedCondition =
+            proveEquivalentSMT(OldBranch->getCondition(), NotCondition);
+        NotCondition->eraseFromParent();
+      }
+      if (!SameCondition && !InvertedCondition)
+        return false;
+      bool TrueIsJoin = OldBranch->getSuccessor(0) == Join;
+      bool FalseIsJoin = OldBranch->getSuccessor(1) == Join;
+      if (TrueIsJoin == FalseIsJoin) return false;
+      BasicBlock *Direct = OldBranch->getSuccessor(TrueIsJoin ? 1 : 0);
+      bool SelectTrueOnDirect = SameCondition ? !TrueIsJoin : TrueIsJoin;
+      BasicBlock *Expected = SelectTrueOnDirect ? Transition.TrueTarget
+                                                : Transition.FalseTarget;
+      if (Direct != Expected)
+        return false;
+    }
+    Transitions.push_back(Transition);
+  }
+
+  SmallVector<Instruction *, 16> HeaderBody;
+  for (Instruction &I : *Header)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I)) {
+      for (User *U : I.users()) {
+        auto *UseI = dyn_cast<Instruction>(U);
+        if (!UseI || !ShardBlocks.contains(UseI->getParent())) return false;
+      }
+      HeaderBody.push_back(&I);
+    }
+
+  {
+    Instruction *Old = EntryPred->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    Map[State] = Initial;
+    cloneBlockPlumbing(HeaderBody, Old, Map);
+    BranchInst::Create(InitialTarget, Old->getIterator());
+    Old->eraseFromParent();
+  }
+  for (const ProvenTransition &Transition : Transitions) {
+    Instruction *Old = Transition.Source->getTerminator();
+    Value *Next = LatchState->getIncomingValueForBlock(Transition.Source);
+    DenseMap<const Value *, Value *> Map;
+    Map[State] = Next;
+    cloneBlockPlumbing(HeaderBody, Old, Map);
+    if (Transition.Condition)
+      BranchInst::Create(Transition.TrueTarget, Transition.FalseTarget,
+                         Transition.Condition, Old->getIterator());
+    else
+      BranchInst::Create(Transition.TrueTarget, Old->getIterator());
+    Old->eraseFromParent();
+    Proofs.push_back({F->getName().str(), "cff_transition",
+                      Transition.Source->getName().str(),
+                      "partitioned_ssa_exact_transition", "proved"});
+  }
+  std::string HeaderName = Header->getName().str();
+  removeUnreachableBlocks(*F);
+  ++M.DispatchersRecovered;
+  ProofRecord Record{F->getName().str(), "cff_dispatcher", HeaderName,
+                     "complete_partitioned_ssa_transition_set", "proved"};
+  Record.Dependencies.push_back("unique_union_of_switch_case_tables");
+  Record.Dependencies.push_back("complete_returning_case_coverage");
+  Record.Dependencies.push_back("all_initial_and_next_states_resolved");
+  Record.Dependencies.push_back("direct_edges_match_z3_proved_state_selects");
+  Proofs.push_back(std::move(Record));
+  return true;
+}
+
+// Partitioned dispatchers with live semantic state use a two-level latch:
+// case paths merge into a funnel PHI block, then a compact latch PHI block
+// feeds the header PHIs.  Demote only the latch/header PHIs with LLVM's exact
+// utility and clone the complete funnel->latch->header plumbing on each
+// proved transition.  This preserves every semantic state component while
+// removing the dispatcher lookup cycle.
+static bool tryRecoverPartitionedSSAPlumbingDispatcher(
+    SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
+  PHINode *State = findStateRoot(SI.getCondition());
+  if (!State || State->getNumIncomingValues() != 2)
+    return false;
+  BasicBlock *Header = State->getParent();
+  Function *F = Header->getParent();
+  if (SI.getFunction() != F)
+    return false;
+
+  ConstantInt *Initial = nullptr;
+  BasicBlock *EntryPred = nullptr, *Latch = nullptr;
+  PHINode *LatchState = nullptr;
+  for (unsigned I = 0; I != 2; ++I) {
+    Value *Incoming = State->getIncomingValue(I);
+    BasicBlock *IncomingBlock = State->getIncomingBlock(I);
+    if (auto *C = asTransitionConstant(Incoming, IncomingBlock)) {
+      Initial = C;
+      EntryPred = IncomingBlock;
+    } else if (auto *PN = dyn_cast<PHINode>(Incoming)) {
+      LatchState = PN;
+      Latch = IncomingBlock;
+    }
+  }
+  if (!Initial || !EntryPred || !LatchState || !Latch ||
+      LatchState->getParent() != Latch || !Header->hasNPredecessors(2))
+    return false;
+  auto *EntryBr = dyn_cast<BranchInst>(EntryPred->getTerminator());
+  auto *LatchBr = dyn_cast<BranchInst>(Latch->getTerminator());
+  if (!EntryBr || !EntryBr->isUnconditional() ||
+      EntryBr->getSuccessor(0) != Header || !LatchBr ||
+      LatchBr->getNumSuccessors() == 0)
+    return false;
+
+  // The compact latch may reserve one exact state for leaving the flattened
+  // region.  Accept only the canonical equality test between LatchState and a
+  // constant, with the other edge returning to Header.  This is the same
+  // fail-closed terminal-state proof used by the direct SSA plumbing engine.
+  ConstantInt *TerminalState = nullptr;
+  BasicBlock *TerminalTarget = nullptr;
+  if (LatchBr->isUnconditional()) {
+    if (LatchBr->getSuccessor(0) != Header) return false;
+  } else {
+    unsigned HeaderSuccessor = LatchBr->getSuccessor(0) == Header
+                                   ? 0
+                                   : LatchBr->getSuccessor(1) == Header ? 1 : 2;
+    if (HeaderSuccessor > 1) return false;
+    auto *Cmp = dyn_cast<ICmpInst>(LatchBr->getCondition());
+    if (!Cmp || !Cmp->isEquality()) return false;
+    Value *Other = nullptr;
+    if (Cmp->getOperand(0) == LatchState)
+      Other = Cmp->getOperand(1);
+    else if (Cmp->getOperand(1) == LatchState)
+      Other = Cmp->getOperand(0);
+    TerminalState = dyn_cast_or_null<ConstantInt>(Other);
+    if (!TerminalState) return false;
+    bool TrueMeansEqual = Cmp->getPredicate() == ICmpInst::ICMP_EQ;
+    unsigned EqualSuccessor = TrueMeansEqual ? 0 : 1;
+    if (EqualSuccessor == HeaderSuccessor) return false;
+    TerminalTarget = LatchBr->getSuccessor(EqualSuccessor);
+    if (TerminalTarget == Header) return false;
+  }
+
+  SmallVector<SwitchInst *, 8> Shards;
+  SmallPtrSet<BasicBlock *, 32> ShardBlocks;
+  struct EqualityShardCase {
+    ConstantInt *Key = nullptr;
+    BasicBlock *Target = nullptr;
+    BasicBlock *Owner = nullptr;
+  };
+  SmallVector<EqualityShardCase, 8> EqualityCases;
+  BasicBlock *CurrentBlock = Header;
+  BasicBlock *PreviousBlock = nullptr;
+  bool ReachedLatch = false;
+  for (unsigned Depth = 0; Depth != 32; ++Depth) {
+    if (!ShardBlocks.insert(CurrentBlock).second) return false;
+    if (PreviousBlock &&
+        (!CurrentBlock->hasNPredecessors(1) ||
+         *pred_begin(CurrentBlock) != PreviousBlock))
+      return false;
+
+    BasicBlock *Next = nullptr;
+    if (auto *Shard = dyn_cast<SwitchInst>(CurrentBlock->getTerminator())) {
+      if (Shards.size() == 8 || Shard->getCondition() != SI.getCondition())
+        return false;
+      if (CurrentBlock != Header)
+        for (Instruction &I : *CurrentBlock)
+          if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I)) return false;
+      Shards.push_back(Shard);
+      Next = Shard->getDefaultDest();
+    } else {
+      // Optimisation may peel one or more sparse switch cases into equality
+      // branches between switch table shards.  They are still part of the
+      // same exhaustive dispatcher lookup chain and must be collected rather
+      // than making the entire partitioned dispatcher unrecognisable.
+      auto *Br = dyn_cast<BranchInst>(CurrentBlock->getTerminator());
+      auto *Cmp = Br && Br->isConditional()
+                      ? dyn_cast<ICmpInst>(Br->getCondition())
+                      : nullptr;
+      if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+                   Cmp->getPredicate() != ICmpInst::ICMP_NE))
+        return false;
+      ConstantInt *Key = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+      Value *Compared = Cmp->getOperand(0);
+      if (!Key) {
+        Key = dyn_cast<ConstantInt>(Cmp->getOperand(0));
+        Compared = Cmp->getOperand(1);
+      }
+      if (!Key || Compared != SI.getCondition()) return false;
+      if (CurrentBlock != Header)
+        for (Instruction &I : *CurrentBlock)
+          if (&I != Cmp && !I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+            return false;
+      unsigned MatchIndex = Cmp->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1;
+      EqualityCases.push_back(
+          {Key, Br->getSuccessor(MatchIndex), CurrentBlock});
+      Next = Br->getSuccessor(1 - MatchIndex);
+    }
+    if (Next == Latch) {
+      ReachedLatch = true;
+      break;
+    }
+    PreviousBlock = CurrentBlock;
+    CurrentBlock = Next;
+  }
+  // A single switch followed by a complete semantic funnel is the same
+  // recurrence as the multi-shard form; partitioning is an optimizer detail,
+  // not part of the proof obligation.
+  // recoverDispatchers visits every large switch in the function.  Only the
+  // first switch in this lookup chain owns the rewrite; accepting a later
+  // shard would replay the whole-chain mutation after earlier CFG changes and
+  // can leave a surviving shard using a latch value that no longer dominates
+  // it.  Equality blocks before the first switch remain supported.
+  if (Shards.empty() || Shards.front() != &SI || !ReachedLatch)
+    return false;
+
+  DenseMap<APInt, BasicBlock *> CaseMap;
+  DenseMap<APInt, BasicBlock *> CaseOwner;
+  SmallPtrSet<BasicBlock *, 4> PhiCaseTargets;
+  for (SwitchInst *Shard : Shards)
+    for (auto Case : Shard->cases()) {
+      APInt Key = Case.getCaseValue()->getValue();
+      BasicBlock *Target = Case.getCaseSuccessor();
+      if (CaseMap.count(Key) || ShardBlocks.contains(Target))
+        return false;
+      if (!Target->phis().empty()) PhiCaseTargets.insert(Target);
+      CaseMap[Key] = Target;
+      CaseOwner[Key] = Shard->getParent();
+    }
+  for (const EqualityShardCase &Case : EqualityCases) {
+    APInt Key = Case.Key->getValue();
+    if (CaseMap.count(Key) || ShardBlocks.contains(Case.Target)) return false;
+    if (!Case.Target->phis().empty()) PhiCaseTargets.insert(Case.Target);
+    CaseMap[Key] = Case.Target;
+    CaseOwner[Key] = Case.Owner;
+  }
+  if (CaseMap.size() < 4) return false;
+
+  SmallVector<PHINode *, 16> HeaderPhis;
+  SmallVector<PHINode *, 16> LatchPhis;
+  for (PHINode &HeaderPhi : Header->phis()) {
+    if (HeaderPhi.getNumIncomingValues() != 2 ||
+        HeaderPhi.getBasicBlockIndex(EntryPred) < 0 ||
+        HeaderPhi.getBasicBlockIndex(Latch) < 0)
+      return false;
+    // A loop-carried component need not be forwarded by a latch PHI
+    // directly.  Optimisation commonly folds its update into a pure latch
+    // instruction (for example, an or/add fed by a latch PHI).  Requiring a
+    // one-to-one HeaderPhi->LatchPhi pairing rejects that valid canonical
+    // SSA shape.  The complete latch body is cloned below, so accepting a
+    // value defined in the latch is exact; values from any other block would
+    // require unsupported cross-block scheduling and remain rejected.
+    Value *LatchIncoming = HeaderPhi.getIncomingValueForBlock(Latch);
+    if (auto *LatchInstruction = dyn_cast<Instruction>(LatchIncoming);
+        !LatchInstruction || LatchInstruction->getParent() != Latch)
+      return false;
+    HeaderPhis.push_back(&HeaderPhi);
+  }
+  for (PHINode &LatchPhi : Latch->phis())
+    LatchPhis.push_back(&LatchPhi);
+  if (!llvm::is_contained(LatchPhis, LatchState)) return false;
+
+  BasicBlock *LastShard = Shards.back()->getParent();
+  BasicBlock *Funnel = nullptr;
+  for (BasicBlock *Pred : predecessors(Latch)) {
+    if (Pred == LastShard) continue;
+    if (Funnel) return false;
+    Funnel = Pred;
+  }
+  if (!Funnel || !llvm::is_contained(predecessors(Latch), LastShard))
+    return false;
+  auto *FunnelBr = dyn_cast<BranchInst>(Funnel->getTerminator());
+  if (!FunnelBr || !FunnelBr->isUnconditional() ||
+      FunnelBr->getSuccessor(0) != Latch)
+    return false;
+
+  DenseMap<PHINode *, PHINode *> LatchToFunnel;
+  SmallPtrSet<PHINode *, 16> UsedFunnelPhis;
+  for (PHINode *LatchPhi : LatchPhis) {
+    if (LatchPhi->getBasicBlockIndex(Funnel) < 0 ||
+        LatchPhi->getBasicBlockIndex(LastShard) < 0)
+      return false;
+    auto *FunnelPhi = dyn_cast<PHINode>(
+        LatchPhi->getIncomingValueForBlock(Funnel));
+    if (!FunnelPhi || FunnelPhi->getParent() != Funnel ||
+        !UsedFunnelPhis.insert(FunnelPhi).second)
+      return false;
+    LatchToFunnel[LatchPhi] = FunnelPhi;
+  }
+  for (PHINode &FunnelPhi : Funnel->phis())
+    if (!UsedFunnelPhis.contains(&FunnelPhi)) return false;
+  PHINode *StateFunnel = LatchToFunnel.lookup(LatchState);
+  if (!StateFunnel) return false;
+  for (BasicBlock *PhiTarget : PhiCaseTargets)
+    if (PhiTarget != Funnel) return false;
+
+  struct ResolvedPlumbingPath {
+    BasicBlock *Target = nullptr;
+    SmallVector<BasicBlock *, 8> TrampolineOwners;
+  };
+  auto Resolve = [&](ConstantInt *Raw) -> std::optional<ResolvedPlumbingPath> {
+    ResolvedPlumbingPath Result;
+    APInt CurrentState = Raw->getValue();
+    SmallPtrSet<BasicBlock *, 8> SeenOwners;
+    for (unsigned Depth = 0; Depth != 8; ++Depth) {
+      if (TerminalState && CurrentState == TerminalState->getValue()) {
+        Result.Target = TerminalTarget;
+        return Result;
+      }
+      auto Encoded = evalStateExpr(SI.getCondition(), State, CurrentState);
+      if (!Encoded) return std::nullopt;
+      auto It = CaseMap.find(*Encoded);
+      if (It == CaseMap.end()) return std::nullopt;
+      if (It->second != Funnel) {
+        Result.Target = It->second;
+        return Result;
+      }
+      BasicBlock *Owner = CaseOwner.lookup(*Encoded);
+      if (!Owner || !SeenOwners.insert(Owner).second) return std::nullopt;
+      auto *Next = dyn_cast_or_null<ConstantInt>(
+          StateFunnel->getIncomingValueForBlock(Owner));
+      if (!Next) return std::nullopt;
+      Result.TrampolineOwners.push_back(Owner);
+      CurrentState = Next->getValue();
+    }
+    return std::nullopt;
+  };
+  std::optional<ResolvedPlumbingPath> InitialPath = Resolve(Initial);
+  if (!InitialPath) return false;
+
+  struct PlumbingTransition {
+    BasicBlock *Source = nullptr;
+    Value *Condition = nullptr;
+    ResolvedPlumbingPath TruePath;
+    std::optional<ResolvedPlumbingPath> FalsePath;
+  };
+  SmallVector<PlumbingTransition, 128> Transitions;
+  for (BasicBlock *Source : predecessors(Funnel)) {
+    // A switch shard may itself target the funnel for a trampoline state.
+    // Resolve() has already proved that state's next hop through StateFunnel;
+    // the shard is dispatcher plumbing, not a returning case transition.
+    if (ShardBlocks.contains(Source)) continue;
+    int StateIndex = StateFunnel->getBasicBlockIndex(Source);
+    if (StateIndex < 0) return false;
+    Value *Next = StateFunnel->getIncomingValue(StateIndex);
+    PlumbingTransition Transition;
+    Transition.Source = Source;
+    if (auto *C = dyn_cast<ConstantInt>(Next)) {
+      auto Path = Resolve(C);
+      if (!Path) return false;
+      Transition.TruePath = std::move(*Path);
+    } else if (auto *Select = dyn_cast<SelectInst>(Next)) {
+      auto *TC = dyn_cast<ConstantInt>(Select->getTrueValue());
+      auto *FC = dyn_cast<ConstantInt>(Select->getFalseValue());
+      if (!TC || !FC) return false;
+      Transition.Condition = Select->getCondition();
+      auto TruePath = Resolve(TC);
+      auto FalsePath = Resolve(FC);
+      if (!TruePath || !FalsePath) return false;
+      Transition.TruePath = std::move(*TruePath);
+      Transition.FalsePath = std::move(*FalsePath);
+    } else {
+      return false;
+    }
+    auto *OldBranch = dyn_cast<BranchInst>(Source->getTerminator());
+    if (!OldBranch) return false;
+    if (OldBranch->isUnconditional()) {
+      if (OldBranch->getSuccessor(0) != Funnel) return false;
+    } else {
+      if (!Transition.Condition) return false;
+      bool Same = OldBranch->getCondition() == Transition.Condition ||
+                  proveEquivalentSMT(OldBranch->getCondition(),
+                                     Transition.Condition);
+      bool Inverted = false;
+      if (!Same) {
+        auto *NotCondition = BinaryOperator::CreateNot(
+            Transition.Condition, "deobf.partition.plumbing.not",
+            OldBranch->getIterator());
+        Inverted = proveEquivalentSMT(OldBranch->getCondition(), NotCondition);
+        NotCondition->eraseFromParent();
+      }
+      if (!Same && !Inverted) return false;
+      bool TrueIsFunnel = OldBranch->getSuccessor(0) == Funnel;
+      bool FalseIsFunnel = OldBranch->getSuccessor(1) == Funnel;
+      if (TrueIsFunnel == FalseIsFunnel) return false;
+      BasicBlock *Direct =
+          OldBranch->getSuccessor(TrueIsFunnel ? 1 : 0);
+      bool SelectTrueOnDirect = Same ? !TrueIsFunnel : TrueIsFunnel;
+      BasicBlock *Expected = SelectTrueOnDirect
+                                 ? Transition.TruePath.Target
+                                 : Transition.FalsePath->Target;
+      if (Direct != Expected) return false;
+    }
+    Transitions.push_back(Transition);
+  }
+  if (Transitions.empty()) return false;
+
+  Instruction *AllocaPoint = &*F->getEntryBlock().getFirstInsertionPt();
+  for (PHINode *LatchPhi : LatchPhis)
+    DemotePHIToStack(LatchPhi, AllocaPoint->getIterator());
+  for (PHINode *HeaderPhi : HeaderPhis)
+    DemotePHIToStack(HeaderPhi, AllocaPoint->getIterator());
+
+  // A conditional terminal edge can consume values produced in the latch.
+  // Once transitions bypass that latch, keep those exact live-outs available
+  // through private reg2mem slots before cloning the latch body per edge.
+  SmallVector<Instruction *, 16> LatchBeforeLiveOutDemotion;
+  for (Instruction &I : *Latch)
+    if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+      LatchBeforeLiveOutDemotion.push_back(&I);
+  for (Instruction *I : LatchBeforeLiveOutDemotion) {
+    if (I->getType()->isVoidTy() || I->use_empty()) continue;
+    bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+      auto *UseI = dyn_cast<Instruction>(U);
+      return UseI && UseI->getParent() != Latch;
+    });
+    if (UsedOutside)
+      DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+  }
+
+  // Header values can feed instructions in case blocks.  Once the dispatcher
+  // header is bypassed, a cloned header definition no longer dominates those
+  // existing uses.  Lower every such live-out through LLVM's reg2mem utility;
+  // cloning the resulting store in HeaderBody then supplies the exact value
+  // to the per-use reloads that remain in each case block.
+  SmallVector<Instruction *, 64> HeaderBeforeLiveOutDemotion;
+  for (Instruction &I : *Header)
+    if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+      HeaderBeforeLiveOutDemotion.push_back(&I);
+  for (Instruction *I : HeaderBeforeLiveOutDemotion) {
+    if (I->getType()->isVoidTy() || I->use_empty()) continue;
+    bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+      auto *UseI = dyn_cast<Instruction>(U);
+      return UseI && UseI->getParent() != Header;
+    });
+    if (UsedOutside)
+      DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+  }
+
+  SmallVector<Instruction *, 64> FunnelBody, LatchBody, HeaderBody;
+  for (Instruction &I : *Funnel)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I))
+      FunnelBody.push_back(&I);
+  for (Instruction &I : *Latch)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I))
+      LatchBody.push_back(&I);
+  for (Instruction &I : *Header)
+    if (!isa<PHINode>(I) && !I.isTerminator() &&
+        !isa<DbgInfoIntrinsic>(I))
+      HeaderBody.push_back(&I);
+
+  // Clone one exact semantic-state update round.  Map is intentionally kept
+  // across rounds: funnel values owned by a dispatcher shard may reference
+  // header values produced by the preceding round.
+  auto CloneRound = [&](BasicBlock *Owner, Instruction *InsertBefore,
+                        DenseMap<const Value *, Value *> &Map) {
+    // Reg2mem may place reloads in a non-header shard for PHI operands whose
+    // edge is owned by that shard.  Those reloads are real dispatcher-path
+    // plumbing and must be cloned before their funnel incoming values are
+    // mapped.  The preflight above proved that a shard had no original body,
+    // so this cannot duplicate case semantics or side effects.
+    if (Owner != Header && ShardBlocks.contains(Owner)) {
+      SmallVector<Instruction *, 16> OwnerBody;
+      for (Instruction &I : *Owner)
+        if (!isa<PHINode>(I) && !I.isTerminator() &&
+            !isa<DbgInfoIntrinsic>(I))
+          OwnerBody.push_back(&I);
+      cloneBlockPlumbing(OwnerBody, InsertBefore, Map);
+    }
+    for (PHINode &FunnelPhi : Funnel->phis()) {
+      Value *Incoming = FunnelPhi.getIncomingValueForBlock(Owner);
+      auto It = Map.find(Incoming);
+      Map[&FunnelPhi] = It == Map.end() ? Incoming : It->second;
+    }
+    cloneBlockPlumbing(FunnelBody, InsertBefore, Map);
+    cloneBlockPlumbing(LatchBody, InsertBefore, Map);
+    cloneBlockPlumbing(HeaderBody, InsertBefore, Map);
+  };
+
+  {
+    Instruction *Old = EntryPred->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    cloneBlockPlumbing(HeaderBody, Old, Map);
+    for (BasicBlock *Owner : InitialPath->TrampolineOwners)
+      CloneRound(Owner, Old, Map);
+    BranchInst::Create(InitialPath->Target, Old->getIterator());
+    Old->eraseFromParent();
+  }
+  unsigned PathSerial = 0;
+  for (const PlumbingTransition &Transition : Transitions) {
+    Instruction *Old = Transition.Source->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    CloneRound(Transition.Source, Old, Map);
+    auto MaterializePath = [&](const ResolvedPlumbingPath &Path,
+                               StringRef Suffix) -> BasicBlock * {
+      if (Path.TrampolineOwners.empty()) return Path.Target;
+      BasicBlock *PathBlock = BasicBlock::Create(
+          F->getContext(), "deobf.partition.plumbing." + Suffix + "." +
+                               Twine(PathSerial++),
+          F, Path.Target);
+      BranchInst *PathBranch = BranchInst::Create(Path.Target, PathBlock);
+      DenseMap<const Value *, Value *> PathMap = Map;
+      for (BasicBlock *Owner : Path.TrampolineOwners)
+        CloneRound(Owner, PathBranch, PathMap);
+      return PathBlock;
+    };
+    BasicBlock *TrueTarget =
+        MaterializePath(Transition.TruePath, "true");
+    if (Transition.Condition) {
+      BasicBlock *FalseTarget =
+          MaterializePath(*Transition.FalsePath, "false");
+      BranchInst::Create(TrueTarget, FalseTarget, Transition.Condition,
+                         Old->getIterator());
+    } else {
+      BranchInst::Create(TrueTarget, Old->getIterator());
+    }
+    Old->eraseFromParent();
+    Proofs.push_back({F->getName().str(), "cff_transition",
+                      Transition.Source->getName().str(),
+                      Shards.size() == 1 ? "ssa_funnel_plumbing"
+                                         : "partitioned_ssa_funnel_plumbing",
+                      "proved"});
+  }
+  std::string HeaderName = Header->getName().str();
+  removeUnreachableBlocks(*F);
+  ++M.DispatchersRecovered;
+  ProofRecord Record{
+      F->getName().str(), "cff_dispatcher", HeaderName,
+      Shards.size() == 1 ? "complete_ssa_funnel_plumbing"
+                         : "complete_partitioned_ssa_funnel_plumbing",
+      "proved"};
+  Record.Dependencies.push_back(
+      Shards.size() == 1 ? "unique_switch_case_table"
+                         : "unique_union_of_switch_case_tables");
+  Record.Dependencies.push_back("complete_funnel_phi_coverage");
+  Record.Dependencies.push_back("llvm_latch_and_header_phi_demotion");
+  Record.Dependencies.push_back("exact_funnel_latch_header_clone");
+  Record.Dependencies.push_back("all_initial_and_next_states_resolved");
+  if (TerminalState)
+    Record.Dependencies.push_back("exact_terminal_latch_state_transition");
+  Proofs.push_back(std::move(Record));
+  return true;
+}
+
 // Recover a dispatcher whose state is already one PHI input per returning
 // case.  A self-looping default is removable only by an exhaustive induction:
 // at least one non-header seed reaches a returning source, every non-default
@@ -4489,6 +7081,7 @@ static bool tryRecoverMultiIncomingSSADispatcher(
 
   SmallVector<ProvenTransition, 32> Transitions;
   bool HasExternalSeed = false;
+  DominatorTree DispatcherDT(*F);
   for (unsigned I = 0; I != State->getNumIncomingValues(); ++I) {
     BasicBlock *Pred = State->getIncomingBlock(I);
     if (Pred == Default) continue;
@@ -4496,8 +7089,11 @@ static bool tryRecoverMultiIncomingSSADispatcher(
     if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != Header)
       return false;
     for (BasicBlock *PredPred : predecessors(Pred))
-      if (PredPred != Header &&
-          !isPotentiallyReachable(Header, PredPred))
+      // Whole-function reachability is too broad for nested dispatchers: a
+      // later outer-loop invocation can make Header reach the entry seed.
+      // Dominance captures the local dispatcher region instead.  A genuine
+      // case path is dominated by Header; an alternate seed edge is not.
+      if (PredPred != Header && !DispatcherDT.dominates(Header, PredPred))
         HasExternalSeed = true;
 
     Value *Raw = State->getIncomingValue(I);
@@ -4515,7 +7111,8 @@ static bool tryRecoverMultiIncomingSSADispatcher(
     } else {
       return false;
     }
-    if (!T.TrueTarget || (T.Condition && !T.FalseTarget)) return false;
+    if (!T.TrueTarget || (T.Condition && !T.FalseTarget))
+      return false;
     Transitions.push_back(T);
   }
   if (!HasExternalSeed || Transitions.empty()) return false;
@@ -4533,6 +7130,15 @@ static bool tryRecoverMultiIncomingSSADispatcher(
     CertificateOS << valueName(*T.Source) << "->"
                   << valueName(*T.TrueTarget);
     if (T.FalseTarget) CertificateOS << ',' << valueName(*T.FalseTarget);
+    if (T.FiniteState) {
+      CertificateOS << ";finite{";
+      for (unsigned I = 0; I != T.FiniteRawValues.size(); ++I) {
+        if (I) CertificateOS << ',';
+        CertificateOS << T.FiniteRawValues[I] << "->"
+                      << valueName(*T.FiniteTargets[I]);
+      }
+      CertificateOS << '}';
+    }
     CertificateOS << '\n';
   }
   CertificateOS.flush();
@@ -4586,44 +7192,89 @@ static bool tryRecoverMultiIncomingSSADispatcher(
 // not infer or discard any side effect.
 static StoreInst *findReachingStateStore(BasicBlock *Source,
                                          Value *StatePointer,
+                                         Type *StateType,
+                                         BasicBlock *Header,
                                          unsigned Depth = 0,
                                          bool *HitBarrier = nullptr);
+static PHINode *buildMergedReachingStateValue(
+    BasicBlock *Merge, Value *StatePointer, Type *StateType,
+    BasicBlock *Header, BasicBlock *Join,
+    const DenseMap<BasicBlock *, APInt> &CaseStates,
+    Value *CurrentState = nullptr);
 
 static bool tryRecoverSSAPlumbingDispatcher(
-    SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
-  BasicBlock *Header = SI.getParent();
-  Function *F = Header->getParent();
-  auto Reject = [](StringRef) { return false; };
+    SwitchInst &SI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs,
+    std::string *RejectionReason = nullptr) {
+  BasicBlock *SwitchBlock = SI.getParent();
+  auto Reject = [&](StringRef Reason) {
+    if (RejectionReason) *RejectionReason = Reason.str();
+    return false;
+  };
   PHINode *State = findStateRoot(SI.getCondition());
-  if (!State || State->getParent() != Header ||
-      State->getNumIncomingValues() != 2)
+  if (!State || State->getNumIncomingValues() != 2)
     return Reject("state-root");
-  // Keep the compact direct-SSA rewrite for the single-state-PHI shape.
-  if (std::next(Header->phis().begin()) == Header->phis().end())
-    return Reject("single-header-phi");
-
+  // A sparse equality case may be peeled in front of the first switch shard.
+  // Anchor the recurrence at the state PHI rather than at that later shard.
+  BasicBlock *Header = State->getParent();
+  Function *F = Header->getParent();
+  if (SwitchBlock->getParent() != F)
+    return Reject("state-root-function");
   PHINode *LatchState = nullptr;
   LoadInst *LatchStateLoad = nullptr;
+  std::string MemoryPromotionFailure;
+  Value *InitialStateValue = nullptr;
   ConstantInt *Initial = nullptr;
   BasicBlock *EntryPred = nullptr, *Latch = nullptr;
+  DominatorTree DispatcherDT(*F);
   for (unsigned I = 0; I != 2; ++I) {
     Value *V = State->getIncomingValue(I);
+    BasicBlock *IncomingBlock = State->getIncomingBlock(I);
     if (auto *C = dyn_cast<ConstantInt>(V)) {
       Initial = C;
-      EntryPred = State->getIncomingBlock(I);
+      InitialStateValue = C;
+      EntryPred = IncomingBlock;
     } else if (auto *PN = dyn_cast<PHINode>(V)) {
-      LatchState = PN;
-      Latch = State->getIncomingBlock(I);
+      // Nested dispatchers commonly receive their first state through an
+      // outer-loop PHI.  Dominance, rather than the value kind, distinguishes
+      // that seed arm from the inner dispatcher latch arm.
+      if (!DispatcherDT.dominates(Header, IncomingBlock)) {
+        InitialStateValue = PN;
+        EntryPred = IncomingBlock;
+      } else {
+        LatchState = PN;
+        Latch = IncomingBlock;
+      }
     } else if (auto *LI = dyn_cast<LoadInst>(V)) {
-      LatchStateLoad = LI;
-      Latch = State->getIncomingBlock(I);
+      // Classify the load after seeing the other arm.  Native cleanup can
+      // materialize an entry-state load from a locally initialized frame
+      // slot, while memory-form CFF uses a load on the cyclic latch arm.
+      BasicBlock *IncomingBlock = State->getIncomingBlock(I);
+      if (!DispatcherDT.dominates(Header, IncomingBlock)) {
+        InitialStateValue = LI;
+        EntryPred = IncomingBlock;
+      } else {
+        LatchStateLoad = LI;
+        Latch = IncomingBlock;
+      }
+    } else if (!DispatcherDT.dominates(Header, IncomingBlock)) {
+      InitialStateValue = V;
+      EntryPred = IncomingBlock;
     }
   }
+  if (!Initial && InitialStateValue && EntryPred)
+    Initial = asTransitionConstant(InitialStateValue, EntryPred);
+  // Keep the compact direct-SSA engine for a constant-seeded dispatcher that
+  // carries no semantic header state.  This plumbing engine is needed for the
+  // single-PHI shape only when the seed is dynamic or belongs to a nested
+  // outer recurrence.
+  if (Initial && SwitchBlock == Header &&
+      std::next(Header->phis().begin()) == Header->phis().end())
+    return Reject("constant-single-header-phi");
   // Late pointer canonicalization can expose a complete memory recurrence
   // only after the broad State-SSA sweep has run. Promote that exact join load
   // to a latch PHI. The dispatcher default edge carries the current state;
   // every other predecessor must have one exact reaching store.
-  if (Initial && !LatchState && LatchStateLoad && Latch &&
+  if (InitialStateValue && !LatchState && LatchStateLoad && Latch &&
       LatchStateLoad->getParent() == Latch &&
       !LatchStateLoad->isAtomic() && !LatchStateLoad->isVolatile()) {
     bool Safe = true;
@@ -4632,32 +7283,70 @@ static bool tryRecoverSSAPlumbingDispatcher(
       if (!isa<PHINode>(I) && !isa<DbgInfoIntrinsic>(I) &&
           I.mayWriteToMemory()) {
         Safe = false;
+        MemoryPromotionFailure = "write-before-latch-state-load";
         break;
       }
     }
+    DenseMap<BasicBlock *, APInt> MemoryCaseStates;
+    SmallPtrSet<BasicBlock *, 8> AmbiguousMemoryCaseStates;
+    for (BasicBlock &LookupBlock : *F) {
+      auto *Lookup = dyn_cast<SwitchInst>(LookupBlock.getTerminator());
+      if (!Lookup || Lookup->getCondition() != SI.getCondition()) continue;
+      for (auto Case : Lookup->cases()) {
+        auto Raw = decodeStateExpr(SI.getCondition(), State,
+                                   Case.getCaseValue()->getValue());
+        if (!Raw) continue;
+        BasicBlock *Target = Case.getCaseSuccessor();
+        auto It = MemoryCaseStates.find(Target);
+        if (It == MemoryCaseStates.end())
+          MemoryCaseStates.try_emplace(Target, *Raw);
+        else if (It->second != *Raw)
+          AmbiguousMemoryCaseStates.insert(Target);
+      }
+    }
+    for (BasicBlock *Target : AmbiguousMemoryCaseStates)
+      MemoryCaseStates.erase(Target);
+
     SmallVector<std::pair<Value *, BasicBlock *>, 64> Incoming;
     for (BasicBlock *Pred : predecessors(Latch)) {
       unsigned EdgeCount = 0;
       for (BasicBlock *Succ : successors(Pred)) EdgeCount += Succ == Latch;
       if (EdgeCount != 1) {
         Safe = false;
+        MemoryPromotionFailure =
+            (Twine("non-unique-latch-edge:") + Pred->getName()).str();
         break;
       }
       bool HitBarrier = false;
       StoreInst *Store = findReachingStateStore(
-          Pred, LatchStateLoad->getPointerOperand(), 0, &HitBarrier);
+          Pred, LatchStateLoad->getPointerOperand(), LatchStateLoad->getType(),
+          Header, 0, &HitBarrier);
+      PHINode *MergedState = nullptr;
+      if (!Store && !HitBarrier)
+        MergedState = buildMergedReachingStateValue(
+            Pred, LatchStateLoad->getPointerOperand(),
+            LatchStateLoad->getType(), Header, Latch, MemoryCaseStates,
+            State);
       if (Pred == Header && !Store && !HitBarrier) {
         Incoming.push_back({State, Pred});
         continue;
       }
-      if (!Store || HitBarrier || Store->isAtomic() || Store->isVolatile() ||
-          Store->getValueOperand()->getType() != LatchStateLoad->getType() ||
-          !sameFrameAddress(Store->getPointerOperand(),
-                            LatchStateLoad->getPointerOperand())) {
+      if ((!Store && !MergedState) || HitBarrier ||
+          (Store && (Store->isAtomic() || Store->isVolatile() ||
+                     Store->getValueOperand()->getType() !=
+                         LatchStateLoad->getType() ||
+                     !sameFrameAddress(Store->getPointerOperand(),
+                                       LatchStateLoad->getPointerOperand())))) {
         Safe = false;
+        MemoryPromotionFailure =
+            (Twine("unproved-reaching-state:") + Pred->getName() +
+             (HitBarrier ? ":alias-barrier" : ":no-exact-store"))
+                .str();
         break;
       }
-      Incoming.push_back({Store->getValueOperand(), Pred});
+      Incoming.push_back(
+          {Store ? Store->getValueOperand() : static_cast<Value *>(MergedState),
+           Pred});
     }
     if (Safe && Incoming.size() == pred_size(Latch)) {
       LatchState = PHINode::Create(
@@ -4677,15 +7366,142 @@ static bool tryRecoverSSAPlumbingDispatcher(
       Proofs.push_back(std::move(Promotion));
     }
   }
-  if (!Initial || !LatchState || LatchState->getParent() != Latch ||
+  if (!InitialStateValue || !LatchState || LatchState->getParent() != Latch ||
       !Header->hasNPredecessors(2))
-    return Reject("entry-latch-shape");
+    return Reject(MemoryPromotionFailure.empty()
+                      ? "entry-latch-shape"
+                      : (Twine("entry-latch-shape;") +
+                         MemoryPromotionFailure).str());
+  // Whole-function reachability is too broad for an inlined/nested region:
+  // Header may reach a later outer path which eventually invokes this region
+  // again, without EntryPred belonging to this dispatcher's recurrence.  A
+  // genuine inner latch/outer recurrence entry is dominated by Header; an
+  // external dynamic seed is not.
+  // A PHI seed is an explicit outer recurrence and must still take the nested
+  // recovery path even when its outer header is not dominated by the inner
+  // dispatcher (the canonical shared-switch shape).
+  bool HasExplicitOuterState = isa<PHINode>(InitialStateValue);
+  bool DynamicEntryIsOneShot =
+      !Initial && !HasExplicitOuterState &&
+      !DispatcherDT.dominates(Header, EntryPred);
   auto *EntryBr = dyn_cast<BranchInst>(EntryPred->getTerminator());
   auto *LatchBr = dyn_cast<BranchInst>(Latch->getTerminator());
   if (!EntryBr || !EntryBr->isUnconditional() ||
-      EntryBr->getSuccessor(0) != Header || !LatchBr ||
-      !LatchBr->isUnconditional() || LatchBr->getSuccessor(0) != Header)
+      EntryBr->getSuccessor(0) != Header || !LatchBr)
     return Reject("entry-latch-branches");
+
+  // A common flattened-loop form reserves one state value for function/loop
+  // exit.  The latch tests that exact value and returns to the dispatcher for
+  // every other state.  Treat the reserved value as one additional resolved
+  // transition target instead of rejecting the whole dispatcher merely
+  // because its latch is conditional.
+  ConstantInt *TerminalState = nullptr;
+  BasicBlock *TerminalTarget = nullptr;
+  if (LatchBr->isUnconditional()) {
+    if (LatchBr->getSuccessor(0) != Header)
+      return Reject("latch-does-not-return-to-header");
+  } else {
+    unsigned HeaderSuccessor = LatchBr->getSuccessor(0) == Header
+                                   ? 0
+                                   : LatchBr->getSuccessor(1) == Header ? 1 : 2;
+    if (HeaderSuccessor > 1)
+      return Reject("conditional-latch-without-header-edge");
+    auto *Cmp = dyn_cast<ICmpInst>(LatchBr->getCondition());
+    if (!Cmp || !Cmp->isEquality())
+      return Reject("unsupported-terminal-latch-condition");
+    Value *Other = nullptr;
+    if (Cmp->getOperand(0) == LatchState)
+      Other = Cmp->getOperand(1);
+    else if (Cmp->getOperand(1) == LatchState)
+      Other = Cmp->getOperand(0);
+    TerminalState = dyn_cast_or_null<ConstantInt>(Other);
+    if (!TerminalState)
+      return Reject("terminal-latch-state-not-constant");
+    bool TrueMeansEqual = Cmp->getPredicate() == ICmpInst::ICMP_EQ;
+    unsigned EqualSuccessor = TrueMeansEqual ? 0 : 1;
+    if (EqualSuccessor == HeaderSuccessor)
+      return Reject("terminal-state-returns-to-dispatcher");
+    TerminalTarget = LatchBr->getSuccessor(EqualSuccessor);
+    if (TerminalTarget == Header)
+      return Reject("terminal-target-is-dispatcher");
+  }
+
+  // A shared-switch nested dispatcher feeds the inner header from an outer
+  // two-level recurrence.  Record that recurrence now so both levels can be
+  // removed in one exact transaction; otherwise demoting only the inner PHIs
+  // leaves a memory-form outer dispatcher behind.
+  BasicBlock *Outer = nullptr, *OuterEntry = nullptr, *OuterSink = nullptr;
+  PHINode *OuterState = nullptr, *OuterSinkState = nullptr;
+  ConstantInt *OuterInitial = nullptr;
+  SmallVector<PHINode *, 8> OuterPhis, OuterSinkPhis;
+  bool HasNestedOuter = false;
+  if (!Initial && !DynamicEntryIsOneShot) {
+    Outer = EntryPred;
+    OuterState = dyn_cast<PHINode>(InitialStateValue);
+    if (!OuterState || OuterState->getParent() != Outer ||
+        OuterState->getNumIncomingValues() != 2)
+      return Reject("nested-outer-state");
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *V = OuterState->getIncomingValue(I);
+      BasicBlock *Pred = OuterState->getIncomingBlock(I);
+      if (auto *C = dyn_cast<ConstantInt>(V)) {
+        OuterInitial = C;
+        OuterEntry = Pred;
+      } else if (auto *PN = dyn_cast<PHINode>(V);
+                 PN && PN->getParent() == Pred) {
+        OuterSinkState = PN;
+        OuterSink = Pred;
+      }
+    }
+    auto *OuterEntryBr = OuterEntry
+                             ? dyn_cast<BranchInst>(OuterEntry->getTerminator())
+                             : nullptr;
+    auto *OuterSinkBr = OuterSink
+                            ? dyn_cast<BranchInst>(OuterSink->getTerminator())
+                            : nullptr;
+    if (!OuterInitial || !OuterEntry || !OuterSinkState || !OuterSink ||
+        !OuterEntryBr || !OuterEntryBr->isUnconditional() ||
+        OuterEntryBr->getSuccessor(0) != Outer || !OuterSinkBr ||
+        !OuterSinkBr->isUnconditional() ||
+        OuterSinkBr->getSuccessor(0) != Outer)
+      return Reject("nested-outer-shape");
+    SmallPtrSet<PHINode *, 8> UsedOuterSinkPhis;
+    std::function<bool(Value *, SmallPtrSetImpl<Value *> &)> CollectSinkPhis;
+    CollectSinkPhis = [&](Value *V, SmallPtrSetImpl<Value *> &Seen) {
+      if (!Seen.insert(V).second) return true;
+      if (auto *PN = dyn_cast<PHINode>(V)) {
+        if (PN->getParent() == OuterSink) UsedOuterSinkPhis.insert(PN);
+        return true;
+      }
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || I->getParent() != OuterSink) return true;
+      if (I->isTerminator() || I->mayReadOrWriteMemory() ||
+          I->mayHaveSideEffects())
+        return false;
+      for (Value *Operand : I->operands())
+        if (!CollectSinkPhis(Operand, Seen)) return false;
+      return true;
+    };
+    for (PHINode &OuterPhi : Outer->phis()) {
+      if (OuterPhi.getNumIncomingValues() != 2 ||
+          OuterPhi.getBasicBlockIndex(OuterEntry) < 0 ||
+          OuterPhi.getBasicBlockIndex(OuterSink) < 0)
+        return Reject("nested-outer-phi-shape");
+      Value *SinkValue = OuterPhi.getIncomingValueForBlock(OuterSink);
+      SmallPtrSet<Value *, 16> SeenSinkValues;
+      if (!CollectSinkPhis(SinkValue, SeenSinkValues))
+        return Reject("nested-outer-phi-pair");
+      OuterPhis.push_back(&OuterPhi);
+    }
+    for (PHINode &SinkPhi : OuterSink->phis()) {
+      if (!UsedOuterSinkPhis.contains(&SinkPhi))
+        return Reject("nested-unpaired-outer-sink-phi");
+      OuterSinkPhis.push_back(&SinkPhi);
+    }
+    if (!UsedOuterSinkPhis.contains(OuterSinkState))
+      return Reject("nested-outer-state-not-paired");
+    HasNestedOuter = true;
+  }
 
   SmallVector<PHINode *, 8> HeaderPhis;
   SmallVector<PHINode *, 8> LatchPhis;
@@ -4707,14 +7523,99 @@ static bool tryRecoverSSAPlumbingDispatcher(
       return Reject("unpaired-latch-phi");
 
   DenseMap<APInt, BasicBlock *> CaseMap;
+  DenseMap<APInt, bool> CaseViaDefault;
   SmallPtrSet<BasicBlock *, 32> CaseEntries;
-  for (auto Case : SI.cases()) {
-    BasicBlock *Target = Case.getCaseSuccessor();
-    if (!Target->phis().empty()) return Reject("case-phi");
-    CaseMap[Case.getCaseValue()->getValue()] = Target;
-    CaseEntries.insert(Target);
+  DenseMap<BasicBlock *, APInt> CaseRawStates;
+  SmallPtrSet<BasicBlock *, 8> AmbiguousCaseRawStates;
+  SmallVector<PHINode *, 32> CaseEntryPhis;
+  SmallPtrSet<PHINode *, 32> SeenCaseEntryPhis;
+  SmallVector<SwitchInst *, 8> LookupSwitches{&SI};
+  SmallPtrSet<BasicBlock *, 8> LookupOwners;
+  LookupOwners.insert(SI.getParent());
+  BasicBlock *LookupCursor = SI.getDefaultDest();
+  SmallPtrSet<BasicBlock *, 16> SeenLookupBlocks;
+  for (unsigned Depth = 0; Depth != 8 && LookupCursor; ++Depth) {
+    if (!SeenLookupBlocks.insert(LookupCursor).second) break;
+    if (auto *Shard = dyn_cast<SwitchInst>(LookupCursor->getTerminator())) {
+      if (Shard->getCondition() != SI.getCondition()) break;
+      bool BodyIsPure = llvm::all_of(*LookupCursor, [&](Instruction &I) {
+        return I.isTerminator() || isa<DbgInfoIntrinsic>(I) ||
+               (!I.mayReadOrWriteMemory() && !I.mayHaveSideEffects());
+      });
+      if (!BodyIsPure) break;
+      LookupSwitches.push_back(Shard);
+      LookupOwners.insert(Shard->getParent());
+      LookupCursor = Shard->getDefaultDest();
+      continue;
+    }
+    auto *Guard = dyn_cast<BranchInst>(LookupCursor->getTerminator());
+    if (!Guard || !Guard->isConditional()) break;
+    BasicBlock *NextShard = nullptr;
+    for (BasicBlock *Succ : successors(LookupCursor))
+      if (auto *SuccSwitch = dyn_cast<SwitchInst>(Succ->getTerminator());
+          SuccSwitch && SuccSwitch->getCondition() == SI.getCondition()) {
+        if (NextShard) {
+          NextShard = nullptr;
+          break;
+        }
+        NextShard = Succ;
+      }
+    if (!NextShard) break;
+    LookupCursor = NextShard;
   }
+  for (SwitchInst *Lookup : LookupSwitches)
+    for (auto Case : Lookup->cases()) {
+    APInt Encoded = Case.getCaseValue()->getValue();
+    // Lookup shards are evaluated in this exact order.  A repeated key in a
+    // later shard is shadowed by the first occurrence; rejecting the whole
+    // dispatcher as a non-unique set confuses ordered switch semantics with a
+    // mathematical union.  Preserve the first reachable mapping exactly.
+    if (CaseMap.count(Encoded)) continue;
+    BasicBlock *Target = Case.getCaseSuccessor();
+    // A trampoline state may dispatch straight to either recurrence sink.
+    // Their PHIs are paired and demoted by the latch/outer-sink machinery;
+    // they are not ordinary case-entry PHIs and need no direct switch input.
+    if (Target != OuterSink && Target != Latch)
+      for (PHINode &TargetPhi : Target->phis()) {
+        if (TargetPhi.getBasicBlockIndex(Header) < 0)
+          return Reject("case-phi-without-dispatch-input");
+        if (SeenCaseEntryPhis.insert(&TargetPhi).second)
+          CaseEntryPhis.push_back(&TargetPhi);
+      }
+    CaseMap[Encoded] = Target;
+    CaseViaDefault[Encoded] = Lookup != &SI;
+    CaseEntries.insert(Target);
+    if (auto Raw = decodeStateExpr(SI.getCondition(), State, Encoded)) {
+      auto It = CaseRawStates.find(Target);
+      if (It == CaseRawStates.end())
+        CaseRawStates.try_emplace(Target, *Raw);
+      else if (It->second != *Raw)
+        AmbiguousCaseRawStates.insert(Target);
+    }
+  }
+  for (BasicBlock *Target : AmbiguousCaseRawStates)
+    CaseRawStates.erase(Target);
   if (CaseMap.size() < 4) return Reject("case-map");
+
+  // With one lookup switch, its unmatched destination can be a real
+  // initialization/case body rather than a pure comparison shard.  Preserve
+  // that body as an explicit case entry; switch semantics prove it is the
+  // exact target for every state absent from the case table.  Multi-shard
+  // lookup chains stay on the ordered resolver path above.
+  BasicBlock *DirectDefaultTarget = nullptr;
+  if (LookupSwitches.size() == 1) {
+    BasicBlock *Target = SI.getDefaultDest();
+    if (Target != OuterSink && Target != Latch) {
+      for (PHINode &TargetPhi : Target->phis()) {
+        if (TargetPhi.getBasicBlockIndex(Header) < 0)
+          return Reject("default-case-phi-without-dispatch-input");
+        if (SeenCaseEntryPhis.insert(&TargetPhi).second)
+          CaseEntryPhis.push_back(&TargetPhi);
+      }
+      CaseEntries.insert(Target);
+      DirectDefaultTarget = Target;
+    }
+  }
 
   // A case may contain internal branches (for example a checked libc call)
   // before reaching the latch.  Classify each latch predecessor by walking
@@ -4722,6 +7623,8 @@ static bool tryRecoverSSAPlumbingDispatcher(
   // such root and is intentionally excluded.
   SmallVector<BasicBlock *, 32> ReturningCases;
   SmallPtrSet<BasicBlock *, 32> ReturningRoots;
+  DenseMap<BasicBlock *, APInt> ReturningRawStates;
+  DenseMap<BasicBlock *, BasicBlock *> ReturningRootBySource;
   for (BasicBlock *Source : predecessors(Latch)) {
     SmallVector<BasicBlock *, 16> Work{Source};
     SmallPtrSet<BasicBlock *, 32> Seen;
@@ -4740,6 +7643,9 @@ static bool tryRecoverSSAPlumbingDispatcher(
     if (!Root) continue;
     ReturningCases.push_back(Source);
     ReturningRoots.insert(Root);
+    ReturningRootBySource[Source] = Root;
+    if (auto It = CaseRawStates.find(Root); It != CaseRawStates.end())
+      ReturningRawStates.try_emplace(Source, It->second);
   }
   if (ReturningCases.empty()) return Reject("no-returning-cases");
   // Whole-function reachability is too broad here: a genuine nested-CFF exit
@@ -4769,44 +7675,334 @@ static bool tryRecoverSSAPlumbingDispatcher(
     for (BasicBlock *CaseBB : ReturningCases)
       if (LP->getBasicBlockIndex(CaseBB) < 0) return Reject("latch-input");
 
-  auto Resolve = [&](ConstantInt *Raw) -> BasicBlock * {
-    auto Encoded = evalStateExpr(SI.getCondition(), State, Raw->getValue());
-    if (!Encoded) return nullptr;
-    auto It = CaseMap.find(*Encoded);
-    return It == CaseMap.end() ? nullptr : It->second;
+  struct ResolvedDirectPath {
+    BasicBlock *Target = nullptr;
+    bool ViaDefault = false;
   };
-  BasicBlock *InitialTarget = Resolve(Initial);
-  if (!InitialTarget) return Reject("initial-target");
+  BasicBlock *DefaultGuard = SI.getDefaultDest();
+  auto *DefaultGuardBr = dyn_cast<BranchInst>(DefaultGuard->getTerminator());
+  bool DefaultGuardCloneable =
+      DefaultGuardBr && DefaultGuardBr->isConditional() &&
+      DefaultGuard->phis().empty() &&
+      llvm::all_of(*DefaultGuard, [&](Instruction &I) {
+        return &I == DefaultGuardBr || isa<DbgInfoIntrinsic>(I) ||
+               (!I.mayReadOrWriteMemory() && !I.mayHaveSideEffects());
+      });
+  std::function<ResolvedDirectPath(const APInt &, unsigned)> ResolveRawImpl;
+  ResolveRawImpl = [&](const APInt &Raw,
+                       unsigned Depth) -> ResolvedDirectPath {
+    if (Depth > 8) return {};
+    if (TerminalState && Raw == TerminalState->getValue())
+      return {TerminalTarget, false};
+    auto Encoded = evalStateExpr(SI.getCondition(), State, Raw);
+    if (!Encoded) return {};
+    auto It = CaseMap.find(*Encoded);
+    if (It == CaseMap.end()) {
+      if (!DefaultGuardCloneable)
+        return DirectDefaultTarget
+                   ? ResolvedDirectPath{DirectDefaultTarget, false}
+                   : ResolvedDirectPath{};
+      auto Taken = evalStatePredicate(DefaultGuardBr->getCondition(), State,
+                                      Raw, 0);
+      if (!Taken) return {};
+      return {DefaultGuardBr->getSuccessor(*Taken ? 0 : 1), true};
+    }
+    BasicBlock *Target = It->second;
+    // Optimizers often retain a dispatcher-owned trampoline case whose only
+    // effect is to feed one exact constant into the latch PHI.  Resolve that
+    // state transitively; otherwise a nominally complete rewrite leaves the
+    // lookup cycle reachable through the trampoline.
+    if (Target == Latch) {
+      int Index = LatchState->getBasicBlockIndex(SwitchBlock);
+      if (Index < 0) return {};
+      ConstantInt *Next = asTransitionConstant(
+          LatchState->getIncomingValue(Index), SwitchBlock);
+      if (!Next || Next->getValue() == Raw) return {};
+      return ResolveRawImpl(Next->getValue(), Depth + 1);
+    }
+    return {Target, CaseViaDefault.lookup(*Encoded)};
+  };
+  auto ResolveRaw = [&](const APInt &Raw) -> ResolvedDirectPath {
+    return ResolveRawImpl(Raw, 0);
+  };
+  auto Resolve = [&](ConstantInt *Raw) -> ResolvedDirectPath {
+    return ResolveRaw(Raw->getValue());
+  };
+  ResolvedDirectPath InitialPath = Initial ? Resolve(Initial)
+                                           : ResolvedDirectPath{};
+  BasicBlock *InitialTarget = InitialPath.Target;
+  if (Initial && !InitialTarget) return Reject("initial-target");
 
-  SmallVector<ProvenTransition, 32> Transitions;
+  struct TransitionCandidate {
+    BasicBlock *Root = nullptr;
+    BasicBlock *Source = nullptr;
+    std::optional<ProvenTransition> Transition;
+  };
+  SmallVector<TransitionCandidate, 32> TransitionCandidates;
   for (BasicBlock *CaseBB : ReturningCases) {
     int Index = LatchState->getBasicBlockIndex(CaseBB);
     if (Index < 0) return Reject("state-latch-input");
     Value *Next = LatchState->getIncomingValue(Index);
+    auto RawIt = ReturningRawStates.find(CaseBB);
+    std::function<std::optional<APInt>(Value *, unsigned)> EvaluateAtCaseState;
+    EvaluateAtCaseState = [&](Value *V,
+                              unsigned Depth) -> std::optional<APInt> {
+      if (Depth > 8 || RawIt == ReturningRawStates.end())
+        return std::nullopt;
+      if (auto Result = evalStateExpr(V, State, RawIt->second)) return Result;
+      auto *LI = dyn_cast<LoadInst>(V);
+      if (!LI) return std::nullopt;
+      bool HitBarrier = false;
+      StoreInst *Store = findReachingStateStore(
+          CaseBB, LI->getPointerOperand(), LI->getType(), Header, 0,
+          &HitBarrier);
+      if (!Store || HitBarrier || Store->isAtomic() || Store->isVolatile() ||
+          Store->getValueOperand()->getType() != LI->getType())
+        return std::nullopt;
+      return EvaluateAtCaseState(Store->getValueOperand(), Depth + 1);
+    };
     ProvenTransition T;
     T.Source = CaseBB;
-    if (auto *C = dyn_cast<ConstantInt>(Next)) {
-      T.TrueTarget = Resolve(C);
+    bool Proved = true;
+    if (auto *C = asTransitionConstant(Next, CaseBB)) {
+      ResolvedDirectPath Path = Resolve(C);
+      T.TrueTarget = Path.Target;
+      T.TrueViaDefault = Path.ViaDefault;
     } else if (auto *Sel = dyn_cast<SelectInst>(Next)) {
-      auto *TC = dyn_cast<ConstantInt>(Sel->getTrueValue());
-      auto *FC = dyn_cast<ConstantInt>(Sel->getFalseValue());
-      if (!TC || !FC) return Reject("nonconstant-select");
-      T.Condition = Sel->getCondition();
-      T.TrueTarget = Resolve(TC);
-      T.FalseTarget = Resolve(FC);
+      auto TrueRaw = EvaluateAtCaseState(Sel->getTrueValue(), 0);
+      auto FalseRaw = EvaluateAtCaseState(Sel->getFalseValue(), 0);
+      if (!TrueRaw || !FalseRaw) {
+        Proved = false;
+      } else {
+        T.Condition = Sel->getCondition();
+        ResolvedDirectPath TruePath = ResolveRaw(*TrueRaw);
+        ResolvedDirectPath FalsePath = ResolveRaw(*FalseRaw);
+        T.TrueTarget = TruePath.Target;
+        T.TrueViaDefault = TruePath.ViaDefault;
+        T.FalseTarget = FalsePath.Target;
+        T.FalseViaDefault = FalsePath.ViaDefault;
+      }
+    } else if (auto Specialized = EvaluateAtCaseState(Next, 0)) {
+      ResolvedDirectPath Path = ResolveRaw(*Specialized);
+      T.TrueTarget = Path.Target;
+      T.TrueViaDefault = Path.ViaDefault;
     } else {
-      return Reject("nonconstant-transition");
+      // A case-local PHI/select can encode more than two next states.  Prove
+      // its complete acyclic value set structurally, then replace the loop
+      // dispatcher with one direct finite switch at the transition source.
+      // Unsupported values, cycles, poison-generating operations, loads that
+      // cannot be evaluated, and outcome explosion all fail closed.
+      SmallVector<APInt, 8> FiniteValues;
+      DenseMap<const Value *, APInt> NoBindings;
+      unsigned ExecutionBudget = 128;
+      Value *FiniteExpr = Next;
+      if (auto *LI = dyn_cast<LoadInst>(Next)) {
+        bool HitBarrier = false;
+        if (StoreInst *Store = findReachingStateStore(
+                CaseBB, LI->getPointerOperand(), LI->getType(), Header, 0,
+                &HitBarrier);
+            Store && !HitBarrier && !Store->isAtomic() &&
+            !Store->isVolatile() &&
+            Store->getValueOperand()->getType() == LI->getType())
+          FiniteExpr = Store->getValueOperand();
+      }
+      bool Finite = RawIt != ReturningRawStates.end() &&
+                    enumerateTransitionValues(
+                        FiniteExpr, nullptr, RawIt->second, NoBindings,
+                        FiniteValues, ExecutionBudget) &&
+                    FiniteValues.size() >= 2;
+      if (Finite) {
+        for (const APInt &Raw : FiniteValues) {
+          ResolvedDirectPath Path = ResolveRaw(Raw);
+          if (!Path.Target) {
+            Finite = false;
+            break;
+          }
+          T.FiniteTargets.push_back(Path.Target);
+          T.FiniteViaDefault.push_back(Path.ViaDefault);
+        }
+      }
+      if (Finite) {
+        T.FiniteState = FiniteExpr;
+        T.FiniteRawValues = std::move(FiniteValues);
+        T.TrueTarget = T.FiniteTargets.front();
+      } else {
+        Proved = false;
+      }
     }
     if (!T.TrueTarget || (T.Condition && !T.FalseTarget))
-      return Reject("unresolved-target");
-    Transitions.push_back(T);
+      Proved = false;
+    TransitionCandidate Candidate;
+    Candidate.Root = ReturningRootBySource.lookup(CaseBB);
+    Candidate.Source = CaseBB;
+    if (Proved) Candidate.Transition = T;
+    TransitionCandidates.push_back(std::move(Candidate));
+  }
+
+  // Prove the transition closure from the actual seed instead of demanding
+  // transitions for syntactically present but unreachable bogus cases.  CFF
+  // routinely contains dead switch entries whose next state intentionally
+  // falls into the default cycle.  They are removable only when induction
+  // from the seed never reaches their case root.  Dynamic/nested seeds cannot
+  // establish that base case and therefore retain the exhaustive requirement.
+  SmallVector<ProvenTransition, 32> Transitions;
+  bool ReachabilityPruned = false;
+  if (Initial) {
+    SmallVector<BasicBlock *, 32> Work;
+    SmallPtrSet<BasicBlock *, 32> ReachableRoots;
+    if (CaseEntries.contains(InitialTarget)) Work.push_back(InitialTarget);
+    while (!Work.empty()) {
+      BasicBlock *Root = Work.pop_back_val();
+      if (!ReachableRoots.insert(Root).second) continue;
+      if (ReachableRoots.size() > CaseEntries.size())
+        return Reject("reachable-transition-closure-overflow");
+      for (const TransitionCandidate &Candidate : TransitionCandidates) {
+        if (Candidate.Root != Root) continue;
+        if (!Candidate.Transition)
+          return Reject((Twine("reachable-unproved-transition:") +
+                         Candidate.Source->getName()).str());
+        const ProvenTransition &T = *Candidate.Transition;
+        Transitions.push_back(T);
+        if (CaseEntries.contains(T.TrueTarget)) Work.push_back(T.TrueTarget);
+        if (T.FalseTarget && CaseEntries.contains(T.FalseTarget))
+          Work.push_back(T.FalseTarget);
+        for (BasicBlock *Target : T.FiniteTargets)
+          if (CaseEntries.contains(Target)) Work.push_back(Target);
+      }
+    }
+    // Seed induction is a closed-world argument only for roots it intends to
+    // prune.  A supposedly unreachable root with an external predecessor can
+    // be entered without following the dispatcher recurrence.  Reachable
+    // roots may legitimately be shared with another proved nested path.
+    for (BasicBlock *CaseEntry : CaseEntries) {
+      if (ReachableRoots.contains(CaseEntry)) continue;
+      for (BasicBlock *Pred : predecessors(CaseEntry))
+        // The switch can live in a semantic-free shard immediately after the
+        // state-PHI header.  An edge from that shard is still dispatcher
+        // lookup plumbing, not an independent external entry into the case.
+        if (Pred != Header && !LookupOwners.contains(Pred))
+          return Reject((Twine("seed-induction-external-case-entry:case=") +
+                         CaseEntry->getName() + ";pred=" + Pred->getName())
+                            .str());
+    }
+    ReachabilityPruned =
+        Transitions.size() != TransitionCandidates.size();
+  } else {
+    for (const TransitionCandidate &Candidate : TransitionCandidates) {
+      if (!Candidate.Transition)
+        return Reject((Twine("dynamic-entry-unproved-transition:") +
+                       Candidate.Source->getName()).str());
+      Transitions.push_back(*Candidate.Transition);
+    }
+  }
+  if (Transitions.empty() && CaseEntries.contains(InitialTarget))
+    return Reject("reachable-case-without-transition");
+
+  SmallVector<ProvenTransition, 8> OuterTransitions;
+  std::optional<ProvenTransition> HeaderTrampolineTransition;
+  auto BuildOuterTransition = [&](BasicBlock *Source,
+                                  Value *Raw) -> std::optional<ProvenTransition> {
+    ProvenTransition T;
+    T.Source = Source;
+    if (auto *C = asTransitionConstant(Raw, Source)) {
+      ResolvedDirectPath Path = Resolve(C);
+      T.TrueTarget = Path.Target;
+      T.TrueViaDefault = Path.ViaDefault;
+    } else if (auto *Sel = dyn_cast<SelectInst>(Raw)) {
+      auto *TC = dyn_cast<ConstantInt>(Sel->getTrueValue());
+      auto *FC = dyn_cast<ConstantInt>(Sel->getFalseValue());
+      if (!TC || !FC) return std::nullopt;
+      T.Condition = Sel->getCondition();
+      ResolvedDirectPath TruePath = Resolve(TC);
+      ResolvedDirectPath FalsePath = Resolve(FC);
+      T.TrueTarget = TruePath.Target;
+      T.TrueViaDefault = TruePath.ViaDefault;
+      T.FalseTarget = FalsePath.Target;
+      T.FalseViaDefault = FalsePath.ViaDefault;
+    } else {
+      // Outer cleanup frequently folds several case tails through another
+      // PHI/select funnel before the recurrence sink.  Enumerate that complete
+      // acyclic value graph instead of requiring the join itself to be a
+      // select.  The enumerator visits every PHI/select arm and fails closed
+      // on cycles, unsupported expressions, or outcome explosion.
+      if (!Raw->getType()->isIntegerTy()) return std::nullopt;
+      SmallVector<APInt, 8> Values;
+      DenseMap<const Value *, APInt> Bindings;
+      unsigned Budget = 512;
+      APInt DummyState(Raw->getType()->getIntegerBitWidth(), 0);
+      if (!enumerateTransitionValues(Raw, nullptr, DummyState, Bindings,
+                                     Values, Budget) ||
+          Values.empty())
+        return std::nullopt;
+      T.FiniteState = Raw;
+      for (const APInt &Value : Values) {
+        ResolvedDirectPath Path = ResolveRaw(Value);
+        if (!Path.Target || Path.Target == OuterSink) return std::nullopt;
+        T.FiniteRawValues.push_back(Value);
+        T.FiniteTargets.push_back(Path.Target);
+        T.FiniteViaDefault.push_back(Path.ViaDefault);
+      }
+      T.TrueTarget = T.FiniteTargets.front();
+      T.TrueViaDefault = T.FiniteViaDefault.front();
+    }
+    // A second trip through the outer sink would require another dispatcher
+    // round.  The supported nested form has one header-owned trampoline and
+    // all actual outer sources resolve directly to real case entries.
+    if (!T.TrueTarget || T.TrueTarget == OuterSink ||
+        (T.Condition && (!T.FalseTarget || T.FalseTarget == OuterSink)))
+      return std::nullopt;
+    return T;
+  };
+  if (HasNestedOuter) {
+    ResolvedDirectPath OuterInitialPath = Resolve(OuterInitial);
+    BasicBlock *OuterInitialTarget = OuterInitialPath.Target;
+    if (!OuterInitialTarget || OuterInitialTarget == OuterSink)
+      return Reject("nested-initial-target");
+    // Reuse InitialTarget for the outer function-entry bypass.
+    InitialTarget = OuterInitialTarget;
+    InitialPath = OuterInitialPath;
+    int HeaderIndex = OuterSinkState->getBasicBlockIndex(Header);
+    if (HeaderIndex >= 0) {
+      HeaderTrampolineTransition = BuildOuterTransition(
+          Header, OuterSinkState->getIncomingValue(HeaderIndex));
+      if (!HeaderTrampolineTransition)
+        return Reject("nested-header-trampoline-transition");
+    }
+    bool InnerTargetsOuterSink = llvm::any_of(
+        Transitions, [&](const ProvenTransition &T) {
+          if (T.TrueTarget == OuterSink || T.FalseTarget == OuterSink)
+            return true;
+          return llvm::is_contained(T.FiniteTargets, OuterSink);
+        });
+    if (InnerTargetsOuterSink && !HeaderTrampolineTransition)
+      return Reject("nested-outer-sink-without-trampoline-input");
+    for (BasicBlock *Source : predecessors(OuterSink)) {
+      if (Source == Header) continue;
+      auto *Br = dyn_cast<BranchInst>(Source->getTerminator());
+      int Index = OuterSinkState->getBasicBlockIndex(Source);
+      if (!Br || !Br->isUnconditional() ||
+          Br->getSuccessor(0) != OuterSink || Index < 0)
+        return Reject("nested-outer-source-shape");
+      auto Transition = BuildOuterTransition(
+          Source, OuterSinkState->getIncomingValue(Index));
+      if (!Transition)
+        return Reject((Twine("nested-outer-transition:source=") +
+                       Source->getName() + ";raw=" +
+                       valueText(*OuterSinkState->getIncomingValue(Index)))
+                          .str());
+      OuterTransitions.push_back(*Transition);
+    }
+    if (OuterTransitions.empty()) return Reject("nested-no-outer-transitions");
   }
 
   std::string OldFunctionText = valueText(*F);
   std::string TransitionCertificate;
   raw_string_ostream CertificateOS(TransitionCertificate);
-  CertificateOS << "entry:" << Initial->getValue() << "->"
-                << valueName(*InitialTarget) << '\n';
+  if (Initial)
+    CertificateOS << "entry:" << Initial->getValue() << "->"
+                  << valueName(*InitialTarget) << '\n';
+  else
+    CertificateOS << "entry:dynamic->retained_exact_switch\n";
   for (const ProvenTransition &T : Transitions) {
     CertificateOS << valueName(*T.Source) << "->"
                   << valueName(*T.TrueTarget);
@@ -4818,10 +8014,40 @@ static bool tryRecoverSSAPlumbingDispatcher(
   // All structural and transition checks completed.  From this point every
   // mutation is an exact LLVM utility lowering or a clone of executed IR.
   Instruction *AllocaPoint = &*F->getEntryBlock().getFirstInsertionPt();
+  // A switch case can enter a semantic join PHI.  Demoting that PHI inserts
+  // its dispatcher-edge store in HeaderBody; cloning HeaderBody on every
+  // proved edge preserves the exact incoming value, while stores for
+  // non-selected targets touch only private allocas and are unobservable.
+  for (PHINode *CasePhi : CaseEntryPhis)
+    DemotePHIToStack(CasePhi, AllocaPoint->getIterator());
+  for (PHINode *SinkPhi : OuterSinkPhis)
+    DemotePHIToStack(SinkPhi, AllocaPoint->getIterator());
+  for (PHINode *OuterPhi : OuterPhis)
+    DemotePHIToStack(OuterPhi, AllocaPoint->getIterator());
   for (PHINode *LP : LatchPhis)
     DemotePHIToStack(LP, AllocaPoint->getIterator());
   for (PHINode *HP : HeaderPhis)
     DemotePHIToStack(HP, AllocaPoint->getIterator());
+
+  // Conditional terminal latches can expose loop-carried values directly to
+  // the exit block.  PHI demotion materializes their reloads in Latch; after
+  // bypassing Latch those SSA reloads would otherwise become unreachable and
+  // LLVM would replace the exit use with poison.  Spill every latch-produced
+  // live-out before cloning so each direct transition writes the same private
+  // slot and the original exit reload remains dominated and exact.
+  SmallVector<Instruction *, 16> LatchBeforeLiveOutDemotion;
+  for (Instruction &I : *Latch)
+    if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+      LatchBeforeLiveOutDemotion.push_back(&I);
+  for (Instruction *I : LatchBeforeLiveOutDemotion) {
+    if (I->getType()->isVoidTy() || I->use_empty()) continue;
+    bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+      auto *UI = dyn_cast<Instruction>(U);
+      return UI && UI->getParent() != Latch;
+    });
+    if (UsedOutside)
+      DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+  }
 
   SmallVector<Instruction *, 16> HeaderBeforeDemotion;
   for (Instruction &I : *Header)
@@ -4837,34 +8063,171 @@ static bool tryRecoverSSAPlumbingDispatcher(
       DemoteRegToStack(*I, false, AllocaPoint->getIterator());
   }
 
-  SmallVector<Instruction *, 32> LatchBody, HeaderBody;
+  if (HasNestedOuter) {
+    SmallVector<Instruction *, 32> OuterBeforeDemotion;
+    for (Instruction &I : *Outer)
+      if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+        OuterBeforeDemotion.push_back(&I);
+    for (Instruction *I : OuterBeforeDemotion) {
+      if (I->getType()->isVoidTy() || I->use_empty()) continue;
+      bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+        auto *UI = dyn_cast<Instruction>(U);
+        return UI && UI->getParent() != Outer;
+      });
+      if (UsedOutside)
+        DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+    }
+  }
+
+  bool HasDefaultPaths = InitialPath.ViaDefault;
+  auto TransitionUsesDefault = [](const ProvenTransition &T) {
+    return T.TrueViaDefault || T.FalseViaDefault ||
+           llvm::is_contained(T.FiniteViaDefault, true);
+  };
+  HasDefaultPaths |= llvm::any_of(Transitions, TransitionUsesDefault);
+  HasDefaultPaths |= llvm::any_of(OuterTransitions, TransitionUsesDefault);
+  if (HasDefaultPaths) {
+    // Values computed by the default guard can feed terminal/fallback code.
+    // Demote those live-outs first so each cloned default path writes the same
+    // private slots and all downstream uses receive exact SSA-safe reloads.
+    SmallVector<Instruction *, 32> DefaultBeforeDemotion;
+    for (Instruction &I : *DefaultGuard)
+      if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+        DefaultBeforeDemotion.push_back(&I);
+    for (Instruction *I : DefaultBeforeDemotion) {
+      if (I->getType()->isVoidTy() || I->use_empty()) continue;
+      bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+        auto *UI = dyn_cast<Instruction>(U);
+        return UI && UI->getParent() != DefaultGuard;
+      });
+      if (UsedOutside)
+        DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+    }
+  }
+
+  SmallVector<Instruction *, 32> LatchBody, HeaderBody, OuterSinkBody,
+      OuterBody, DefaultBody;
   for (Instruction &I : *Latch)
     if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
       LatchBody.push_back(&I);
   for (Instruction &I : *Header)
     if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
       HeaderBody.push_back(&I);
+  if (HasDefaultPaths)
+    for (Instruction &I : *DefaultGuard)
+      if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+        DefaultBody.push_back(&I);
+  if (HasNestedOuter) {
+    for (Instruction &I : *OuterSink)
+      if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+        OuterSinkBody.push_back(&I);
+    for (Instruction &I : *Outer)
+      if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+        OuterBody.push_back(&I);
+  }
 
-  {
+  unsigned DefaultPathSerial = 0;
+  auto MaterializeDefaultPath =
+      [&](BasicBlock *Target, bool ViaDefault,
+          DenseMap<const Value *, Value *> &ParentMap,
+          StringRef Suffix) -> BasicBlock * {
+    if (!ViaDefault) return Target;
+    BasicBlock *PathBlock = BasicBlock::Create(
+        F->getContext(), "deobf.default." + Suffix + "." +
+                             Twine(DefaultPathSerial++),
+        F, Target);
+    BranchInst *Placeholder = BranchInst::Create(Target, PathBlock);
+    DenseMap<const Value *, Value *> Map = ParentMap;
+    cloneBlockPlumbing(DefaultBody, Placeholder, Map);
+    return PathBlock;
+  };
+
+  if (Initial) {
     Instruction *Old = EntryPred->getTerminator();
     DenseMap<const Value *, Value *> Map;
     cloneBlockPlumbing(HeaderBody, Old, Map);
-    BranchInst::Create(InitialTarget, Old->getIterator());
+    BasicBlock *Target = MaterializeDefaultPath(
+        InitialTarget, InitialPath.ViaDefault, Map, "entry");
+    BranchInst::Create(Target, Old->getIterator());
+    Old->eraseFromParent();
+  } else if (HasNestedOuter) {
+    Instruction *Old = OuterEntry->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    cloneBlockPlumbing(OuterBody, Old, Map);
+    cloneBlockPlumbing(HeaderBody, Old, Map);
+    BasicBlock *Target = MaterializeDefaultPath(
+        InitialTarget, InitialPath.ViaDefault, Map, "outer.entry");
+    BranchInst::Create(Target, Old->getIterator());
     Old->eraseFromParent();
   }
   std::string FunctionName = F->getName().str();
   std::string HeaderName = Header->getName().str();
+  unsigned NestedPathSerial = 0;
+  auto MaterializeNestedTarget =
+      [&](BasicBlock *Target, DenseMap<const Value *, Value *> &ParentMap,
+          StringRef Suffix) -> BasicBlock * {
+    if (!HasNestedOuter || Target != OuterSink) return Target;
+    if (!HeaderTrampolineTransition) return Target;
+    BasicBlock *PathBlock = BasicBlock::Create(
+        F->getContext(), "deobf.nested.outer." + Suffix + "." +
+                             Twine(NestedPathSerial++),
+        F, HeaderTrampolineTransition->TrueTarget);
+    BranchInst *Placeholder =
+        BranchInst::Create(HeaderTrampolineTransition->TrueTarget, PathBlock);
+    DenseMap<const Value *, Value *> Map = ParentMap;
+    cloneBlockPlumbing(OuterSinkBody, Placeholder, Map);
+    cloneBlockPlumbing(OuterBody, Placeholder, Map);
+    cloneBlockPlumbing(HeaderBody, Placeholder, Map);
+    if (HeaderTrampolineTransition->Condition) {
+      Value *Condition = HeaderTrampolineTransition->Condition;
+      if (auto It = Map.find(Condition); It != Map.end()) Condition = It->second;
+      BranchInst::Create(HeaderTrampolineTransition->TrueTarget,
+                         HeaderTrampolineTransition->FalseTarget, Condition,
+                         Placeholder->getIterator());
+      Placeholder->eraseFromParent();
+    }
+    return PathBlock;
+  };
   for (const ProvenTransition &T : Transitions) {
     Instruction *Old = T.Source->getTerminator();
     std::string OldTerminatorText = valueText(*Old);
     DenseMap<const Value *, Value *> Map;
     cloneBlockPlumbing(LatchBody, Old, Map);
     cloneBlockPlumbing(HeaderBody, Old, Map);
-    if (T.Condition)
-      BranchInst::Create(T.TrueTarget, T.FalseTarget, T.Condition,
+    BasicBlock *TrueTarget =
+        MaterializeNestedTarget(T.TrueTarget, Map, "inner.true");
+    BasicBlock *FalseTarget = T.FalseTarget
+                                  ? MaterializeNestedTarget(
+                                        T.FalseTarget, Map, "inner.false")
+                                  : nullptr;
+    TrueTarget = MaterializeDefaultPath(
+        TrueTarget, T.TrueViaDefault, Map, "inner.true");
+    if (FalseTarget)
+      FalseTarget = MaterializeDefaultPath(
+          FalseTarget, T.FalseViaDefault, Map, "inner.false");
+    if (T.FiniteState) {
+      SmallVector<BasicBlock *, 8> FiniteTargets;
+      for (unsigned I = 0; I != T.FiniteTargets.size(); ++I) {
+        BasicBlock *Target = MaterializeNestedTarget(
+            T.FiniteTargets[I], Map, "inner.finite");
+        bool ViaDefault = I < T.FiniteViaDefault.size() &&
+                          T.FiniteViaDefault[I];
+        FiniteTargets.push_back(MaterializeDefaultPath(
+            Target, ViaDefault, Map, "inner.finite"));
+      }
+      auto *FiniteSwitch = SwitchInst::Create(
+          T.FiniteState, FiniteTargets.front(),
+          T.FiniteRawValues.size() - 1, Old->getIterator());
+      for (unsigned I = 1; I != T.FiniteRawValues.size(); ++I)
+        FiniteSwitch->addCase(
+            ConstantInt::get(T.FiniteState->getContext(),
+                             T.FiniteRawValues[I]),
+            FiniteTargets[I]);
+    } else if (T.Condition)
+      BranchInst::Create(TrueTarget, FalseTarget, T.Condition,
                          Old->getIterator());
     else
-      BranchInst::Create(T.TrueTarget, Old->getIterator());
+      BranchInst::Create(TrueTarget, Old->getIterator());
     Old->eraseFromParent();
     Instruction *NewTerminator = T.Source->getTerminator();
     ProofRecord TransitionRecord{
@@ -4875,8 +8238,63 @@ static bool tryRecoverSSAPlumbingDispatcher(
     TransitionRecord.ProofQueryHash = hashText(TransitionCertificate);
     TransitionRecord.Dependencies.push_back("llvm_phi_demotion");
     TransitionRecord.Dependencies.push_back("exact_latch_header_clone");
+    if (T.FiniteState)
+      TransitionRecord.Dependencies.push_back(
+          "exhaustive_acyclic_finite_transition_set");
     Proofs.push_back(std::move(TransitionRecord));
   }
+  for (const ProvenTransition &T : OuterTransitions) {
+    Instruction *Old = T.Source->getTerminator();
+    DenseMap<const Value *, Value *> Map;
+    cloneBlockPlumbing(OuterSinkBody, Old, Map);
+    cloneBlockPlumbing(OuterBody, Old, Map);
+    cloneBlockPlumbing(HeaderBody, Old, Map);
+    BasicBlock *TrueTarget = MaterializeDefaultPath(
+        T.TrueTarget, T.TrueViaDefault, Map, "outer.true");
+    BasicBlock *FalseTarget = T.FalseTarget
+                                  ? MaterializeDefaultPath(
+                                        T.FalseTarget, T.FalseViaDefault, Map,
+                                        "outer.false")
+                                  : nullptr;
+    if (T.FiniteState) {
+      Value *FiniteState = T.FiniteState;
+      if (auto It = Map.find(FiniteState); It != Map.end())
+        FiniteState = It->second;
+      SmallVector<BasicBlock *, 8> FiniteTargets;
+      for (unsigned I = 0; I != T.FiniteTargets.size(); ++I) {
+        bool ViaDefault = I < T.FiniteViaDefault.size() &&
+                          T.FiniteViaDefault[I];
+        FiniteTargets.push_back(MaterializeDefaultPath(
+            T.FiniteTargets[I], ViaDefault, Map, "outer.finite"));
+      }
+      auto *FiniteSwitch = SwitchInst::Create(
+          FiniteState, FiniteTargets.front(),
+          T.FiniteRawValues.size() - 1, Old->getIterator());
+      for (unsigned I = 1; I != T.FiniteRawValues.size(); ++I)
+        FiniteSwitch->addCase(
+            ConstantInt::get(FiniteState->getContext(),
+                             T.FiniteRawValues[I]),
+            FiniteTargets[I]);
+    } else if (T.Condition)
+      BranchInst::Create(TrueTarget, FalseTarget, T.Condition,
+                         Old->getIterator());
+    else
+      BranchInst::Create(TrueTarget, Old->getIterator());
+    Old->eraseFromParent();
+    ProofRecord OuterRecord{FunctionName, "cff_transition",
+                            valueName(*T.Source),
+                            "nested_outer_ssa_exact_plumbing", "proved"};
+    OuterRecord.Dependencies.push_back("llvm_phi_demotion");
+    OuterRecord.Dependencies.push_back("exact_outer_sink_header_clone");
+    if (T.FiniteState)
+      OuterRecord.Dependencies.push_back(
+          "exhaustive_outer_phi_funnel_transition_set");
+    Proofs.push_back(std::move(OuterRecord));
+  }
+  if (DynamicEntryIsOneShot)
+    for (SwitchInst *Lookup : LookupSwitches)
+      Lookup->setMetadata("ollvm.deobf.dynamic_entry_dispatch",
+                          MDNode::get(F->getContext(), {}));
   removeUnreachableBlocks(*F);
   ++M.DispatchersRecovered;
   ProofRecord Record{FunctionName, "cff_dispatcher", HeaderName,
@@ -4886,6 +8304,16 @@ static bool tryRecoverSSAPlumbingDispatcher(
   Record.ProofQueryHash = hashText(TransitionCertificate);
   Record.Dependencies.push_back("llvm_phi_demotion");
   Record.Dependencies.push_back("exact_latch_header_clone");
+  if (ReachabilityPruned)
+    Record.Dependencies.push_back("seed_reachable_transition_induction");
+  if (TerminalState)
+    Record.Dependencies.push_back("exact_terminal_latch_state_transition");
+  if (HasNestedOuter) {
+    Record.Dependencies.push_back("complete_nested_outer_transition_set");
+    Record.Dependencies.push_back("exact_outer_sink_header_clone");
+  }
+  if (DynamicEntryIsOneShot)
+    Record.Dependencies.push_back("dynamic_entry_exact_switch_retained");
   Proofs.push_back(std::move(Record));
   return true;
 }
@@ -4902,6 +8330,10 @@ static bool tryRecoverSSADispatcher(SwitchInst &SI, Metrics &M,
   PHINode *State = findStateRoot(SI.getCondition());
   if (!State || State->getParent() != Header || State->getNumIncomingValues() != 2)
     return false;
+  for (User *U : State->users()) {
+    auto *UseI = dyn_cast<Instruction>(U);
+    if (!UseI || UseI->getParent() != Header) return false;
+  }
 
   PHINode *LatchState = nullptr;
   ConstantInt *Initial = nullptr;
@@ -5102,6 +8534,8 @@ struct MemoryJoinEdge {
 
 static StoreInst *findReachingStateStore(BasicBlock *Source,
                                          Value *StatePointer,
+                                         Type *StateType,
+                                         BasicBlock *Header,
                                          unsigned Depth,
                                          bool *HitBarrier) {
   if (Depth > 8) return nullptr;
@@ -5114,26 +8548,66 @@ static StoreInst *findReachingStateStore(BasicBlock *Source,
       }
       continue;
     }
-    if (sameFrameAddress(SI->getPointerOperand(), StatePointer)) return SI;
+    if (sameFrameAddress(SI->getPointerOperand(), StatePointer) ||
+        sameFrameAddressAlongUniquePath(SI->getPointerOperand(), StatePointer,
+                                        SI->getParent(), Header))
+      return SI;
     IntAffine Stored = parsePointerAffine(SI->getPointerOperand());
     IntAffine State = parsePointerAffine(StatePointer);
-    if (!Stored.Valid || !State.Valid || !Stored.Base || !State.Base) {
+    if (!Stored.Valid || !State.Valid || Stored.Terms.empty() ||
+        State.Terms.empty()) {
       if (HitBarrier) *HitBarrier = true;
       return nullptr;
     }
     // Distinct identified globals cannot alias.  Continue through their
     // stores while remaining conservative for every unidentified object.
-    if (Stored.Base != State.Base) continue;
+    if (definitelyDistinctAffineObjects(Stored, State)) continue;
+    if (!sameAffineTerms(Stored, State)) {
+      if (HitBarrier) *HitBarrier = true;
+      return nullptr;
+    }
+    if (Stored.Offset != State.Offset) {
+      const DataLayout &DL = Source->getModule()->getDataLayout();
+      TypeSize StoreSize = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+      TypeSize StateSize = DL.getTypeStoreSize(StateType);
+      bool NonOverlapping = false;
+      if (!StoreSize.isScalable() && !StateSize.isScalable() &&
+          Stored.Offset.isSignedIntN(64) && State.Offset.isSignedIntN(64)) {
+        int64_t StoreBegin = Stored.Offset.getSExtValue();
+        int64_t StateBegin = State.Offset.getSExtValue();
+        uint64_t StoreBytes = StoreSize.getFixedValue();
+        uint64_t StateBytes = StateSize.getFixedValue();
+        if (StoreBytes <= uint64_t(std::numeric_limits<int64_t>::max()) &&
+            StateBytes <= uint64_t(std::numeric_limits<int64_t>::max()) &&
+            StoreBegin <= std::numeric_limits<int64_t>::max() -
+                              int64_t(StoreBytes) &&
+            StateBegin <= std::numeric_limits<int64_t>::max() -
+                              int64_t(StateBytes)) {
+          int64_t StoreEnd = StoreBegin + int64_t(StoreBytes);
+          int64_t StateEnd = StateBegin + int64_t(StateBytes);
+          NonOverlapping = StoreEnd <= StateBegin || StateEnd <= StoreBegin;
+        }
+      }
+      if (NonOverlapping) continue;
+      if (HitBarrier) *HitBarrier = true;
+      return nullptr;
+    }
   }
   if (Source->hasNPredecessors(1))
-    return findReachingStateStore(*pred_begin(Source), StatePointer, Depth + 1,
-                                  HitBarrier);
+    return findReachingStateStore(*pred_begin(Source), StatePointer, StateType,
+                                  Header, Depth + 1, HitBarrier);
   return nullptr;
 }
 
-static PHINode *buildMergedReachingStateValue(BasicBlock *Merge,
-                                              Value *StatePointer,
-                                              Type *StateType) {
+static std::optional<APInt> findUniqueCaseEntryState(
+    BasicBlock *Source, BasicBlock *Header, BasicBlock *Join,
+    const DenseMap<BasicBlock *, APInt> &CaseStates);
+
+static PHINode *buildMergedReachingStateValue(
+    BasicBlock *Merge, Value *StatePointer, Type *StateType,
+    BasicBlock *Header, BasicBlock *Join,
+    const DenseMap<BasicBlock *, APInt> &CaseStates,
+    Value *CurrentState) {
   if (!Merge || !StateType || !StateType->isIntegerTy()) return nullptr;
   SmallVector<std::pair<Value *, BasicBlock *>, 8> Incoming;
   for (Instruction &I : *Merge) {
@@ -5147,12 +8621,34 @@ static PHINode *buildMergedReachingStateValue(BasicBlock *Merge,
     if (EdgeCount != 1 || Incoming.size() == 8) return nullptr;
     bool HitBarrier = false;
     StoreInst *Store =
-        findReachingStateStore(Pred, StatePointer, 0, &HitBarrier);
-    if (!Store || HitBarrier || Store->isAtomic() || Store->isVolatile() ||
-        Store->getValueOperand()->getType() != StateType ||
-        !sameFrameAddress(Store->getPointerOperand(), StatePointer))
+        findReachingStateStore(Pred, StatePointer, StateType, Header, 0,
+                               &HitBarrier);
+    if (Store) {
+      if (HitBarrier || Store->isAtomic() || Store->isVolatile() ||
+          Store->getValueOperand()->getType() != StateType ||
+          !sameFrameAddress(Store->getPointerOperand(), StatePointer))
+        return nullptr;
+      Incoming.push_back({Store->getValueOperand(), Pred});
+      continue;
+    }
+    // No reaching write and no alias barrier means this edge preserves the
+    // dispatcher state it entered with.  Materialize that exact raw case
+    // value instead of rejecting a partially-stored memory join.
+    if (HitBarrier) return nullptr;
+    if (CurrentState) {
+      auto *Lookup = dyn_cast<SwitchInst>(Pred->getTerminator());
+      if (Pred == Header ||
+          (Lookup && Lookup->getCondition() == CurrentState)) {
+        Incoming.push_back({CurrentState, Pred});
+        continue;
+      }
+    }
+    auto EntryState =
+        findUniqueCaseEntryState(Pred, Header, Join, CaseStates);
+    if (!EntryState || EntryState->getBitWidth() !=
+                           cast<IntegerType>(StateType)->getBitWidth())
       return nullptr;
-    Incoming.push_back({Store->getValueOperand(), Pred});
+    Incoming.push_back({ConstantInt::get(StateType, *EntryState), Pred});
   }
   if (Incoming.size() < 2) return nullptr;
   auto *Merged = PHINode::Create(StateType, Incoming.size(),
@@ -5160,6 +8656,80 @@ static PHINode *buildMergedReachingStateValue(BasicBlock *Merge,
                                  Merge->getFirstNonPHIIt());
   for (const auto &[Value, Pred] : Incoming) Merged->addIncoming(Value, Pred);
   return Merged;
+}
+
+// Promote a loop-header state load when whole-function MemorySSA is too
+// conservative because unrelated lifted-frame stores share an unidentified
+// base.  This proof is edge-local: every predecessor must have one exact
+// reaching same-width store, possibly through a side-effect-free PHI merge,
+// and address equality must hold after substituting the PHIs on the unique
+// path into the load block.  No live-on-entry arm or alias barrier is crossed.
+static bool promoteExactPredecessorJoinStateLoad(
+    LoadInst &LI, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs) {
+  if (LI.isAtomic() || LI.isVolatile() ||
+      !LI.getType()->isIntegerTy())
+    return false;
+  BasicBlock *Header = LI.getParent();
+  Function *F = Header->getParent();
+  DominatorTree DT(*F);
+  LoopInfo Loops(DT);
+  Loop *L = Loops.getLoopFor(Header);
+  if (!L || L->getHeader() != Header || pred_size(Header) < 2) return false;
+
+  DenseMap<BasicBlock *, APInt> NoCaseStates;
+  SmallVector<std::pair<Value *, BasicBlock *>, 8> Incoming;
+  SmallVector<PHINode *, 4> TemporaryMerges;
+  auto RollBack = [&]() {
+    for (PHINode *Phi : reverse(TemporaryMerges))
+      if (Phi && Phi->use_empty()) Phi->eraseFromParent();
+  };
+  for (BasicBlock *Pred : predecessors(Header)) {
+    unsigned EdgeCount = 0;
+    for (BasicBlock *Succ : successors(Pred)) EdgeCount += Succ == Header;
+    if (EdgeCount != 1) {
+      RollBack();
+      return false;
+    }
+    bool HitBarrier = false;
+    StoreInst *Store = findReachingStateStore(
+        Pred, LI.getPointerOperand(), LI.getType(), Header, 0, &HitBarrier);
+    Value *Reaching = Store ? Store->getValueOperand() : nullptr;
+    if (!Reaching && !HitBarrier) {
+      PHINode *Merged = buildMergedReachingStateValue(
+          Pred, LI.getPointerOperand(), LI.getType(), Header, Header,
+          NoCaseStates, nullptr);
+      if (Merged) {
+        TemporaryMerges.push_back(Merged);
+        Reaching = Merged;
+      }
+    }
+    if (!Reaching || HitBarrier || Reaching->getType() != LI.getType()) {
+      RollBack();
+      return false;
+    }
+    Incoming.push_back({Reaching, Pred});
+  }
+  if (Incoming.size() < 2) {
+    RollBack();
+    return false;
+  }
+
+  PHINode *State = PHINode::Create(
+      LI.getType(), Incoming.size(), "deobf.dispatch.state.edge.ph",
+      Header->getFirstNonPHIIt());
+  for (const auto &[Value, Pred] : Incoming) State->addIncoming(Value, Pred);
+  std::string Origin = valueName(LI);
+  LI.replaceAllUsesWith(State);
+  LI.eraseFromParent();
+  ++M.MemorySSAPhisResolved;
+  ProofRecord Record{F->getName().str(), "cff_state_promotion", Origin,
+                     "exact_predecessor_join_state_phi", "proved"};
+  Record.Dependencies.push_back("complete_predecessor_coverage");
+  Record.Dependencies.push_back("unique_path_phi_address_substitution");
+  Record.Dependencies.push_back("exact_same_width_reaching_stores");
+  Record.Dependencies.push_back("no_alias_or_memory_barrier_crossed");
+  Proofs.push_back(std::move(Record));
+  return true;
 }
 
 static std::optional<APInt> findUniqueCaseEntryState(
@@ -5195,6 +8765,15 @@ static unsigned recoverMemoryJoinTransitions(
   if (!State || State->getParent() != Header ||
       !canCloneHeaderPlumbing(Header, State))
     return 0;
+  // This partial bypass clones only the current header.  A partitioned lookup
+  // has later shards that still consume the header PHI; removing incoming
+  // edges can then fold that PHI to a latch-local value which does not
+  // dominate those shards.  Such a chain must be handled transactionally by
+  // a complete partitioned-dispatcher engine.
+  for (User *U : State->users()) {
+    auto *UseI = dyn_cast<Instruction>(U);
+    if (!UseI || UseI->getParent() != Header) return 0;
+  }
 
   DenseMap<APInt, BasicBlock *> CaseMap;
   DenseMap<BasicBlock *, APInt> CaseStates;
@@ -5251,7 +8830,7 @@ static unsigned recoverMemoryJoinTransitions(
     if (!LI || LI->isAtomic() || LI->isVolatile() || LI->getParent() != Pred)
       continue;
     IntAffine StateAddress = parsePointerAffine(LI->getPointerOperand());
-    if (!StateAddress.Valid || !StateAddress.Base || StateAddress.Coeff != 1)
+    if (!StateAddress.Valid || StateAddress.Terms.empty())
       continue;
     auto *JoinBr = dyn_cast<BranchInst>(Pred->getTerminator());
     if (!JoinBr || !JoinBr->isUnconditional() ||
@@ -5269,11 +8848,13 @@ static unsigned recoverMemoryJoinTransitions(
       if (EdgeCount != 1) continue;
       bool HitBarrier = false;
       StoreInst *Store = findReachingStateStore(
-          Source, LI->getPointerOperand(), 0, &HitBarrier);
+          Source, LI->getPointerOperand(), LI->getType(), Header, 0,
+          &HitBarrier);
       PHINode *MergedState = nullptr;
       if (!Store && !HitBarrier)
         MergedState = buildMergedReachingStateValue(
-            Source, LI->getPointerOperand(), LI->getType());
+            Source, LI->getPointerOperand(), LI->getType(), Header, Pred,
+            CaseStates, State);
       if (!Store && !MergedState) {
         if (HitBarrier)
           Proofs.push_back({Header->getParent()->getName().str(),
@@ -5643,7 +9224,8 @@ static bool recoverDispatchers(Function &F, Metrics &M,
   SmallVector<WeakTrackingVH, 16> Candidates;
   for (BasicBlock &BB : F)
     if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
-        SI && SI->getNumCases() >= 4) {
+        SI && SI->getNumCases() >= 4 &&
+        !SI->getMetadata("ollvm.deobf.dynamic_entry_dispatch")) {
       SmallPtrSet<BasicBlock *, 16> Successors;
       for (BasicBlock *Succ : successors(&BB)) Successors.insert(Succ);
       unsigned Returning = 0;
@@ -5662,15 +9244,27 @@ static bool recoverDispatchers(Function &F, Metrics &M,
     if (!SI) continue;
     bool CandidateChanged = false;
     std::string Origin = SI->getParent()->getName().str();
-    if (tryRecoverMultiIncomingSSADispatcher(*SI, M, Proofs) ||
-        tryRecoverSSAPlumbingDispatcher(*SI, M, Proofs) ||
+    std::string SSAPlumbingRejection;
+    std::string RegionRejection;
+    if (tryRecoverCyclicStateFamilyDispatcher(*SI, M, Proofs,
+                                               &RegionRejection) ||
+        tryRecoverMultiIncomingSSADispatcher(*SI, M, Proofs) ||
+        tryRecoverPartitionedSSADispatcher(*SI, M, Proofs) ||
+        tryRecoverPartitionedSSAPlumbingDispatcher(*SI, M, Proofs) ||
+        tryRecoverSSAPlumbingDispatcher(*SI, M, Proofs,
+                                        &SSAPlumbingRejection) ||
         tryRecoverSSADispatcher(*SI, M, Proofs) ||
+        tryRecoverGeneralFunnelPlumbingDispatcher(*SI, M, Proofs) ||
         tryRecoverFunnelDispatcher(*SI, M, Proofs)) {
       Changed = CandidateChanged = true;
     } else {
       // Capture the structural diagnosis before partial bypassing can simplify
       // the state PHI into its sole remaining load.
       std::string Residual = describeDispatcherResidual(*SI);
+      if (!RegionRejection.empty())
+        Residual += ";region_rejection=" + RegionRejection;
+      if (!SSAPlumbingRejection.empty())
+        Residual += ";ssa_plumbing_rejection=" + SSAPlumbingRejection;
       unsigned ProvedTransitions = recoverMemoryJoinTransitions(*SI, Proofs);
       Changed |= ProvedTransitions != 0;
       CandidateChanged = ProvedTransitions != 0;
@@ -5712,9 +9306,12 @@ static void reconcileDispatcherProofs(Module &M, Metrics &Stats,
           break;
         }
     if (Origin) {
-      if (!isa<SwitchInst>(Origin->getTerminator()))
+      auto *SurvivingSwitch = dyn_cast<SwitchInst>(Origin->getTerminator());
+      if (!SurvivingSwitch)
         P.ResidualReason = "dispatcher_origin_survives_without_switch";
-      continue;
+      else if (!SurvivingSwitch->getMetadata(
+                   "ollvm.deobf.dynamic_entry_dispatch"))
+        continue;
     }
     P.Kind = "cff_dispatcher";
     P.Engine = "dead_after_proved_transition_rewrites";
@@ -5764,16 +9361,17 @@ static LiftProfile inventoryModule(Module &M) {
       }
       if (AccessPointer && AccessType && AccessType->isSized()) {
         IntAffine A = parsePointerAffine(AccessPointer);
+        const Value *Base = unitAffineRoot(A);
         TypeSize TS = DL.getTypeStoreSize(AccessType);
-        if (A.Valid && A.Base && A.Coeff == 1 && !TS.isScalable() &&
-            (containsLiftMarker(A.Base->getName()) ||
-             A.Base->getName().contains_insensitive("frame_storage"))) {
+        if (Base && Base->hasName() && !TS.isScalable() &&
+            (containsLiftMarker(Base->getName()) ||
+             Base->getName().contains_insensitive("frame_storage"))) {
           uint64_t Size = TS.getFixedValue();
           int64_t Offset = A.Offset.getSExtValue();
           if (Size && Size <= static_cast<uint64_t>(INT64_MAX) &&
               Offset <= INT64_MAX - static_cast<int64_t>(Size))
             FrameAccesses.push_back(
-                {A.Base->getName().str(), Offset, Size, IsStore});
+                {Base->getName().str(), Offset, Size, IsStore});
         }
       }
       if (isa<PtrToIntInst>(I) || isa<IntToPtrInst>(I))
@@ -5804,11 +9402,12 @@ static LiftProfile inventoryModule(Module &M) {
         if (!LI || !SeenLocations.insert(LI->getPointerOperand()).second)
           continue;
         IntAffine A = parsePointerAffine(LI->getPointerOperand());
-        if (!A.Valid || !A.Base || A.Coeff != 1) continue;
+        const Value *Base = unitAffineRoot(A);
+        if (!Base || !Base->hasName()) continue;
         SmallString<32> Offset;
         A.Offset.toStringSigned(Offset);
         P.CandidateStateLocations.push_back(
-            (A.Base->getName() + ":" + Offset).str());
+            (Base->getName() + ":" + Offset).str());
       }
     }
     if (Instructions <= 8 && Calls == 1) ++P.SmallWrapperCandidates;
@@ -6081,7 +9680,7 @@ static void writeReport(const Module &M, const Metrics &Stats,
           {"P21", "implemented for pure equality ladders"},
           {"P22", "implemented for proved SSA/memory recurrences and invertible encodings"},
           {"P23", "implemented as a bounded fail-closed CFG/transition executor: APInt BV semantics cover casts, in-range shifts, rotate/bswap/bitreverse/ctpop/select; persistent frame values use exact reaching stores across up to 12 predecessor blocks, equal-value merges across eight paths, and synthesized proof-only PHIs for same-location stores on separate CFG arms; proven-disjoint ranges, single-block readnone/readonly summaries, constant loop invariants, and exhaustive multi-incoming default induction are supported; nested select/PHI forks enumerate at most 32 outcomes and require a Z3 finite-set proof, while irreducibly symbolic states use an exact cloned encoded switch only with cloneable plumbing and PHI-free targets; unknown aliasing, unsupported effects, cycles outside proved induction, and cap hits are explicit barriers rather than guessed transitions"},
-          {"P24", "implemented for complete proved transition sets including multi-incoming SSA dispatchers with self-looping defaults; residual-strict otherwise"},
+          {"P24", "implemented for complete proved transition sets including multi-incoming SSA dispatchers with self-looping defaults; unproved regions remain unchanged"},
           {"P30", "implemented for bounded proof slices: SSA plus SAT-checked dominating branch/assume constraints, symbolic modulo-width rotates, bswap/bitreverse/ctpop, exact diamond/switch-funnel PHIs as ITEs, inductively proved constant cyclic PHIs, exact MemorySSA stores and equal-value MemoryPhi joins; nonconstant one-PHI cyclic predicates additionally require universal Z3 seed/backedge 1-induction, while unsupported operations and multi-PHI cyclic relations remain explicit barriers"},
           {"P31", "implemented: theorem library plus Z3 UNSAT gate"},
           {"P32", "implemented: proved-edge pruning only"},

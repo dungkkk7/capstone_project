@@ -2,7 +2,7 @@
 ; RUN: opt-21 -load-pass-plugin %plugin -ollvm-deobf-report=%t.json -passes=brighten-ollvm-deobf-pass,sroa,instcombine,simplifycfg,dce,verify -S %s -o %t.ll
 ; RUN: FileCheck-21 %s < %t.ll
 ; RUN: lli-21 %t.ll
-; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind'] in ('cff_dispatcher','cff_transition') and x['proof_engine'] in ('complete_ssa_transition_and_plumbing_set','ssa_phi_demotion_exact_plumbing')]; assert d['status']=='pass_detected_scope' and d['metrics']['dispatchers_recovered']==1 and len(p)==4 and all(x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and x['dependencies']==['llvm_phi_demotion','exact_latch_header_clone'] for x in p); assert not [x for x in d['proofs'] if x['result']!='proved']"
+; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind'] in ('cff_dispatcher','cff_transition') and x['proof_engine'] in ('complete_ssa_transition_and_plumbing_set','ssa_phi_demotion_exact_plumbing')]; base={'llvm_phi_demotion','exact_latch_header_clone'}; assert d['status']=='pass_detected_scope' and d['metrics']['dispatchers_recovered']==1 and len(p)==4 and all(x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and base.issubset(x['dependencies']) for x in p) and any(x['kind']=='cff_dispatcher' and 'seed_reachable_transition_induction' in x['dependencies'] for x in p); assert not [x for x in d['proofs'] if x['result']!='proved']"
 
 @trace = internal global i32 0
 

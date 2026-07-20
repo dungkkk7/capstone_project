@@ -104,8 +104,17 @@ def main():
             current = candidate
         if not result["fixed_point_converged"]:
             raise SystemExit("fixed_point_cap_reached")
-        subprocess.run([clang, args.input_bc, "-O2", "-o", before_bin], check=True)
-        subprocess.run([clang, after_bc, "-O2", "-o", after_bin], check=True)
+        # Lifted programs may retain libc/libm imports (sqrt, round, ...).
+        # Keep the differential harness link-complete for the same native
+        # surface accepted by the production compiler.
+        subprocess.run(
+            [clang, args.input_bc, "-O2", "-o", before_bin, "-lm"],
+            check=True,
+        )
+        subprocess.run(
+            [clang, after_bc, "-O2", "-o", after_bin, "-lm"],
+            check=True,
+        )
 
         for index, payload in enumerate(payloads):
             before = run_bounded(before_bin, payload, args.timeout)

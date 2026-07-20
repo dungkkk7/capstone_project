@@ -104,13 +104,27 @@ implements a proof-gated subset of `ollvm_deobfuscation_design_vi.md`:
   always reconstructed from the low byte even for wider producers;
 - complete SSA dispatcher recovery for constant/select transitions, including
   affine encodings made from add/sub/mul/xor/and/or.
+- cyclic dispatcher-region recovery treats default-linked switches, forwarded
+  state PHIs, and equality guards as one ordered state family.  External entry
+  and recursively nested many-way funnel edges are resolved against the exact
+  lookup order (later duplicate keys are shadowed, not rejected), while every
+  skipped PHI, side-effecting plumbing instruction, target PHI, and case
+  live-in is cloned or translated in a two-phase transaction before the lookup
+  SCC is removed.  Loop-carried case live-ins are distributed backwards to a
+  fixed point over the proved transition graph, and shared state PHIs are
+  accepted across a wrap edge only when that edge forwards the same state;
+- dynamic entry values are retained only for acyclic edges and only when their
+  discriminator is defined outside the lookup/funnel region; unknown states
+  preserve the original non-returning lookup behavior instead of selecting a
+  guessed case;
 - exact SSA loop-variable preservation for multi-PHI dispatchers by lowering
   header/latch PHIs to private slots and cloning the executed plumbing on each
   proved edge; terminal cases and case-local control flow are retained;
 - funnel dispatcher recovery with affine frame-address canonicalization and
   preservation of state-store plumbing.
-- memory-join recurrence recovery with invertible modular state decoding and a
-  fixed-width evaluator for state-dependent next-state expressions;
+- memory-join recurrence recovery with invertible modular state decoding, exact
+  predecessor coverage, unique-path PHI address substitution, and a fixed-width
+  evaluator for state-dependent next-state expressions;
 - path-local edge splitting for conditional join edges, so dispatcher effects
   execute on exactly the original path;
 - exact cloning/remapping of dispatcher plumbing and cloneable default-entry
@@ -144,21 +158,19 @@ are isolated through private shadows before compaction so LLVM 21's incomplete
 variadic ModRef model cannot let GVN replace post-scanf loads with pre-call
 zeros; failed conversions retain the old destination bytes.
 
-Production mode is residual-strict: convergence alone is insufficient. Any
-remaining proof obligation also returns failure and prevents Souper.
-`BRIGHTEN_DEOBF_ALLOW_RESIDUALS=1` is an explicit diagnostic override only;
-the ledger still reports `partial_with_residuals`.
+Production has one deterministic contract: a CFG rewrite is committed only
+when its proof obligations hold, and any unresolved dispatcher at the fixed
+point fails deobfuscation before Souper.  There is no environment-variable
+override that relabels partial deobfuscation as success.
 
 The JSON report includes `component_coverage` for every P00-P60 identifier in
 the design. It distinguishes implemented, partial, and upstream components so
 a successful detected-scope run cannot be mistaken for unsupported general
 path execution or a general-purpose bit-vector e-graph.
 
-The p00008 regression used during development removes both detected CFF
-dispatchers (zero remaining `switch i32`) and passes 97/97 exact payloads
-against both the pre-pass bitcode and original obfuscated ELF. Corpus results
-are evidence for that fixture, not a substitute for proof obligations or wider
-corpus testing.
+The regression corpus covers complete and partial dispatcher shapes, including
+seed-reachable transition induction.  Corpus results supplement rather than
+replace the proof obligations and wider differential testing.
 
 Build and test:
 

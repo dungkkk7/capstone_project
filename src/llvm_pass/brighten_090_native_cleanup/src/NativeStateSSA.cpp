@@ -1770,23 +1770,86 @@ static bool lowerNativeMainStackBufferImpl(Module &M) {
     if (!OldStack)
       continue;
 
-    // Keep the guest frame off the host stack, but preserve the established
-    // compatibility representation until a complete per-invocation frame
-    // proof exists.  The semantic baseline relies on this backing for deep
-    // negative guest offsets and callback re-entry.
-    constexpr uint64_t NativeStackBytes = 16 * 1024 * 1024;
-    constexpr uint64_t NativeStackGuard = 64 * 1024;
-    constexpr uint64_t NativeStackTop = NativeStackBytes - NativeStackGuard;
+    // Once a derived stack pointer escapes or participates in dynamic address
+    // arithmetic, downstream native code may access an unbounded guest range.
+    // A global replacement has no guard-page contract at its LLVM object edge,
+    // so even an equal-sized global can mask the fault observed with the
+    // original host-stack allocation.  Lower only constant, in-bounds pointer
+    // graphs; every other form requires a separate range proof.
+    SmallPtrSet<Value *, 32> SeenStackValues;
+    std::function<bool(Value *)> HasUnboundedUse = [&](Value *V) {
+      if (!SeenStackValues.insert(V).second)
+        return false;
+      for (User *U : V->users()) {
+        if (isa<PtrToIntInst>(U))
+          return true;
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          if (!GEP->isInBounds())
+            return true;
+          for (Value *Index : GEP->indices())
+            if (!isa<ConstantInt>(Index))
+              return true;
+          if (HasUnboundedUse(GEP))
+            return true;
+          continue;
+        }
+        if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) {
+          if (HasUnboundedUse(cast<Value>(U)))
+            return true;
+          continue;
+        }
+        if (auto *LI = dyn_cast<LoadInst>(U)) {
+          if (LI->getPointerOperand() == V)
+            continue;
+        }
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == V)
+            continue;
+        }
+        // Calls, PHIs/selects, storing the pointer value, and every other
+        // escape need an interprocedural range proof that this pass lacks.
+        return true;
+      }
+      return false;
+    };
+    if (HasUnboundedUse(OldStack))
+      continue;
+
+    // Keep the guest frame off the host stack without changing its mapped
+    // address interval.  Enlarging a 2 MiB lifted stack to a 16 MiB global
+    // silently turns sufficiently deep invalid accesses into valid memory.
+    // Preserve both the original object extent and every original GEP.
     IRBuilder<> B(OldStack);
-    auto *StorageTy = ArrayType::get(B.getInt8Ty(), NativeStackBytes);
+    auto *StorageTy = cast<ArrayType>(OldStack->getAllocatedType());
     std::string StorageName = "frame_storage_backing.";
     StorageName += FunctionName.str();
     GlobalVariable *Storage = M.getNamedGlobal(StorageName);
+    if (Storage && Storage->getValueType() != StorageTy)
+      return false;
     if (!Storage) {
       Storage = new GlobalVariable(
           M, StorageTy, false, GlobalValue::InternalLinkage,
           ConstantAggregateZero::get(StorageTy), StorageName);
       Storage->setAlignment(Align(16));
+    }
+
+    for (User *U : OldStack->users()) {
+      auto *GEP = dyn_cast<GetElementPtrInst>(U);
+      if (!GEP || !GEP->getName().starts_with("native_stack_top"))
+        continue;
+      auto It = GEP->idx_end();
+      if (It == GEP->idx_begin())
+        continue;
+      --It;
+      auto *Top = dyn_cast<ConstantInt>(*It);
+      if (!Top || Top->isNegative())
+        continue;
+      Storage->setMetadata(
+          "brighten.stack.top",
+          MDNode::get(M.getContext(), ConstantAsMetadata::get(
+                                          ConstantInt::get(B.getInt64Ty(),
+                                                           Top->getZExtValue()))));
+      break;
     }
     SmallVector<Value *, 2> StorageIndices = {B.getInt32(0), B.getInt32(0)};
     Value *NewStack = GetElementPtrInst::CreateInBounds(
@@ -1800,39 +1863,8 @@ static bool lowerNativeMainStackBufferImpl(Module &M) {
         return false;
       StackUsers.push_back(GEP);
     }
-    for (Instruction *I : StackUsers) {
-      auto *GEP = cast<GetElementPtrInst>(I);
-      IRBuilder<> GB(GEP);
-      Value *Top = GB.CreateConstGEP1_64(B.getInt8Ty(), NewStack,
-                                         NativeStackTop, "native_stack_top");
-      GEP->replaceAllUsesWith(Top);
-      GEP->eraseFromParent();
-    }
-
-    SmallVector<GetElementPtrInst *, 32> NegativeFrameGEPs;
-    for (User *U : NewStack->users()) {
-      auto *GEP = dyn_cast<GetElementPtrInst>(U);
-      if (!GEP || GEP->getNumIndices() == 0)
-        continue;
-      auto It = GEP->idx_end();
-      --It;
-      auto *CI = dyn_cast<ConstantInt>(*It);
-      if (CI && CI->getValue().isNegative())
-        NegativeFrameGEPs.push_back(GEP);
-    }
-    for (GetElementPtrInst *GEP : NegativeFrameGEPs) {
-      auto It = GEP->idx_end();
-      --It;
-      int64_t Offset = cast<ConstantInt>(*It)->getSExtValue();
-      IRBuilder<> GB(GEP);
-      Value *Top = GB.CreateConstGEP1_64(B.getInt8Ty(), NewStack,
-                                         NativeStackTop, "native_stack_top");
-      Value *Rebased = GB.CreateGEP(B.getInt8Ty(), Top,
-                                    GB.getInt64(Offset), "native_stack_rebased");
-      GEP->replaceAllUsesWith(Rebased);
-      GEP->eraseFromParent();
-      Changed = true;
-    }
+    for (Instruction *I : StackUsers)
+      I->setOperand(0, NewStack);
     if (!OldStack->use_empty())
       continue;
     OldStack->eraseFromParent();
@@ -2197,8 +2229,8 @@ static bool lowerNativeStackAddressesImpl(Module &M) {
         // A positive offset above the entry stack top is the SysV incoming
         // stack-argument area when it is only read by the recovered callee.
         // It must stay relative to entry RSP.  Treating every top+K address as
-        // a post-prologue local moved p00187's seventh/eighth integer args by
-        // the full 568-byte frame allocation.  A written fixed slot retains
+        // a post-prologue local moves overflow integer arguments by the full
+        // local-frame allocation.  A written fixed slot retains
         // the existing allocated-frame interpretation used by recovered
         // callee locals.
         SmallPtrSet<Value *, 16> ReadSeen;

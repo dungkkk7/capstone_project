@@ -9,6 +9,14 @@ PLUGIN="$ROOT/build/BrightenNativeCleanupPass.so"
 [[ -x "$OPT" ]]
 [[ -f "$PLUGIN" ]]
 
+PUBLISH_METADATA_OUT="$(mktemp)"
+trap 'rm -f "$PUBLISH_METADATA_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-publish-metadata-cleanup-pass,verify' -S \
+  "$ROOT/tests/publish_metadata_cleanup.ll" -o "$PUBLISH_METADATA_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/publish_metadata_cleanup.ll" < "$PUBLISH_METADATA_OUT"
+
 MEMSET_SIZE_OUT="$(mktemp)"
 trap 'rm -f "$MEMSET_SIZE_OUT"' EXIT
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -29,6 +37,8 @@ if grep -Eq 'native\.data\.pointer\.select|store i32 7, ptr %guest\.pointer' \
 fi
 grep -Eq 'store i32 7, ptr (%frame\.slot|%native\.frame\.slot|getelementptr .*@frame_storage_backing\.main)' \
   "$STACK_DATA_SELECT_OUT"
+grep -Eq 'store i32 9, ptr %local\.frame\.slot' "$STACK_DATA_SELECT_OUT"
+grep -Eq 'store i32 11, ptr %argument\.frame\.slot' "$STACK_DATA_SELECT_OUT"
 
 SCANF_SEED_OUT="$(mktemp)"
 trap 'rm -f "$SCANF_SEED_OUT"' EXIT
@@ -296,6 +306,27 @@ rm -f "$AFFINE_MEMSET_OUT" "$AFFINE_MEMSET_ORIGINAL_BIN" \
   "$AFFINE_MEMSET_COMPACT_BIN"
 
 echo "Native cleanup tests: PASS"
+
+INT_ESCAPED_STACK_OUT="$(mktemp)"
+trap 'rm -f "$INT_ESCAPED_STACK_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/int_escaped_entry_stack_preserved.ll" \
+  -o "$INT_ESCAPED_STACK_OUT"
+grep -Eq '%frame_storage = alloca \[2097152 x i8\]' \
+  "$INT_ESCAPED_STACK_OUT"
+grep -Eq '%frame_top = getelementptr i8, ptr %frame_storage, i64 2096896' \
+  "$INT_ESCAPED_STACK_OUT"
+grep -Eq 'call i8 @worker\(ptr %frame_top,' "$INT_ESCAPED_STACK_OUT"
+if grep -Eq 'native\.data\.pointer\.select' "$INT_ESCAPED_STACK_OUT"; then
+  echo "FAIL: local frame integer was misclassified as guest data" >&2
+  exit 1
+fi
+if grep -Eq '@frame_storage_backing\.main' "$INT_ESCAPED_STACK_OUT"; then
+  echo "FAIL: integer-escaped entry stack was unsafely moved to a global" >&2
+  exit 1
+fi
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,default<O3>,brighten-native-cleanup-final-pass,verify' \

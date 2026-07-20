@@ -1,6 +1,6 @@
 ; RUN: opt-21 -load-pass-plugin %plugin -ollvm-deobf-report=%t.json -passes=brighten-ollvm-deobf-pass,simplifycfg,dce -S %s -o - | FileCheck-21 %s
 ; RUN: lli-21 %s
-; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind'] in ('bv_canonicalize','instsub_rewrite')]; assert p and all(x['result']=='proved' and x['proof_engine']=='z3_bv_equivalence_unsat' and x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and x['dependencies'] for x in p); assert not [x for x in d['proofs'] if x['kind']=='rewrite_candidate']"
+; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind'] in ('bv_canonicalize','instsub_rewrite')]; assert p and all(x['result']=='proved' and x['proof_engine'] in ('z3_bv_equivalence_unsat','llvm_instruction_simplify') and x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and x['dependencies'] for x in p); assert not [x for x in d['proofs'] if x['kind']=='rewrite_candidate']"
 
 define i8 @carry_i8(i8 %x, i8 %y) {
 ; CHECK-LABEL: @carry_i8
