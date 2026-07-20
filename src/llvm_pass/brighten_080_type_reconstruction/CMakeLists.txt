@@ -17,14 +17,14 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
 add_llvm_pass_plugin(BrightenTypeReconstructionPass
-  main.cpp
-  ObjectDiscovery.cpp
-  PointerOffsetAnalysis.cpp
-  AccessEvidenceCollector.cpp
-  TypeConstraintSolver.cpp
-  ArrayInference.cpp
-  StructInference.cpp
-  RewritePlanner.cpp
-  IRTypeRewriter.cpp
-  ReconstructionVerifier.cpp
+  src/main.cpp
+  src/ObjectDiscovery.cpp
+  src/PointerOffsetAnalysis.cpp
+  src/AccessEvidenceCollector.cpp
+  src/TypeConstraintSolver.cpp
+  src/ArrayInference.cpp
+  src/StructInference.cpp
+  src/RewritePlanner.cpp
+  src/IRTypeRewriter.cpp
+  src/ReconstructionVerifier.cpp
 )

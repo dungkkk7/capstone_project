@@ -16,5 +16,18 @@ include(AddLLVM)
 add_llvm_pass_plugin(BrightenNativeCleanupPass
   src/main.cpp
   src/NativeCleanup.cpp
+  src/NativeCleanupCommon.cpp
+  src/NativeCleanupUndefPoison.cpp
+  src/NativeCleanupPointerAnalysis.cpp
+  src/NativeCleanupGuestData.cpp
+  src/NativeCleanupPointerMaterialization.cpp
+  src/NativeCleanupExternalABI.cpp
+  src/NativeCleanupSegments.cpp
+  src/NativeCleanupContractReport.cpp
+  src/NativeCleanupCallbacks.cpp
+  src/NativeCleanupDeadCode.cpp
+  src/NativeCleanupEntrypoint.cpp
+  src/NativeCleanupStackFrame.cpp
+  src/NativeCleanupBoundsGuards.cpp
   src/NativeStateSSA.cpp
 )

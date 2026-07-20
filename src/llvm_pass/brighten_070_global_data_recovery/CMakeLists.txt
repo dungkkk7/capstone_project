@@ -17,15 +17,15 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
 add_llvm_pass_plugin(BrightenGlobalDataRecoveryPass
-  main.cpp
-  RuleDiscoverGuestSegments.cpp
-  RuleFlattenSegmentBytes.cpp
-  RuleBuildGuestAddressMap.cpp
-  GenerateObjectCandidates.cpp
-  ResolveObjectConflicts.cpp
-  MaterializeRecoveredGlobals.cpp
-  RuleRewriteGuestDataReferences.cpp
-  RecoverJumpTableCFG.cpp
-  RuleCleanupAndVerify.cpp
-  RuleReport.cpp
+  src/main.cpp
+  src/RuleDiscoverGuestSegments.cpp
+  src/RuleFlattenSegmentBytes.cpp
+  src/RuleBuildGuestAddressMap.cpp
+  src/GenerateObjectCandidates.cpp
+  src/ResolveObjectConflicts.cpp
+  src/MaterializeRecoveredGlobals.cpp
+  src/RuleRewriteGuestDataReferences.cpp
+  src/RecoverJumpTableCFG.cpp
+  src/RuleCleanupAndVerify.cpp
+  src/RuleReport.cpp
 )

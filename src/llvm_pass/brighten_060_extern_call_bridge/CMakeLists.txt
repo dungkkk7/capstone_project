@@ -17,12 +17,12 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
 add_llvm_pass_plugin(BrightenExternCallBridgePass
-  main.cpp
-  LibcSignatureDB.cpp
-  RuleDiscoverExternalSymbols.cpp
-  RuleAnalyzeExternalCallsites.cpp
-  RuleRecoverVarargArguments.cpp
-  RuleRewriteExternalCallsites.cpp
-  RuleCleanupAndVerify.cpp
-  RuleReport.cpp
+  src/main.cpp
+  src/LibcSignatureDB.cpp
+  src/RuleDiscoverExternalSymbols.cpp
+  src/RuleAnalyzeExternalCallsites.cpp
+  src/RuleRecoverVarargArguments.cpp
+  src/RuleRewriteExternalCallsites.cpp
+  src/RuleCleanupAndVerify.cpp
+  src/RuleReport.cpp
 )

@@ -17,19 +17,19 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
 add_llvm_pass_plugin(BrightenABIRecoveryPass
-  main.cpp
-  ABIModel.cpp
-  RegisterAccess.cpp
-  ABIAnalysis.cpp
-  RuleNormalizeRegisterAccesses.cpp
-  RuleAnalyzeFunctionLiveIns.cpp
-  RuleAnalyzeFunctionLiveOuts.cpp
-  RuleAnalyzeCallsiteABI.cpp
-  RuleInferFunctionABISignatures.cpp
-  RuleCloneNativeFunctions.cpp
-  RuleRewriteNativeFunctionBodies.cpp
-  RuleRewriteKnownCallsites.cpp
-  RuleCreateRemillWrappers.cpp
-  RuleRewriteMainWrapper.cpp
-  RuleCleanupDeadRemillABI.cpp
+  src/main.cpp
+  src/ABIModel.cpp
+  src/RegisterAccess.cpp
+  src/ABIAnalysis.cpp
+  src/RuleNormalizeRegisterAccesses.cpp
+  src/RuleAnalyzeFunctionLiveIns.cpp
+  src/RuleAnalyzeFunctionLiveOuts.cpp
+  src/RuleAnalyzeCallsiteABI.cpp
+  src/RuleInferFunctionABISignatures.cpp
+  src/RuleCloneNativeFunctions.cpp
+  src/RuleRewriteNativeFunctionBodies.cpp
+  src/RuleRewriteKnownCallsites.cpp
+  src/RuleCreateRemillWrappers.cpp
+  src/RuleRewriteMainWrapper.cpp
+  src/RuleCleanupDeadRemillABI.cpp
 )
