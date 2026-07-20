@@ -43,7 +43,8 @@ assert "brighten-ollvm-deobf-pass" not in module.PASS_PIPELINE
 assert module.DEOBF_ROUND_PIPELINE.count("brighten-ollvm-deobf-pass") == 1
 source = Path(module.__file__).read_text(encoding="utf-8")
 assert "brighten-native-cleanup-post-souper-pass," in source
-assert "brighten-publish-metadata-cleanup-pass,verify" in source
+assert "brighten-publish-metadata-cleanup-pass," in source
+assert "default<O3>,verify" in source
 assert module.DEOBF_ROUND_PIPELINE.endswith("verify")
 assert module.DEOBF_FIXED_POINT_MAX_ROUNDS == 8
 assert "instcombine<no-verify-fixpoint>" in module.SOUPER_PASS_PIPELINE

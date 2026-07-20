@@ -984,7 +984,8 @@ def run_final_native_audit(output_path, opt_bin):
     command.extend([
         "-passes", (
             "brighten-native-cleanup-post-souper-pass,"
-            "brighten-publish-metadata-cleanup-pass,verify"
+            "brighten-publish-metadata-cleanup-pass,"
+            "default<O3>,verify"
         ),
         output_path,
         "-o", temporary,
