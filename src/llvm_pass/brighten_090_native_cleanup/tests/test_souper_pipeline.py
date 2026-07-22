@@ -25,14 +25,15 @@ assert b"dependency/souper/bin/z3" in Path(plugin).read_bytes(), (
 )
 maximum_mode, maximum_flags = module.souper_mode_flags("maximum")
 default_mode, default_flags = module.souper_mode_flags(None)
-assert module.SOUPER_CASE_BUDGET_SECONDS == 1800
-assert module.SOUPER_MAXIMUM_BUDGET_SECONDS == 1680
+assert module.SOUPER_CASE_BUDGET_SECONDS == 300
+assert module.SOUPER_MAXIMUM_BUDGET_SECONDS == 300
 assert module.SOUPER_SAFE_FALLBACK_RESERVE_SECONDS == 300
-assert module.SOUPER_MAXIMUM_SOLVER_TIMEOUT_SECONDS == 60
-assert module.SOUPER_SAFE_SOLVER_TIMEOUT_SECONDS == 30
+assert module.SOUPER_MAXIMUM_SOLVER_TIMEOUT_SECONDS == 15
+assert module.SOUPER_SAFE_SOLVER_TIMEOUT_SECONDS == 15
 assert maximum_mode == "maximum"
 assert default_mode == "safe"
 assert default_flags == []
+assert module.SOUPER_DEFAULT_MODE == "safe"
 assert "-souper-use-cegis" in maximum_flags
 assert any(flag.startswith("-souper-synthesis-comps=") for flag in maximum_flags)
 assert "-souper-harvest-uses" in maximum_flags
@@ -41,10 +42,22 @@ assert artifact_names["after_souper"] == "case_brightened.ll"
 assert artifact_names["before_souper"] == "case_brightened_before_souper.ll"
 assert "brighten-ollvm-deobf-pass" not in module.PASS_PIPELINE
 assert module.DEOBF_ROUND_PIPELINE.count("brighten-ollvm-deobf-pass") == 1
+assert module.DEOBF_ROUND_PIPELINE.startswith("function(mem2reg),")
 source = Path(module.__file__).read_text(encoding="utf-8")
 assert "brighten-native-cleanup-post-souper-pass," in source
 assert "brighten-publish-metadata-cleanup-pass," in source
-assert "default<O3>,verify" in source
+audit_start = source.index("def run_final_native_audit")
+audit_source = source[audit_start : source.index("\ndef ", audit_start + 1)]
+assert "default<O3>" not in audit_source
+assert audit_source.index("instcombine<no-verify-fixpoint>") < audit_source.index(
+    "brighten-publish-metadata-cleanup-pass"
+) < audit_source.index("brighten-native-cleanup-post-souper-pass")
+assert audit_source.index("simplifycfg") < audit_source.index(
+    "brighten-native-cleanup-post-souper-pass"
+)
+assert audit_source.index("adce") < audit_source.index(
+    "brighten-native-cleanup-post-souper-pass"
+)
 assert module.DEOBF_ROUND_PIPELINE.endswith("verify")
 assert module.DEOBF_FIXED_POINT_MAX_ROUNDS == 8
 assert "instcombine<no-verify-fixpoint>" in module.SOUPER_PASS_PIPELINE
@@ -169,7 +182,7 @@ with tempfile.TemporaryDirectory() as directory:
         ["llvm-as-21", "-o", residual_bc], input=residual_dispatcher,
         text=True, check=True,
     )
-    assert not module.run_deobf_fixed_point(str(residual_bc))
+    assert module.run_deobf_fixed_point(str(residual_bc))
     residual_report = json.loads(
         Path(module.deobf_proof_ledger_path(str(residual_bc))).read_text(
             encoding="utf-8"
@@ -181,6 +194,11 @@ with tempfile.TemporaryDirectory() as directory:
         proof["result"] == "unresolved"
         for proof in residual_report["proofs"]
     )
+    os.environ["BRIGHTEN_DEOBF_STRICT_GATE"] = "1"
+    try:
+        assert not module.run_deobf_fixed_point(str(residual_bc))
+    finally:
+        os.environ.pop("BRIGHTEN_DEOBF_STRICT_GATE", None)
 
 with tempfile.TemporaryDirectory() as directory:
     input_path = Path(directory) / "input.ll"
@@ -195,8 +213,9 @@ with tempfile.TemporaryDirectory() as directory:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["status"] == "pass"
     assert report["pipeline"] == module.SOUPER_PASS_PIPELINE
+    assert report["mode"] == "safe"
     assert report["module_timeout_seconds"] == 300
-    assert report["solver_timeout_seconds"] == 30
+    assert report["solver_timeout_seconds"] == 15
     assert report["output_bytes"] == output_path.stat().st_size
     assert Path(report["log"]).is_file()
     assert "replacements_found" in report["diagnostics"]
@@ -219,53 +238,50 @@ with tempfile.TemporaryDirectory() as directory:
     input_path = Path(directory) / "fallback-input.ll"
     output_path = Path(directory) / "fallback-output.ll"
     input_path.write_text(source, encoding="utf-8")
-    real_run = module.subprocess.run
+    real_run = module._run_souper_with_live_log
 
     def fake_run(command, **kwargs):
         if "-souper-use-cegis" in command:
             return subprocess.CompletedProcess(
                 command, -6, "", "function broken after Souper changed it"
             )
-        shutil.copy2(input_path, command[-1])
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    module.subprocess.run = fake_run
+    module._run_souper_with_live_log = fake_run
     os.environ["BRIGHTEN_SOUPER_MODE"] = "maximum"
     try:
         assert module.optimize_with_souper(str(input_path), str(output_path))
     finally:
         os.environ.pop("BRIGHTEN_SOUPER_MODE", None)
-        module.subprocess.run = real_run
+        module._run_souper_with_live_log = real_run
     fallback_report = json.loads(
         Path(module.souper_report_path(str(output_path))).read_text(
             encoding="utf-8"
         )
     )
-    assert fallback_report["status"] == "pass_with_fallback"
-    assert fallback_report["requested_mode"] == "maximum"
-    assert fallback_report["effective_mode"] == "safe"
-    assert fallback_report["maximum_failure"]["returncode"] == -6
-    assert fallback_report["maximum_failure"]["log"].endswith(
+    assert fallback_report["status"] == "verified_passthrough"
+    assert fallback_report["mode"] == "maximum"
+    assert fallback_report["souper_failure"]["returncode"] == -6
+    assert fallback_report["souper_failure"]["log"].endswith(
         "_souper_maximum.log"
     )
-    assert fallback_report["log"].endswith("_souper_safe.log")
+    assert fallback_report["passthrough_verification"] == "pass"
+    assert fallback_report["optimized_by_souper"] is False
 
 with tempfile.TemporaryDirectory() as directory:
     input_path = Path(directory) / "safe-timeout-input.ll"
     output_path = Path(directory) / "safe-timeout-output.ll"
     input_path.write_text(source, encoding="utf-8")
-    real_run = module.subprocess.run
+    real_run = module._run_souper_with_live_log
 
     def fake_safe_timeout(command, **kwargs):
-        if "-disable-output" in command:
-            return subprocess.CompletedProcess(command, 0, "", "")
         raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 300))
 
-    module.subprocess.run = fake_safe_timeout
+    module._run_souper_with_live_log = fake_safe_timeout
     try:
         assert module.optimize_with_souper(str(input_path), str(output_path))
     finally:
-        module.subprocess.run = real_run
+        module._run_souper_with_live_log = real_run
     assert output_path.read_text(encoding="utf-8") == source
     timeout_report = json.loads(
         Path(module.souper_report_path(str(output_path))).read_text(

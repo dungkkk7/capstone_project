@@ -63,8 +63,14 @@ collectDominatingConstraints(BranchInst &Target, DominatorTree &DT) {
     if (BB == TargetBB || Constraints.size() == 32) continue;
     auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
     if (!BI || !BI->isConditional()) continue;
-    bool TrueDominates = DT.dominates(BI->getSuccessor(0), TargetBB);
-    bool FalseDominates = DT.dominates(BI->getSuccessor(1), TargetBB);
+    // A successor block may dominate Target even when it is reachable through
+    // the opposite arm (for example, a false arm that joins the true
+    // successor).  In that shape block dominance does not prove which branch
+    // outcome was taken.  Only the concrete CFG edge carries that path fact.
+    bool TrueDominates = DT.dominates(
+        BasicBlockEdge(BB, BI->getSuccessor(0)), TargetBB);
+    bool FalseDominates = DT.dominates(
+        BasicBlockEdge(BB, BI->getSuccessor(1)), TargetBB);
     if (TrueDominates != FalseDominates)
       Constraints.push_back({BI->getCondition(), TrueDominates});
   }

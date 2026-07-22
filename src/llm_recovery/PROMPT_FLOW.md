@@ -19,11 +19,11 @@ mode 1: reference binary
           -> Ghidra analyzeHeadless
           -> ghidra_pseudocode.c
           -> ghidra_recovery_input.c
-          -> File API + message prompt
+          -> pseudocode attachment + message prompt
           -> LLM JSON {"source": "..."}
 
 mode 2: brightened LLVM IR
-          -> File API + message prompt
+          -> bounded message prompt
           -> LLM JSON {"source": "..."}
 
 LLM candidate
@@ -46,9 +46,11 @@ Mode 1 khong fallback tu dong sang mode 2. Neu Ghidra khong tao duoc pseudocode,
 run mode 1 dung lai de tranh vo tinh doi nguon bang chung. Muon dung IR thi chon
 mode 2 tu dau.
 
-`brightened_ref.bin` va pseudocode Ghidra deu duoc attach raw trong cung request mode 1.
-Pseudocode la bang chung doc chinh; ELF la bang chung binary bo sung de model co them context.
-O mode 2 khong can binary hay Ghidra, chi gui brightened LLVM IR.
+O mode 1, `brightened_ref.bin` chi la input local cho Ghidra va semantic checker;
+request Vertex attach pseudocode Ghidra lam bang chung doc chinh. Brightened LLVM IR khong
+duoc gui lap mac dinh vi cung mo ta mot chuong trinh va co the lam vuot context. Chi bat
+`LLM_RECOVERY_ATTACH_IR_WITH_GHIDRA=1` khi can dieu tra thu cong. O mode 2 khong can binary
+hay Ghidra; IR duoc gioi han boi `LLM_RECOVERY_MAX_IR_CHARS`.
 
 ## 2. Cac lop prompt
 
@@ -100,8 +102,9 @@ Moi vong sua dung ba khoi du lieu:
 - `MODEL_INPUT_ARTIFACT`: pseudocode Ghidra hoac IR cua case dang recovery de model khong sua
   theo feedback mot cach mu quang. Day khong phai source goc.
 
-Repair prompt yeu cau sua toi thieu nhung van tra ve **toan bo** translation unit. Neu candidate
-bi cat ngang, model phai viet lai tu model input artifact, khong duoc tra ve declarations, diff hoac mot doan
+Repair prompt yeu cau sua toi thieu nhung van tra ve **toan bo** translation unit. Adapter gioi
+han candidate va feedback rieng biet, giu ca dau va cuoi kem marker neu phai bo phan giua.
+Model phai viet lai tu model input artifact, khong duoc tra ve declarations, diff hoac mot doan
 patch. Day la **iterative self-refinement co external verifier**, trong do compiler va semantic
 checker la nguoi danh gia, khong phai tu-danh-gia bang text cua LLM.
 
@@ -127,10 +130,11 @@ LLM phai tra:
 ```
 
 Adapter se parse JSON, lay `source`, compile candidate va dua candidate vao semantic/fuzz check.
-Moi request gui day du system/task prompt va attach nguyen artifact. Input khong bi cat. Request
-dung output ceiling toi da theo model (`65,535` token voi `gemini-3.5-flash`), khong dung cap
-32K rieng cua adapter. Gioi han recovery van la `max_iter=5`; loi parse/compile/semantic va
-`finishReason` cua provider duoc dua vao feedback cua vong ke tiep.
+Moi request gui system/task prompt va mot nguon evidence chinh. Tong prompt + attachment bi
+chan tai local boi `LLM_RECOVERY_MAX_REQUEST_INPUT_BYTES` truoc khi lay credential hay goi
+Vertex. Request dung output ceiling toi da theo model (`65,535` token voi
+`gemini-3.5-flash`). Gioi han recovery van la `max_iter=5`; loi parse/compile/semantic va
+`finishReason` cua provider duoc dua vao feedback cua vong ke tiep trong gioi han rieng.
 
 Prompt yeu cau model thuc hien noi bo program mapping, I/O analysis, semantic deobfuscation,
 algorithm reconstruction va validation discipline truoc khi sinh code. Adapter van chi nhan JSON
@@ -173,5 +177,5 @@ duy nhat la mode `1`/`ghidra` hoac `2`/`ir`.
 - `recovery_iter*.candidate.c`: source da extract.
 - `recovery_iter*.parse.txt`: loi parse/compile/semantic dung lam feedback.
 
-File attach va message prompt cung nam trong cung request; message noi cach dung evidence,
-con file cung cap noi dung day du ma khong can cat IR.
+File attach va message prompt cung nam trong cung request mode 1; message noi cach dung
+pseudocode evidence. Mode 2 dua IR da gioi han truc tiep vao message prompt.

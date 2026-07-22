@@ -280,6 +280,25 @@ class AsymmetricCrashReportTests(unittest.TestCase):
         self.assertEqual(report["fuzz_config"]["engine"], "fallback")
         self.assertEqual(report["fuzz_config"]["timeout_seconds"], 0.1)
 
+    def test_recovery_mode_collects_five_crash_examples_without_fail_fast(self):
+        fuzzer = SemanticFuzzer.__new__(SemanticFuzzer)
+        fuzzer.bin1 = "/tmp/recovered_f1.bin"
+        fuzzer.bin2 = "/tmp/original_f2.bin"
+        fuzzer.seed_inputs = []
+
+        with patch("fuzzing_equi_check.fuzzing.run_binary", self._mock_execution):
+            report = fuzzer.run_differential_test_fallback(
+                iterations=5,
+                generator=lambda: ([], self.payload),
+                timeout=0.1,
+                fail_fast=False,
+            )
+
+        self.assertEqual(report["total_runs"], 5)
+        self.assertEqual(report["mismatches"], 5)
+        self.assertFalse(report.get("early_stopped", False))
+        self.assertEqual(len(report["mismatch_examples"]), 5)
+
     def test_afl_fail_fast_accounts_asymmetric_crash_before_cancel(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             fuzzer = SemanticFuzzer.__new__(SemanticFuzzer)

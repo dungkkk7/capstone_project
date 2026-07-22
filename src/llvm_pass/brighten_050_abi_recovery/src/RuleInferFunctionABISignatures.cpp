@@ -55,9 +55,37 @@ static void InferArgs(FunctionABISummary &S, ABIRecoveryContext &Ctx) {
 }
 
 static void InferReturn(FunctionABISummary &S, ABIRecoveryContext &Ctx) {
-  if (S.HasCompleteReturnValues &&
+  bool HasProvenXMMReturn =
+      S.HasCompleteXMM0Values && S.ReturnXMM0ObservedByCaller &&
+      S.XMM0ReturnKind != ReturnKind::Unknown;
+  bool HasObservedRAXReturn =
+      S.HasCompleteReturnValues &&
       (S.ReturnObservedByCaller || S.HasReturnMetadata ||
-       S.OriginalName.find("_main") != std::string::npos)) {
+       S.OriginalName.find("_main") != std::string::npos);
+
+  if (HasProvenXMMReturn && !HasObservedRAXReturn) {
+    // SysV scalar/vector floating-point results are returned through XMM0.
+    // Select it only when it is the unique observed return channel.
+    S.RetKind = S.XMM0ReturnKind;
+  } else if (HasProvenXMMReturn && HasObservedRAXReturn &&
+             S.XMM0ReturnDerivedFromRAX) {
+    // Integer State can be a temporary bit carrier for an FP return.  Direct
+    // SSA dependence from final XMM0 to RAX proves that relationship.
+    S.RetKind = S.XMM0ReturnKind;
+  } else if (HasProvenXMMReturn && HasObservedRAXReturn) {
+    // Lifted callsites commonly reload the entire register file after a call.
+    // A function returning int in RAX may therefore also appear to expose an
+    // FP scratch value in XMM0, while a real FP-returning function may leave
+    // unrelated scratch data in RAX.  Without the carrier dependency above,
+    // preserve the architectural integer result rather than misclassifying
+    // an XMM scratch value as the source-level return.
+    S.RetKind = S.HasCompleteRDXValues &&
+                        S.LiveOutStores.count(ABIReg::RDX) != 0 &&
+                        !S.LiveIns.count(ABIReg::RDX) &&
+                        S.ReturnRDXRAXObservedBySameCallsite
+                    ? ReturnKind::IntRDXRAX
+                    : ReturnKind::IntRAX;
+  } else if (HasObservedRAXReturn) {
     // SysV returns a 128-bit integer in RDX:RAX.  Return metadata alone only
     // proves the primary RAX value; require one caller to directly consume
     // both registers before turning mutable lifted register state into a

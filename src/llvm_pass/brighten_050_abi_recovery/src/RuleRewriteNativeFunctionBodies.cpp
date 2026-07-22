@@ -279,10 +279,17 @@ static bool RewriteReturns(FunctionABISummary &S) {
                           "abi.ret.high.shifted");
       RetV = B.CreateOr(High, Low, "abi.ret.rdxrax");
     } else {
-      RetV = FindRegisterValueBeforeReturn(RI, ABIReg::RAX);
+      ABIReg ReturnReg =
+          (S.RetKind == ReturnKind::FloatXMM0 ||
+           S.RetKind == ReturnKind::DoubleXMM0 ||
+           S.RetKind == ReturnKind::VectorXMM0)
+              ? ABIReg::XMM0
+              : ABIReg::RAX;
+      RetV = FindRegisterValueBeforeReturn(RI, ReturnReg);
       if (!RetV) {
         errs() << "[brighten-abi] skipped return rewrite: " << S.OriginalName
-               << " reason=no-rax-value\n";
+               << " reason=no-" << GetRegisterName(ReturnReg)
+               << "-value\n";
         continue;
       }
       RetV = CoerceValue(B, RetV, S.RetTy, "abi.ret");

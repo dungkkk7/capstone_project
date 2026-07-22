@@ -1,6 +1,9 @@
 #include "NativeCleanupInternal.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/PatternMatch.h"
 
 using namespace llvm;
+using namespace llvm::PatternMatch;
 
 namespace brighten_native_cleanup {
 
@@ -814,13 +817,15 @@ bool containsNativeStackAnchorInteger(
   return false;
 }
 
-Value *lowerNativeStackInteger(IRBuilder<> &B, Value *Integer,
-                                      Function &F) {
+static Value *lowerNativeStackIntegerImpl(IRBuilder<> &B, Value *Integer,
+                                          Function &F,
+                                          bool ProvenStackInteger) {
   Value *NativeStack = findNativeStackAnchor(F);
   if (!NativeStack || !Integer || !Integer->getType()->isIntegerTy())
     return nullptr;
   SmallPtrSet<Value *, 32> Seen;
-  bool HasStackProvenance = containsNativeStackInteger(Integer, Seen);
+  bool HasStackProvenance =
+      ProvenStackInteger || containsNativeStackInteger(Integer, Seen);
   bool RelativeStack = F.hasFnAttribute("brighten.relative-stack");
   if (RelativeStack) {
     SmallPtrSet<Value *, 32> AnchorSeen;
@@ -911,10 +916,1540 @@ Value *lowerNativeStackInteger(IRBuilder<> &B, Value *Integer,
   return B.CreateGEP(B.getInt8Ty(), FrameTop, Delta, "native.stack.gep");
 }
 
+Value *lowerNativeStackInteger(IRBuilder<> &B, Value *Integer, Function &F) {
+  return lowerNativeStackIntegerImpl(B, Integer, F, false);
+}
+
+namespace {
+
+// Normalize the small affine address language emitted by State-SSA.  Pointer
+// symbols and their ptrtoint forms intentionally share the same coefficient,
+// so expressions such as
+//
+//   frame_base + ((state_in_2312 - 32) - ptrtoint(frame_base))
+//
+// reduce to { state_in_2312: 1, constant: -32 }.  This is used only to prove
+// that an intervening memory write cannot alias a load; unsupported arithmetic
+// fails closed and never supplies stack provenance by itself.
+struct NativeAffineAddress {
+  DenseMap<Value *, int64_t> Coefficients;
+  int64_t MinConstant = 0;
+  int64_t MaxConstant = 0;
+};
+
+static bool addNativeAffineCoefficient(NativeAffineAddress &Address,
+                                       Value *Symbol, int64_t Delta) {
+  int64_t Current = Address.Coefficients.lookup(Symbol);
+  int64_t Next = 0;
+  if (!addSignedOffset(Current, Delta, Next))
+    return false;
+  if (Next)
+    Address.Coefficients[Symbol] = Next;
+  else
+    Address.Coefficients.erase(Symbol);
+  return true;
+}
+
+static bool mergeNativeAffineAddress(NativeAffineAddress &Into,
+                                     const NativeAffineAddress &From,
+                                     int64_t Sign) {
+  int64_t NewMin = 0;
+  int64_t NewMax = 0;
+  if (Sign == 1) {
+    if (!addSignedOffset(Into.MinConstant, From.MinConstant, NewMin) ||
+        !addSignedOffset(Into.MaxConstant, From.MaxConstant, NewMax))
+      return false;
+  } else {
+    if (From.MaxConstant == std::numeric_limits<int64_t>::min() ||
+        From.MinConstant == std::numeric_limits<int64_t>::min() ||
+        !addSignedOffset(Into.MinConstant, -From.MaxConstant, NewMin) ||
+        !addSignedOffset(Into.MaxConstant, -From.MinConstant, NewMax))
+      return false;
+  }
+  if (NewMin > NewMax)
+    return false;
+  Into.MinConstant = NewMin;
+  Into.MaxConstant = NewMax;
+  for (auto [Symbol, Coefficient] : From.Coefficients) {
+    if (Sign == -1 && Coefficient == std::numeric_limits<int64_t>::min())
+      return false;
+    if (!addNativeAffineCoefficient(Into, Symbol, Sign * Coefficient))
+      return false;
+  }
+  return true;
+}
+
+static std::optional<NativeAffineAddress>
+evaluateNativeAffinePointer(Value *V, const DataLayout &DL, unsigned Depth);
+
+static bool collectDirectAggregateFieldValues(
+    Value *Aggregate, unsigned Field, SmallVectorImpl<Value *> &Resolved,
+    SmallPtrSetImpl<Value *> &Seen) {
+  if (!Aggregate || !Seen.insert(Aggregate).second)
+    return false;
+  if (auto *PN = dyn_cast<PHINode>(Aggregate)) {
+    for (Value *Incoming : PN->incoming_values())
+      if (!collectDirectAggregateFieldValues(Incoming, Field, Resolved,
+                                             Seen))
+        return false;
+    return true;
+  }
+  if (auto *SI = dyn_cast<SelectInst>(Aggregate))
+    return collectDirectAggregateFieldValues(SI->getTrueValue(), Field,
+                                             Resolved, Seen) &&
+           collectDirectAggregateFieldValues(SI->getFalseValue(), Field,
+                                             Resolved, Seen);
+  auto *CB = dyn_cast<CallBase>(Aggregate);
+  Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+  if (!CB || !Callee || Callee->isDeclaration())
+    return false;
+  bool SawReturn = false;
+  for (BasicBlock &BB : *Callee) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI || !RI->getReturnValue())
+      continue;
+    SawReturn = true;
+    Value *Current = RI->getReturnValue();
+    Value *FieldValue = nullptr;
+    while (auto *IV = dyn_cast<InsertValueInst>(Current)) {
+      if (IV->getNumIndices() == 1 && *IV->idx_begin() == Field) {
+        FieldValue = IV->getInsertedValueOperand();
+        break;
+      }
+      Current = IV->getAggregateOperand();
+    }
+    if (!FieldValue)
+      if (auto *C = dyn_cast<Constant>(Current))
+        FieldValue = C->getAggregateElement(Field);
+    if (!FieldValue)
+      return false;
+    if (auto *Arg = dyn_cast<Argument>(FieldValue)) {
+      if (Arg->getParent() != Callee || Arg->getArgNo() >= CB->arg_size())
+        return false;
+      FieldValue = CB->getArgOperand(Arg->getArgNo());
+    } else if (!isa<Constant>(FieldValue)) {
+      return false;
+    }
+    Resolved.push_back(FieldValue);
+  }
+  return SawReturn;
+}
+
+static std::optional<NativeAffineAddress>
+evaluateNativeAffineInteger(Value *V, const DataLayout &DL, unsigned Depth) {
+  if (!V || Depth > 32 || !V->getType()->isIntegerTy())
+    return std::nullopt;
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    if (!CI->getValue().isSignedIntN(64))
+      return std::nullopt;
+    NativeAffineAddress Result;
+    Result.MinConstant = CI->getSExtValue();
+    Result.MaxConstant = CI->getSExtValue();
+    return Result;
+  }
+  if (auto *PTI = dyn_cast<PtrToIntOperator>(V))
+    return evaluateNativeAffinePointer(PTI->getPointerOperand(), DL,
+                                       Depth + 1);
+  if (auto *Op = dyn_cast<Operator>(V);
+      Op && (Op->getOpcode() == Instruction::Add ||
+             Op->getOpcode() == Instruction::Sub)) {
+    auto Left = evaluateNativeAffineInteger(Op->getOperand(0), DL, Depth + 1);
+    auto Right = evaluateNativeAffineInteger(Op->getOperand(1), DL,
+                                              Depth + 1);
+    if (!Left || !Right ||
+        !mergeNativeAffineAddress(*Left, *Right,
+                                  Op->getOpcode() == Instruction::Add ? 1
+                                                                      : -1))
+      return std::nullopt;
+    return Left;
+  }
+  if (auto *Cast = dyn_cast<CastInst>(V)) {
+    Value *Operand = Cast->getOperand(0);
+    if (!Operand->getType()->isIntegerTy() ||
+        Operand->getType()->getIntegerBitWidth() !=
+            V->getType()->getIntegerBitWidth())
+      return std::nullopt;
+    return evaluateNativeAffineInteger(Operand, DL, Depth + 1);
+  }
+  auto MergeAlternatives = [&](auto Values)
+      -> std::optional<NativeAffineAddress> {
+    std::optional<NativeAffineAddress> Result;
+    for (Value *Incoming : Values) {
+      // A shallow dynamic merge often exposes the same affine RSP root on
+      // every arm and is useful for forwarding stack spills.  Stop expanding
+      // once nesting becomes non-trivial: the owning PHI/select is then a
+      // stable symbolic atom, avoiding exponential work on flattened CFGs.
+      if (!isa<ConstantInt>(Incoming) && Depth >= 8)
+        return std::nullopt;
+      auto Arm = evaluateNativeAffineInteger(Incoming, DL, Depth + 1);
+      if (!Arm)
+        return std::nullopt;
+      if (!Result) {
+        Result = std::move(Arm);
+        continue;
+      }
+      if (Result->Coefficients.size() != Arm->Coefficients.size())
+        return std::nullopt;
+      for (auto [Symbol, Coefficient] : Result->Coefficients)
+        if (Arm->Coefficients.lookup(Symbol) != Coefficient)
+          return std::nullopt;
+      Result->MinConstant =
+          std::min(Result->MinConstant, Arm->MinConstant);
+      Result->MaxConstant =
+          std::max(Result->MaxConstant, Arm->MaxConstant);
+    }
+    return Result;
+  };
+  if (auto *EV = dyn_cast<ExtractValueInst>(V)) {
+    if (EV->getNumIndices() != 1)
+      return std::nullopt;
+    unsigned Field = *EV->idx_begin();
+    SmallVector<Value *, 8> Resolved;
+    SmallPtrSet<Value *, 16> Seen;
+    if (collectDirectAggregateFieldValues(EV->getAggregateOperand(), Field,
+                                          Resolved, Seen))
+      if (auto Merged = MergeAlternatives(Resolved))
+        return Merged;
+    return std::nullopt;
+  }
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    if (auto Merged = MergeAlternatives(PN->incoming_values()))
+      return Merged;
+    // The alternatives need not share one affine expansion for the PHI itself
+    // to be a stable symbolic coordinate.  Keeping the exact SSA value as an
+    // atom lets two addresses based on that same dynamic state compare, while
+    // addresses based on different symbols still cannot be declared disjoint.
+    NativeAffineAddress Symbol;
+    Symbol.Coefficients[V] = 1;
+    return Symbol;
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V)) {
+    SmallVector<Value *, 2> Arms{SI->getTrueValue(), SI->getFalseValue()};
+    if (auto Merged = MergeAlternatives(Arms))
+      return Merged;
+    NativeAffineAddress Symbol;
+    Symbol.Coefficients[V] = 1;
+    return Symbol;
+  }
+  if (isa<Argument>(V)) {
+    NativeAffineAddress Result;
+    Result.Coefficients[V] = 1;
+    return Result;
+  }
+  return std::nullopt;
+}
+
+static std::optional<NativeAffineAddress>
+evaluateNativeAffinePointer(Value *V, const DataLayout &DL, unsigned Depth) {
+  if (!V || Depth > 32 || !V->getType()->isPointerTy())
+    return std::nullopt;
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    auto Base = evaluateNativeAffinePointer(GEP->getPointerOperand(), DL,
+                                            Depth + 1);
+    if (!Base)
+      return std::nullopt;
+    APInt ConstantDelta(
+        DL.getIndexSizeInBits(GEP->getPointerAddressSpace()), 0, true);
+    if (GEP->accumulateConstantOffset(DL, ConstantDelta)) {
+      if (!ConstantDelta.isSignedIntN(64) ||
+          !addSignedOffset(Base->MinConstant, ConstantDelta.getSExtValue(),
+                           Base->MinConstant) ||
+          !addSignedOffset(Base->MaxConstant, ConstantDelta.getSExtValue(),
+                           Base->MaxConstant))
+        return std::nullopt;
+      return Base;
+    }
+    if (!GEP->getSourceElementType()->isIntegerTy(8) ||
+        GEP->getNumIndices() != 1)
+      return std::nullopt;
+    auto Index = evaluateNativeAffineInteger(GEP->idx_begin()->get(), DL,
+                                             Depth + 1);
+    if (!Index || !mergeNativeAffineAddress(*Base, *Index, 1))
+      return std::nullopt;
+    return Base;
+  }
+  if (auto *BC = dyn_cast<BitCastOperator>(V))
+    return evaluateNativeAffinePointer(BC->getOperand(0), DL, Depth + 1);
+  if (isa<Argument, AllocaInst, GlobalValue>(V)) {
+    NativeAffineAddress Result;
+    Result.Coefficients[V->stripPointerCasts()] = 1;
+    return Result;
+  }
+  return std::nullopt;
+}
+
+static bool haveEqualNativeAffineRoots(const NativeAffineAddress &Left,
+                                       const NativeAffineAddress &Right) {
+  if (Left.Coefficients.size() != Right.Coefficients.size())
+    return false;
+  for (auto [Symbol, Coefficient] : Left.Coefficients)
+    if (Right.Coefficients.lookup(Symbol) != Coefficient)
+      return false;
+  return true;
+}
+
+static bool areSameExactNativeAffineAddress(const NativeAffineAddress &Left,
+                                            const NativeAffineAddress &Right) {
+  return Left.MinConstant == Left.MaxConstant &&
+         Right.MinConstant == Right.MaxConstant &&
+         Left.MinConstant == Right.MinConstant &&
+         haveEqualNativeAffineRoots(Left, Right);
+}
+
+static bool affineIntervalsMayOverlap(const NativeAffineAddress &Left,
+                                      uint64_t LeftSize,
+                                      const NativeAffineAddress &Right,
+                                      uint64_t RightSize) {
+  if (!LeftSize || !RightSize || LeftSize > uint64_t(INT64_MAX) ||
+      RightSize > uint64_t(INT64_MAX) ||
+      !haveEqualNativeAffineRoots(Left, Right))
+    return false;
+  int64_t LeftEnd = 0;
+  int64_t RightEnd = 0;
+  if (!addSignedOffset(Left.MaxConstant, int64_t(LeftSize), LeftEnd) ||
+      !addSignedOffset(Right.MaxConstant, int64_t(RightSize), RightEnd))
+    return true;
+  return !(LeftEnd <= Right.MinConstant || RightEnd <= Left.MinConstant);
+}
+
+// Compute bounds for the loop-carried stack-address language produced by
+// State-SSA.  The ordinary affine normalizer deliberately treats a PHI as an
+// opaque symbol when its alternatives differ.  That is sufficient for exact
+// forwarding, but it loses a useful fact for dead lifted call-frame stores:
+// a loop may move RSP only downwards, so a dynamic slot is still provably
+// below every fixed entry-frame slot.
+//
+// Model the supported SSA graph as difference constraints
+//
+//   value = predecessor + constant
+//
+// with PHI/select nodes taking the union of their incoming alternatives.
+// Longest-path relaxation gives a finite upper bound across zero/negative
+// cycles; a positive cycle is detected by the final relaxation and leaves the
+// upper bound unknown.  The dual calculation handles lower bounds.  Every
+// leaf must be a ptrtoint rooted in the same backing object.  Unsupported
+// arithmetic and unseeded cycles fail closed.
+struct FrameOffsetBounds {
+  std::optional<int64_t> Lower;
+  std::optional<int64_t> Upper;
+};
+
+struct FrameOffsetEquation {
+  Value *Node = nullptr;
+  std::optional<int64_t> Seed;
+  SmallVector<std::pair<Value *, int64_t>, 4> Incoming;
+};
+
+static std::optional<FrameOffsetBounds>
+evaluateLoopCarriedFrameIntegerBounds(Value *Root, Value &Backing,
+                                      const DataLayout &DL) {
+  if (!Root || !Root->getType()->isIntegerTy())
+    return std::nullopt;
+
+  constexpr unsigned MaxNodes = 4096;
+  DenseMap<Value *, unsigned> NodeIndex;
+  SmallVector<FrameOffsetEquation, 64> Equations;
+  bool Valid = true;
+
+  std::function<void(Value *)> Build = [&](Value *V) {
+    if (!Valid || NodeIndex.contains(V))
+      return;
+    if (!V || !V->getType()->isIntegerTy() ||
+        Equations.size() >= MaxNodes) {
+      Valid = false;
+      return;
+    }
+    unsigned Index = Equations.size();
+    NodeIndex[V] = Index;
+    Equations.push_back({V, std::nullopt, {}});
+    FrameOffsetEquation &Equation = Equations[Index];
+
+    if (auto *PTI = dyn_cast<PtrToIntOperator>(V)) {
+      SmallPtrSet<Value *, 16> Seen;
+      Equation.Seed = evaluateFramePointerOffset(
+          PTI->getPointerOperand(), Backing, DL, Seen);
+      if (!Equation.Seed)
+        Valid = false;
+      return;
+    }
+
+    auto AddIncoming = [&](Value *Pred, int64_t Delta) {
+      Equation.Incoming.push_back({Pred, Delta});
+      Build(Pred);
+    };
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      Value *Pred = nullptr;
+      ConstantInt *Constant = nullptr;
+      int64_t Delta = 0;
+      if (BO->getOpcode() == Instruction::Add) {
+        Constant = dyn_cast<ConstantInt>(BO->getOperand(1));
+        Pred = BO->getOperand(0);
+        if (!Constant) {
+          Constant = dyn_cast<ConstantInt>(BO->getOperand(0));
+          Pred = BO->getOperand(1);
+        }
+      } else if (BO->getOpcode() == Instruction::Sub) {
+        Constant = dyn_cast<ConstantInt>(BO->getOperand(1));
+        Pred = BO->getOperand(0);
+      }
+      if (!Constant || !Constant->getValue().isSignedIntN(64)) {
+        Valid = false;
+        return;
+      }
+      Delta = Constant->getSExtValue();
+      if (BO->getOpcode() == Instruction::Sub) {
+        if (Delta == std::numeric_limits<int64_t>::min()) {
+          Valid = false;
+          return;
+        }
+        Delta = -Delta;
+      }
+      AddIncoming(Pred, Delta);
+      return;
+    }
+    if (auto *PN = dyn_cast<PHINode>(V)) {
+      if (PN->getNumIncomingValues() == 0) {
+        Valid = false;
+        return;
+      }
+      for (Value *Incoming : PN->incoming_values())
+        AddIncoming(Incoming, 0);
+      return;
+    }
+    if (auto *SI = dyn_cast<SelectInst>(V)) {
+      AddIncoming(SI->getTrueValue(), 0);
+      AddIncoming(SI->getFalseValue(), 0);
+      return;
+    }
+    if (auto *FI = dyn_cast<FreezeInst>(V)) {
+      AddIncoming(FI->getOperand(0), 0);
+      return;
+    }
+    if (auto *Cast = dyn_cast<CastInst>(V)) {
+      Value *Operand = Cast->getOperand(0);
+      if (!Operand->getType()->isIntegerTy() ||
+          Operand->getType()->getIntegerBitWidth() !=
+              V->getType()->getIntegerBitWidth()) {
+        Valid = false;
+        return;
+      }
+      AddIncoming(Operand, 0);
+      return;
+    }
+    Valid = false;
+  };
+  Build(Root);
+  if (!Valid || Equations.empty())
+    return std::nullopt;
+
+  // An SSA cycle is admissible only if it is ultimately seeded by a concrete
+  // pointer into this backing.  This rejects self-contained poison/undef-like
+  // recurrences instead of manufacturing a bound for them.
+  SmallVector<bool, 64> ReachesSeed(Equations.size(), false);
+  for (unsigned I = 0; I < Equations.size(); ++I)
+    ReachesSeed[I] = Equations[I].Seed.has_value();
+  for (unsigned Round = 0; Round < Equations.size(); ++Round) {
+    bool Changed = false;
+    for (unsigned I = 0; I < Equations.size(); ++I) {
+      if (ReachesSeed[I])
+        continue;
+      for (auto [Pred, Delta] : Equations[I].Incoming) {
+        (void)Delta;
+        auto It = NodeIndex.find(Pred);
+        if (It != NodeIndex.end() && ReachesSeed[It->second]) {
+          ReachesSeed[I] = true;
+          Changed = true;
+          break;
+        }
+      }
+    }
+    if (!Changed)
+      break;
+  }
+  if (llvm::any_of(ReachesSeed, [](bool Reachable) { return !Reachable; }))
+    return std::nullopt;
+
+  auto Solve = [&](bool Upper) -> std::optional<int64_t> {
+    SmallVector<std::optional<int64_t>, 64> Bounds(Equations.size());
+    for (unsigned I = 0; I < Equations.size(); ++I)
+      Bounds[I] = Equations[I].Seed;
+    bool ChangedOnFinalRound = false;
+    for (unsigned Round = 0; Round <= Equations.size(); ++Round) {
+      SmallVector<std::optional<int64_t>, 64> Next = Bounds;
+      bool Changed = false;
+      for (unsigned I = 0; I < Equations.size(); ++I) {
+        for (auto [Pred, Delta] : Equations[I].Incoming) {
+          auto It = NodeIndex.find(Pred);
+          if (It == NodeIndex.end() || !Bounds[It->second])
+            continue;
+          int64_t Candidate = 0;
+          if (!addSignedOffset(*Bounds[It->second], Delta, Candidate))
+            return std::nullopt;
+          if (!Next[I] || (Upper ? Candidate > *Next[I]
+                                 : Candidate < *Next[I])) {
+            Next[I] = Candidate;
+            Changed = true;
+          }
+        }
+      }
+      Bounds.swap(Next);
+      if (!Changed)
+        break;
+      ChangedOnFinalRound = Round == Equations.size();
+    }
+    if (ChangedOnFinalRound)
+      return std::nullopt;
+    auto It = NodeIndex.find(Root);
+    if (It == NodeIndex.end())
+      return std::nullopt;
+    return Bounds[It->second];
+  };
+
+  FrameOffsetBounds Result;
+  Result.Lower = Solve(false);
+  Result.Upper = Solve(true);
+  if (!Result.Lower && !Result.Upper)
+    return std::nullopt;
+  return Result;
+}
+
+static std::optional<FrameOffsetBounds>
+evaluateBoundedFramePointer(Value *Pointer, Value &Backing,
+                            const DataLayout &DL) {
+  SmallPtrSet<Value *, 16> FixedSeen;
+  if (auto Fixed =
+          evaluateFramePointerOffset(Pointer, Backing, DL, FixedSeen))
+    return FrameOffsetBounds{*Fixed, *Fixed};
+
+  auto *GEP = dyn_cast<GEPOperator>(Pointer);
+  if (!GEP || !GEP->getSourceElementType()->isIntegerTy(8) ||
+      GEP->getNumIndices() != 1)
+    return std::nullopt;
+  SmallPtrSet<Value *, 16> BaseSeen;
+  auto BaseOffset = evaluateFramePointerOffset(
+      GEP->getPointerOperand(), Backing, DL, BaseSeen);
+  auto *Delta = dyn_cast<BinaryOperator>(GEP->idx_begin()->get());
+  auto *Anchor = Delta && Delta->getOpcode() == Instruction::Sub
+                     ? dyn_cast<PtrToIntOperator>(Delta->getOperand(1))
+                     : nullptr;
+  if (!BaseOffset || !Anchor)
+    return std::nullopt;
+  SmallPtrSet<Value *, 16> AnchorSeen;
+  auto AnchorOffset = evaluateFramePointerOffset(
+      Anchor->getPointerOperand(), Backing, DL, AnchorSeen);
+  if (!AnchorOffset)
+    return std::nullopt;
+  auto Logical = evaluateLoopCarriedFrameIntegerBounds(
+      Delta->getOperand(0), Backing, DL);
+  if (!Logical)
+    return std::nullopt;
+
+  int64_t Adjustment = 0;
+  if (*AnchorOffset == std::numeric_limits<int64_t>::min() ||
+      !addSignedOffset(*BaseOffset, -*AnchorOffset, Adjustment))
+    return std::nullopt;
+  FrameOffsetBounds Result;
+  if (Logical->Lower) {
+    int64_t Bound = 0;
+    if (addSignedOffset(*Logical->Lower, Adjustment, Bound))
+      Result.Lower = Bound;
+  }
+  if (Logical->Upper) {
+    int64_t Bound = 0;
+    if (addSignedOffset(*Logical->Upper, Adjustment, Bound))
+      Result.Upper = Bound;
+  }
+  if (!Result.Lower && !Result.Upper)
+    return std::nullopt;
+  return Result;
+}
+
+static bool boundedFrameIntervalsAreDisjoint(const FrameOffsetBounds &Left,
+                                             uint64_t LeftSize,
+                                             const FrameOffsetBounds &Right,
+                                             uint64_t RightSize) {
+  if (!LeftSize || !RightSize || LeftSize > uint64_t(INT64_MAX) ||
+      RightSize > uint64_t(INT64_MAX))
+    return false;
+  int64_t End = 0;
+  if (Left.Upper && Right.Lower &&
+      addSignedOffset(*Left.Upper, int64_t(LeftSize), End) &&
+      End <= *Right.Lower)
+    return true;
+  if (Right.Upper && Left.Lower &&
+      addSignedOffset(*Right.Upper, int64_t(RightSize), End) &&
+      End <= *Left.Lower)
+    return true;
+  return false;
+}
+
+static bool areDefinitelyDisjointAffineAccesses(LoadInst &Load,
+                                                StoreInst &Store) {
+  if (Load.isVolatile() || Load.isAtomic() || Store.isVolatile() ||
+      Store.isAtomic())
+    return false;
+  const DataLayout &DL = Load.getModule()->getDataLayout();
+  auto LoadAddress =
+      evaluateNativeAffinePointer(Load.getPointerOperand(), DL, 0);
+  auto StoreAddress =
+      evaluateNativeAffinePointer(Store.getPointerOperand(), DL, 0);
+  if (!LoadAddress || !StoreAddress)
+    return false;
+  if (!haveEqualNativeAffineRoots(*LoadAddress, *StoreAddress)) {
+    Value *LoadObject = getUnderlyingObject(Load.getPointerOperand());
+    Value *StoreObject = getUnderlyingObject(Store.getPointerOperand());
+    return LoadObject != StoreObject &&
+           isa<AllocaInst, GlobalVariable>(LoadObject) &&
+           isa<AllocaInst, GlobalVariable>(StoreObject);
+  }
+  TypeSize LoadSize = DL.getTypeStoreSize(Load.getType());
+  TypeSize StoreSize = DL.getTypeStoreSize(Store.getValueOperand()->getType());
+  if (LoadSize.isScalable() || StoreSize.isScalable() ||
+      !LoadSize.getFixedValue() || !StoreSize.getFixedValue() ||
+      LoadSize.getFixedValue() > uint64_t(INT64_MAX) ||
+      StoreSize.getFixedValue() > uint64_t(INT64_MAX))
+    return false;
+  return !affineIntervalsMayOverlap(*LoadAddress, LoadSize.getFixedValue(),
+                                    *StoreAddress,
+                                    StoreSize.getFixedValue());
+}
+
+static bool knownCallCannotClobberAffineFrameSlot(
+    CallBase &CB, const NativeAffineAddress &Target, uint64_t TargetSize,
+    Value *TargetObject, const DataLayout &DL) {
+  if (!CB.mayWriteToMemory())
+    return true;
+  Function *Callee = CB.getCalledFunction();
+  if (!Callee || (Callee->getName() != "scanf" &&
+                  Callee->getName() != "__isoc99_scanf"))
+    return false;
+
+  // scanf can modify only its parsed, non-suppressed destination arguments
+  // (plus libc-owned state).  A recovered frame slot may therefore be
+  // forwarded across the call when every destination has a finite format-
+  // derived size and is either a distinct object or affine-disjoint.
+  for (unsigned ArgNo = 1; ArgNo < CB.arg_size(); ++ArgNo) {
+    auto Size = getScanfDestinationSize(CB, ArgNo, DL);
+    Value *Destination = CB.getArgOperand(ArgNo)->stripPointerCasts();
+    auto Address = evaluateNativeAffinePointer(Destination, DL, 0);
+    if (!Size || !*Size || !Address)
+      return false;
+    if (haveEqualNativeAffineRoots(Target, *Address)) {
+      if (affineIntervalsMayOverlap(Target, TargetSize, *Address, *Size))
+        return false;
+      continue;
+    }
+    Value *DestinationObject = getUnderlyingObject(Destination);
+    if (DestinationObject == TargetObject ||
+        !isa<AllocaInst, GlobalVariable>(DestinationObject))
+      return false;
+  }
+  return true;
+}
+
+} // namespace
+
+// Forward an exact reaching definition through the recovered affine frame
+// language.  LLVM's generic alias analysis often loses the relation between
+// two GEPs after RSP was converted to integer SSA, so ordinary GVN leaves
+// these spill/reload pairs intact.  This local proof is intentionally
+// transactional per load: only the identical slot can define it and only
+// complete, affine-disjoint store intervals may be crossed.
+unsigned forwardProvenAffineStackSlotLoads(Module &M, bool &Changed) {
+  // Reaching values can themselves be loads scheduled for forwarding later
+  // in this batch. Raw Value pointers become dangling when an earlier pair
+  // RAUWs and erases such a load, which can silently feed a reused,
+  // differently typed Value into a later replacement. Tracking handles
+  // follow the RAUW chain and keep the transaction type-correct.
+  SmallVector<std::pair<WeakTrackingVH, WeakTrackingVH>, 64> Replacements;
+  for (Function &F : M) {
+    if (F.isDeclaration() || !findNativeStackAnchor(F))
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI || LI->isVolatile() || LI->isAtomic())
+          continue;
+        auto LoadAddress = evaluateNativeAffinePointer(
+            LI->getPointerOperand(), M.getDataLayout(), 0);
+        TypeSize LoadSize = M.getDataLayout().getTypeStoreSize(LI->getType());
+        Value *LoadObject = getUnderlyingObject(LI->getPointerOperand());
+        for (Instruction *Prev = LI->getPrevNode(); Prev;
+             Prev = Prev->getPrevNode()) {
+          if (auto *SI = dyn_cast<StoreInst>(Prev)) {
+            if (SI->isVolatile() || SI->isAtomic())
+              break;
+            auto StoreAddress = evaluateNativeAffinePointer(
+                SI->getPointerOperand(), M.getDataLayout(), 0);
+            bool SameSlot =
+                SI->getPointerOperand() == LI->getPointerOperand() ||
+                (LoadAddress && StoreAddress &&
+                 areSameExactNativeAffineAddress(*LoadAddress,
+                                                 *StoreAddress));
+            if (SameSlot) {
+              if (SI->getValueOperand()->getType() == LI->getType())
+                Replacements.push_back({LI, SI->getValueOperand()});
+              break;
+            }
+            if (areDefinitelyDisjointAffineAccesses(*LI, *SI))
+              continue;
+            break;
+          }
+          if (auto *CB = dyn_cast<CallBase>(Prev)) {
+            if (LoadAddress && !LoadSize.isScalable() &&
+                LoadSize.getFixedValue() &&
+                knownCallCannotClobberAffineFrameSlot(
+                    *CB, *LoadAddress, LoadSize.getFixedValue(), LoadObject,
+                    M.getDataLayout()))
+              continue;
+            break;
+          }
+          // Volatile/atomic loads are observable operations but they do not
+          // clobber another stack slot.  mayWriteToMemory() is intentionally
+          // conservative for side-effecting instructions, so classify loads
+          // explicitly before consulting it.
+          if (isa<LoadInst>(Prev))
+            continue;
+          if (Prev->mayWriteToMemory())
+            break;
+        }
+      }
+    }
+  }
+
+  unsigned Forwarded = 0;
+  for (auto &Replacement : Replacements) {
+    auto *LI = dyn_cast_or_null<LoadInst>(Replacement.first);
+    Value *Value = Replacement.second;
+    if (!LI || !LI->getParent() || !Value ||
+        LI->getType() != Value->getType())
+      continue;
+    Instruction *PointerExpression =
+        dyn_cast<Instruction>(LI->getPointerOperand());
+    LI->replaceAllUsesWith(Value);
+    LI->eraseFromParent();
+    if (PointerExpression && PointerExpression->getParent())
+      RecursivelyDeleteTriviallyDeadInstructions(PointerExpression);
+    ++Forwarded;
+    Changed = true;
+  }
+  // Passthrough extraction often turns a loop-carried State field into
+  //   %state = phi [ %entry.value, %entry ], [ %state, %backedge ]
+  // which is exactly the entry value on every defined execution.  Collapse
+  // these self-only recurrences to expose constant frame offsets before the
+  // dynamic-region and frame-compaction proofs run.
+  auto GetSelfRecurrenceBase = [](PHINode &PN) -> Value * {
+    Value *Common = nullptr;
+    for (Value *Incoming : PN.incoming_values()) {
+      if (Incoming == &PN)
+        continue;
+      if (!Common)
+        Common = Incoming;
+      else if (Incoming != Common)
+        return nullptr;
+    }
+    return Common && Common->getType() == PN.getType() ? Common : nullptr;
+  };
+  for (;;) {
+    PHINode *Selected = nullptr;
+    Value *SelectedBase = nullptr;
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      for (BasicBlock &BB : F) {
+        for (PHINode &PN : BB.phis()) {
+          Value *Common = GetSelfRecurrenceBase(PN);
+          if (!Common)
+            continue;
+          // Do not choose an arbitrary representative for a rootless PHI
+          // cycle.  Follow only other self-recurrence PHIs; reaching PN (or
+          // another cycle) means there is no independently defined base.
+          SmallPtrSet<Value *, 16> Chain;
+          Chain.insert(&PN);
+          Value *Cursor = Common;
+          bool Rooted = true;
+          while (auto *Other = dyn_cast<PHINode>(Cursor)) {
+            if (!Chain.insert(Other).second) {
+              Rooted = false;
+              break;
+            }
+            Value *Next = GetSelfRecurrenceBase(*Other);
+            if (!Next)
+              break;
+            Cursor = Next;
+          }
+          if (!Rooted)
+            continue;
+          Selected = &PN;
+          SelectedBase = Common;
+          break;
+        }
+        if (Selected)
+          break;
+      }
+      if (Selected)
+        break;
+    }
+    if (!Selected)
+      break;
+    // Mutate one PHI at a time and rescan.  This keeps SelectedBase live even
+    // when several collapsible PHIs form a dependency chain.
+    Selected->replaceAllUsesWith(SelectedBase);
+    Selected->eraseFromParent();
+    ++Forwarded;
+    Changed = true;
+  }
+  return Forwarded;
+}
+
+unsigned forwardRecoveredAggregatePassthroughs(Module &M, bool &Changed) {
+  SmallVector<std::pair<WeakTrackingVH, WeakTrackingVH>, 32> Replacements;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *EV = dyn_cast<ExtractValueInst>(&I);
+        if (!EV || EV->getNumIndices() != 1)
+          continue;
+        SmallVector<Value *, 8> Resolved;
+        SmallPtrSet<Value *, 16> Seen;
+        if (!collectDirectAggregateFieldValues(
+                EV->getAggregateOperand(), *EV->idx_begin(), Resolved, Seen) ||
+            Resolved.empty())
+          continue;
+        Value *Common = Resolved.front();
+        if (!Common || Common->getType() != EV->getType() ||
+            !llvm::all_of(Resolved,
+                          [&](Value *V) { return V == Common; }))
+          continue;
+        Replacements.push_back({EV, Common});
+      }
+    }
+  }
+  // Resolve replacement chains before mutating the IR.  Mutually recursive
+  // aggregate plumbing can otherwise produce A -> B and B -> A candidates;
+  // applying either edge would erase a value still used as the other's
+  // replacement.  A cycle is not a direct passthrough proof, so fail closed.
+  DenseMap<Value *, Value *> CandidateTargets;
+  for (auto &Replacement : Replacements) {
+    Value *Source = Replacement.first;
+    Value *Target = Replacement.second;
+    if (Source && Target)
+      CandidateTargets[Source] = Target;
+  }
+  for (auto &Replacement : Replacements) {
+    Value *Source = Replacement.first;
+    Value *Target = Replacement.second;
+    SmallPtrSet<Value *, 16> Chain;
+    while (Target && CandidateTargets.contains(Target)) {
+      if (Target == Source || !Chain.insert(Target).second) {
+        Target = nullptr;
+        break;
+      }
+      Target = CandidateTargets.lookup(Target);
+    }
+    Replacement.second = Target;
+  }
+  unsigned Forwarded = 0;
+  for (auto &Replacement : Replacements) {
+    auto *EV = dyn_cast_or_null<ExtractValueInst>(Replacement.first);
+    Value *Value = Replacement.second;
+    if (!EV || !EV->getParent() || !Value ||
+        Value->getType() != EV->getType())
+      continue;
+    EV->replaceAllUsesWith(Value);
+    EV->eraseFromParent();
+    ++Forwarded;
+    Changed = true;
+  }
+  return Forwarded;
+}
+
+unsigned simplifyRecoveredSignedCompareIdioms(Module &M, bool &Changed) {
+  SmallVector<std::pair<Instruction *, Value *>, 32> Replacements;
+  auto MatchSignOfXor = [](Value *V, Value *Left,
+                           Value *Right) -> bool {
+    auto *Shift = dyn_cast<BinaryOperator>(V);
+    auto *Amount =
+        Shift ? dyn_cast<ConstantInt>(Shift->getOperand(1)) : nullptr;
+    auto *Xor = Shift ? dyn_cast<BinaryOperator>(Shift->getOperand(0))
+                      : nullptr;
+    if (!Shift || Shift->getOpcode() != Instruction::LShr || !Amount ||
+        !Xor || Xor->getOpcode() != Instruction::Xor ||
+        !Xor->getType()->isIntegerTy() ||
+        Amount->getZExtValue() + 1 !=
+            Xor->getType()->getIntegerBitWidth())
+      return false;
+    return (Xor->getOperand(0) == Left && Xor->getOperand(1) == Right) ||
+           (Xor->getOperand(0) == Right && Xor->getOperand(1) == Left);
+  };
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *XorResult = dyn_cast<BinaryOperator>(&I);
+        if (!XorResult || XorResult->getOpcode() != Instruction::Xor ||
+            !XorResult->getType()->isIntegerTy(1))
+          continue;
+        ICmpInst *Negative = nullptr;
+        ICmpInst *Overflow = nullptr;
+        for (Value *Operand : XorResult->operands()) {
+          auto *Cmp = dyn_cast<ICmpInst>(Operand);
+          if (!Cmp)
+            continue;
+          if (Cmp->getPredicate() == ICmpInst::ICMP_SLT &&
+              match(Cmp->getOperand(1), m_Zero()))
+            Negative = Cmp;
+          else if (Cmp->getPredicate() == ICmpInst::ICMP_EQ &&
+                   (match(Cmp->getOperand(0), m_SpecificInt(2)) ||
+                    match(Cmp->getOperand(1), m_SpecificInt(2))))
+            Overflow = Cmp;
+        }
+        if (!Negative || !Overflow)
+          continue;
+        auto *Difference =
+            dyn_cast<BinaryOperator>(Negative->getOperand(0));
+        if (!Difference || Difference->getOpcode() != Instruction::Sub)
+          continue;
+        Value *Left = Difference->getOperand(0);
+        Value *Right = Difference->getOperand(1);
+        Value *SumValue = match(Overflow->getOperand(0), m_SpecificInt(2))
+                              ? Overflow->getOperand(1)
+                              : Overflow->getOperand(0);
+        auto *Sum = dyn_cast<BinaryOperator>(SumValue);
+        if (!Sum || Sum->getOpcode() != Instruction::Add)
+          continue;
+        bool MatchesOverflow =
+            (MatchSignOfXor(Sum->getOperand(0), Left, Right) &&
+             MatchSignOfXor(Sum->getOperand(1), Difference, Left)) ||
+            (MatchSignOfXor(Sum->getOperand(1), Left, Right) &&
+             MatchSignOfXor(Sum->getOperand(0), Difference, Left));
+        if (!MatchesOverflow)
+          continue;
+        IRBuilder<> B(XorResult);
+        Replacements.push_back(
+            {XorResult, B.CreateICmpSLT(Left, Right, "native.slt")});
+      }
+    }
+  }
+
+  unsigned Simplified = 0;
+  for (auto [Old, New] : Replacements) {
+    if (!Old->getParent())
+      continue;
+    Old->replaceAllUsesWith(New);
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+    ++Simplified;
+    Changed = true;
+  }
+
+  Replacements.clear();
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *Or = dyn_cast<BinaryOperator>(&I);
+        if (!Or || Or->getOpcode() != Instruction::Or ||
+            !Or->getType()->isIntegerTy(1))
+          continue;
+        auto *First = dyn_cast<ICmpInst>(Or->getOperand(0));
+        auto *Second = dyn_cast<ICmpInst>(Or->getOperand(1));
+        if (!First || !Second)
+          continue;
+        ICmpInst *Equal = First->getPredicate() == ICmpInst::ICMP_EQ
+                              ? First
+                              : Second->getPredicate() == ICmpInst::ICMP_EQ
+                                    ? Second
+                                    : nullptr;
+        ICmpInst *Less = First->getPredicate() == ICmpInst::ICMP_SLT
+                             ? First
+                             : Second->getPredicate() == ICmpInst::ICMP_SLT
+                                   ? Second
+                                   : nullptr;
+        if (!Equal || !Less)
+          continue;
+        Value *Left = Less->getOperand(0);
+        Value *Right = Less->getOperand(1);
+        bool SameOperands =
+            (Equal->getOperand(0) == Left && Equal->getOperand(1) == Right) ||
+            (Equal->getOperand(0) == Right && Equal->getOperand(1) == Left);
+        if (!SameOperands)
+          continue;
+        IRBuilder<> B(Or);
+        Replacements.push_back(
+            {Or, B.CreateICmpSLE(Left, Right, "native.sle")});
+      }
+    }
+  }
+  for (auto [Old, New] : Replacements) {
+    if (!Old->getParent())
+      continue;
+    Old->replaceAllUsesWith(New);
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+    ++Simplified;
+    Changed = true;
+  }
+  return Simplified;
+}
+
+bool isProvenWriteOnlyAffineFrameSlot(Function &F, Value *Pointer) {
+  if (!Pointer || !Pointer->getType()->isPointerTy())
+    return false;
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  auto Target = evaluateNativeAffinePointer(Pointer, DL, 0);
+  Value *TargetObject = getUnderlyingObject(Pointer);
+  auto TargetBounds = TargetObject
+                          ? evaluateBoundedFramePointer(Pointer,
+                                                        *TargetObject, DL)
+                          : std::nullopt;
+  if ((!Target || Target->MinConstant != Target->MaxConstant) &&
+      !TargetBounds)
+    return false;
+  uint64_t TargetSize = 0;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (SI->isVolatile() || SI->isAtomic())
+          continue;
+        auto Store = evaluateNativeAffinePointer(SI->getPointerOperand(), DL,
+                                                 0);
+        bool SameTarget = SI->getPointerOperand() == Pointer;
+        if (!SameTarget && Target && Store)
+          SameTarget = areSameExactNativeAffineAddress(*Target, *Store);
+        if (!SameTarget)
+          continue;
+        TypeSize TS = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+        if (TS.isScalable() || !TS.getFixedValue())
+          return false;
+        TargetSize = std::max(TargetSize, TS.getFixedValue());
+      }
+  if (!TargetSize)
+    return false;
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      Value *ReadPointer = nullptr;
+      Type *ReadType = nullptr;
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        ReadPointer = LI->getPointerOperand();
+        ReadType = LI->getType();
+      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+        ReadPointer = RMW->getPointerOperand();
+        ReadType = RMW->getValOperand()->getType();
+      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+        ReadPointer = CX->getPointerOperand();
+        ReadType = CX->getCompareOperand()->getType();
+      }
+      if (ReadPointer && ReadType) {
+        TypeSize TS = DL.getTypeStoreSize(ReadType);
+        if (TS.isScalable() || !TS.getFixedValue())
+          return false;
+        auto Read = evaluateNativeAffinePointer(ReadPointer, DL, 0);
+        bool MayOverlap = false;
+        if (Target && Read && haveEqualNativeAffineRoots(*Target, *Read)) {
+            MayOverlap = affineIntervalsMayOverlap(
+                *Target, TargetSize, *Read, TS.getFixedValue());
+        } else if (getUnderlyingObject(ReadPointer) == TargetObject) {
+          auto ReadBounds = TargetObject
+                                ? evaluateBoundedFramePointer(
+                                      ReadPointer, *TargetObject, DL)
+                                : std::nullopt;
+          MayOverlap = !TargetBounds || !ReadBounds ||
+                       !boundedFrameIntervalsAreDisjoint(
+                           *TargetBounds, TargetSize, *ReadBounds,
+                           TS.getFixedValue());
+        }
+        if (MayOverlap)
+          return false;
+      }
+
+      if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
+        auto *Length = dyn_cast<ConstantInt>(MT->getLength());
+        if (!Length || Length->getValue().getActiveBits() > 63)
+          return false;
+        auto Read = evaluateNativeAffinePointer(MT->getRawSource(), DL, 0);
+        bool MayOverlap = false;
+        if (Target && Read && haveEqualNativeAffineRoots(*Target, *Read)) {
+            MayOverlap = affineIntervalsMayOverlap(
+                *Target, TargetSize, *Read, Length->getZExtValue());
+        } else if (getUnderlyingObject(MT->getRawSource()) == TargetObject) {
+          auto ReadBounds = TargetObject
+                                ? evaluateBoundedFramePointer(
+                                      MT->getRawSource(), *TargetObject, DL)
+                                : std::nullopt;
+          MayOverlap = !TargetBounds || !ReadBounds ||
+                       !boundedFrameIntervalsAreDisjoint(
+                           *TargetBounds, TargetSize, *ReadBounds,
+                           Length->getZExtValue());
+        }
+        if (MayOverlap)
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+// A final inttoptr rewrite needs must-provenance, not the may-provenance used
+// by discovery.  In particular, a PHI/select with one RSP arm and one
+// heap/global arm is not a stack address on every execution.  Rebasing that
+// complete value on frame_top corrupts the non-stack arm.  Keep this proof
+// deliberately narrow: affine stack arithmetic and casts are admitted;
+// merges are admitted only when every incoming value is independently proven.
+static bool isDefiniteNativeStackInteger(Value *V) {
+  auto PointsAtFrameStorage = [&](Value *P, auto &&Self) -> bool {
+    if (!P)
+      return false;
+    P = P->stripPointerCasts();
+    if (auto *GV = dyn_cast<GlobalVariable>(P))
+      return GV->getName().starts_with("frame_storage_backing.");
+    if (auto *AI = dyn_cast<AllocaInst>(P)) {
+      auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType());
+      StringRef Name = AI->getName();
+      return AT && AT->getElementType()->isIntegerTy(8) &&
+             (Name.starts_with("frame_storage") ||
+              Name.starts_with("native_stack_storage"));
+    }
+    if (auto *GEP = dyn_cast<GEPOperator>(P))
+      return Self(GEP->getPointerOperand(), Self);
+    return false;
+  };
+
+  struct StackProofState {
+    bool Valid = false;
+    bool HasConcreteRoot = false;
+  };
+  // This proof is invoked independently for each raw inttoptr candidate.
+  // Bound total work as well as recursion depth so a highly branching lifted
+  // CFG cannot turn a fail-closed query into exponential compile time.
+  constexpr unsigned MaxStackProofSteps = 16384;
+  unsigned StackProofSteps = 0;
+  DenseMap<Value *, StackProofState> Memo;
+  SmallPtrSet<Value *, 32> Active;
+  SmallVector<std::pair<Function *, unsigned>, 16> ActiveCallFields;
+  std::function<StackProofState(Value *, unsigned)> Prove;
+  using StackOperandProver =
+      std::function<StackProofState(Value *, unsigned)>;
+  std::function<StackProofState(Value *, ArrayRef<unsigned>, unsigned,
+                                const StackOperandProver &)>
+      ProveAggregateElement;
+
+  // State-SSA result tuples are sparse and their field order depends on the
+  // recovered live-out set.  Establish the provenance of an extracted field
+  // from the callee's actual return construction instead of assuming a fixed
+  // RSP/RBP tuple index.  Callee state arguments are substituted with the
+  // corresponding call operands, so an ABI-shaped call carrying a non-stack
+  // value in its RSP input still fails closed.
+  ProveAggregateElement =
+      [&](Value *Aggregate, ArrayRef<unsigned> Indices,
+          unsigned Depth,
+          const StackOperandProver &ProveOperand) -> StackProofState {
+    if (!Aggregate || Indices.empty() || Depth > 128 ||
+        ++StackProofSteps > MaxStackProofSteps)
+      return {};
+    if (auto *PN = dyn_cast<PHINode>(Aggregate)) {
+      StackProofState Result{true, false};
+      for (Value *Incoming : PN->incoming_values()) {
+        StackProofState Arm =
+            ProveAggregateElement(Incoming, Indices, Depth + 1,
+                                  ProveOperand);
+        if (!Arm.Valid)
+          return {};
+        Result.HasConcreteRoot |= Arm.HasConcreteRoot;
+      }
+      return Result;
+    }
+    if (auto *SI = dyn_cast<SelectInst>(Aggregate)) {
+      StackProofState True =
+          ProveAggregateElement(SI->getTrueValue(), Indices, Depth + 1,
+                                ProveOperand);
+      StackProofState False =
+          ProveAggregateElement(SI->getFalseValue(), Indices, Depth + 1,
+                                ProveOperand);
+      bool Valid = True.Valid && False.Valid;
+      return {Valid, Valid && (True.HasConcreteRoot ||
+                              False.HasConcreteRoot)};
+    }
+
+    auto *CB = dyn_cast<CallBase>(Aggregate);
+    Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+    if (!CB || !Callee || Callee->isDeclaration() || Indices.size() != 1)
+      return {};
+    std::pair<Function *, unsigned> CallField{Callee, Indices.front()};
+    if (llvm::is_contained(ActiveCallFields, CallField))
+      return {true, false};
+    ActiveCallFields.push_back(CallField);
+    auto FinishCall = [&](StackProofState Result) {
+      ActiveCallFields.pop_back();
+      return Result;
+    };
+
+    DenseMap<Value *, StackProofState> LocalMemo;
+    SmallPtrSet<Value *, 32> LocalActive;
+    std::function<StackProofState(Value *, unsigned)> ProveReturned =
+        [&](Value *Returned, unsigned LocalDepth) -> StackProofState {
+      if (!Returned || LocalDepth > 128 ||
+          !Returned->getType()->isIntegerTy() ||
+          ++StackProofSteps > MaxStackProofSteps)
+        return {};
+      if (auto It = LocalMemo.find(Returned); It != LocalMemo.end())
+        return It->second;
+      if (!LocalActive.insert(Returned).second)
+        return {true, false};
+      auto FinishLocal = [&](StackProofState Result) {
+        LocalActive.erase(Returned);
+        LocalMemo[Returned] = Result;
+        return Result;
+      };
+
+      if (auto *Arg = dyn_cast<Argument>(Returned)) {
+        StringRef ArgName = Arg->getName();
+        bool IsStackState = ArgName == "state_in_2312" ||
+                            ArgName == "state_in_2328";
+        if (!IsStackState || Arg->getArgNo() >= CB->arg_size())
+          return FinishLocal({});
+        return FinishLocal(
+            ProveOperand(CB->getArgOperand(Arg->getArgNo()),
+                         Depth + LocalDepth + 1));
+      }
+      if (auto *PN = dyn_cast<PHINode>(Returned)) {
+        if (!PN->getNumIncomingValues())
+          return FinishLocal({});
+        StackProofState Result{true, false};
+        for (Value *Incoming : PN->incoming_values()) {
+          StackProofState Arm = ProveReturned(Incoming, LocalDepth + 1);
+          if (!Arm.Valid)
+            return FinishLocal({});
+          Result.HasConcreteRoot |= Arm.HasConcreteRoot;
+        }
+        return FinishLocal(Result);
+      }
+      if (auto *Select = dyn_cast<SelectInst>(Returned)) {
+        StackProofState True =
+            ProveReturned(Select->getTrueValue(), LocalDepth + 1);
+        StackProofState False =
+            ProveReturned(Select->getFalseValue(), LocalDepth + 1);
+        bool Valid = True.Valid && False.Valid;
+        return FinishLocal({Valid, Valid && (True.HasConcreteRoot ||
+                                             False.HasConcreteRoot)});
+      }
+      if (auto *Cast = dyn_cast<CastInst>(Returned)) {
+        if (!Cast->getOperand(0)->getType()->isIntegerTy())
+          return FinishLocal({});
+        return FinishLocal(
+            ProveReturned(Cast->getOperand(0), LocalDepth + 1));
+      }
+      if (auto *EV = dyn_cast<ExtractValueInst>(Returned))
+        return FinishLocal(ProveAggregateElement(
+            EV->getAggregateOperand(), EV->getIndices(),
+            Depth + LocalDepth + 1, ProveReturned));
+      if (auto *Op = dyn_cast<Operator>(Returned)) {
+        if (Op->getOpcode() != Instruction::Add &&
+            Op->getOpcode() != Instruction::Sub)
+          return FinishLocal({});
+        StackProofState Left =
+            ProveReturned(Op->getOperand(0), LocalDepth + 1);
+        StackProofState Right =
+            ProveReturned(Op->getOperand(1), LocalDepth + 1);
+        bool Valid = Op->getOpcode() == Instruction::Sub
+                         ? Left.Valid && !Right.Valid
+                         : Left.Valid != Right.Valid;
+        return FinishLocal(
+            {Valid, Valid && (Left.HasConcreteRoot ||
+                              Right.HasConcreteRoot)});
+      }
+      return FinishLocal({});
+    };
+
+    bool SawReturn = false;
+    StackProofState Result{true, false};
+    for (BasicBlock &BB : *Callee) {
+      auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+      if (!RI || !RI->getReturnValue())
+        continue;
+      Value *Field = FindInsertedValue(RI->getReturnValue(), Indices);
+      if (!Field || !Field->getType()->isIntegerTy())
+        return FinishCall({});
+      SawReturn = true;
+      StackProofState Arm = ProveReturned(Field, 0);
+      if (!Arm.Valid)
+        return FinishCall({});
+      Result.HasConcreteRoot |= Arm.HasConcreteRoot;
+    }
+    return FinishCall(SawReturn ? Result : StackProofState{});
+  };
+
+  Prove =
+      [&](Value *Current, unsigned Depth) -> StackProofState {
+    if (!Current || Depth > 128 || !Current->getType()->isIntegerTy() ||
+        ++StackProofSteps > MaxStackProofSteps)
+      return {};
+    if (auto It = Memo.find(Current); It != Memo.end())
+      return It->second;
+    // A revisit is a provisional affine recurrence, not a root.  The SCC is
+    // accepted only if another incoming path eventually contributes a real
+    // frame/RSP seed; a rootless self-cycle therefore remains invalid.
+    if (!Active.insert(Current).second)
+      return {true, false};
+    auto Finish = [&](StackProofState Result) {
+      Active.erase(Current);
+      Memo[Current] = Result;
+      return Result;
+    };
+
+    if (auto *PTI = dyn_cast<PtrToIntOperator>(Current)) {
+      bool IsFrame = PointsAtFrameStorage(PTI->getPointerOperand(),
+                                          PointsAtFrameStorage);
+      return Finish({IsFrame, IsFrame});
+    }
+    StringRef Name = Current->getName();
+    if (isa<Argument>(Current)) {
+      bool IsRoot = Name == "state_in_2312" || Name == "state_in_2328" ||
+                    Name == "new_rsp" || Name == "new_rbp";
+      return Finish({IsRoot, IsRoot});
+    }
+    if (auto *LI = dyn_cast<LoadInst>(Current)) {
+      if (LI->isVolatile() || LI->isAtomic())
+        return Finish({});
+      const DataLayout &DL = LI->getModule()->getDataLayout();
+      auto LoadAddress =
+          evaluateNativeAffinePointer(LI->getPointerOperand(), DL, 0);
+      TypeSize LoadSize = DL.getTypeStoreSize(LI->getType());
+      if (!LoadAddress || LoadAddress->MinConstant != LoadAddress->MaxConstant ||
+          LoadSize.isScalable() || !LoadSize.getFixedValue())
+        return Finish({});
+
+      // Follow the first may-aliasing definition backwards through the CFG.
+      // A loop backedge is provisional, exactly like a loop-carried SSA PHI:
+      // every acyclic entry path must still reach a concrete, stack-proven
+      // store.  Unknown writes, partial stores and rootless memory cycles are
+      // rejected.  This proves spill/reload provenance without manufacturing
+      // a value PHI or assuming that a load from the guest stack contains RSP.
+      DenseMap<BasicBlock *, StackProofState> EndMemo;
+      SmallPtrSet<BasicBlock *, 32> ActiveBlocks;
+      auto ConstantPrintfHasNoWriteConversion =
+          [&](CallBase &CB) -> bool {
+        if (!CB.arg_size())
+          return false;
+        StringRef Format;
+        if (!getConstantStringInfo(CB.getArgOperand(0), Format))
+          return false;
+        for (size_t I = 0; I < Format.size();) {
+          if (Format[I++] != '%')
+            continue;
+          if (I >= Format.size())
+            return false;
+          if (Format[I] == '%') {
+            ++I;
+            continue;
+          }
+          // Skip flags, dynamic/constant width, precision and length.  The
+          // first recognized conversion terminates this directive.  Unknown
+          // or incomplete syntax is not used as a memory proof.
+          while (I < Format.size() && StringRef("-+ #0'").contains(Format[I]))
+            ++I;
+          if (I < Format.size() && Format[I] == '*')
+            ++I;
+          else
+            while (I < Format.size() && Format[I] >= '0' &&
+                   Format[I] <= '9')
+              ++I;
+          if (I < Format.size() && Format[I] == '.') {
+            ++I;
+            if (I < Format.size() && Format[I] == '*')
+              ++I;
+            else
+              while (I < Format.size() && Format[I] >= '0' &&
+                     Format[I] <= '9')
+                ++I;
+          }
+          if (I < Format.size() && StringRef("hljztL").contains(Format[I])) {
+            char Length = Format[I++];
+            if (I < Format.size() &&
+                ((Length == 'h' && Format[I] == 'h') ||
+                 (Length == 'l' && Format[I] == 'l')))
+              ++I;
+          }
+          if (I >= Format.size())
+            return false;
+          char Conversion = Format[I++];
+          if (!StringRef("diouxXaAeEfFgGcspn").contains(Conversion) ||
+              Conversion == 'n')
+            return false;
+        }
+        return true;
+      };
+      auto CallCannotClobber = [&](CallBase &CB) -> bool {
+        if (!CB.mayWriteToMemory())
+          return true;
+        Function *Callee = CB.getCalledFunction();
+        auto *FrameObject = dyn_cast<AllocaInst>(
+            getUnderlyingObject(LI->getPointerOperand()));
+        if (!Callee || !FrameObject)
+          return false;
+        StringRef CalleeName = Callee->getName();
+        if (CalleeName == "puts")
+          return true;
+        if (CalleeName == "printf")
+          return ConstantPrintfHasNoWriteConversion(CB);
+        if (CalleeName != "scanf" && CalleeName != "__isoc99_scanf")
+          return false;
+
+        // scanf writes only its non-suppressed destination arguments.  The
+        // existing format parser gives each one an exact byte bound; require
+        // every actual destination to have such a bound and to be affine-
+        // disjoint from the load.  Unbounded %s/%[ and dynamic formats fail.
+        for (unsigned ArgNo = 1; ArgNo < CB.arg_size(); ++ArgNo) {
+          auto Size = getScanfDestinationSize(CB, ArgNo, DL);
+          Value *Destination = CB.getArgOperand(ArgNo)->stripPointerCasts();
+          auto DestinationAddress =
+              evaluateNativeAffinePointer(Destination, DL, 0);
+          if (!Size || !*Size || !DestinationAddress)
+            return false;
+          if (!haveEqualNativeAffineRoots(*LoadAddress,
+                                          *DestinationAddress)) {
+            Value *DestinationObject = getUnderlyingObject(Destination);
+            if (DestinationObject == FrameObject ||
+                !isa<AllocaInst, GlobalVariable>(DestinationObject))
+              return false;
+            continue;
+          }
+          if (affineIntervalsMayOverlap(*LoadAddress,
+                                        LoadSize.getFixedValue(),
+                                        *DestinationAddress, *Size))
+            return false;
+        }
+        return true;
+      };
+      std::function<StackProofState(BasicBlock *, Instruction *, unsigned)>
+          ProveReachingStores;
+      ProveReachingStores =
+          [&](BasicBlock *BB, Instruction *Before,
+              unsigned MemoryDepth) -> StackProofState {
+        if (!BB || MemoryDepth > 256 ||
+            ++StackProofSteps > MaxStackProofSteps)
+          return {};
+        bool AtBlockEnd = Before == nullptr;
+        if (AtBlockEnd)
+          if (auto It = EndMemo.find(BB); It != EndMemo.end())
+            return It->second;
+        if (!ActiveBlocks.insert(BB).second)
+          return {true, false};
+        auto FinishMemory = [&](StackProofState Result) {
+          ActiveBlocks.erase(BB);
+          if (AtBlockEnd)
+            EndMemo[BB] = Result;
+          return Result;
+        };
+
+        Instruction *Cursor = Before ? Before->getPrevNode()
+                                     : BB->getTerminator();
+        for (; Cursor; Cursor = Cursor->getPrevNode()) {
+          if (++StackProofSteps > MaxStackProofSteps)
+            return FinishMemory({});
+          if (auto *SI = dyn_cast<StoreInst>(Cursor)) {
+            if (SI->isVolatile() || SI->isAtomic())
+              return FinishMemory({});
+            auto StoreAddress = evaluateNativeAffinePointer(
+                SI->getPointerOperand(), DL, 0);
+            bool SameSlot =
+                SI->getPointerOperand() == LI->getPointerOperand() ||
+                (StoreAddress &&
+                 areSameExactNativeAffineAddress(*LoadAddress,
+                                                 *StoreAddress));
+            if (SameSlot) {
+              TypeSize StoreSize =
+                  DL.getTypeStoreSize(SI->getValueOperand()->getType());
+              if (StoreSize.isScalable() ||
+                  StoreSize.getFixedValue() != LoadSize.getFixedValue() ||
+                  SI->getValueOperand()->getType() != LI->getType())
+                return FinishMemory({});
+              return FinishMemory(
+                  Prove(SI->getValueOperand(), Depth + MemoryDepth + 1));
+            }
+            if (areDefinitelyDisjointAffineAccesses(*LI, *SI))
+              continue;
+            return FinishMemory({});
+          }
+          if (auto *CB = dyn_cast<CallBase>(Cursor)) {
+            if (CallCannotClobber(*CB))
+              continue;
+            return FinishMemory({});
+          }
+          if (Cursor->mayWriteToMemory())
+            return FinishMemory({});
+        }
+
+        if (pred_empty(BB))
+          return FinishMemory({});
+        StackProofState Result{true, false};
+        for (BasicBlock *Pred : predecessors(BB)) {
+          StackProofState Arm =
+              ProveReachingStores(Pred, nullptr, MemoryDepth + 1);
+          if (!Arm.Valid)
+            return FinishMemory({});
+          Result.HasConcreteRoot |= Arm.HasConcreteRoot;
+        }
+        return FinishMemory(Result);
+      };
+      return Finish(ProveReachingStores(LI->getParent(), LI, 0));
+    }
+    if (auto *EV = dyn_cast<ExtractValueInst>(Current))
+      return Finish(ProveAggregateElement(EV->getAggregateOperand(),
+                                          EV->getIndices(), Depth + 1,
+                                          Prove));
+    if (auto *PN = dyn_cast<PHINode>(Current)) {
+      if (!PN->getNumIncomingValues())
+        return Finish({});
+      StackProofState Result{true, false};
+      for (Value *Incoming : PN->incoming_values()) {
+        StackProofState Arm = Prove(Incoming, Depth + 1);
+        if (!Arm.Valid)
+          return Finish({});
+        Result.HasConcreteRoot |= Arm.HasConcreteRoot;
+      }
+      return Finish(Result);
+    }
+    if (auto *SI = dyn_cast<SelectInst>(Current)) {
+      StackProofState True = Prove(SI->getTrueValue(), Depth + 1);
+      StackProofState False = Prove(SI->getFalseValue(), Depth + 1);
+      bool Valid = True.Valid && False.Valid;
+      return Finish({Valid, Valid && (True.HasConcreteRoot ||
+                                     False.HasConcreteRoot)});
+    }
+    if (auto *Cast = dyn_cast<CastInst>(Current)) {
+      if (!Cast->getOperand(0)->getType()->isIntegerTy())
+        return Finish({});
+      return Finish(Prove(Cast->getOperand(0), Depth + 1));
+    }
+    if (auto *Op = dyn_cast<Operator>(Current)) {
+      if (Op->getOpcode() != Instruction::Add &&
+          Op->getOpcode() != Instruction::Sub)
+        return Finish({});
+      StackProofState Left = Prove(Op->getOperand(0), Depth + 1);
+      StackProofState Right = Prove(Op->getOperand(1), Depth + 1);
+      bool Valid = Op->getOpcode() == Instruction::Sub
+                       ? Left.Valid && !Right.Valid
+                       : Left.Valid != Right.Valid;
+      bool HasRoot = Valid && (Left.HasConcreteRoot ||
+                               Right.HasConcreteRoot);
+      return Finish({Valid, HasRoot});
+    }
+    return Finish({});
+  };
+
+  StackProofState Result = Prove(V, 0);
+  return Result.Valid && Result.HasConcreteRoot;
+}
+
 // O3 can leave an internal RSP/RBP value as a direct inttoptr after the
-// translator and external-call rewrites have already run.  Lower only values
-// with explicit stack provenance; arbitrary dynamic inttoptr values still
-// represent native heap/data/callback pointers and must remain untouched.
+// translator and external-call rewrites have already run. Lower only values
+// with definite stack provenance; arbitrary or mixed dynamic inttoptr values
+// still represent native heap/data/callback pointers and remain untouched.
 bool hasRawNativeStackIntToPtrCandidate(Module &M) {
   for (Function &F : M) {
     if (F.isDeclaration() || !findNativeStackAnchor(F))
@@ -924,8 +2459,7 @@ bool hasRawNativeStackIntToPtrCandidate(Module &M) {
         auto *ITP = dyn_cast<IntToPtrInst>(&I);
         if (!ITP || !ITP->getOperand(0)->getType()->isIntegerTy())
           continue;
-        SmallPtrSet<Value *, 32> Seen;
-        if (containsNativeStackInteger(ITP->getOperand(0), Seen))
+        if (isDefiniteNativeStackInteger(ITP->getOperand(0)))
           return true;
       }
     }
@@ -934,7 +2468,10 @@ bool hasRawNativeStackIntToPtrCandidate(Module &M) {
 }
 
 unsigned lowerRawNativeStackIntToPtrs(Module &M, bool &Changed) {
-  SmallVector<IntToPtrInst *, 32> Candidates;
+  // Materializing one recovered stack pointer can fold or recursively delete
+  // another candidate.  Tracking handles prevent a later batch entry from
+  // dereferencing an instruction that no longer exists.
+  SmallVector<WeakTrackingVH, 32> Candidates;
   for (Function &F : M) {
     if (F.isDeclaration() || !findNativeStackAnchor(F))
       continue;
@@ -943,20 +2480,26 @@ unsigned lowerRawNativeStackIntToPtrs(Module &M, bool &Changed) {
         auto *ITP = dyn_cast<IntToPtrInst>(&I);
         if (!ITP || !ITP->getOperand(0)->getType()->isIntegerTy())
           continue;
-        SmallPtrSet<Value *, 32> Seen;
-        if (containsNativeStackInteger(ITP->getOperand(0), Seen))
+        if (isDefiniteNativeStackInteger(ITP->getOperand(0)))
           Candidates.push_back(ITP);
       }
     }
   }
 
   unsigned Lowered = 0;
-  for (IntToPtrInst *ITP : Candidates) {
+  for (WeakTrackingVH &Candidate : Candidates) {
+    auto *ITP = dyn_cast_or_null<IntToPtrInst>(Candidate);
+    if (!ITP)
+      continue;
     if (!ITP->getParent())
       continue;
     IRBuilder<> B(ITP);
-    Value *NativePtr = lowerNativeStackInteger(
-        B, ITP->getOperand(0), *ITP->getFunction());
+    // Candidate collection already established must-stack provenance with
+    // isDefiniteNativeStackInteger.  Preserve that proof when materializing
+    // the pointer: the older may-provenance walker deliberately cannot see an
+    // exact stack value that was spilled and reloaded from a private slot.
+    Value *NativePtr = lowerNativeStackIntegerImpl(
+        B, ITP->getOperand(0), *ITP->getFunction(), true);
     if (!NativePtr)
       continue;
     if (NativePtr->getType() != ITP->getType())

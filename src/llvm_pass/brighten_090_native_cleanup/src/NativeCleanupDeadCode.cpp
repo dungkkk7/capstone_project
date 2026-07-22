@@ -116,6 +116,23 @@ unsigned eraseUnusedInternalGlobals(Module &M, bool &Changed) {
 unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
   unsigned Removed = 0;
 
+  auto HasOnlyRetentionUses = [&](Value *V, auto &&Self,
+                                  SmallPtrSetImpl<Value *> &Seen) -> bool {
+    if (!V || !Seen.insert(V).second)
+      return true;
+    for (User *U : V->users()) {
+      if (auto *GV = dyn_cast<GlobalVariable>(U)) {
+        if (GV->getName() == "llvm.used" ||
+            GV->getName() == "llvm.compiler.used")
+          continue;
+      }
+      if (isa<Constant>(U) && Self(cast<Value>(U), Self, Seen))
+        continue;
+      return false;
+    }
+    return true;
+  };
+
   // Global-data recovery keeps temporary segment copies alive through
   // llvm.used until this final pass.  Drop only those temporary entries; do
   // not disturb unrelated compiler-used roots.
@@ -130,8 +147,21 @@ unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
     for (Value *Operand : Array->operands()) {
       Value *Stripped = Operand->stripPointerCasts();
       auto *GV = dyn_cast<GlobalVariable>(Stripped);
-      if (GV && GV->getName().starts_with("native_data_"))
-        continue;
+      if (GV) {
+        StringRef Name = GV->getName();
+        bool TemporaryNativeCopy = Name.starts_with("native_data_");
+        bool DeadLiftedSegment =
+            GV->hasLocalLinkage() && !GV->hasSection() &&
+            (Name.starts_with("seg_") ||
+             Name.starts_with("native_residual_"));
+        if (DeadLiftedSegment) {
+          SmallPtrSet<Value *, 16> Seen;
+          DeadLiftedSegment =
+              HasOnlyRetentionUses(GV, HasOnlyRetentionUses, Seen);
+        }
+        if (TemporaryNativeCopy || DeadLiftedSegment)
+          continue;
+      }
       Kept.push_back(cast<Constant>(Operand));
     }
     if (Kept.size() == Array->getNumOperands())
@@ -141,7 +171,12 @@ unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
     } else {
       ArrayType *Ty = ArrayType::get(Array->getType()->getElementType(),
                                      Kept.size());
-      Used->setInitializer(ConstantArray::get(Ty, Kept));
+      auto *Replacement = new GlobalVariable(
+          M, Ty, Used->isConstant(), Used->getLinkage(),
+          ConstantArray::get(Ty, Kept), "");
+      Replacement->copyAttributesFrom(Used);
+      Replacement->takeName(Used);
+      Used->eraseFromParent();
     }
     Changed = true;
   }
@@ -156,10 +191,12 @@ unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
 
   SmallVector<GlobalVariable *, 32> DeadGlobals;
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.getName().starts_with("native_data_"))
+    StringRef Name = GV.getName();
+    if (!Name.starts_with("native_data_") && !Name.starts_with("seg_") &&
+        !Name.starts_with("native_residual_"))
       continue;
     GV.removeDeadConstantUsers();
-    if (GV.use_empty())
+    if (GV.hasLocalLinkage() && !GV.hasSection() && GV.use_empty())
       DeadGlobals.push_back(&GV);
   }
   for (GlobalVariable *GV : DeadGlobals) {

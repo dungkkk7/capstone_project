@@ -18,6 +18,10 @@ PLUGIN="${PLUGIN:-$ROOT/build/BrightenDevirtPass.so}"
   -S "$ROOT/tests/late_dispatcher_internalize.ll" -o - \
   | "$FILECHECK_BIN" "$ROOT/tests/late_dispatcher_internalize.ll"
 
+"$OPT_BIN" -load-pass-plugin "$PLUGIN" -passes=brighten-devirt-pass,verify \
+  -S "$ROOT/tests/exhausted_immutable_jump_table.ll" -o - \
+  | "$FILECHECK_BIN" "$ROOT/tests/exhausted_immutable_jump_table.ll"
+
 TRANSFORMED="$(mktemp)"
 REGION_TRANSFORMED="$(mktemp)"
 CROSS_TRANSFORMED="$(mktemp)"
@@ -58,11 +62,37 @@ set -e
 test "$REGION_ORIGINAL_STATUS" -eq 3
 test "$REGION_TRANSFORMED_STATUS" -eq "$REGION_ORIGINAL_STATUS"
 
+SUCCESSOR_PHI_TRANSFORMED="$(mktemp)"
+"$OPT_BIN" -load-pass-plugin "$PLUGIN" \
+  -passes=brighten-region-ssa-unflatten-pass,verify \
+  -S "$ROOT/tests/region_ssa_successor_phi.ll" \
+  -o "$SUCCESSOR_PHI_TRANSFORMED"
+grep -q 'region.thread' "$SUCCESSOR_PHI_TRANSFORMED"
+set +e
+lli-21 "$ROOT/tests/region_ssa_successor_phi.ll"
+SUCCESSOR_PHI_ORIGINAL_STATUS=$?
+lli-21 "$SUCCESSOR_PHI_TRANSFORMED"
+SUCCESSOR_PHI_TRANSFORMED_STATUS=$?
+set -e
+test "$SUCCESSOR_PHI_ORIGINAL_STATUS" -eq 1
+test "$SUCCESSOR_PHI_TRANSFORMED_STATUS" -eq \
+  "$SUCCESSOR_PHI_ORIGINAL_STATUS"
+
 "$OPT_BIN" -load-pass-plugin "$PLUGIN" \
   -passes=brighten-region-ssa-unflatten-pass,verify \
   -S "$ROOT/tests/region_ssa_cross_carried.ll" -o "$CROSS_TRANSFORMED"
 if grep -q 'region.thread' "$CROSS_TRANSFORMED"; then
   echo "FAIL: cross-carried region was partially threaded" >&2
+  exit 1
+fi
+
+NESTED_TRANSFORMED="$(mktemp)"
+"$OPT_BIN" -load-pass-plugin "$PLUGIN" \
+  -passes=brighten-region-ssa-unflatten-pass,verify \
+  -S "$ROOT/tests/region_ssa_nested_case_rejected.ll" \
+  -o "$NESTED_TRANSFORMED"
+if grep -q 'region.thread' "$NESTED_TRANSFORMED"; then
+  echo "FAIL: nested multi-block case was partially threaded" >&2
   exit 1
 fi
 

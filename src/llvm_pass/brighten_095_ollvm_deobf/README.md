@@ -202,3 +202,50 @@ opt-21 \
   -passes='brighten-ollvm-deobf-pass,simplifycfg,adce,verify' \
   input.bc -o output.bc
 ```
+
+## Verifier-safe dispatcher transactions and reproducible semantic reports
+
+Dispatcher and compare-ladder recovery now commit as function-body
+transactions.  The pass snapshots the exact function with LLVM's cloning
+utility before a candidate rewrite, verifies the rewritten function, and
+commits only valid IR.  A verifier failure, or a candidate attempt that reports
+no change while leaving the function mutated, is rolled back to the snapshot,
+marked as an unresolved proof obligation, and processing continues with the
+remaining candidates.
+This converts a single bad candidate from an `opt`-terminating abort into a
+machine-readable `partial_with_residuals` result without publishing invalid IR.
+
+The general-funnel, partitioned-funnel, and SSA-plumbing engines also refresh
+saved select conditions after reg2mem lowering.  General-funnel recovery now
+demotes header PHIs and every header value used outside the header before
+cloning the returning round.  This specifically prevents old header values
+from surviving in cloned sink/outer instructions after the original dispatcher
+is bypassed (`Instruction does not dominate all uses`).
+
+`tests/differential_validate.py` emits schema v2 reports containing SHA-256
+bindings for the input IR, transformed IR, plugin, LLVM tools, generated
+executables, and captured mismatch streams.  Generated executable names are
+content-addressed, so parallel jobs cannot silently reuse a common stale path.
+
+A saved production report can be audited against its published artifact:
+
+```sh
+python3 tools/replay_semantic_report.py \
+  --case-dir result/pipeline_YYYYMMDD_HHMMSS/p03114 \
+  --report p03114_artifact_replay.json
+```
+
+The replay tool recompiles the exact saved `*_brightened.bc`, replays every
+recorded payload against it and the saved reference executable, and reports
+whether the historical `prog2` output can actually be reproduced from that
+artifact.  Use `--compat-strip-icmp-samesign --artifact file.ll --clang clang`
+only for forensic replay with a pre-LLVM-21 compiler; normal LLVM 21 validation
+must compile the unmodified bitcode.
+
+Pipeline failure classes can be summarized without conflating verifier crashes,
+proof residuals, semantic mismatches, and native-contract findings:
+
+```sh
+python3 tools/audit_pipeline_results.py result/pipeline_YYYYMMDD_HHMMSS \
+  --report pipeline_audit.json
+```

@@ -510,6 +510,67 @@ bool collectStateGlobalInstructionUsers(
   return true;
 }
 
+bool collectStateGlobalInstructionOwners(
+    Value *V, SmallPtrSetImpl<Function *> &Owners,
+    SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return true;
+  for (User *U : V->users()) {
+    if (auto *C = dyn_cast<Constant>(U)) {
+      if (!collectStateGlobalInstructionOwners(C, Owners, Seen))
+        return false;
+      continue;
+    }
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      return false;
+    Owners.insert(I->getFunction());
+    // State storage may be followed only through ordinary pointer carriers
+    // and accessed as memory.  Passing its address across a call, converting
+    // it to an observable integer, returning it, or storing the pointer itself
+    // would make per-entry ownership unprovable.
+    if (isa<CallBase>(I) || isa<PtrToIntInst>(I) || isa<ReturnInst>(I))
+      return false;
+    if (auto *SI = dyn_cast<StoreInst>(I))
+      if (SI->getValueOperand() == V)
+        return false;
+    if (I->getType()->isPointerTy())
+      if (!collectStateGlobalInstructionOwners(I, Owners, Seen))
+        return false;
+  }
+  return true;
+}
+
+static bool isIndependentNativeStateRoot(Function *F) {
+  if (!F || F->isDeclaration())
+    return false;
+  StringRef Name = F->getName();
+  return Name == "main" || Name == "native_entry_impl" ||
+         Name.ends_with(".native_callback") ||
+         Name.ends_with(".qsort_callback");
+}
+
+static bool haveIndependentNativeStateOwners(
+    const SmallPtrSetImpl<Function *> &Owners) {
+  if (Owners.empty())
+    return false;
+  for (Function *Owner : Owners)
+    if (!isIndependentNativeStateRoot(Owner))
+      return false;
+
+  // These functions are separate host ABI entry activations.  A direct call
+  // between two of them would instead establish an ordinary interprocedural
+  // State flow, so reject that shape rather than silently splitting it.
+  for (Function *Owner : Owners)
+    for (BasicBlock &BB : *Owner)
+      for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (Function *Callee = CB->getCalledFunction())
+            if (Owners.contains(Callee))
+              return false;
+  return true;
+}
+
 Value *materializeStateConstantForAlloca(Constant *C,
                                                 GlobalVariable *GV,
                                                 AllocaInst *Storage,
@@ -541,60 +602,75 @@ Value *materializeStateConstantForAlloca(Constant *C,
 // Localize only a non-escaping, single-owner object; O3 can then split its
 // constant slots and promote them to ordinary SSA values.
 unsigned localizePrivateStateGlobals(Module &M, bool &Changed) {
-  SmallVector<GlobalVariable *, 8> Candidates;
+  struct Candidate {
+    GlobalVariable *GV = nullptr;
+    SmallVector<Function *, 4> Owners;
+  };
+  SmallVector<Candidate, 8> Candidates;
   for (GlobalVariable &GV : M.globals()) {
     if (!GV.getName().contains("__mcsema_reg_state") || GV.isThreadLocal() ||
         !GV.hasInitializer() || containsUndefined(GV.getInitializer()))
       continue;
-    Function *Owner = nullptr;
+    SmallPtrSet<Function *, 4> Owners;
     SmallPtrSet<Value *, 32> Seen;
-    if (collectStateGlobalInstructionUsers(&GV, Owner, Seen) && Owner &&
-        !Owner->isDeclaration())
-      Candidates.push_back(&GV);
+    if (!collectStateGlobalInstructionOwners(&GV, Owners, Seen) ||
+        Owners.empty())
+      continue;
+    if (Owners.size() > 1 && !haveIndependentNativeStateOwners(Owners))
+      continue;
+    Candidate C;
+    C.GV = &GV;
+    C.Owners.append(Owners.begin(), Owners.end());
+    Candidates.push_back(std::move(C));
   }
 
   unsigned Localized = 0;
-  for (GlobalVariable *GV : Candidates) {
-    Function *Owner = nullptr;
-    SmallPtrSet<Value *, 32> Seen;
-    if (!collectStateGlobalInstructionUsers(GV, Owner, Seen) || !Owner)
-      continue;
-    IRBuilder<> EB(&*Owner->getEntryBlock().getFirstInsertionPt());
-    AllocaInst *Storage = EB.CreateAlloca(GV->getValueType(), nullptr,
-                                          "native_state_storage");
-    Storage->setAlignment(GV->getAlign().valueOrOne());
-    EB.CreateStore(GV->getInitializer(), Storage);
+  for (Candidate &C : Candidates) {
+    GlobalVariable *GV = C.GV;
+    bool CandidateComplete = true;
+    for (Function *Owner : C.Owners) {
+      IRBuilder<> EB(&*Owner->getEntryBlock().getFirstInsertionPt());
+      AllocaInst *Storage = EB.CreateAlloca(GV->getValueType(), nullptr,
+                                            "native_state_storage");
+      Storage->setAlignment(GV->getAlign().valueOrOne());
+      EB.CreateStore(GV->getInitializer(), Storage);
 
-    SmallVector<Instruction *, 128> Instructions;
-    for (BasicBlock &BB : *Owner)
-      for (Instruction &I : BB)
-        Instructions.push_back(&I);
-    for (Instruction *I : Instructions) {
-      for (unsigned OpNo = 0; OpNo < I->getNumOperands(); ++OpNo) {
-        auto *C = dyn_cast<Constant>(I->getOperand(OpNo));
-        if (!C)
-          continue;
-        SmallPtrSet<Constant *, 16> ConstantSeen;
-        if (!constantContainsStateGlobal(C, GV, ConstantSeen))
-          continue;
-        Instruction *InsertBefore = I;
-        if (auto *PN = dyn_cast<PHINode>(I)) {
-          unsigned Incoming = PN->getIncomingValueNumForOperand(OpNo);
-          InsertBefore = PN->getIncomingBlock(Incoming)->getTerminator();
+      SmallVector<Instruction *, 128> Instructions;
+      for (BasicBlock &BB : *Owner)
+        for (Instruction &I : BB)
+          Instructions.push_back(&I);
+      for (Instruction *I : Instructions) {
+        for (unsigned OpNo = 0; OpNo < I->getNumOperands(); ++OpNo) {
+          auto *ConstantOperand = dyn_cast<Constant>(I->getOperand(OpNo));
+          if (!ConstantOperand)
+            continue;
+          SmallPtrSet<Constant *, 16> ConstantSeen;
+          if (!constantContainsStateGlobal(ConstantOperand, GV, ConstantSeen))
+            continue;
+          Instruction *InsertBefore = I;
+          if (auto *PN = dyn_cast<PHINode>(I)) {
+            unsigned Incoming = PN->getIncomingValueNumForOperand(OpNo);
+            InsertBefore = PN->getIncomingBlock(Incoming)->getTerminator();
+          }
+          I->setOperand(OpNo, materializeStateConstantForAlloca(
+                                  ConstantOperand, GV, Storage, InsertBefore));
         }
-        I->setOperand(OpNo, materializeStateConstantForAlloca(
-                                C, GV, Storage, InsertBefore));
+      }
+      if (isAllocaPromotable(Storage)) {
+        DominatorTree DT(*Owner);
+        SmallVector<AllocaInst *, 1> Allocas{Storage};
+        PromoteMemToReg(Allocas, DT);
       }
     }
     GV->removeDeadConstantUsers();
-    if (!GV->use_empty())
+    if (!GV->use_empty()) {
+      CandidateComplete = false;
+      errs() << "brighten-native-state-ssa: localized State still has "
+             << GV->getNumUses() << " use(s)\n";
+    }
+    if (!CandidateComplete)
       continue;
     GV->eraseFromParent();
-    if (isAllocaPromotable(Storage)) {
-      DominatorTree DT(*Owner);
-      SmallVector<AllocaInst *, 1> Allocas{Storage};
-      PromoteMemToReg(Allocas, DT);
-    }
     ++Localized;
     Changed = true;
   }

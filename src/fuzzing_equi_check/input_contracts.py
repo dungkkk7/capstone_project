@@ -26,15 +26,19 @@ def _manifest_path(project_root: str) -> Path:
 
 
 def load_contracts(project_root: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    path = _manifest_path(project_root)
-    if not path.is_file():
+    contracts_dir = Path(project_root) / "data" / "input_contracts"
+    if not contracts_dir.is_dir():
         return {}
-    with path.open("r", encoding="utf-8") as handle:
-        document = json.load(handle)
-    return {
-        (entry["case_id"], entry["submission_id"]): entry
-        for entry in document.get("contracts", [])
-    }
+    contracts = {}
+    for path in contracts_dir.glob("*.json"):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                document = json.load(handle)
+            for entry in document.get("contracts", []):
+                contracts[(entry["case_id"], entry["submission_id"])] = entry
+        except Exception:
+            pass
+    return contracts
 
 
 def resolve_input_contract(project_root: str, binary_path: str) -> Optional[Dict[str, Any]]:
@@ -172,6 +176,7 @@ def _validate_grid(payload: bytes, kind: str, contract: Dict[str, Any]) -> Tuple
             cursor += height
         return True, ""
     if kind == "grid_batches":
+        constraints = contract.get("constraints", {})
         cursor = 0
         while cursor < len(lines):
             try:
@@ -181,13 +186,34 @@ def _validate_grid(payload: bytes, kind: str, contract: Dict[str, Any]) -> Tuple
             cursor += 1
             if height == 0 and width == 0:
                 return (True, "") if cursor == len(lines) else (False, "trailing_after_grid_terminator")
-            if height < 1 or width < 1 or cursor + height > len(lines):
+            if (
+                height < int(constraints.get("h_min", 1))
+                or width < int(constraints.get("w_min", 1))
+                or height > int(constraints.get("h_max", 1 << 30))
+                or width > int(constraints.get("w_max", 1 << 30))
+                or cursor + height > len(lines)
+            ):
                 return False, "grid_batch_dimensions"
-            if any(len(row) != width for row in lines[cursor : cursor + height]):
+            rows = lines[cursor : cursor + height]
+            if any(len(row) != width for row in rows):
                 return False, "grid_batch_row_shape"
-            alphabet = set(str(contract.get("constraints", {}).get("alphabet", "#@.wcE")))
-            if any(char not in alphabet for row in lines[cursor : cursor + height] for char in row):
+            alphabet = set(str(constraints.get("alphabet", "#@.wcE")))
+            if any(char not in alphabet for row in rows for char in row):
                 return False, "grid_batch_alphabet"
+            if constraints.get("boundary_walls"):
+                if (
+                    any(char != "#" for char in rows[0])
+                    or any(char != "#" for char in rows[-1])
+                    or any(row[0] != "#" or row[-1] != "#" for row in rows)
+                ):
+                    return False, "grid_batch_boundary"
+            joined = "".join(rows)
+            for char, expected in constraints.get("exact_symbol_counts", {}).items():
+                if joined.count(char) != int(expected):
+                    return False, "grid_batch_symbol_count"
+            for char, maximum in constraints.get("max_symbol_counts", {}).items():
+                if joined.count(char) > int(maximum):
+                    return False, "grid_batch_symbol_count"
             cursor += height
         return False, "missing_grid_batch_terminator"
     return True, ""
@@ -660,7 +686,9 @@ def _validate_fixed_records(payload: bytes, contract: Dict[str, Any]) -> Tuple[b
             size = fields * records
         else:
             if values[cursor] == 0:
-                return (True, "") if cursor + 1 == len(values) else (False, "fixed_record_trailing")
+                if all(v == 0 for v in values[cursor:]):
+                    return True, ""
+                return False, "fixed_record_trailing"
             size = fields
         if cursor + size > len(values):
             return False, "fixed_record_size"
@@ -897,8 +925,9 @@ def validate_contract_payload(
         if not lines or len(lines) != 2:
             return False, "length_string_lines"
         try:
-            length, _ = [int(value) for value in lines[0].split()]
-        except (ValueError, TypeError):
+            parts = [int(value) for value in lines[0].split()]
+            length = parts[0]
+        except (ValueError, TypeError, IndexError):
             return False, "length_string_header"
         alphabet = set(str(constraints.get("string_alphabet", "")))
         if len(lines[1]) != length or (alphabet and any(char not in alphabet for char in lines[1])):

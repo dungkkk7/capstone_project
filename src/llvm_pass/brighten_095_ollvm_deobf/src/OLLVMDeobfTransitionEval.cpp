@@ -12,6 +12,11 @@ std::optional<APInt> evalTransitionExpr(Value *V, Value *StatePointer,
     auto It = Bindings->find(V);
     if (It != Bindings->end()) return It->second;
   }
+  // StatePointer historically denoted a memory state cell, but SSA
+  // dispatchers pass their state PHI directly.  Bind that exact integer root
+  // to the case's decoded raw state before recursively evaluating its update.
+  if (V == StatePointer && V->getType()->isIntegerTy(EntryState.getBitWidth()))
+    return EntryState;
   if (auto *C = dyn_cast<ConstantInt>(V)) return C->getValue();
   if (auto *Arg = dyn_cast<Argument>(V)) {
     if (!Bindings) return std::nullopt;

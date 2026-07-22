@@ -52,8 +52,10 @@ with tempfile.TemporaryDirectory() as directory:
     def fake_run(command, **_kwargs):
         pipeline = command[command.index("-passes") + 1]
         assert pipeline == (
-            "brighten-native-cleanup-post-souper-pass,"
-            "brighten-publish-metadata-cleanup-pass,verify"
+            "function(instcombine<no-verify-fixpoint>,simplifycfg,adce),"
+            "globaldce,"
+            "brighten-publish-metadata-cleanup-pass,"
+            "brighten-native-cleanup-post-souper-pass,verify"
         )
         Path(command[-1]).write_bytes(b"verified-final")
         return SimpleNamespace(

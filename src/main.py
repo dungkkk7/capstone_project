@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from binary_lifting.lifting import lift_binary
 from llvm_pass.britening_ir import (
     brighten_ir,
+    deobf_proof_ledger_path,
     native_contract_report_path,
     read_native_contract_report,
 )
@@ -67,7 +68,7 @@ def _resolve_seed_paths(project_root, binary_path):
         candidate_case = rel_path.split(os.sep)[0]
     else:
         for part in reversed(binary_abs.split(os.sep)):
-            if part.startswith("p000"):
+            if re.fullmatch(r"p\d+", part):
                 candidate_case = part
                 break
 
@@ -122,6 +123,23 @@ def _native_contract_status(report: Optional[Mapping[str, Any]]) -> str:
     return "pass" if report.get("is_fully_native") is True else "nonpass"
 
 
+def _read_deobf_status(output_path: str) -> Tuple[str, int]:
+    """Return the honest proof status without conflating residuals with failure."""
+    try:
+        with open(deobf_proof_ledger_path(output_path), "r", encoding="utf-8") as handle:
+            ledger = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return "unchecked", 0
+    unresolved = sum(
+        proof.get("result") == "unresolved"
+        for proof in ledger.get("proofs", [])
+        if isinstance(proof, Mapping)
+    )
+    if ledger.get("status") == "pass_detected_scope" and unresolved == 0:
+        return "complete", 0
+    return "partial", unresolved
+
+
 def _semantic_status(report: Optional[Mapping[str, Any]]) -> str:
     """Classify differential fuzzing without treating no-verdict raw runs as bugs."""
     if not report:
@@ -141,6 +159,7 @@ def _run_fuzzer_sync(
     iterations: int,
     generator: Callable[[], Tuple[List[str], bytes]],
     timeout: float,
+    fail_fast: bool = True,
 ) -> Dict[str, Any]:
     try:
         fuzzer.compile()
@@ -150,6 +169,7 @@ def _run_fuzzer_sync(
             timeout=timeout,
             compare_stderr=False,
             num_workers=1,
+            fail_fast=fail_fast,
         )
     finally:
         fuzzer.cleanup()
@@ -159,15 +179,25 @@ def _find_reference_source(project_root, binary_path):
     """Find the clean C source belonging to a dataset binary, if present."""
     binary_abs = os.path.abspath(binary_path)
     obfuscated_root = os.path.join(project_root, "data", "obfuscated")
-    if not binary_abs.startswith(obfuscated_root + os.sep):
-        return None
-    rel_path = os.path.relpath(binary_abs, obfuscated_root)
-    case = rel_path.split(os.sep)[0]
-    stem = os.path.splitext(os.path.basename(binary_abs))[0]
-    source_stem = stem.split("_", 1)[0]
-    candidate = os.path.join(project_root, "data", "clean_src", case, source_stem + ".c")
-    if os.path.isfile(candidate):
-        return candidate
+    dataset_root = "/home/dungbv/Dataset_DoAn"
+    
+    if binary_abs.startswith(obfuscated_root + os.sep):
+        rel_path = os.path.relpath(binary_abs, obfuscated_root)
+        case = rel_path.split(os.sep)[0]
+        stem = os.path.splitext(os.path.basename(binary_abs))[0]
+        source_stem = stem.split("_", 1)[0]
+        candidate = os.path.join(project_root, "data", "clean_src", case, source_stem + ".c")
+        if os.path.isfile(candidate):
+            return candidate
+    elif binary_abs.startswith(os.path.join(dataset_root, "obfuscated_bin") + os.sep):
+        rel_path = os.path.relpath(binary_abs, os.path.join(dataset_root, "obfuscated_bin"))
+        case = rel_path.split(os.sep)[0]
+        stem = os.path.splitext(os.path.basename(binary_abs))[0]
+        source_stem = stem.split("_", 1)[0]
+        candidate = os.path.join(dataset_root, "clean_src", case, source_stem + ".c")
+        if os.path.isfile(candidate):
+            return candidate
+            
     return None
 
 
@@ -432,6 +462,7 @@ def _run_llm_recovery_mode(list_path, project_root, use_cache=True, force_relift
                         iterations=config.fuzz_iterations,
                         generator=_generator,
                         timeout=config.fuzz_timeout,
+                        fail_fast=False,
                     )
 
                 fuzzer_callback = run_fuzz
@@ -534,6 +565,7 @@ def main(argv=None):
             seed_label = "1 (Ghidra pseudocode - default)"
         print(f"{Color.BLUE}[*] LLM seed mode (1=Ghidra -> LLM, 2=IR -> LLM): {seed_label}{Color.END}")
 
+    project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     binary_paths = []
     try:
         with open(list_obfuscated_bin, mode='r', encoding='utf-8') as f:
@@ -547,7 +579,7 @@ def main(argv=None):
             # Xác định header nếu có
             header = [cell.strip().lower() for cell in rows[0]]
             path_col_index = -1
-            for name in ["binary_path", "binary", "path", "file", "filepath"]:
+            for name in ["binary_path", "binary", "path", "file", "filepath", "obfuscated_binary"]:
                 if name in header:
                     path_col_index = header.index(name)
                     break
@@ -562,6 +594,13 @@ def main(argv=None):
                     continue
                 path = row[path_col_index].strip()
                 if path:
+                    if not os.path.isabs(path):
+                        candidates = [
+                            os.path.abspath(os.path.join(project_root, path)),
+                            os.path.abspath(os.path.join(project_root, "data", path)),
+                            os.path.abspath(os.path.join("/home/dungbv/Dataset_DoAn", path))
+                        ]
+                        path = next((cand for cand in candidates if os.path.exists(cand)), candidates[0])
                     binary_paths.append(path)
     except Exception as e:
         print(f"{Color.RED}[✗] Lỗi khi đọc tệp CSV: {e}{Color.END}")
@@ -587,6 +626,9 @@ def main(argv=None):
     native_contract_pass_count = 0
     native_contract_nonpass_count = 0
     native_contract_unchecked_count = 0
+    deobf_complete_count = 0
+    deobf_partial_count = 0
+    deobf_unchecked_count = 0
     semantic_pass_count = 0
     semantic_nonpass_count = 0
     semantic_unchecked_count = 0
@@ -628,6 +670,8 @@ def main(argv=None):
             "output_dir": os.path.abspath(case_output_dir),
             "lift": "pending",
             "brightening": "not_run",
+            "deobf": "not_run",
+            "deobf_residuals": 0,
             "output_class": None,
             "semantic": "not_run",
         }
@@ -651,7 +695,12 @@ def main(argv=None):
                     output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
                     native_report = read_native_contract_report(output_brightened_bc)
                     native_status = _native_contract_status(native_report)
+                    deobf_status, deobf_residuals = _read_deobf_status(
+                        output_brightened_bc
+                    )
                     case_record["brightening"] = "pass"
+                    case_record["deobf"] = deobf_status
+                    case_record["deobf_residuals"] = deobf_residuals
                     case_record["output_class"] = (
                         native_report.get("output_class") if native_report else None
                     )
@@ -681,6 +730,12 @@ def main(argv=None):
                         f"{native_contract_report_path(output_brightened_bc)}{Color.END}"
                     )
                     brightened_count += 1
+                    if deobf_status == "complete":
+                        deobf_complete_count += 1
+                    elif deobf_status == "partial":
+                        deobf_partial_count += 1
+                    else:
+                        deobf_unchecked_count += 1
                     case_record["semantic"] = "unchecked"
                     
                     # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
@@ -829,6 +884,7 @@ def main(argv=None):
                                     iterations=llm_config.fuzz_iterations,
                                     generator=generator,
                                     timeout=llm_config.fuzz_timeout,
+                                    fail_fast=False,
                                 )
 
                             output_source = os.path.join(case_output_dir, f"{base_name}_recovered.c")
@@ -863,7 +919,18 @@ def main(argv=None):
                         case_record["semantic"] = "unchecked"
                         print(f"{Color.RED}      [✗] Lỗi xảy ra khi chạy kiểm tra Semantic Equivalence: {fe}{Color.END}")
                 else:
+                    deobf_status, deobf_residuals = _read_deobf_status(
+                        output_brightened_bc
+                    )
                     case_record["brightening"] = "fail"
+                    case_record["deobf"] = deobf_status
+                    case_record["deobf_residuals"] = deobf_residuals
+                    if deobf_status == "complete":
+                        deobf_complete_count += 1
+                    elif deobf_status == "partial":
+                        deobf_partial_count += 1
+                    else:
+                        deobf_unchecked_count += 1
                     case_record["semantic"] = "not_run"
                     print(f"{Color.RED}[✗] Làm đẹp mã IR THẤT BẠI cho: {path}{Color.END}")
             except Exception as e:
@@ -914,6 +981,9 @@ def main(argv=None):
             "native_contract_pass": native_contract_pass_count,
             "native_contract_nonpass": native_contract_nonpass_count,
             "native_contract_unchecked": native_contract_unchecked_count,
+            "deobf_complete": deobf_complete_count,
+            "deobf_partial": deobf_partial_count,
+            "deobf_unchecked": deobf_unchecked_count,
         },
         "all_verified": all_verified,
         "cases": case_results,
@@ -930,6 +1000,8 @@ def main(argv=None):
             f"Native contract PASS: {native_contract_pass_count}/{native_contract_checked_count} | "
             f"Native contract non-pass: {native_contract_nonpass_count} | "
             f"Native contract unchecked: {native_contract_unchecked_count} | "
+            f"Deobf complete/partial/unchecked: {deobf_complete_count}/"
+            f"{deobf_partial_count}/{deobf_unchecked_count} | "
             f"Semantic PASS: {semantic_pass_count}/{semantic_checked_count} | "
             f"Semantic non-pass: {semantic_nonpass_count} | "
             f"Semantic unchecked: {semantic_unchecked_count} | "
@@ -942,6 +1014,8 @@ def main(argv=None):
             f"Native contract PASS: {native_contract_pass_count}/{native_contract_checked_count} | "
             f"Native contract non-pass: {native_contract_nonpass_count} | "
             f"Native contract unchecked: {native_contract_unchecked_count} | "
+            f"Deobf complete/partial/unchecked: {deobf_complete_count}/"
+            f"{deobf_partial_count}/{deobf_unchecked_count} | "
             f"Semantic PASS: {semantic_pass_count}/{semantic_checked_count} | "
             f"Semantic non-pass: {semantic_nonpass_count} | "
             f"Semantic unchecked: {semantic_unchecked_count} | "

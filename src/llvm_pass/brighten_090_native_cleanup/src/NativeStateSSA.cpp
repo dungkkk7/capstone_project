@@ -11,6 +11,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -581,6 +582,13 @@ static bool AddCallStateRequirements(DenseMap<Function *, std::unique_ptr<Plan>>
   bool Changed = false;
   for (auto &Entry : Plans) {
     Plan &Caller = *Entry.second;
+    auto EnsureCallerSlot = [&](uint64_t Offset, Type *Ty) {
+      Type *Before = Caller.SlotTypes.lookup(Offset);
+      AddUsedSlot(Caller, Offset, Ty);
+      Type *After = Caller.SlotTypes.lookup(Offset);
+      if (Before != After)
+        Changed = true;
+    };
     for (BasicBlock &BB : *Caller.Old) {
       for (Instruction &I : BB) {
         auto *CB = dyn_cast<CallBase>(&I);
@@ -595,14 +603,24 @@ static bool AddCallStateRequirements(DenseMap<Function *, std::unique_ptr<Plan>>
           Changed = true;
         }
         for (const Slot &S : CalleePlan->Inputs) {
-          if (!Caller.SlotTypes.count(S.Offset)) {
-            AddUsedSlot(Caller, S.Offset, S.Ty);
-            Changed = true;
-          }
+          EnsureCallerSlot(S.Offset, S.Ty);
           auto Before = Caller.Inputs.size();
           Caller.Inputs.push_back(S);
           SortSlots(Caller.Inputs);
           Changed |= Caller.Inputs.size() != Before;
+        }
+        // A transformed call returns the callee's live State outputs as SSA
+        // values.  The caller needs local storage for those values even when
+        // it never accessed the corresponding TLS State slot itself.  Without
+        // this transitive requirement, nested native calls fail rewriting and
+        // the whole module rolls back to shared fixed-frame backing, allowing
+        // the callee to overwrite the caller's guest stack locals.
+        for (const Slot &S : CalleePlan->Outputs)
+          EnsureCallerSlot(S.Offset, S.Ty);
+        if (CalleePlan->ReturnSlot) {
+          Type *Ty = CalleePlan->SlotTypes.lookup(*CalleePlan->ReturnSlot);
+          if (Ty)
+            EnsureCallerSlot(*CalleePlan->ReturnSlot, Ty);
         }
         if (CalleePlan->Old != Callee) {
           for (unsigned ArgNo : CalleePlan->OldExplicitArgs) {
@@ -610,10 +628,7 @@ static bool AddCallStateRequirements(DenseMap<Function *, std::unique_ptr<Plan>>
             auto Offset = ExplicitRegisterStateOffset(Arg->getName());
             if (!Offset)
               continue;
-            if (!Caller.SlotTypes.count(*Offset)) {
-              AddUsedSlot(Caller, *Offset, Arg->getType());
-              Changed = true;
-            }
+            EnsureCallerSlot(*Offset, Arg->getType());
             auto Before = Caller.Inputs.size();
             Caller.Inputs.push_back({*Offset, Arg->getType()});
             SortSlots(Caller.Inputs);
@@ -1053,7 +1068,14 @@ static bool ClonePlan(Plan &P, Module &M) {
   for (auto [I, Offset] : StatePointerValues) {
     if (!I->getParent())
       continue;
-    IRBuilder<> B(I);
+    // A state-address PHI is replaced by one invariant local-slot address.
+    // Materialize that address at the block's first legal non-PHI insertion
+    // point.  Inserting a GEP directly before I would put a non-PHI between
+    // existing PHIs and make the module structurally invalid.
+    Instruction *InsertBefore = I;
+    if (isa<PHINode>(I))
+      InsertBefore = &*I->getParent()->getFirstInsertionPt();
+    IRBuilder<> B(InsertBefore);
     Value *Replacement = LocalSlotPointer(B, P, Offset);
     if (!Replacement || I == Replacement)
       continue;
@@ -2274,14 +2296,27 @@ static bool lowerNativeStackAddressesImpl(Module &M) {
       for (auto [I, OpNo, Offset] : FixedConstantOperands) {
         if (!I->getParent())
           continue;
+        Instruction *InsertBefore = I;
+        if (auto *PN = dyn_cast<PHINode>(I)) {
+          // PHI operands live on predecessor edges.  Rebase a constant
+          // stack address on that edge; inserting the address arithmetic
+          // before the PHI both breaks PHI grouping and defines the incoming
+          // value in the wrong block.
+          unsigned Incoming =
+              PN->getIncomingValueNumForOperand(OpNo);
+          InsertBefore =
+              PN->getIncomingBlock(Incoming)->getTerminator();
+        }
         bool IsIncomingStackArgument =
             Offset > NativeStackTop && !WrittenFixedOffsets.count(Offset) &&
             isa<LoadInst>(I);
         Value *SlotRSP = Offset >= NativeStackTop &&
                                  !IsIncomingStackArgument
-                             ? GetFixedSlotRSP(I)
+                             ? GetFixedSlotRSP(InsertBefore)
                              : IncomingRSP;
-        I->setOperand(OpNo, BuildNestedAddress(I, SlotRSP, Offset));
+        I->setOperand(
+            OpNo,
+            BuildNestedAddress(InsertBefore, SlotRSP, Offset));
         ++Lowered;
       }
     }
@@ -2369,10 +2404,101 @@ static bool lowerNativeStackAddressesImpl(Module &M) {
           Address = B.CreateGEP(B.getInt8Ty(), Base,
                                 B.getInt64(Affine->Offset),
                                 "native.stack.gep");
+        // A function whose native State ABI could not yet be lowered has no
+        // explicit native_stack argument and reaches this fallback path.  The
+        // affine parser still proves the complete address, including a
+        // runtime array index.  Dropping that term turns
+        //   rsp + constant + index
+        // into
+        //   rsp + constant
+        // and aliases every loop iteration to element zero.  Apply the same
+        // dynamic component preserved by the explicit-frame path above.
+        if (Affine->Dynamic) {
+          Value *Dynamic = Affine->Dynamic;
+          if (Affine->NegateDynamic)
+            Dynamic = B.CreateNeg(Dynamic, "native.stack.dynamic.neg");
+          Address = B.CreateGEP(B.getInt8Ty(), Address, Dynamic,
+                                "native.stack.dynamic.gep");
+        }
       }
       ITP->replaceAllUsesWith(Address);
       ITP->eraseFromParent();
       ++Lowered;
+    }
+
+    // Recovered guest stack pointers do not carry a generally valid host
+    // alignment guarantee.  In particular, an incoming SysV RSP and a local
+    // byte offset can produce an 8-byte-aligned address even when the lifted
+    // memory operation claimed align 16.  Keeping that stale promise lets O2
+    // select faulting aligned vector instructions (for example movapd).
+    //
+    // Cap every memory access rooted at the recovered stack object to align
+    // 1.  This is deliberately conservative and semantics-preserving; later
+    // LLVM analyses may recover a stronger alignment when it is actually
+    // provable from the pointer expression.
+    if (NativeStack) {
+      Value *StackObject = getUnderlyingObject(NativeStack);
+      auto IsRecoveredStackAddress = [&](Value *Pointer) {
+        return Pointer && getUnderlyingObject(Pointer) == StackObject;
+      };
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (IsRecoveredStackAddress(LI->getPointerOperand()) &&
+                LI->getAlign() != Align(1)) {
+              LI->setAlignment(Align(1));
+              ++Lowered;
+            }
+            continue;
+          }
+          if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (IsRecoveredStackAddress(SI->getPointerOperand()) &&
+                SI->getAlign() != Align(1)) {
+              SI->setAlignment(Align(1));
+              ++Lowered;
+            }
+            continue;
+          }
+          if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+            if (IsRecoveredStackAddress(RMW->getPointerOperand()) &&
+                RMW->getAlign() != Align(1)) {
+              RMW->setAlignment(Align(1));
+              ++Lowered;
+            }
+            continue;
+          }
+          if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+            if (IsRecoveredStackAddress(CX->getPointerOperand()) &&
+                CX->getAlign() != Align(1)) {
+              CX->setAlignment(Align(1));
+              ++Lowered;
+            }
+            continue;
+          }
+          if (auto *MS = dyn_cast<MemSetInst>(&I)) {
+            if (IsRecoveredStackAddress(MS->getRawDest()) &&
+                MS->getDestAlign().value_or(Align(1)) != Align(1)) {
+              MS->setDestAlignment(Align(1));
+              ++Lowered;
+            }
+            continue;
+          }
+          if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
+            bool ChangedAlignment = false;
+            if (IsRecoveredStackAddress(MT->getRawDest()) &&
+                MT->getDestAlign().value_or(Align(1)) != Align(1)) {
+              MT->setDestAlignment(Align(1));
+              ChangedAlignment = true;
+            }
+            if (IsRecoveredStackAddress(MT->getRawSource()) &&
+                MT->getSourceAlign().value_or(Align(1)) != Align(1)) {
+              MT->setSourceAlignment(Align(1));
+              ChangedAlignment = true;
+            }
+            Lowered += ChangedAlignment;
+          }
+        }
+      }
     }
   }
   if (Lowered)

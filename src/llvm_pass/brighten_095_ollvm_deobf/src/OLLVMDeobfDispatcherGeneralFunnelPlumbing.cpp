@@ -201,6 +201,7 @@ bool tryRecoverGeneralFunnelPlumbingDispatcher(
 
   struct FunnelTransition {
     BasicBlock *Source = nullptr;
+    SelectInst *Selector = nullptr;
     Value *Condition = nullptr;
     ResolvedFunnelPath TruePath;
     std::optional<ResolvedFunnelPath> FalsePath;
@@ -221,11 +222,18 @@ bool tryRecoverGeneralFunnelPlumbingDispatcher(
       if (!Path) return false;
       Transition.TruePath = *Path;
     } else if (auto *Select = dyn_cast<SelectInst>(Raw)) {
+      // The direct edge below evaluates the state decision in Source.  Accept
+      // only an edge-owned select; moving a select from a dispatcher/header
+      // block across arbitrary case side effects would not be an exact CFG
+      // rewrite.  Keep the instruction so its condition can be refreshed
+      // after reg2mem rewrites dispatcher live-outs to Source-local reloads.
+      if (Select->getParent() != Source) return false;
       auto *TC = dyn_cast<ConstantInt>(Select->getTrueValue());
       auto *FC = dyn_cast<ConstantInt>(Select->getFalseValue());
       if (!TC || !FC) return false;
       auto TruePath = Resolve(TC), FalsePath = Resolve(FC);
       if (!TruePath || !FalsePath) return false;
+      Transition.Selector = Select;
       Transition.Condition = Select->getCondition();
       Transition.TruePath = *TruePath;
       Transition.FalsePath = *FalsePath;
@@ -237,12 +245,17 @@ bool tryRecoverGeneralFunnelPlumbingDispatcher(
   if (Transitions.empty()) return false;
 
   Instruction *AllocaPoint = &*F->getEntryBlock().getFirstInsertionPt();
+  SmallVector<PHINode *, 8> HeaderPhis;
+  for (PHINode &HeaderPhi : Header->phis())
+    HeaderPhis.push_back(&HeaderPhi);
   for (PHINode *CasePhi : CaseEntryPhis)
     DemotePHIToStack(CasePhi, AllocaPoint->getIterator());
   for (PHINode *SinkPhi : SinkPhis)
     DemotePHIToStack(SinkPhi, AllocaPoint->getIterator());
   for (PHINode *OuterPhi : OuterPhis)
     DemotePHIToStack(OuterPhi, AllocaPoint->getIterator());
+  for (PHINode *HeaderPhi : HeaderPhis)
+    DemotePHIToStack(HeaderPhi, AllocaPoint->getIterator());
 
   SmallVector<Instruction *, 64> OuterBeforeLiveOutDemotion;
   for (Instruction &I : *Outer)
@@ -257,6 +270,38 @@ bool tryRecoverGeneralFunnelPlumbingDispatcher(
     if (UsedOutside)
       DemoteRegToStack(*I, false, AllocaPoint->getIterator());
   }
+
+  // The old lookup header dominates Sink/Outer/case uses only while the
+  // dispatcher cycle is present.  A direct transition clones Sink and Outer
+  // before Header and then bypasses the original lookup block.  Without this
+  // lowering, a cloned instruction can retain an operand defined by the old
+  // Header (for example the lshr/xor/add chain seen in production), and that
+  // definition no longer dominates its clone.
+  //
+  // Spill every original Header value used outside Header before taking body
+  // snapshots.  The cloned Header body writes the private slot and all
+  // external uses consume edge-local reloads, so CFG rewiring remains valid
+  // SSA regardless of clone order.
+  SmallVector<Instruction *, 64> HeaderBeforeLiveOutDemotion;
+  for (Instruction &I : *Header)
+    if (!I.isTerminator() && !isa<DbgInfoIntrinsic>(I))
+      HeaderBeforeLiveOutDemotion.push_back(&I);
+  for (Instruction *I : HeaderBeforeLiveOutDemotion) {
+    if (I->getType()->isVoidTy() || I->use_empty()) continue;
+    bool UsedOutside = llvm::any_of(I->users(), [&](User *U) {
+      auto *UseI = dyn_cast<Instruction>(U);
+      return UseI && UseI->getParent() != Header;
+    });
+    if (UsedOutside)
+      DemoteRegToStack(*I, false, AllocaPoint->getIterator());
+  }
+
+  // Reg2mem may replace a dispatcher-defined select condition with a reload
+  // in Source.  Never branch on the pre-demotion Value * captured during the
+  // proof phase.
+  for (FunnelTransition &Transition : Transitions)
+    if (Transition.Selector)
+      Transition.Condition = Transition.Selector->getCondition();
 
   SmallVector<Instruction *, 64> SinkBody, OuterBody, HeaderBody;
   for (Instruction &I : *Sink)
@@ -326,7 +371,10 @@ bool tryRecoverGeneralFunnelPlumbingDispatcher(
     BasicBlock *TrueTarget = Materialize(Transition.TruePath, "true");
     if (Transition.Condition) {
       BasicBlock *FalseTarget = Materialize(*Transition.FalsePath, "false");
-      BranchInst::Create(TrueTarget, FalseTarget, Transition.Condition,
+      Value *Condition = Transition.Condition;
+      if (auto It = Map.find(Condition); It != Map.end())
+        Condition = It->second;
+      BranchInst::Create(TrueTarget, FalseTarget, Condition,
                          Old->getIterator());
     } else {
       BranchInst::Create(TrueTarget, Old->getIterator());
@@ -351,6 +399,7 @@ bool tryRecoverGeneralFunnelPlumbingDispatcher(
     Record.Dependencies.push_back("unique_cyclic_union_of_lookup_tables");
   Record.Dependencies.push_back("complete_sink_phi_coverage");
   Record.Dependencies.push_back("llvm_sink_outer_case_phi_demotion");
+  Record.Dependencies.push_back("llvm_header_phi_and_liveout_demotion");
   Record.Dependencies.push_back("exact_sink_outer_header_clone");
   Record.Dependencies.push_back("all_state_transitions_resolved");
   Record.Dependencies.push_back("trampoline_rounds_preserved");

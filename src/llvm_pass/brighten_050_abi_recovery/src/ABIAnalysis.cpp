@@ -190,6 +190,12 @@ Value *CoerceValue(IRBuilder<> &B, Value *V, Type *DstTy, Twine Name) {
       return B.CreateZExt(V, DstTy, Name);
     }
   }
+  if (!SrcTy->isPointerTy() && !DstTy->isPointerTy() &&
+      SrcTy->isFirstClassType() && DstTy->isFirstClassType() &&
+      IntegerWidth(SrcTy, DL) != 0 &&
+      IntegerWidth(SrcTy, DL) == IntegerWidth(DstTy, DL)) {
+    return B.CreateBitCast(V, DstTy, Name);
+  }
   if (SrcTy->isFloatingPointTy() && DstTy->isFloatingPointTy()) {
     unsigned SW = IntegerWidth(SrcTy, DL);
     unsigned DW = IntegerWidth(DstTy, DL);
@@ -410,6 +416,9 @@ void DebugReturn(FunctionABISummary &S) {
   if (S.RetTy) {
     errs() << " " << TypeToString(S.RetTy);
   }
+  if (S.HasCompleteXMM0Values && S.HasCompleteReturnValues)
+    errs() << " xmm0-derived-from-rax="
+           << (S.XMM0ReturnDerivedFromRAX ? "yes" : "no");
   errs() << "\n";
 }
 

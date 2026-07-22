@@ -352,6 +352,7 @@ PreservedAnalyses OLLVMDeobfPass::run(Module &M,
       Changed |= Local;
       if (!Local) break;
     }
+    Changed |= recoverFiniteBranchDispatchers(F, Stats, Proofs);
     Changed |= recoverCompareLadders(F, Stats, Proofs);
     Changed |= recoverDispatchers(F, Stats, Proofs);
   }

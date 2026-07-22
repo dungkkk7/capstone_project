@@ -160,14 +160,99 @@ Constant *definedScaffold(Constant *C) {
 
 unsigned lowerFullyOverwrittenUndefinedScaffolds(Module &M) {
   SmallVector<FreezeInst *, 32> Work;
+  SmallVector<Instruction *, 64> DirectWork;
   for (Function &F : M)
     for (BasicBlock &BB : F)
-      for (Instruction &I : BB)
+      for (Instruction &I : BB) {
         if (auto *FI = dyn_cast<FreezeInst>(&I))
           if (containsUndefined(FI->getOperand(0)))
             Work.push_back(FI);
+        if ((isa<InsertValueInst>(&I) || isa<InsertElementInst>(&I)) &&
+            isa<Constant>(I.getOperand(0)) &&
+            containsUndefined(I.getOperand(0)))
+          DirectWork.push_back(&I);
+      }
 
   unsigned Lowered = 0;
+  // O3 does not always retain the freeze around a return-aggregate scaffold.
+  // Prove the same complete overwrite directly from the first insertion.
+  // The seed constant may feed multiple independent chains, so rewrite only
+  // this root operand after its own chain is proved complete.
+  for (Instruction *Root : DirectWork) {
+    if (!Root->getParent())
+      continue;
+    auto *C = dyn_cast<Constant>(Root->getOperand(0));
+    if (!C)
+      continue;
+
+    unsigned ElementCount = 0;
+    if (auto *ST = dyn_cast<StructType>(C->getType()))
+      ElementCount = ST->getNumElements();
+    else if (auto *VT = dyn_cast<FixedVectorType>(C->getType()))
+      ElementCount = VT->getNumElements();
+    else
+      continue;
+
+    SmallVector<bool, 16> NeedsOverwrite(ElementCount, false);
+    if (isa<UndefValue>(C) || isa<PoisonValue>(C)) {
+      std::fill(NeedsOverwrite.begin(), NeedsOverwrite.end(), true);
+    } else {
+      if (C->getNumOperands() != ElementCount)
+        continue;
+      for (unsigned I = 0; I < ElementCount; ++I)
+        NeedsOverwrite[I] = containsUndefined(C->getOperand(I));
+    }
+    auto HasPending = [&]() {
+      return llvm::any_of(NeedsOverwrite, [](bool V) { return V; });
+    };
+    if (!HasPending())
+      continue;
+
+    Value *Previous = C;
+    Instruction *Current = Root;
+    bool Proven = true;
+    while (Proven && HasPending()) {
+      unsigned Index = 0;
+      if (auto *IV = dyn_cast<InsertValueInst>(Current)) {
+        ArrayRef<unsigned> Indices = IV->getIndices();
+        if (IV->getAggregateOperand() != Previous || Indices.size() != 1) {
+          Proven = false;
+          break;
+        }
+        Index = Indices.front();
+      } else if (auto *IE = dyn_cast<InsertElementInst>(Current)) {
+        auto *CI = dyn_cast<ConstantInt>(IE->getOperand(2));
+        if (IE->getOperand(0) != Previous || !CI) {
+          Proven = false;
+          break;
+        }
+        Index = CI->getZExtValue();
+      } else {
+        Proven = false;
+        break;
+      }
+      if (Index >= ElementCount) {
+        Proven = false;
+        break;
+      }
+      NeedsOverwrite[Index] = false;
+      if (!HasPending())
+        break;
+      if (!Current->hasOneUse()) {
+        Proven = false;
+        break;
+      }
+      Previous = Current;
+      Current = dyn_cast<Instruction>(*Current->user_begin());
+      if (!Current)
+        Proven = false;
+    }
+    if (!Proven || HasPending())
+      continue;
+    Root->setOperand(0, definedScaffold(C));
+    ++Lowered;
+  }
+
   for (FreezeInst *FI : Work) {
     auto *C = dyn_cast<Constant>(FI->getOperand(0));
     if (!C || !FI->hasOneUse())
@@ -319,9 +404,6 @@ unsigned lowerUnobservedUndefinedShuffleLanes(Module &M) {
       Mask[Lane] = 0;
       ChangedMask = true;
     }
-    if (!ChangedMask)
-      continue;
-
     unsigned Width = VT->getNumElements();
     bool UsesSecond = llvm::any_of(Mask, [Width](int Index) {
       return Index >= static_cast<int>(Width);
@@ -330,7 +412,10 @@ unsigned lowerUnobservedUndefinedShuffleLanes(Module &M) {
     bool UndefinedSecond = containsUndefined(Second);
     if (auto *FI = dyn_cast<FreezeInst>(Second))
       UndefinedSecond |= containsUndefined(FI->getOperand(0));
-    if (!UsesSecond && UndefinedSecond)
+    bool ReplaceUnusedSecond = !UsesSecond && UndefinedSecond;
+    if (!ChangedMask && !ReplaceUnusedSecond)
+      continue;
+    if (ReplaceUnusedSecond)
       Second = Constant::getNullValue(Second->getType());
 
     IRBuilder<> B(SV);

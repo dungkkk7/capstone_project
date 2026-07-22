@@ -6,6 +6,8 @@
 ; native variadic call.
 
 @.fmt = private constant [4 x i8] c"%ld\00"
+@.float_fmt = private constant [7 x i8] c"%.9lf\0A\00"
+@.file_scan = private constant [3 x i8] c"%d\00"
 @.scan8 = private constant [25 x i8] c"%lf%lf%lf%lf%lf%lf%lf%lf\00"
 @.scan6 = private constant [19 x i8] c"%lf%lf%lf%lf%lf%lf\00"
 @.unrelated = private constant [3 x i8] c"%d\00"
@@ -13,6 +15,7 @@
 
 declare i32 @vprintf(ptr, ptr)
 declare i32 @vscanf(ptr, ptr)
+declare i64 @vfscanf(ptr, ptr, ptr)
 
 define i32 @materialized_printf(i64 %x) {
 entry:
@@ -31,6 +34,50 @@ entry:
 
 ; CHECK-LABEL: define i32 @materialized_printf
 ; CHECK: call i32 (ptr, ...) @printf(ptr @.fmt, i64 %x)
+; CHECK-NOT: call i32 @vprintf
+
+define i64 @materialized_file_scanf(ptr %stream, ptr %destination) {
+entry:
+  %save = alloca [176 x i8], align 16
+  %va = alloca [24 x i8], align 8
+  %gp.slot = getelementptr i8, ptr %save, i64 8
+  store ptr %destination, ptr %gp.slot, align 8
+  store i32 8, ptr %va, align 8
+  %fp.offset = getelementptr i8, ptr %va, i64 4
+  store i32 48, ptr %fp.offset, align 4
+  %overflow = getelementptr i8, ptr %va, i64 8
+  store ptr null, ptr %overflow, align 8
+  %save.field = getelementptr i8, ptr %va, i64 16
+  store ptr %save, ptr %save.field, align 8
+  %ret = call i64 @vfscanf(ptr %stream, ptr @.file_scan, ptr %va)
+  ret i64 %ret
+}
+
+; CHECK-LABEL: define i64 @materialized_file_scanf
+; CHECK: %native.vararg.direct = call i32 (ptr, ptr, ...) @fscanf(ptr %stream, ptr @.file_scan, ptr %destination)
+; CHECK: %{{.*}} = zext i32 %native.vararg.direct to i64
+; CHECK-NOT: call i64 @vfscanf
+
+define i32 @materialized_printf_double(i64 %double.bits) {
+entry:
+  %save = alloca [176 x i8], align 16
+  %va = alloca [24 x i8], align 8
+  %fp.slot = getelementptr i8, ptr %save, i64 48
+  store i64 %double.bits, ptr %fp.slot, align 8
+  store i32 8, ptr %va, align 8
+  %fp.offset = getelementptr i8, ptr %va, i64 4
+  store i32 48, ptr %fp.offset, align 4
+  %overflow = getelementptr i8, ptr %va, i64 8
+  store ptr poison, ptr %overflow, align 8
+  %save.field = getelementptr i8, ptr %va, i64 16
+  store ptr %save, ptr %save.field, align 8
+  %ret = call i32 @vprintf(ptr @.float_fmt, ptr %va)
+  ret i32 %ret
+}
+
+; CHECK-LABEL: define i32 @materialized_printf_double
+; CHECK: %{{.*}} = bitcast i64 %double.bits to double
+; CHECK: call i32 (ptr, ...) @printf(ptr @.float_fmt, double %{{.*}})
 ; CHECK-NOT: call i32 @vprintf
 
 define i32 @materialized_scanf_overflow(ptr %a, ptr %b, ptr %c, ptr %d,

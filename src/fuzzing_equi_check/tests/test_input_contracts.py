@@ -76,6 +76,22 @@ class InputContractManifestTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn(reason, {"circle_batch_size", "circle_batch_count", "circle_batch_terminator"})
 
+    def test_grid_batches_reject_missing_endpoints_and_open_boundary(self):
+        contract = load_contracts(str(self.project_root))[("p00624", "s760639333")]
+        seed = (self.project_root / "data/seeds/p00624/p00624_seed.txt").read_bytes()
+        valid, reason = validate_contract_payload(contract, seed)
+        self.assertTrue(valid, reason)
+
+        missing_goal = seed.replace(b"#Ew.#", b"#.w.#", 1)
+        valid, reason = validate_contract_payload(contract, missing_goal)
+        self.assertFalse(valid)
+        self.assertEqual(reason, "grid_batch_symbol_count")
+
+        open_boundary = seed.replace(b"#####", b".####", 1)
+        valid, reason = validate_contract_payload(contract, open_boundary)
+        self.assertFalse(valid)
+        self.assertEqual(reason, "grid_batch_boundary")
+
     def test_structural_contracts_reject_timeout_and_short_read_payloads(self):
         contracts = load_contracts(str(self.project_root))
         invalid = {

@@ -15,5 +15,8 @@ entry:
   %result = call x86_64_sysvcc i64 @qsort(
       i64 0, i64 0, i64 16,
       i64 ptrtoint (ptr @callback_sub_test to i64))
+  %result.again = call x86_64_sysvcc i64 @qsort(
+      i64 0, i64 0, i64 16,
+      i64 ptrtoint (ptr @callback_sub_test to i64))
   ret i32 0
 }

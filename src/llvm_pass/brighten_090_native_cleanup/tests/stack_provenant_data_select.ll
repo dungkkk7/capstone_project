@@ -36,6 +36,22 @@ entry:
   ret i32 %value
 }
 
+; A runtime RSP/RBP delta prevents constant-offset folding but does not erase
+; the underlying global-frame provenance.
+define i32 @dynamic_global_frame_select(i64 %offset) {
+entry:
+  %frame.top = getelementptr i8, ptr @frame_storage_backing.main, i64 128
+  %dynamic.frame.slot = getelementptr i8, ptr %frame.top, i64 %offset
+  %dynamic.frame.address = ptrtoint ptr %dynamic.frame.slot to i64
+  %dynamic.in.guest.range = icmp ult i64 %dynamic.frame.address, 16
+  %dynamic.guest.offset = and i64 %dynamic.frame.address, 15
+  %dynamic.guest.pointer = getelementptr i8, ptr @g_scalar_0, i64 %dynamic.guest.offset
+  %native.data.pointer.select.dynamic = select i1 %dynamic.in.guest.range, ptr %dynamic.guest.pointer, ptr %dynamic.frame.slot
+  store i32 13, ptr %native.data.pointer.select.dynamic, align 1
+  %value = load i32, ptr %dynamic.frame.slot, align 1
+  ret i32 %value
+}
+
 ; Cloned/recovered functions receive the native frame as an argument instead
 ; of referring to the original backing object directly.  That provenance is
 ; just as strong and must not be hidden behind the guest-data mapper.

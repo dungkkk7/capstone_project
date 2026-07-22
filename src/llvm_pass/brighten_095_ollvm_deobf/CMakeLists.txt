@@ -27,6 +27,7 @@ add_llvm_pass_plugin(BrightenOLLVMDeobfPass
   src/OLLVMDeobfStateExprEval.cpp
   src/OLLVMDeobfPointerAffine.cpp
   src/OLLVMDeobfTransitionEval.cpp
+  src/OLLVMDeobfBranchDispatcher.cpp
   src/OLLVMDeobfDispatcherPlumbing.cpp
   src/OLLVMDeobfDispatcherCyclicStateFamily.cpp
   src/OLLVMDeobfDispatcherGeneralFunnelPlumbing.cpp

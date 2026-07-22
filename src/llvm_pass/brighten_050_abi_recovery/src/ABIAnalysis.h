@@ -36,6 +36,7 @@ struct CallsiteABIInfo {
   std::map<ABIReg, llvm::Type *> ArgTypes;
   bool ObservesRAX = false;
   bool ObservesRDX = false;
+  bool ObservesXMM0 = false;
   bool RewritableMemoryResult = false;
   bool Rewritten = false;
 };
@@ -79,8 +80,12 @@ struct FunctionABISummary {
   bool HasRAXStoreBeforeReturn = false;
   bool HasCompleteReturnValues = false;
   bool HasCompleteRDXValues = false;
+  bool HasCompleteXMM0Values = false;
   bool ReturnObservedByCaller = false;
   bool ReturnRDXObservedByCaller = false;
+  bool ReturnXMM0ObservedByCaller = false;
+  bool XMM0ReturnDerivedFromRAX = false;
+  ReturnKind XMM0ReturnKind = ReturnKind::Unknown;
   // A SysV i128 return is justified only when one callsite observes both
   // physical return registers.  Aggregating independent RAX and RDX uses
   // from different callsites fabricates a composite return ABI.

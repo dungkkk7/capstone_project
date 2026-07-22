@@ -246,7 +246,15 @@ unsigned lowerNativeQsortCallbacks(Module &M, bool &Changed) {
   for (CallBase *CB : Calls) {
     SmallPtrSet<Value *, 16> Seen;
     Function *Callback = resolveCallbackFunction(CB->getArgOperand(3), Seen);
-    if (!Callback)
+    // An earlier qsort call in this worklist may already have redirected all
+    // uses of the same guest callback to its native adapter.  Resolve again
+    // and re-check the complete lifted shape before constructing a zero-arg
+    // call: calling InlineFunction on a call whose newly resolved callee now
+    // has the native (lhs, rhs) ABI corrupts the inliner's use bookkeeping.
+    if (!Callback || Callback->isDeclaration() ||
+        !Callback->getReturnType()->isVoidTy() ||
+        Callback->arg_size() != 0 ||
+        !Callback->getName().starts_with("callback_"))
       continue;
     std::string Name = (Callback->getName() + ".qsort_callback").str();
     if (M.getFunction(Name))
@@ -265,15 +273,44 @@ unsigned lowerNativeQsortCallbacks(Module &M, bool &Changed) {
     };
     B.CreateStore(B.CreatePtrToInt(Adapter->getArg(0), I64Ty), StateSlot(2296));
     B.CreateStore(B.CreatePtrToInt(Adapter->getArg(1), I64Ty), StateSlot(2280));
-    B.CreateCall(Callback, {});
+    CallInst *GuestCallbackCall = B.CreateCall(Callback, {});
+    GuestCallbackCall->setCallingConv(Callback->getCallingConv());
     Value *Ret = B.CreateLoad(Type::getInt32Ty(Ctx), StateSlot(2216),
                               "qsort.callback.ret");
     B.CreateRet(Ret);
+
+    // The zero-argument callback is a lifted State wrapper, not a second host
+    // ABI entry.  Inline it into the proven (lhs, rhs) adapter before
+    // publishing the adapter.  This keeps the callback's register-file
+    // accesses in one native activation; the subsequent private-State
+    // localization can then promote them instead of retaining a shared global
+    // solely to communicate across this synthetic call boundary.
+    bool HadNoInline = Callback->hasFnAttribute(Attribute::NoInline);
+    bool HadOptimizeNone = Callback->hasFnAttribute(Attribute::OptimizeNone);
+    Callback->removeFnAttr(Attribute::NoInline);
+    Callback->removeFnAttr(Attribute::OptimizeNone);
+    InlineFunctionInfo IFI;
+    bool CallbackInlined =
+        InlineFunction(*GuestCallbackCall, IFI).isSuccess();
+    if (!CallbackInlined) {
+      if (HadNoInline)
+        Callback->addFnAttr(Attribute::NoInline);
+      if (HadOptimizeNone)
+        Callback->addFnAttr(Attribute::OptimizeNone);
+    }
 
     IRBuilder<> At(CB);
     Value *AdapterBits = At.CreatePtrToInt(Adapter, CB->getArgOperand(3)->getType(),
                                            "qsort.callback.bits");
     CB->setArgOperand(3, AdapterBits);
+    if (CallbackInlined) {
+      // All remaining address uses denote the same callback boundary (for
+      // example a guest-PC carrier that survived data recovery).  Redirect
+      // them to the native adapter after its only body call has disappeared.
+      Callback->replaceAllUsesWith(Adapter);
+      if (Callback->hasLocalLinkage() && Callback->use_empty())
+        Callback->eraseFromParent();
+    }
     Changed = true;
     ++Lowered;
   }

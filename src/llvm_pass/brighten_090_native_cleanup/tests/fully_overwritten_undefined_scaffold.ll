@@ -10,6 +10,15 @@ entry:
   ret { i64, i8 } %complete
 }
 
+; O3 may remove the freeze and leave the poison seed directly on the first
+; insertion.  The same complete-chain proof must still apply.
+define { i64, i8 } @build_struct_direct(i64 %x, i8 %flag) {
+entry:
+  %with.x = insertvalue { i64, i8 } poison, i64 %x, 0
+  %complete = insertvalue { i64, i8 } %with.x, i8 %flag, 1
+  ret { i64, i8 } %complete
+}
+
 define <2 x i32> @build_vector(i32 %x, i32 %y) {
 entry:
   %base = freeze <2 x i32> <i32 17, i32 poison>

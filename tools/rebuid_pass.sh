@@ -5,12 +5,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Nếu script nằm ngay trong src/llvm_pass thì dùng luôn thư mục đó.
 # Nếu script nằm ở root/scripts thì fallback về PROJECT_ROOT/src/llvm_pass.
-if [[ -d "$SCRIPT_DIR/brighten_010_repair_pass" || -d "$SCRIPT_DIR/brighten_020_devirt_pass" ]]; then
-    PASS_DIR="$SCRIPT_DIR"
-else
-    PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-    PASS_DIR="$PROJECT_ROOT/src/llvm_pass"
-fi
+
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PASS_DIR="$PROJECT_ROOT/src/llvm_pass"
+
 
 cd "$PASS_DIR"
 

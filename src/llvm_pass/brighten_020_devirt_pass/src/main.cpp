@@ -16,6 +16,7 @@ PreservedAnalyses BrightenDevirtPass::run(Module &M, ModuleAnalysisManager &) {
   Changed |= AnnotateRemillReturns(M);
   Changed |= CleanupCallbackThunks(M);
   Changed |= CleanupUnusedRemillDispatchers(M);
+
   Changed |= LowerProvenConstantStateSwitches(M);
 
   VerifyDevirtualization(M);

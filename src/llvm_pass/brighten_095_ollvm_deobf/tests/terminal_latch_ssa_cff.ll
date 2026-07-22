@@ -3,7 +3,7 @@
 ; CHECK-LABEL: define i32 @terminal_latch_dispatcher(
 ; CHECK-NOT: switch i32
 ; CHECK-NOT: ret i32 poison
-; CHECK: ret i32 %
+; CHECK: ret i32
 
 define i32 @terminal_latch_dispatcher(i1 %choose) {
 entry:

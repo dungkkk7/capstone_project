@@ -47,9 +47,14 @@ class RecoveryConfig:
     fuzz_timeout: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_FUZZ_TIMEOUT", "0.1"))
     )
-    # No adapter-side prompt/IR size limit. The model/API remains responsible
-    # for its own context window; recovery itself is bounded by max_iterations.
-    max_ir_chars: Optional[int] = None
+    # Keep enough IR for reconstruction while leaving room for the system
+    # prompt, candidate and validation feedback.  Unlimited raw IR made large
+    # lifted modules exceed Vertex's context window before inference started.
+    max_ir_chars: Optional[int] = field(
+        default_factory=lambda: max(
+            1, int(os.environ.get("LLM_RECOVERY_MAX_IR_CHARS", "600000"))
+        )
+    )
     temperature: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_TEMPERATURE", "0.05"))
     )
@@ -64,6 +69,26 @@ class RecoveryConfig:
     use_file_api: bool = field(
         default_factory=lambda: _text(os.environ.get("LLM_RECOVERY_USE_FILE_API", "1")).lower()
         not in {"", "0", "false", "no", "off"}
+    )
+    attach_ir_with_ghidra: bool = field(
+        default_factory=lambda: _text(
+            os.environ.get("LLM_RECOVERY_ATTACH_IR_WITH_GHIDRA", "0")
+        ).lower() in {"1", "true", "yes", "on"}
+    )
+    max_request_input_bytes: int = field(
+        default_factory=lambda: max(
+            1, int(os.environ.get("LLM_RECOVERY_MAX_REQUEST_INPUT_BYTES", "900000"))
+        )
+    )
+    max_candidate_chars: int = field(
+        default_factory=lambda: max(
+            1, int(os.environ.get("LLM_RECOVERY_MAX_CANDIDATE_CHARS", "250000"))
+        )
+    )
+    max_feedback_chars: int = field(
+        default_factory=lambda: max(
+            1, int(os.environ.get("LLM_RECOVERY_MAX_FEEDBACK_CHARS", "40000"))
+        )
     )
     file_api_inline_max_bytes: Optional[int] = None
     request_timeout: float = field(
@@ -137,6 +162,9 @@ def _resolve_path(value: str, base_dir: Path, fallback_dir: Optional[Path] = Non
         candidates = [base_dir / path]
         if fallback_dir is not None:
             candidates.append(fallback_dir / path)
+        dataset_root = Path("/home/dungbv/Dataset_DoAn")
+        if dataset_root.exists():
+            candidates.append(dataset_root / path)
         path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     return str(path.resolve())
 
@@ -729,7 +757,7 @@ def read_recovery_csv(csv_path: str, project_root: str) -> List[RecoveryInput]:
 
     aliases = {
         "ir": {"ir", "ir_path", "llvm_ir", "llvm_ir_path", "brightened_ir", "brightened_ir_path"},
-        "binary": {"binary", "binary_path", "original_binary", "original_binary_path", "file", "path"},
+        "binary": {"binary", "binary_path", "original_binary", "original_binary_path", "file", "path", "obfuscated_binary"},
     }
     header = [_text(cell).lower() for cell in rows[0]]
     has_header = any(cell in aliases["ir"] | aliases["binary"] for cell in header)
@@ -819,11 +847,11 @@ Input may be:
 - C-like pseudocode exported by Ghidra headless.
 
 Input provenance:
-- In mode 1, the complete Ghidra pseudocode and complete brightened LLVM IR artifacts
-  are attached to the model request as complementary readable evidence.
+- In mode 1, Ghidra pseudocode is the primary attached evidence. Brightened LLVM IR is
+  attached only when the caller explicitly enables it; do not assume both views exist.
 - The brightened reference ELF is used locally as Ghidra input and as differential-testing
   evidence. Do not claim to inspect raw executable bytes that the model cannot consume.
-- In mode 2, the model receives the complete brightened LLVM IR instead.
+- In mode 2, the model receives a bounded brightened LLVM IR artifact instead.
 - Never assume access to a local path, the original source, or the semantic-checker target.
 
 Rules:
@@ -864,6 +892,19 @@ def _clip_ir(ir_text: str, max_chars: Optional[int] = None) -> str:
         ir_text[:head]
         + "\n\n; [IR truncated by adapter: omitted middle section]\n\n"
         + ir_text[-tail:]
+    )
+
+
+def _clip_context(text: str, max_chars: Optional[int], label: str) -> str:
+    text = _text(text)
+    if not max_chars or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = max_chars * 3 // 4
+    tail = max_chars - head
+    return (
+        text[:head]
+        + f"\n\n/* [{label} clipped by adapter: omitted middle section] */\n\n"
+        + text[-tail:]
     )
 
 
@@ -940,7 +981,7 @@ Input context:
 
 Model input artifact ({ir_header}; not original source):
 <MODEL_INPUT_ARTIFACT>
-{ir_body if not seed_attached_file else "/* COMPLETE GHIDRA PSEUDOCODE AND BRIGHTENED LLVM IR ATTACHED IN THIS REQUEST */"}
+{ir_body if not seed_attached_file else "/* PRIMARY GHIDRA PSEUDOCODE IS ATTACHED IN THIS REQUEST */"}
 </MODEL_INPUT_ARTIFACT>"""
 
     source += f"""
@@ -1424,21 +1465,29 @@ def build_repair_prompt(
     max_ir_chars: Optional[int],
     source_label: str = "brightened LLVM IR",
     evidence_attached: bool = False,
+    max_candidate_chars: Optional[int] = None,
+    max_feedback_chars: Optional[int] = None,
 ) -> str:
     evidence = (
-        "/* COMPLETE GHIDRA PSEUDOCODE AND BRIGHTENED LLVM IR ATTACHED IN THIS REQUEST */"
+        "/* PRIMARY MODEL EVIDENCE IS ATTACHED IN THIS REQUEST */"
         if evidence_attached
         else _clip_ir(ir_text, max_ir_chars)
+    )
+    bounded_candidate = _clip_context(
+        candidate, max_candidate_chars, "candidate source"
+    )
+    bounded_feedback = _clip_context(
+        feedback, max_feedback_chars, "validation feedback"
     )
     return f"""Repair the C recovery candidate below using the validation feedback.
 
 <VALIDATION_FEEDBACK>
-{feedback}
+{bounded_feedback}
 </VALIDATION_FEEDBACK>
 
 <CANDIDATE_SOURCE>
 ```c
-{candidate}
+{bounded_candidate}
 ```
 </CANDIDATE_SOURCE>
 
@@ -1860,6 +1909,25 @@ def _vertex_generation_config(config: RecoveryConfig) -> Dict[str, Any]:
     return generation_config
 
 
+def _validate_request_input_budget(
+    prompt_bytes: int,
+    attachment_bytes: int,
+    max_input_bytes: int,
+) -> int:
+    """Reject oversized selected evidence before credentials or network are used."""
+    total_input_bytes = prompt_bytes + attachment_bytes
+    if total_input_bytes > max_input_bytes:
+        raise RecoveryError(
+            "Vertex input context rejected locally before upload: "
+            f"selected_input={total_input_bytes} bytes exceeds budget="
+            f"{max_input_bytes} bytes "
+            f"(attachments={attachment_bytes}, prompt={prompt_bytes}). "
+            "Reduce selected evidence or raise "
+            "LLM_RECOVERY_MAX_REQUEST_INPUT_BYTES explicitly."
+        )
+    return total_input_bytes
+
+
 class VertexGemini:
     """Lazy Vertex AI Gemini client using ADC, as described in LLM_api.md."""
 
@@ -1891,9 +1959,53 @@ class VertexGemini:
         attachment_paths: Optional[Sequence[str]] = None,
     ) -> str:
         """Call Vertex AI generateContent through REST with ADC credentials."""
+        paths: List[str] = []
+        if attachment_path:
+            paths.append(_text(attachment_path))
+        if attachment_paths:
+            paths.extend(_text(path) for path in attachment_paths)
+        paths = list(dict.fromkeys(path for path in paths if path))
+
+        file_parts: List[Dict[str, Any]] = []
+        attachment_bytes = 0
+        for path in paths:
+            attachment = Path(path)
+            if not attachment.is_file():
+                raise RecoveryError(f"File attachment không tồn tại: {path}")
+            file_size = attachment.stat().st_size
+            if (
+                self.config.file_api_inline_max_bytes
+                and file_size > self.config.file_api_inline_max_bytes
+            ):
+                raise RecoveryError(
+                    f"File attachment quá lớn cho inlineData ({file_size} bytes > {self.config.file_api_inline_max_bytes})."
+                )
+            raw = attachment.read_bytes()
+            attachment_bytes += len(raw)
+            mime_type = _vertex_inline_mime_type(attachment)
+            file_parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+        prompt_bytes = len(prompt.encode("utf-8"))
+        total_input_bytes = _validate_request_input_budget(
+            prompt_bytes,
+            attachment_bytes,
+            self.config.max_request_input_bytes,
+        )
+        print(
+            "[LLM] Vertex selected context: "
+            f"attachments={attachment_bytes} bytes, prompt={prompt_bytes} bytes, "
+            f"total={total_input_bytes}/{self.config.max_request_input_bytes} bytes"
+        )
+        parts = file_parts + [{"text": prompt}]
+
         credentials = _load_adc_credentials()
         access_token = _request_access_token_via_refresh(credentials)
-
         project = self.config.project or _text(credentials.get("quota_project_id"))
         if not project:
             raise RecoveryError(
@@ -1910,37 +2022,6 @@ class VertexGemini:
             f"v1/projects/{project}/locations/{self.config.location}/"
             f"publishers/google/models/{self.config.model}:generateContent"
         )
-        paths: List[str] = []
-        if attachment_path:
-            paths.append(_text(attachment_path))
-        if attachment_paths:
-            paths.extend(_text(path) for path in attachment_paths)
-        paths = list(dict.fromkeys(path for path in paths if path))
-
-        file_parts: List[Dict[str, Any]] = []
-        for path in paths:
-            attachment = Path(path)
-            if not attachment.is_file():
-                raise RecoveryError(f"File attachment không tồn tại: {path}")
-            file_size = attachment.stat().st_size
-            if (
-                self.config.file_api_inline_max_bytes
-                and file_size > self.config.file_api_inline_max_bytes
-            ):
-                raise RecoveryError(
-                    f"File attachment quá lớn cho inlineData ({file_size} bytes > {self.config.file_api_inline_max_bytes})."
-                )
-            raw = attachment.read_bytes()
-            mime_type = _vertex_inline_mime_type(attachment)
-            file_parts.append(
-                {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": base64.b64encode(raw).decode("ascii"),
-                    }
-                }
-            )
-        parts = file_parts + [{"text": prompt}]
 
         generation_config = _vertex_generation_config(self.config)
 
@@ -2102,15 +2183,47 @@ def _format_fuzz_feedback(report: Mapping[str, Any]) -> str:
         left = sample.get("prog1", {})
         right = sample.get("prog2", {})
         lines.append(
-            "Mismatch #{index}: input={stdin!r}; recovered(status={ls}, rc={lr}, stdout={lo!r}, stderr={le!r}); "
-            "reference(status={rs}, rc={rr}, stdout={ro!r}, stderr={re!r})".format(
+            "Mismatch #{index}: reason={reason!r}, args={args!r}, input={stdin!r}; "
+            "recovered(status={ls}, rc={lr}, signal={lsg}, stdout={lo!r}, stderr={le!r}); "
+            "reference(status={rs}, rc={rr}, signal={rsg}, stdout={ro!r}, stderr={re!r})".format(
                 index=sample.get("index", "?"),
-                stdin=sample.get("stdin", ""),
-                ls=left.get("status"), lr=left.get("returncode"), lo=left.get("stdout", "")[:1200], le=left.get("stderr", "")[:1200],
-                rs=right.get("status"), rr=right.get("returncode"), ro=right.get("stdout", "")[:1200], re=right.get("stderr", "")[:1200],
+                reason=sample.get("reason", "semantic mismatch"),
+                args=sample.get("args", []),
+                stdin=sample.get("stdin", "")[:2000],
+                ls=left.get("status"), lr=left.get("returncode"),
+                lsg=left.get("signal"), lo=left.get("stdout", "")[:1200],
+                le=left.get("stderr", "")[:1200],
+                rs=right.get("status"), rr=right.get("returncode"),
+                rsg=right.get("signal"), ro=right.get("stdout", "")[:1200],
+                re=right.get("stderr", "")[:1200],
             )
         )
     return "\n".join(lines)
+
+
+def _recovery_attachment_paths(
+    use_two_stage: bool,
+    config: RecoveryConfig,
+    pseudo_path: Optional[str],
+    metadata: Mapping[str, str],
+) -> List[str]:
+    """Select non-duplicative readable evidence for one Vertex request."""
+    if not use_two_stage or not config.use_file_api:
+        return []
+    if not pseudo_path or not os.path.isfile(pseudo_path):
+        raise RecoveryError(
+            "File-API recovery enabled but Ghidra artifact is unavailable."
+        )
+    paths = [pseudo_path]
+    if config.attach_ir_with_ghidra:
+        brightened_ir_path = _text(metadata.get("input_ir"))
+        if not brightened_ir_path or not os.path.isfile(brightened_ir_path):
+            raise RecoveryError(
+                "LLM_RECOVERY_ATTACH_IR_WITH_GHIDRA is enabled but the "
+                f"brightened LLVM IR is unavailable: {brightened_ir_path}"
+            )
+        paths.append(brightened_ir_path)
+    return paths
 
 
 def run_recovery_loop(
@@ -2143,7 +2256,8 @@ def run_recovery_loop(
     last_report: Optional[Dict[str, Any]] = None
     print(
         f"[LLM] Bắt đầu recovery loop | max_iter={config.max_iterations} | "
-        f"fuzz_iter={config.fuzz_iterations}, timeout={config.fuzz_timeout}s | prompt=unlimited"
+        f"fuzz_iter={config.fuzz_iterations}, timeout={config.fuzz_timeout}s | "
+        f"ir_chars={config.max_ir_chars}, request_bytes={config.max_request_input_bytes}"
     )
 
     backend = _text(config.pseudo_backend).strip().lower()
@@ -2246,6 +2360,8 @@ def run_recovery_loop(
                     and pseudo_path_for_api is not None
                     and os.path.isfile(pseudo_path_for_api)
                 ),
+                max_candidate_chars=config.max_candidate_chars,
+                max_feedback_chars=config.max_feedback_chars,
             )
 
         response: Optional[str] = None
@@ -2257,29 +2373,17 @@ def run_recovery_loop(
                 f"max_output_tokens={config.max_output_tokens} | "
                 f"thinking_level={config.thinking_level or 'default'}"
             )
-            attachment_paths: List[str] = []
-            if use_two_stage and config.use_file_api:
-                if not pseudo_path_for_api or not os.path.isfile(pseudo_path_for_api):
-                    raise RecoveryError("File-API recovery enabled but Ghidra artifact is unavailable.")
-                # The reference ELF has already served as Ghidra input. Gemini's
-                # inlineData API does not accept raw executable/octet-stream MIME,
-                # so attach its readable pseudocode plus the brightened textual IR.
-                attachment_paths = [pseudo_path_for_api]
-                brightened_ir_path = _text(metadata.get("input_ir"))
-                if brightened_ir_path:
-                    if not os.path.isfile(brightened_ir_path):
-                        raise RecoveryError(
-                            f"File-API recovery enabled but brightened LLVM IR is unavailable: "
-                            f"{brightened_ir_path}"
-                        )
-                    attachment_paths.append(brightened_ir_path)
+            attachment_paths = _recovery_attachment_paths(
+                use_two_stage, config, pseudo_path_for_api, metadata
+            )
+            if attachment_paths:
                 print(
                     "[LLM] Readable evidence attachments: "
                     + ", ".join(os.path.basename(path) for path in attachment_paths)
                 )
 
             response = client.generate(
-                build_system_prompt() + "\n\n" + make_prompt(None),
+                build_system_prompt() + "\n\n" + make_prompt(config.max_ir_chars),
                 attachment_paths=attachment_paths,
             )
             response_meta = dict(getattr(client, "last_response_meta", {}) or {})

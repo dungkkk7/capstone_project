@@ -100,6 +100,7 @@ bool BrightenABIRecoveryPass::AnalyzeCallsiteABI(ABIRecoveryContext &Ctx) {
         FindStoredArgsInBlock(*CI, Info, Ctx.DL);
         Info.ObservesRAX = ObservesRegisterAfter(*CI, ABIReg::RAX);
         Info.ObservesRDX = ObservesRegisterAfter(*CI, ABIReg::RDX);
+        Info.ObservesXMM0 = ObservesRegisterAfter(*CI, ABIReg::XMM0);
         Info.RewritableMemoryResult = HasOnlyMemoryReplacementUses(*CI, *S);
 
         for (auto &[Reg, Ty] : Info.ArgTypes) {
@@ -111,6 +112,9 @@ bool BrightenABIRecoveryPass::AnalyzeCallsiteABI(ABIRecoveryContext &Ctx) {
         }
         if (Info.ObservesRDX) {
           S->ReturnRDXObservedByCaller = true;
+        }
+        if (Info.ObservesXMM0) {
+          S->ReturnXMM0ObservedByCaller = true;
         }
         if (Info.ObservesRAX && Info.ObservesRDX) {
           S->ReturnRDXRAXObservedBySameCallsite = true;

@@ -260,6 +260,7 @@ bool tryRecoverPartitionedSSAPlumbingDispatcher(
 
   struct PlumbingTransition {
     BasicBlock *Source = nullptr;
+    SelectInst *Selector = nullptr;
     Value *Condition = nullptr;
     ResolvedPlumbingPath TruePath;
     std::optional<ResolvedPlumbingPath> FalsePath;
@@ -280,9 +281,15 @@ bool tryRecoverPartitionedSSAPlumbingDispatcher(
       if (!Path) return false;
       Transition.TruePath = std::move(*Path);
     } else if (auto *Select = dyn_cast<SelectInst>(Next)) {
+      // The rewritten edge branches in Source, so the state select must be
+      // owned by that edge.  Otherwise the rewrite could move the decision
+      // across case side effects.  Retain the select to refresh its condition
+      // after Header/Latch reg2mem lowering.
+      if (Select->getParent() != Source) return false;
       auto *TC = dyn_cast<ConstantInt>(Select->getTrueValue());
       auto *FC = dyn_cast<ConstantInt>(Select->getFalseValue());
       if (!TC || !FC) return false;
+      Transition.Selector = Select;
       Transition.Condition = Select->getCondition();
       auto TruePath = Resolve(TC);
       auto FalsePath = Resolve(FC);
@@ -367,6 +374,10 @@ bool tryRecoverPartitionedSSAPlumbingDispatcher(
       DemoteRegToStack(*I, false, AllocaPoint->getIterator());
   }
 
+  for (PlumbingTransition &Transition : Transitions)
+    if (Transition.Selector)
+      Transition.Condition = Transition.Selector->getCondition();
+
   SmallVector<Instruction *, 64> FunnelBody, LatchBody, HeaderBody;
   for (Instruction &I : *Funnel)
     if (!isa<PHINode>(I) && !I.isTerminator() &&
@@ -441,7 +452,10 @@ bool tryRecoverPartitionedSSAPlumbingDispatcher(
     if (Transition.Condition) {
       BasicBlock *FalseTarget =
           MaterializePath(*Transition.FalsePath, "false");
-      BranchInst::Create(TrueTarget, FalseTarget, Transition.Condition,
+      Value *Condition = Transition.Condition;
+      if (auto It = Map.find(Condition); It != Map.end())
+        Condition = It->second;
+      BranchInst::Create(TrueTarget, FalseTarget, Condition,
                          Old->getIterator());
     } else {
       BranchInst::Create(TrueTarget, Old->getIterator());

@@ -25,6 +25,32 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
   // Running the mutation pipeline again after O3 hides phase-ownership bugs.
   if (EnforceStrict) {
     bool Changed = false;
+    unsigned FinalUndefinedScaffolds =
+        lowerFullyOverwrittenUndefinedScaffolds(M);
+    if (FinalUndefinedScaffolds) {
+      Changed = true;
+      errs() << "  final fully-overwritten undef/poison scaffolds normalized: "
+             << FinalUndefinedScaffolds << "\n";
+    }
+    unsigned FinalUndefinedShuffleLanes =
+        lowerUnobservedUndefinedShuffleLanes(M);
+    if (FinalUndefinedShuffleLanes) {
+      Changed = true;
+      errs() << "  final unobserved undef/poison shuffle lanes normalized: "
+             << FinalUndefinedShuffleLanes << "\n";
+    }
+    unsigned FinalVectorBroadcasts = lowerSingleLaneVectorBroadcasts(M);
+    if (FinalVectorBroadcasts) {
+      Changed = true;
+      errs() << "  final single-lane vector broadcasts normalized: "
+             << FinalVectorBroadcasts << "\n";
+    }
+    // The exact vector rewrites above can leave their old poison-seeded
+    // insertelement scaffolds use-empty.  Remove those dead instructions
+    // before the contract report so it describes the published module rather
+    // than temporary operands with no observable users.
+    if (cleanupNativeDeadInstructions(M))
+      Changed = true;
     unsigned PromotedDispatchers = promoteStackDispatcherStateSlots(M, Changed);
     if (PromotedDispatchers)
       errs() << "  final stack dispatcher state slots promoted to SSA: "
@@ -49,13 +75,57 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
       errs() << "  final unused inline-asm calls erased: " << DeadInlineAsm
              << "\n";
     if (PostSouper) {
+      unsigned AggregatePassthroughs =
+          forwardRecoveredAggregatePassthroughs(M, Changed);
+      if (AggregatePassthroughs)
+        errs() << "  post-Souper aggregate ABI passthroughs forwarded: "
+               << AggregatePassthroughs << "\n";
+      unsigned SimplifiedSignedCompares =
+          simplifyRecoveredSignedCompareIdioms(M, Changed);
+      if (SimplifiedSignedCompares)
+        errs() << "  post-Souper recovered signed comparisons simplified: "
+               << SimplifiedSignedCompares << "\n";
+      unsigned EarlyAffineFramePointers =
+          canonicalizeFrameBackingAffinePointers(M, Changed);
+      if (EarlyAffineFramePointers)
+        errs() << "  post-Souper early affine frame pointers canonicalized: "
+               << EarlyAffineFramePointers << "\n";
+      unsigned EarlyScanfShadows =
+          isolateRecoveredScanfDestinations(M, Changed);
+      if (EarlyScanfShadows)
+        errs() << "  post-Souper early recovered scanf destinations isolated: "
+               << EarlyScanfShadows << "\n";
+      unsigned FinalDynamicFrames =
+          localizeProvenDynamicFrameRegions(M, Changed);
+      if (FinalDynamicFrames)
+        errs() << "  post-Souper dynamic guest-frame regions localized: "
+               << FinalDynamicFrames << "\n";
       unsigned FinalAffineFramePointers =
           canonicalizeFrameBackingAffinePointers(M, Changed);
       if (FinalAffineFramePointers)
         errs() << "  post-Souper affine frame pointers canonicalized: "
                << FinalAffineFramePointers << "\n";
-      unsigned FinalStackDataSelects =
-          collapseFrameProvenantDataPointerSelects(M, Changed);
+      unsigned FinalForwardedStackLoads = 0;
+      unsigned FinalStackDataSelects = 0;
+      unsigned FinalRawNativeStackPointers = 0;
+      // Forwarding one exact RSP spill can expose the frame fallback of a
+      // generated data-select tree; collapsing that tree can in turn make the
+      // next spill exact.  Iterate this proof chain to a fixed point instead
+      // of depending on a case-specific number of nested recovered calls.
+      for (;;) {
+        unsigned Forwarded = forwardProvenAffineStackSlotLoads(M, Changed);
+        unsigned Lowered = lowerRawNativeStackIntToPtrs(M, Changed);
+        unsigned Collapsed =
+            collapseFrameProvenantDataPointerSelects(M, Changed);
+        FinalForwardedStackLoads += Forwarded;
+        FinalRawNativeStackPointers += Lowered;
+        FinalStackDataSelects += Collapsed;
+        if (!Forwarded && !Lowered && !Collapsed)
+          break;
+      }
+      if (FinalForwardedStackLoads)
+        errs() << "  post-Souper proven affine stack loads forwarded: "
+               << FinalForwardedStackLoads << "\n";
       if (FinalStackDataSelects)
         errs() << "  post-Souper stack-provenant data selects collapsed: "
                << FinalStackDataSelects << "\n";
@@ -70,7 +140,32 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
         errs() << "  post-Souper proven fake stack backings converted to "
                   "native frames: "
                << FinalCompactedFrames << "\n";
+      // default<O3> can reassociate a recovered frame GEP back into an
+      // inttoptr of an architectural RSP/RBP expression. Re-run only the
+      // provenance-gated stack lowering here; arbitrary heap/data integer
+      // pointers remain untouched. Keep this after data-select collapsing:
+      // a newly recovered fallback does not by itself prove that every
+      // pre-existing guest/global range arm is impossible.
+      if (FinalRawNativeStackPointers)
+        errs() << "  post-Souper raw guest stack inttoptrs lowered: "
+               << FinalRawNativeStackPointers << "\n";
+      unsigned FinalPrivateFrames =
+          localizeProvenPrivateFrameArguments(M, Changed);
+      if (FinalPrivateFrames)
+        errs() << "  post-Souper private frame ABIs localized: "
+               << FinalPrivateFrames << "\n";
     }
+    unsigned FinalNativeDataArtifacts =
+        eraseUnusedNativeDataArtifacts(M, Changed);
+    if (FinalNativeDataArtifacts)
+      errs() << "  final unused lifted segment artifacts removed: "
+             << FinalNativeDataArtifacts << "\n";
+    unsigned FinalNativeResidualSegments =
+        canonicalizeLiveNativeResidualSegments(M, Changed);
+    if (FinalNativeResidualSegments)
+      errs() << "  final live residual segments canonicalized: "
+             << FinalNativeResidualSegments << "\n";
+    eraseUnusedInternalGlobals(M, Changed);
     stripRemillMetadata(M, Changed);
     reportNativeContract(M, 0, 0, true);
     return Changed;
@@ -340,6 +435,12 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
   if (DataAliases)
     errs() << "  remaining guest data aliases lowered: " << DataAliases << "\n";
 
+  unsigned NativeResidualSegments =
+      canonicalizeLiveNativeResidualSegments(M, Changed);
+  if (NativeResidualSegments)
+    errs() << "  live residual segments canonicalized as native bytes: "
+           << NativeResidualSegments << "\n";
+
   // Conservatively preserved residual segments acquire their exact guest
   // range while the final data_<addr> aliases are removed above.  Revisit
   // dynamic inttoptrs now: the earlier State-SSA-dependent sweep could not
@@ -454,6 +555,11 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict,
   if (LateRawNativeStackPointers)
     errs() << "  late raw guest stack inttoptrs lowered: "
            << LateRawNativeStackPointers << "\n";
+  unsigned DynamicFrameRegions =
+      localizeProvenDynamicFrameRegions(M, Changed);
+  if (DynamicFrameRegions)
+    errs() << "  dynamic guest-frame regions localized: "
+           << DynamicFrameRegions << "\n";
   unsigned AffineFramePointers =
       canonicalizeFrameBackingAffinePointers(M, Changed);
   if (AffineFramePointers)

@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -22,6 +23,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -109,6 +111,10 @@ Value *lowerNativeStackInteger(IRBuilder<> &B, Value *Integer,
                                       Function &F);
 bool hasRawNativeStackIntToPtrCandidate(Module &M);
 unsigned lowerRawNativeStackIntToPtrs(Module &M, bool &Changed);
+unsigned forwardProvenAffineStackSlotLoads(Module &M, bool &Changed);
+unsigned forwardRecoveredAggregatePassthroughs(Module &M, bool &Changed);
+unsigned simplifyRecoveredSignedCompareIdioms(Module &M, bool &Changed);
+bool isProvenWriteOnlyAffineFrameSlot(Function &F, Value *Pointer);
 unsigned rewriteNativeDataStackGEPs(Module &M, bool &Changed);
 
 // ---- GuestData ---------------------------------------------------
@@ -226,6 +232,7 @@ std::optional<uint64_t> segmentPointerOffset(Value *V,
                                                      GlobalVariable *Segment,
                                                      const DataLayout &DL);
 unsigned materializeNativeSegmentPointers(Module &M, bool &Changed);
+unsigned canonicalizeLiveNativeResidualSegments(Module &M, bool &Changed);
 unsigned rewriteExactNativeSegmentGEPs(Module &M, bool &Changed);
 
 // ---- ContractReport ----------------------------------------------
@@ -316,10 +323,10 @@ struct FrameAffineInteger {
 
 bool addSignedOffset(int64_t Base, int64_t Delta, int64_t &Result);
 std::optional<FrameAffineInteger>
-evaluateFrameInteger(Value *V, GlobalVariable &Backing, const DataLayout &DL,
+evaluateFrameInteger(Value *V, Value &Backing, const DataLayout &DL,
                      unsigned Bits, SmallPtrSetImpl<Value *> &IntegerSeen);
 std::optional<int64_t>
-evaluateFramePointerOffset(Value *V, GlobalVariable &Backing,
+evaluateFramePointerOffset(Value *V, Value &Backing,
                            const DataLayout &DL,
                            SmallPtrSetImpl<Value *> &PointerSeen);
 unsigned canonicalizeFrameBackingAffinePointers(Module &M,
@@ -336,6 +343,8 @@ bool proveConstantFrameBacking(GlobalVariable &Backing,
 bool readsAreDominatedByWrites(ArrayRef<ProvenFrameAccess> Accesses,
                                       Function &Owner);
 unsigned compactProvenConstantFrameBackings(Module &M, bool &Changed);
+unsigned localizeProvenDynamicFrameRegions(Module &M, bool &Changed);
+unsigned localizeProvenPrivateFrameArguments(Module &M, bool &Changed);
 
 // ---- BoundsGuards ------------------------------------------------
 

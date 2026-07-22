@@ -2,6 +2,69 @@
 
 namespace brighten_ollvm_deobf {
 
+static std::optional<APInt> evaluateConcreteStateBinary(
+    BinaryOperator &BO, const APInt &L, const APInt &R) {
+  if (L.getBitWidth() != R.getBitWidth())
+    return std::nullopt;
+
+  auto RejectOverflow = [&](bool SignedOverflow,
+                            bool UnsignedOverflow) {
+    auto *OBO = dyn_cast<OverflowingBinaryOperator>(&BO);
+    return OBO && ((OBO->hasNoSignedWrap() && SignedOverflow) ||
+                   (OBO->hasNoUnsignedWrap() && UnsignedOverflow));
+  };
+
+  bool SignedOverflow = false;
+  bool UnsignedOverflow = false;
+  switch (BO.getOpcode()) {
+  case Instruction::Add: {
+    APInt Signed = L.sadd_ov(R, SignedOverflow);
+    APInt Unsigned = L.uadd_ov(R, UnsignedOverflow);
+    if (RejectOverflow(SignedOverflow, UnsignedOverflow))
+      return std::nullopt;
+    return Signed == Unsigned ? Signed : std::optional<APInt>();
+  }
+  case Instruction::Sub: {
+    APInt Signed = L.ssub_ov(R, SignedOverflow);
+    APInt Unsigned = L.usub_ov(R, UnsignedOverflow);
+    if (RejectOverflow(SignedOverflow, UnsignedOverflow))
+      return std::nullopt;
+    return Signed == Unsigned ? Signed : std::optional<APInt>();
+  }
+  case Instruction::Mul: {
+    APInt Signed = L.smul_ov(R, SignedOverflow);
+    APInt Unsigned = L.umul_ov(R, UnsignedOverflow);
+    if (RejectOverflow(SignedOverflow, UnsignedOverflow))
+      return std::nullopt;
+    return Signed == Unsigned ? Signed : std::optional<APInt>();
+  }
+  case Instruction::Xor: return L ^ R;
+  case Instruction::And: return L & R;
+  case Instruction::Or: return L | R;
+  case Instruction::Shl:
+  case Instruction::LShr:
+  case Instruction::AShr: {
+    uint64_t Amount = R.getLimitedValue(L.getBitWidth());
+    if (Amount >= L.getBitWidth())
+      return std::nullopt;
+    if (BO.getOpcode() == Instruction::Shl) {
+      APInt Signed = L.sshl_ov(unsigned(Amount), SignedOverflow);
+      APInt Unsigned = L.ushl_ov(unsigned(Amount), UnsignedOverflow);
+      if (RejectOverflow(SignedOverflow, UnsignedOverflow))
+        return std::nullopt;
+      return Signed == Unsigned ? Signed : std::optional<APInt>();
+    }
+    if (auto *PEO = dyn_cast<PossiblyExactOperator>(&BO);
+        PEO && PEO->isExact() && Amount != 0 &&
+        !(L & APInt::getLowBitsSet(L.getBitWidth(), unsigned(Amount))).isZero())
+      return std::nullopt;
+    return BO.getOpcode() == Instruction::LShr ? L.lshr(unsigned(Amount))
+                                                : L.ashr(unsigned(Amount));
+  }
+  default: return std::nullopt;
+  }
+}
+
 PHINode *findStateRoot(Value *V, unsigned Depth) {
   if (Depth > 8) return nullptr;
   if (auto *PN = dyn_cast<PHINode>(V)) return PN;
@@ -108,28 +171,11 @@ std::optional<APInt> evalStateExpr(Value *V, PHINode *Root,
     return std::nullopt;
   }
   auto *BO = dyn_cast<BinaryOperator>(V);
-  if (!BO || hasPoisonGeneratingFlags(BO)) return std::nullopt;
+  if (!BO) return std::nullopt;
   auto L = evalStateExpr(BO->getOperand(0), Root, State, Depth + 1);
   auto R = evalStateExpr(BO->getOperand(1), Root, State, Depth + 1);
   if (!L || !R || L->getBitWidth() != R->getBitWidth()) return std::nullopt;
-  switch (BO->getOpcode()) {
-  case Instruction::Add: return *L + *R;
-  case Instruction::Sub: return *L - *R;
-  case Instruction::Mul: return *L * *R;
-  case Instruction::Xor: return *L ^ *R;
-  case Instruction::And: return *L & *R;
-  case Instruction::Or: return *L | *R;
-  case Instruction::Shl:
-  case Instruction::LShr:
-  case Instruction::AShr: {
-    uint64_t Amount = R->getLimitedValue(L->getBitWidth());
-    if (Amount >= L->getBitWidth()) return std::nullopt;
-    if (BO->getOpcode() == Instruction::Shl) return L->shl(Amount);
-    if (BO->getOpcode() == Instruction::LShr) return L->lshr(Amount);
-    return L->ashr(Amount);
-  }
-  default: return std::nullopt;
-  }
+  return evaluateConcreteStateBinary(*BO, *L, *R);
 }
 
 std::optional<APInt> decodeStateExpr(Value *V, PHINode *Root,

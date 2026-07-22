@@ -76,6 +76,16 @@ static void StoreReturnToState(IRBuilder<> &B, FunctionABISummary &S,
     return;
   }
 
+  if (S.RetKind == ReturnKind::FloatXMM0 ||
+      S.RetKind == ReturnKind::DoubleXMM0 ||
+      S.RetKind == ReturnKind::VectorXMM0) {
+    Value *Ptr = BuildStateRegisterPointer(B, State, ABIReg::XMM0);
+    if (Ptr) {
+      B.CreateStore(Ret, Ptr);
+    }
+    return;
+  }
+
   Value *Ptr = BuildStateRegisterPointer(B, State, ABIReg::RAX);
   if (!Ptr) {
     return;
@@ -84,6 +94,38 @@ static void StoreReturnToState(IRBuilder<> &B, FunctionABISummary &S,
   if (I64) {
     B.CreateStore(I64, Ptr);
   }
+}
+
+static bool RewriteImmediateXMM0Loads(CallInst &NewCall) {
+  if (NewCall.getType()->isVoidTy()) {
+    return false;
+  }
+  bool Changed = false;
+  BasicBlock *BB = NewCall.getParent();
+  for (auto It = std::next(NewCall.getIterator()); It != BB->end(); ++It) {
+    Instruction &I = *It;
+    if (auto RA = IdentifyRegAccess(I)) {
+      if (RA->Reg == ABIReg::XMM0) {
+        if (RA->IsStore) {
+          break;
+        }
+        if (RA->IsLoad) {
+          auto *LI = cast<LoadInst>(&I);
+          IRBuilder<> B(LI);
+          Value *V = CoerceValue(B, &NewCall, LI->getType(),
+                                 "abi.ret.xmm0.use");
+          if (V) {
+            LI->replaceAllUsesWith(V);
+            Changed = true;
+          }
+        }
+      }
+    }
+    if (isa<CallBase>(&I) && &I != &NewCall) {
+      break;
+    }
+  }
+  return Changed;
 }
 
 static bool RewriteImmediateRAXLoads(CallInst &NewCall) {
@@ -245,7 +287,13 @@ static bool RewriteOne(FunctionABISummary &S, CallsiteABIInfo &Info) {
 
   if (S.RetKind != ReturnKind::Void) {
     StoreReturnToState(B, S, *Old, NewCall);
-    RewriteImmediateRAXLoads(*NewCall);
+    if (S.RetKind == ReturnKind::FloatXMM0 ||
+        S.RetKind == ReturnKind::DoubleXMM0 ||
+        S.RetKind == ReturnKind::VectorXMM0) {
+      RewriteImmediateXMM0Loads(*NewCall);
+    } else {
+      RewriteImmediateRAXLoads(*NewCall);
+    }
     if (S.RetKind == ReturnKind::IntRDXRAX) {
       RewriteImmediateRDXLoads(*NewCall);
     }

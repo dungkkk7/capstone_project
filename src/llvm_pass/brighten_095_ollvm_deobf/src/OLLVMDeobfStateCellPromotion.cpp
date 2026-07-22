@@ -231,18 +231,31 @@ bool promoteExactStateCellLoad(
   DominatorTree DT(F);
   LoopInfo Loops(DT);
   Loop *DispatcherLoop = Loops.getLoopFor(LI.getParent());
-  if (!DispatcherLoop || DispatcherLoop->getHeader() != LI.getParent())
+  if (!DispatcherLoop)
     return false;
 
   SmallVector<BasicBlock *, 4> EntryPreds;
-  for (BasicBlock *Pred : predecessors(LI.getParent()))
-    if (!DispatcherLoop->contains(Pred)) {
-      auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
-      if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != LI.getParent())
-        return false;
-      EntryPreds.push_back(Pred);
-    }
-  if (EntryPreds.empty() || (!HasLiveIn && EntryPreds.size() > 1)) return false;
+  if (DispatcherLoop->getHeader() == LI.getParent()) {
+    for (BasicBlock *Pred : predecessors(LI.getParent()))
+      if (!DispatcherLoop->contains(Pred)) {
+        auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
+        if (!Br || !Br->isUnconditional() ||
+            Br->getSuccessor(0) != LI.getParent())
+          return false;
+        EntryPreds.push_back(Pred);
+      }
+    if (EntryPreds.empty() || (!HasLiveIn && EntryPreds.size() > 1))
+      return false;
+  } else {
+    // Nested dispatcher shards commonly load the same state cell from an
+    // interior block.  There is no single edge on which to materialize a
+    // live-in seed, so only accept this layout when MemorySSA proved that
+    // every reaching definition is an exact store (HasLiveIn == false).
+    if (HasLiveIn)
+      return false;
+    if (!DispatcherLoop->contains(LI.getParent()))
+      return false;
+  }
 
   IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
   AllocaInst *Shadow = EntryBuilder.CreateAlloca(

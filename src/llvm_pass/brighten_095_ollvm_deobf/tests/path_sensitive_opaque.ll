@@ -2,7 +2,7 @@
 ; RUN: opt-21 -load-pass-plugin %plugin -ollvm-deobf-report=%t.json -passes=brighten-ollvm-deobf-pass,verify -S %s -o %t.ll
 ; RUN: FileCheck-21 %s < %t.ll
 ; RUN: lli-21 %t.ll
-; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind']=='opaque_edge' and x['proof_engine']=='z3_bitvector_with_dominating_constraints_unsat']; assert d['metrics']['path_constrained_opaque_edges']==3 and len(p)==3 and {x['function'] for x in p}=={'dominated_true','dominated_false','assumed_true'}; assert all(x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and 'dominating_path_constraints_sat' in x['dependencies'] and any(y.startswith('path_constraint_count=') for y in x['dependencies']) for x in p); assert not [x for x in d['proofs'] if x['function'] in ('merge_unknown','freeze_relation_unknown','inconsistent_assumptions') and x['kind']=='opaque_edge']"
+; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind']=='opaque_edge' and x['proof_engine']=='z3_bitvector_with_dominating_constraints_unsat']; assert d['metrics']['path_constrained_opaque_edges']==3 and len(p)==3 and {x['function'] for x in p}=={'dominated_true','dominated_false','assumed_true'}; assert all(x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and 'dominating_path_constraints_sat' in x['dependencies'] and any(y.startswith('path_constraint_count=') for y in x['dependencies']) for x in p); assert not [x for x in d['proofs'] if x['function'] in ('merge_unknown','freeze_relation_unknown','inconsistent_assumptions','shared_successor_unknown') and x['kind']=='opaque_edge']"
 
 declare void @llvm.assume(i1)
 
@@ -105,6 +105,23 @@ no:
   ret i32 0
 }
 
+define i32 @shared_successor_unknown(i32 %x) {
+; CHECK-LABEL: @shared_successor_unknown(
+entry:
+  %guard = icmp ult i32 %x, 10
+  br i1 %guard, label %shared, label %other
+other:
+  br label %shared
+shared:
+  %unknown = icmp ult i32 %x, 20
+; CHECK: br i1 %unknown, label %yes, label %no
+  br i1 %unknown, label %yes, label %no
+yes:
+  ret i32 1
+no:
+  ret i32 0
+}
+
 define i32 @main() {
   %a = call i32 @dominated_true(i32 5)
   %a.ok = icmp eq i32 %a, 1
@@ -116,10 +133,13 @@ define i32 @main() {
   %d.ok = icmp eq i32 %d, 1
   %e = call i32 @freeze_relation_unknown(i32 42)
   %e.ok = icmp eq i32 %e, 1
+  %f = call i32 @shared_successor_unknown(i32 30)
+  %f.ok = icmp eq i32 %f, 0
   %ab = and i1 %a.ok, %b.ok
   %cd = and i1 %c.ok, %d.ok
   %abcd = and i1 %ab, %cd
-  %ok = and i1 %abcd, %e.ok
+  %abcde = and i1 %abcd, %e.ok
+  %ok = and i1 %abcde, %f.ok
   %status = select i1 %ok, i32 0, i32 1
   ret i32 %status
 }

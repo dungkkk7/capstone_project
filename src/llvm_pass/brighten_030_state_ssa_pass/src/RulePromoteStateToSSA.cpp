@@ -53,11 +53,32 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
     if (HasUnsupportedCallBoundary) continue;
 
     struct FieldInfo {
+      enum class ABITypeHint {
+        None,
+        Float,
+        Double,
+        Vector,
+      };
+
       unsigned offset;
       Type *type = nullptr;
       unsigned max_access_size = 0;
+      ABITypeHint abi_type_hint = ABITypeHint::None;
       SmallVector<LoadInst *, 4> loads;
       SmallVector<StoreInst *, 4> stores;
+    };
+
+    auto RecordABITypeHint = [](FieldInfo &Info, Type *Ty) {
+      FieldInfo::ABITypeHint Hint = FieldInfo::ABITypeHint::None;
+      if (Ty->isVectorTy())
+        Hint = FieldInfo::ABITypeHint::Vector;
+      else if (Ty->isDoubleTy())
+        Hint = FieldInfo::ABITypeHint::Double;
+      else if (Ty->isFloatTy())
+        Hint = FieldInfo::ABITypeHint::Float;
+      if (static_cast<unsigned>(Hint) >
+          static_cast<unsigned>(Info.abi_type_hint))
+        Info.abi_type_hint = Hint;
     };
 
     DenseMap<unsigned, FieldInfo> fields;
@@ -106,6 +127,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
               info.max_access_size = sz;
               info.type = LI->getType();
             }
+            RecordABITypeHint(info, LI->getType());
             info.loads.push_back(LI);
           } else if (IsStateRootedPointer(LI->getPointerOperand()))
             UnsupportedStateAccess = true;
@@ -128,6 +150,7 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
               info.max_access_size = sz;
               info.type = SI->getValueOperand()->getType();
             }
+            RecordABITypeHint(info, SI->getValueOperand()->getType());
             info.stores.push_back(SI);
           } else if (IsStateRootedPointer(SI->getPointerOperand()))
             UnsupportedStateAccess = true;
@@ -182,6 +205,9 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
         break;
       }
       Target.max_access_size = unsigned(TargetEnd - Target.offset);
+      if (static_cast<unsigned>(Source.abi_type_hint) >
+          static_cast<unsigned>(Target.abi_type_hint))
+        Target.abi_type_hint = Source.abi_type_hint;
       Target.loads.append(Source.loads.begin(), Source.loads.end());
       Target.stores.append(Source.stores.begin(), Source.stores.end());
     }
@@ -229,6 +255,24 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
           "brighten.state.offset",
           MDNode::get(Ctx, ConstantAsMetadata::get(
                                ConstantInt::get(Type::getInt64Ty(Ctx), offset))));
+      StringRef ABITypeName;
+      switch (info.abi_type_hint) {
+      case FieldInfo::ABITypeHint::Float:
+        ABITypeName = "float";
+        break;
+      case FieldInfo::ABITypeHint::Double:
+        ABITypeName = "double";
+        break;
+      case FieldInfo::ABITypeHint::Vector:
+        ABITypeName = "vector";
+        break;
+      case FieldInfo::ABITypeHint::None:
+        break;
+      }
+      if (!ABITypeName.empty())
+        Alloca->setMetadata(
+            "brighten.state.abi_type",
+            MDNode::get(Ctx, MDString::get(Ctx, ABITypeName)));
       field_allocas[offset] = Alloca;
 
       // Initialize alloca from state

@@ -314,6 +314,20 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
       if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != Latch ||
           !State)
         continue;
+      // This engine clones only latch/header/hub plumbing.  Therefore the
+      // source must itself be the single-block case selected by the hub.
+      // A deeper block inside a multi-block case may have executed additional
+      // control-dependent semantics that require region-wide renaming; merely
+      // seeing a constant latch state does not prove that bypassing the whole
+      // dispatcher iteration is equivalent.
+      bool DirectSwitchCase = false;
+      for (auto Case : SW->cases())
+        if (Case.getCaseSuccessor() == Pred) {
+          DirectSwitchCase = true;
+          break;
+        }
+      if (!DirectSwitchCase)
+        continue;
       ConstantInt *Condition = EvaluateSelector(State, SelectorSteps);
       auto Case = SW->findCaseValue(Condition);
       if (Case == SW->case_default())
@@ -352,6 +366,24 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
       Rewrites.push_back(std::move(R));
     }
     if (!Valid || Rewrites.empty())
+      continue;
+
+    // Do not commit adjacent links of a case chain in the same analysis
+    // snapshot.  If A -> B and B -> C are both threaded simultaneously, B's
+    // outgoing carried values depend on whether B was entered from Hub or
+    // from A's new thread edge.  CandidateRewrite has only one Outgoing vector
+    // and therefore cannot represent that edge-sensitive parallel update.
+    // Commit only chain roots; a later pass invocation may re-analyse the next
+    // layer after B has an explicit carried PHI.
+    SmallPtrSet<BasicBlock *, 32> ThreadedDestinations;
+    for (const CandidateRewrite &R : Rewrites)
+      ThreadedDestinations.insert(R.Dest);
+    SmallVector<CandidateRewrite, 32> NonAdjacentRewrites;
+    for (CandidateRewrite &R : Rewrites)
+      if (!ThreadedDestinations.contains(R.Pred))
+        NonAdjacentRewrites.push_back(std::move(R));
+    Rewrites = std::move(NonAdjacentRewrites);
+    if (Rewrites.empty())
       continue;
 
     // Existing destination PHIs must have an unambiguous value on the old
@@ -432,6 +464,18 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
           auto *UserI = dyn_cast<Instruction>(U.getUser());
           if (UserI && UserI->getParent() == Dest && UserI != Carried &&
               !isa<PHINode>(UserI))
+            LocalUses.push_back(&U);
+          // A PHI use belongs to its predecessor edge, not to the block that
+          // contains the PHI.  When Dest feeds the latch (or another merge),
+          // its outgoing PHI operand must see the carried value selected at
+          // Dest.  Leaving HP here silently restores the previous iteration's
+          // value and can turn a finite state loop into an infinite loop.
+          auto *PN = dyn_cast_or_null<PHINode>(UserI);
+          if (!PN || PN == Carried || PN->getParent() == Dest)
+            continue;
+          unsigned Incoming =
+              PN->getIncomingValueNumForOperand(U.getOperandNo());
+          if (PN->getIncomingBlock(Incoming) == Dest)
             LocalUses.push_back(&U);
         }
         for (Use *U : LocalUses)

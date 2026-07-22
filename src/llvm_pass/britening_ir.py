@@ -64,6 +64,8 @@ import shutil
 import re
 import json
 import time
+import selectors
+import signal
 import hashlib
 import tempfile
 
@@ -87,7 +89,7 @@ PLUGINS = [
     "brighten_095_ollvm_deobf/build/BrightenOLLVMDeobfPass.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,brighten-native-cleanup-final-pass,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-devirt-pass,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,sroa,mem2reg,instcombine<no-verify-fixpoint>,simplifycfg,adce,brighten-native-cleanup-final-pass,verify"
 )
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
@@ -97,7 +99,8 @@ if os.environ.get("BRIGHTEN_DISABLE_EXTERN_BRIDGE", "").lower() in {"1", "true",
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-extern-call-bridge", "")
 PASS_PIPELINE = os.environ.get("BRIGHTEN_PASS_PIPELINE", PASS_PIPELINE)
 DEOBF_ROUND_PIPELINE = (
-    "brighten-ollvm-deobf-pass,jump-threading,simplifycfg,adce,verify"
+    "function(mem2reg),brighten-ollvm-deobf-pass,"
+    "jump-threading,simplifycfg,adce,verify"
 )
 DEOBF_FIXED_POINT_MAX_ROUNDS = 8
 class Color:
@@ -122,11 +125,12 @@ SOUPER_MAXIMUM_COMPONENTS = (
     "and,or,xor,add,sub,mul,shl,lshr,ashr,"
     "eq,ne,ult,slt,ule,sle,select,const"
 )
-SOUPER_CASE_BUDGET_SECONDS = 1800
-SOUPER_MAXIMUM_BUDGET_SECONDS = 1680
+SOUPER_CASE_BUDGET_SECONDS = 300
+SOUPER_MAXIMUM_BUDGET_SECONDS = 300
 SOUPER_SAFE_FALLBACK_RESERVE_SECONDS = 300
-SOUPER_MAXIMUM_SOLVER_TIMEOUT_SECONDS = 60
-SOUPER_SAFE_SOLVER_TIMEOUT_SECONDS = 30
+SOUPER_MAXIMUM_SOLVER_TIMEOUT_SECONDS = 15
+SOUPER_SAFE_SOLVER_TIMEOUT_SECONDS = 15
+SOUPER_DEFAULT_MODE = "safe"
 
 
 def native_contract_report_path(output_path):
@@ -247,26 +251,43 @@ def run_deobf_fixed_point(bitcode_path, opt_bin=None):
         print(f"{Color.RED}[✗] Deobf did not converge within "
               f"{max_rounds} rounds; Souper is not run.{Color.END}")
         return False
-    if ledger.get("status") != "pass_detected_scope":
-        print(f"{Color.RED}[✗] Deobf converged but mandatory residuals "
-              f"remain; Souper is not run. "
+    # Deobfuscation is proof-carrying and fail-closed: a `partial_with_residuals`
+    # status means some dispatcher/expression could not be *proved* recoverable,
+    # not that the IR is wrong.  Every round already verifies the module, so the
+    # converged IR is always valid.  CFF recovery is undecidable in general, so
+    # for arbitrary real-world inputs some residual is expected and must not
+    # veto the whole pipeline.  Souper is itself an equivalence-checked
+    # superoptimizer, so it is safe to run on valid IR that still carries a few
+    # un-flattened dispatchers.  Residuals are therefore reported for
+    # transparency but do not block Souper.  Set BRIGHTEN_DEOBF_STRICT_GATE=1 to
+    # restore the old behaviour that requires a fully clean proof scope.
+    unresolved = [
+        proof for proof in ledger.get("proofs", [])
+        if proof.get("result") == "unresolved"
+    ]
+    strict_gate = os.environ.get(
+        "BRIGHTEN_DEOBF_STRICT_GATE", "0"
+    ).lower() in {"1", "true", "on", "yes"}
+    if unresolved:
+        head_color = Color.RED if strict_gate else Color.YELLOW
+        verb = "Souper is not run" if strict_gate else "Souper still runs"
+        print(f"{head_color}[{'✗' if strict_gate else '!'}] Deobf converged "
+              f"with {len(unresolved)} fail-closed residual(s); {verb}. "
               f"Ledger: {report_path}{Color.END}")
-        unresolved = [
-            proof for proof in ledger.get("proofs", [])
-            if proof.get("result") == "unresolved"
-        ]
         for proof in unresolved[:8]:
             print(
-                f"{Color.RED}    - function={proof.get('function', '?')}, "
+                f"{head_color}    - function={proof.get('function', '?')}, "
                 f"origin={proof.get('origin', '?')}, "
                 f"kind={proof.get('kind', '?')}, "
                 f"reason={proof.get('residual_reason', 'unspecified')}"
                 f"{Color.END}"
             )
         if len(unresolved) > 8:
-            print(f"{Color.RED}    - ... và {len(unresolved) - 8} residual khác."
+            print(f"{head_color}    - ... và {len(unresolved) - 8} residual khác."
                   f"{Color.END}")
-        return False
+        if strict_gate:
+            return False
+        return True
     print(f"{Color.GREEN}[✓] Deobf fixed point after {rounds} rounds. "
           f"Ledger: {report_path}{Color.END}")
     return True
@@ -488,7 +509,7 @@ def _env_enabled(name, default=True):
 
 def souper_mode_flags(mode):
     """Return solver/synthesis flags for a named Souper strength preset."""
-    normalized = (mode or "safe").strip().lower()
+    normalized = (mode or SOUPER_DEFAULT_MODE).strip().lower()
     if normalized in {"safe", "default"}:
         return "safe", []
     if normalized in {"maximum", "max", "aggressive"}:
@@ -529,6 +550,67 @@ def _write_souper_report(output_path, payload):
                   ensure_ascii=False)
     os.replace(tmp_path, report_path)
     return report_path
+
+
+def _run_souper_with_live_log(command, log_handle, env, timeout):
+    """Run Souper while teeing output to its log and the live console."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        cwd=PROJECT_ROOT,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    show_console = _env_enabled("BRIGHTEN_SOUPER_CONSOLE_LOG", True)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                raise subprocess.TimeoutExpired(command, timeout)
+
+            ready = selector.select(min(remaining, 0.5))
+            if not ready:
+                if process.poll() is not None:
+                    break
+                continue
+            for key, _ in ready:
+                chunk = os.read(key.fd, 8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                text = chunk.decode("utf-8", errors="replace")
+                log_handle.write(text)
+                log_handle.flush()
+                if show_console:
+                    for line in text.splitlines():
+                        if line:
+                            print(f"{Color.GRAY}[Souper] {line}{Color.END}")
+        return subprocess.CompletedProcess(command, process.wait())
+    finally:
+        selector.close()
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
 
 
 def optimize_with_souper(input_path, output_path=None, _mode_override=None):
@@ -572,7 +654,9 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
     pipeline = os.environ.get("BRIGHTEN_SOUPER_PIPELINE", SOUPER_PASS_PIPELINE)
     try:
         mode, mode_flags = souper_mode_flags(
-            _mode_override or os.environ.get("BRIGHTEN_SOUPER_MODE", "safe")
+            _mode_override or os.environ.get(
+                "BRIGHTEN_SOUPER_MODE", SOUPER_DEFAULT_MODE
+            )
         )
     except ValueError as exc:
         report_path = _write_souper_report(output_path, {
@@ -633,53 +717,20 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
     print(f"{Color.BLUE}[*] Souper {mode} budget: module={timeout:.0f}s, "
           f"solver-query={solver_timeout}s.{Color.END}")
 
-    def fallback_to_safe(maximum_failure):
-        if mode != "maximum":
-            return False
-        try:
-            os.unlink(temp_output)
-        except FileNotFoundError:
-            pass
-        print(f"{Color.YELLOW}[!] Souper maximum không xử lý an toàn module "
-              f"này; tự động fallback sang safe.{Color.END}")
-        if not optimize_with_souper(
-            input_path, output_path, _mode_override="safe"
-        ):
-            return False
-        fallback_path = souper_report_path(output_path)
-        try:
-            with open(fallback_path, "r", encoding="utf-8") as handle:
-                fallback_report = json.load(handle)
-        except (OSError, ValueError):
-            fallback_report = {
-                "status": "pass",
-                "input": input_path,
-                "output": output_path,
-                "mode": "safe",
-            }
-        fallback_report.pop("schema_version", None)
-        fallback_report.update({
-            "status": "pass_with_fallback",
-            "requested_mode": "maximum",
-            "effective_mode": "safe",
-            "maximum_failure": maximum_failure,
-        })
-        report_path = _write_souper_report(output_path, fallback_report)
-        print(f"{Color.GREEN}[✓] Souper safe fallback hoàn tất. Report: "
-              f"{report_path}{Color.END}")
-        return True
-
     def publish_verified_passthrough(souper_failure):
-        """Publish the proved deobf IR when optional safe Souper gives up.
+        """Publish verified IR when Souper gives up within its budget.
 
-        Safe mode is an optimization boundary, not a semantic acceptance
+        Souper is an optional optimization boundary, not a semantic acceptance
         gate.  A timeout/non-zero exit must not discard an already verified
-        fixed point, but the report must state plainly that Souper produced no
-        accepted replacement.
+        fixed point.  In particular, maximum mode must not start another long
+        safe-mode attempt after it gives up on a complex module.
         """
-        if mode != "safe" or not _env_enabled(
-            "BRIGHTEN_SOUPER_SAFE_PASSTHROUGH", True
-        ):
+        passthrough_enabled = _env_enabled("BRIGHTEN_SOUPER_PASSTHROUGH", True)
+        if mode == "safe":
+            passthrough_enabled = passthrough_enabled and _env_enabled(
+                "BRIGHTEN_SOUPER_SAFE_PASSTHROUGH", True
+            )
+        if not passthrough_enabled:
             return False
         verify_timeout = min(30.0, max(1.0, timeout))
         verify_command = [
@@ -707,7 +758,7 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
                 "passthrough_verification": "failed",
                 "verification_error": verification_error,
             })
-            print(f"{Color.RED}[✗] Souper safe fallback IR verification "
+            print(f"{Color.RED}[✗] Souper {mode} passthrough IR verification "
                   f"failed. Report: {report_path}{Color.END}")
             return False
         if input_path != output_path:
@@ -734,15 +785,16 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
             "passthrough_verification": "pass",
             "optimized_by_souper": False,
         })
-        print(f"{Color.YELLOW}[✓] Souper safe không hoàn tất; giữ nguyên IR "
+        print(f"{Color.YELLOW}[✓] Souper {mode} không hoàn tất; bỏ qua tối ưu "
+              f"và giữ nguyên IR "
               f"deobf đã verify. Report: {report_path}{Color.END}")
         return True
 
     try:
+        print(f"{Color.BLUE}[*] Souper live log: {log_path}{Color.END}")
         with open(log_path, "w", encoding="utf-8") as log_handle:
-            result = subprocess.run(
-                cmd, stdout=log_handle, stderr=subprocess.STDOUT, text=True,
-                env=env, timeout=timeout, cwd=PROJECT_ROOT,
+            result = _run_souper_with_live_log(
+                cmd, log_handle=log_handle, env=env, timeout=timeout
             )
         diagnostics = summarize_souper_log(log_path)
         if result.returncode != 0 or not os.path.isfile(temp_output):
@@ -785,8 +837,7 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
                 "diagnostics": diagnostics,
                 "error": error,
             }
-            return (fallback_to_safe(failure) or
-                    publish_verified_passthrough(failure))
+            return publish_verified_passthrough(failure)
         output_size = os.path.getsize(temp_output)
         os.replace(temp_output, output_path)
         report_path = _write_souper_report(output_path, {
@@ -855,8 +906,7 @@ def optimize_with_souper(input_path, output_path=None, _mode_override=None):
             "detailed_diagnostics": debug_level >= 2,
             "diagnostics": diagnostics,
         }
-        return (fallback_to_safe(failure) or
-                publish_verified_passthrough(failure))
+        return publish_verified_passthrough(failure)
     except OSError as exc:
         report_path = _write_souper_report(output_path, {
             "status": "failed",
@@ -983,9 +1033,15 @@ def run_final_native_audit(output_path, opt_bin):
         command.append("-brighten-native-strict")
     command.extend([
         "-passes", (
-            "brighten-native-cleanup-post-souper-pass,"
+            # The module has already crossed the production O3 boundary
+            # before the deobfuscation/Souper stages.  Re-running the full
+            # IPO pipeline here is both redundant and unbounded on CFG-heavy
+            # modules.  Souper only introduces local SSA replacements, so a
+            # bounded scalar cleanup is the appropriate publication step.
+            "function(instcombine<no-verify-fixpoint>,simplifycfg,adce),"
+            "globaldce,"
             "brighten-publish-metadata-cleanup-pass,"
-            "default<O3>,verify"
+            "brighten-native-cleanup-post-souper-pass,verify"
         ),
         output_path,
         "-o", temporary,
@@ -1216,7 +1272,12 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         o3_boundary, 1
     )
     pre_o3_pipeline += ",verify"
-    post_o3_pipeline = "default<O3>" + post_o3_tail
+    llvm_opt_level = os.environ.get("BRIGHTEN_LLVM_OPT_LEVEL", "O3").upper()
+    if llvm_opt_level not in {"O0", "O1", "O2", "O3", "OS", "OZ"}:
+        print(f"{Color.RED}[✗] BRIGHTEN_LLVM_OPT_LEVEL không hợp lệ: "
+              f"{llvm_opt_level}.{Color.END}")
+        return False
+    post_o3_pipeline = f"default<{llvm_opt_level}>" + post_o3_tail
 
     descriptor, early_deobf_path = tempfile.mkstemp(
         prefix=".brighten-pre-deobf-",
@@ -1260,15 +1321,23 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                       f"(code={early_res.returncode}): "
                       f"{early_res.stderr}{Color.END}")
                 return False
-            print(f"{Color.BLUE}[*] Chạy OLLVM deobfuscation fixed-point "
-                  f"trên canonical IR trước native cleanup/O3...{Color.END}")
-            if not run_deobf_fixed_point(early_deobf_path, opt_bin):
-                early_ledger = deobf_proof_ledger_path(early_deobf_path)
-                if os.path.isfile(early_ledger):
-                    shutil.copyfile(
-                        early_ledger, deobf_proof_ledger_path(output_path)
-                    )
-                return False
+            early_deobf_enabled = os.environ.get(
+                "BRIGHTEN_EARLY_DEOBF", "0"
+            ).lower() in {"1", "true", "on", "yes"}
+            if early_deobf_enabled:
+                print(f"{Color.BLUE}[*] Chạy OLLVM deobfuscation fixed-point "
+                      f"trên canonical IR trước native cleanup/O3...{Color.END}")
+                if not run_deobf_fixed_point(early_deobf_path, opt_bin):
+                    early_ledger = deobf_proof_ledger_path(early_deobf_path)
+                    if os.path.isfile(early_ledger):
+                        shutil.copyfile(
+                            early_ledger, deobf_proof_ledger_path(output_path)
+                        )
+                    return False
+            else:
+                print(f"{Color.BLUE}[*] Hoãn OLLVM deobfuscation đến sau "
+                      f"native State/stack SSA để tránh rewrite memory-State "
+                      f"không ổn định.{Color.END}")
             print(f"{Color.GRAY}    Phase 3 native cleanup / pre-O3: "
                   f"{' '.join(pre_o3_cmd)}{Color.END}")
             pre_o3_res = subprocess.run(
@@ -1280,10 +1349,11 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
                       f"(code={pre_o3_res.returncode}): "
                       f"{pre_o3_res.stderr}{Color.END}")
                 return False
-            print(f"{Color.BLUE}[*] Chuẩn hóa memory-form dispatcher thành "
-                  f"SSA trước O3...{Color.END}")
-            if not run_deobf_normalization_round(pre_o3_path, opt_bin):
-                return False
+            if early_deobf_enabled:
+                print(f"{Color.BLUE}[*] Chuẩn hóa memory-form dispatcher thành "
+                      f"SSA trước O3...{Color.END}")
+                if not run_deobf_normalization_round(pre_o3_path, opt_bin):
+                    return False
             print(f"{Color.GRAY}    Phase 4 O3 / final native cleanup: "
                   f"{' '.join(cmd)}{Color.END}")
             res = subprocess.run(cmd, capture_output=True, text=True,

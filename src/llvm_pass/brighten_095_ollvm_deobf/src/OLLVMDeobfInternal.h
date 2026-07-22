@@ -382,7 +382,9 @@ unsigned recoverMemoryJoinTransitions(
 // Reporting (OLLVMDeobfReporting.cpp)
 std::string describeDispatcherResidual(SwitchInst &SI);
 bool recoverCompareLadders(Function &F, Metrics &M,
-                                  SmallVectorImpl<ProofRecord> &Proofs);
+                           SmallVectorImpl<ProofRecord> &Proofs);
+bool recoverFiniteBranchDispatchers(
+    Function &F, Metrics &M, SmallVectorImpl<ProofRecord> &Proofs);
 bool recoverDispatchers(Function &F, Metrics &M,
                                SmallVectorImpl<ProofRecord> &Proofs);
 void reconcileDispatcherProofs(Module &M, Metrics &Stats,
@@ -813,6 +815,17 @@ public:
       // repeated uses agree without introducing a false relation to poison.
       Result = makeLeaf(V);
     }
+    // Any remaining integer value the theory does not model exactly (a vector
+    // extractelement, an unsupported binary op, a call, ...) is a deterministic
+    // leaf: model it as one uninterpreted symbol keyed by its Value*.  Because
+    // the same definition maps to the same symbol on both sides of an
+    // equivalence query, an affine/AC identity whose leaves include such a
+    // value is still provable; abstracting a shared subterm only makes the
+    // query strictly more general (universally quantified over the symbol), so
+    // it can never manufacture a false Proved -- at worst a false Disproved,
+    // which merely declines the speculative rewrite.
+    if (!Result && V->getType()->isIntegerTy())
+      Result = makeLeaf(V);
     TranslationStack.erase(V);
     if (Result) Cache.emplace(V, *Result);
     return Result;
@@ -881,6 +894,7 @@ struct TestFlagCandidate {
 
 struct ProvenTransition {
   BasicBlock *Source = nullptr;
+  SelectInst *Selector = nullptr;
   Value *Condition = nullptr;
   BasicBlock *TrueTarget = nullptr;
   BasicBlock *FalseTarget = nullptr;

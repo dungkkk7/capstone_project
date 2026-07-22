@@ -1,5 +1,7 @@
 #include "OLLVMDeobfInternal.h"
 
+#include "llvm/Transforms/Utils/Cloning.h"
+
 namespace brighten_ollvm_deobf {
 
 // Recover a dispatcher as one cyclic lookup region rather than assigning an
@@ -51,7 +53,13 @@ bool tryRecoverCyclicStateFamilyDispatcher(
   BasicBlock *Current = SI.getParent();
   unsigned SwitchCount = 0;
   BasicBlock *TerminalUnknownSink = nullptr;
-  for (unsigned Depth = 0; Depth != 32; ++Depth) {
+  // Native cleanup can shard a single flattened dispatcher into a long
+  // default-linked ring interleaved with affine equality guards.  Bound the
+  // walk by the actual block count (plus slack) rather than a small constant
+  // so a genuinely large ring is still collected exactly; the ShardBlocks
+  // duplicate guard and the ring-closure break keep this terminating.
+  const unsigned MaxShards = F->size() + 8;
+  for (unsigned Depth = 0; Depth != MaxShards; ++Depth) {
     BasicBlock *BB = Current;
     if (!ShardBlocks.insert(BB).second) return false;
     Shards.emplace_back();
@@ -110,9 +118,11 @@ bool tryRecoverCyclicStateFamilyDispatcher(
     return false;
 
   // Resolve transparent nodes backwards.  The next shard's state PHI names
-  // the exact value carried by the transparent predecessor, which must itself
-  // be an integer PHI defined in that predecessor.  This is structural SSA
-  // identity, not a block-name or state-number heuristic.
+  // the exact value carried by the transparent predecessor.  Canonical loop
+  // form may either materialize a PHI in that predecessor or forward the
+  // preceding shard's SSA state unchanged through the empty block.  Accept
+  // only those two structural identities: an arbitrary expression in the
+  // transparent block could change the state and is not lookup plumbing.
   Diag.Stage = "transparent-state-carrier-resolution";
   for (unsigned Pass = 0; Pass != Shards.size(); ++Pass) {
     bool Progress = false;
@@ -123,12 +133,22 @@ bool tryRecoverCyclicStateFamilyDispatcher(
       if (!To.State || To.State->getParent() != To.Block) continue;
       int Incoming = To.State->getBasicBlockIndex(S.Block);
       if (Incoming < 0) return false;
-      auto *Carrier = dyn_cast<PHINode>(To.State->getIncomingValue(Incoming));
-      if (!Carrier || Carrier->getParent() != S.Block ||
-          !Carrier->getType()->isIntegerTy())
+      Value *IncomingState = To.State->getIncomingValue(Incoming);
+      auto *LocalCarrier = dyn_cast<PHINode>(IncomingState);
+      if (LocalCarrier && LocalCarrier->getParent() == S.Block &&
+          LocalCarrier->getType()->isIntegerTy()) {
+        S.State = LocalCarrier;
+        S.Expression = LocalCarrier;
+        Progress = true;
+        continue;
+      }
+
+      Shard &From = Shards[(I + Shards.size() - 1) % Shards.size()];
+      if (!From.State || IncomingState != From.State ||
+          !IncomingState->getType()->isIntegerTy())
         return false;
-      S.State = Carrier;
-      S.Expression = Carrier;
+      S.State = From.State;
+      S.Expression = From.State;
       Progress = true;
     }
     if (!Progress) break;
@@ -143,6 +163,17 @@ bool tryRecoverCyclicStateFamilyDispatcher(
     Shard &From = Shards[I];
     Shard &To = Shards[(I + 1) % Shards.size()];
     if (To.State == From.State) {
+      // A one-shard dispatcher can have explicit switch cases whose successor
+      // is the dispatcher block itself.  Those are state transitions carried
+      // by distinct parallel CFG edges, not a transparent lookup-ring wrap.
+      // Resolve and clone them by exact PHI edge occurrence below.
+      bool HasExplicitSelfTransition =
+          From.Lookup && llvm::any_of(From.Lookup->cases(), [&](auto Case) {
+            return Case.getCaseSuccessor() == From.Block;
+          });
+      if (Shards.size() == 1 && From.Block == To.Block &&
+          HasExplicitSelfTransition)
+        continue;
       // Sharing one SSA state across consecutive lookup shards is valid while
       // the definition dominates both shards.  On the wrap edge into the
       // state PHI's own block, however, the PHI may receive a different
@@ -328,6 +359,7 @@ bool tryRecoverCyclicStateFamilyDispatcher(
   struct PathStep {
     BasicBlock *Block = nullptr;
     BasicBlock *IncomingBlock = nullptr;
+    int IncomingOccurrence = -1;
   };
   struct ResolvedPath {
     SmallVector<PathStep, 24> Steps;
@@ -353,7 +385,7 @@ bool tryRecoverCyclicStateFamilyDispatcher(
     SmallPtrSet<BasicBlock *, 8> SeenPrefix;
     while (Prefix) {
       if (!SeenPrefix.insert(Prefix).second) return std::nullopt;
-      Result.Steps.push_back({Prefix, Incoming});
+      Result.Steps.push_back({Prefix, Incoming, -1});
       auto *Br = dyn_cast<BranchInst>(Prefix->getTerminator());
       if (!Br || !Br->isUnconditional()) return std::nullopt;
       BasicBlock *Next = Br->getSuccessor(0);
@@ -364,7 +396,7 @@ bool tryRecoverCyclicStateFamilyDispatcher(
     }
     for (unsigned Visited = 0; Visited != Shards.size(); ++Visited) {
       Shard &S = Shards[Index];
-      Result.Steps.push_back({S.Block, Incoming});
+      Result.Steps.push_back({S.Block, Incoming, -1});
       auto It = S.Cases.find(Raw);
       if (It != S.Cases.end()) {
         BasicBlock *Target = It->second;
@@ -385,6 +417,49 @@ bool tryRecoverCyclicStateFamilyDispatcher(
           Result.Owner = Tail->Owner;
           return Result;
         }
+        if (Target == S.Block && Shards.size() == 1) {
+          // Map this exact switch edge to the corresponding PHI occurrence.
+          // Multiple cases may target the same dispatcher block and LLVM PHIs
+          // carry one incoming value per edge, so block-only lookup is not
+          // sufficient and can silently select the wrong next state.
+          unsigned SuccessorIndex = S.Lookup->getNumSuccessors();
+          for (auto Case : S.Lookup->cases()) {
+            auto CaseRaw = decodeStateExpr(
+                S.Expression, S.State, Case.getCaseValue()->getValue());
+            if (CaseRaw && *CaseRaw == Raw) {
+              SuccessorIndex = Case.getSuccessorIndex();
+              break;
+            }
+          }
+          if (SuccessorIndex == S.Lookup->getNumSuccessors())
+            return std::nullopt;
+          unsigned EdgeOccurrence = 0;
+          for (unsigned Edge = 0; Edge != SuccessorIndex; ++Edge)
+            if (S.Lookup->getSuccessor(Edge) == S.Block) ++EdgeOccurrence;
+          int StateIncomingIndex = -1;
+          unsigned SeenOccurrence = 0;
+          for (unsigned PhiIndex = 0;
+               PhiIndex != S.State->getNumIncomingValues(); ++PhiIndex) {
+            if (S.State->getIncomingBlock(PhiIndex) != S.Block) continue;
+            if (SeenOccurrence++ == EdgeOccurrence) {
+              StateIncomingIndex = int(PhiIndex);
+              break;
+            }
+          }
+          if (StateIncomingIndex < 0) return std::nullopt;
+          ConstantInt *Next = asTransitionConstant(
+              S.State->getIncomingValue(unsigned(StateIncomingIndex)),
+              S.Block);
+          if (!Next || Next->getValue() == Raw) return std::nullopt;
+          auto Tail = Resolve(Next->getValue(), Index, nullptr, S.Block,
+                              Depth + 1);
+          if (!Tail || Tail->Steps.empty()) return std::nullopt;
+          Tail->Steps.front().IncomingOccurrence = int(EdgeOccurrence);
+          Result.Steps.append(Tail->Steps.begin(), Tail->Steps.end());
+          Result.Target = Tail->Target;
+          Result.Owner = Tail->Owner;
+          return Result;
+        }
         if (ShardBlocks.contains(Target)) return std::nullopt;
         Result.Target = Target;
         Result.Owner = S.Block;
@@ -394,6 +469,21 @@ bool tryRecoverCyclicStateFamilyDispatcher(
       Index = (Index + 1) % Shards.size();
     }
     return std::nullopt;
+  };
+
+  auto StepIncomingValue = [](PHINode &Phi,
+                              const PathStep &Step) -> Value * {
+    if (Step.IncomingOccurrence >= 0) {
+      unsigned Wanted = unsigned(Step.IncomingOccurrence);
+      unsigned Seen = 0;
+      for (unsigned Index = 0; Index != Phi.getNumIncomingValues(); ++Index) {
+        if (Phi.getIncomingBlock(Index) != Step.IncomingBlock) continue;
+        if (Seen++ == Wanted) return Phi.getIncomingValue(Index);
+      }
+      return nullptr;
+    }
+    int Index = Phi.getBasicBlockIndex(Step.IncomingBlock);
+    return Index < 0 ? nullptr : Phi.getIncomingValue(unsigned(Index));
   };
 
   struct Variant {
@@ -496,7 +586,7 @@ bool tryRecoverCyclicStateFamilyDispatcher(
       // Preflight exact PHI translation for every skipped block and target.
       for (const PathStep &Step : Path->Steps)
         for (PHINode &Phi : Step.Block->phis())
-          if (Phi.getBasicBlockIndex(Step.IncomingBlock) < 0) {
+          if (!StepIncomingValue(Phi, Step)) {
             Diag.Stage = (Twine("finite-step-phi-uncovered:block=") +
                           Step.Block->getName() + ";incoming=" +
                           Step.IncomingBlock->getName())
@@ -593,8 +683,8 @@ bool tryRecoverCyclicStateFamilyDispatcher(
       };
       for (const PathStep &Step : V.Path.Steps) {
         for (PHINode &Phi : Step.Block->phis()) {
-          Value *Incoming =
-              Phi.getIncomingValueForBlock(Step.IncomingBlock);
+          Value *Incoming = StepIncomingValue(Phi, Step);
+          if (!Incoming) return false;
           if (!RequireAvailable(Incoming,
                                 Twine("phi=") + Phi.getName()))
             return false;
@@ -800,8 +890,8 @@ bool tryRecoverCyclicStateFamilyDispatcher(
       };
       for (const PathStep &Step : V.Path.Steps) {
         for (PHINode &Phi : Step.Block->phis()) {
-          if (!IsAvailable(
-                  Phi.getIncomingValueForBlock(Step.IncomingBlock))) {
+          Value *Incoming = StepIncomingValue(Phi, Step);
+          if (!Incoming || !IsAvailable(Incoming)) {
             Diag.Stage = (Twine("case-livein-path-phi:def=") +
                           Phi.getName() + ";source=" +
                           Plan.Input->Source->getName())
@@ -845,9 +935,11 @@ bool tryRecoverCyclicStateFamilyDispatcher(
   };
   auto CloneStep = [&](const PathStep &Step, Instruction *Before,
                        DenseMap<const Value *, Value *> &Map) {
-    for (PHINode &Phi : Step.Block->phis())
-      Map[&Phi] = Translate(
-          Phi.getIncomingValueForBlock(Step.IncomingBlock), Map);
+    for (PHINode &Phi : Step.Block->phis()) {
+      Value *Incoming = StepIncomingValue(Phi, Step);
+      if (!Incoming) return false;
+      Map[&Phi] = Translate(Incoming, Map);
+    }
     for (Instruction &I : *Step.Block) {
       if (isa<PHINode>(I) || I.isTerminator() || isa<DbgInfoIntrinsic>(I))
         continue;
@@ -859,6 +951,7 @@ bool tryRecoverCyclicStateFamilyDispatcher(
       Clone->insertBefore(Before->getIterator());
       Map[&I] = Clone;
     }
+    return true;
   };
 
   DenseMap<BasicBlock *, DenseMap<const Value *, PHINode *>> LiveInPhis;
@@ -888,26 +981,37 @@ bool tryRecoverCyclicStateFamilyDispatcher(
           It != SourceCarrierOwners.end())
         for (auto &[Def, Owner] : It->second) {
           auto OwnerIt = LiveInPhis.find(Owner);
-          if (OwnerIt == LiveInPhis.end() || !OwnerIt->second.count(Def))
-            report_fatal_error("missing cyclic region source carrier");
+          if (OwnerIt == LiveInPhis.end() || !OwnerIt->second.count(Def)) {
+            // Incomplete commit: the driver runs this engine under a private
+            // transaction, so returning false rolls the partial rewrite back
+            // to the exact pre-attempt body instead of aborting opt.
+            Diag.Stage = "transaction-commit-missing-source-carrier";
+            return false;
+          }
           Map[Def] = OwnerIt->second.lookup(Def);
         }
       for (const PathStep &Step : V.Path.Steps)
-        CloneStep(Step, EdgeBranch, Map);
+        if (!CloneStep(Step, EdgeBranch, Map)) {
+          Diag.Stage = "transaction-commit-step-phi-edge-mismatch";
+          return false;
+        }
       for (PHINode &Phi : V.Path.Target->phis()) {
         if (Phi.getName().contains(".deobf.region.livein")) continue;
         Value *Incoming = Phi.getIncomingValueForBlock(V.Path.Owner);
         Value *Translated = Translate(Incoming, Map);
-        if (Translated->getType() != Phi.getType())
-          report_fatal_error("cyclic region target PHI translation type mismatch");
+        if (Translated->getType() != Phi.getType()) {
+          Diag.Stage = "transaction-commit-target-phi-type-mismatch";
+          return false;
+        }
         Phi.addIncoming(Translated, Edge);
       }
       if (auto It = LiveInPhis.find(V.Path.Target); It != LiveInPhis.end())
         for (auto &[Def, Bridge] : It->second) {
           Value *Translated = Translate(const_cast<Value *>(Def), Map);
-          if (Translated->getType() != Bridge->getType())
-            report_fatal_error(
-                "cyclic region live-in translation type mismatch");
+          if (Translated->getType() != Bridge->getType()) {
+            Diag.Stage = "transaction-commit-live-in-type-mismatch";
+            return false;
+          }
           Bridge->addIncoming(Translated, Edge);
         }
       Targets.push_back(Edge);
@@ -983,9 +1087,13 @@ bool tryRecoverCyclicStateFamilyDispatcher(
     }
     for (PHINode *Phi : InsertedPhis)
       for (Value *Incoming : Phi->incoming_values())
-        if (isa<PoisonValue>(Incoming))
-          report_fatal_error(
-              "cyclic region SSAUpdater produced an uncovered path");
+        if (isa<PoisonValue>(Incoming)) {
+          // A downstream external use is not covered by any proved case-entry
+          // bridge on this path.  Fail closed; the driver transaction restores
+          // the exact pre-attempt body so no poison reaches committed IR.
+          Diag.Stage = "transaction-commit-ssa-updater-uncovered-path";
+          return false;
+        }
   }
 
   std::string Origin = SI.getParent()->getName().str();

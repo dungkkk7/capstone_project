@@ -113,6 +113,24 @@ IntAffine parsePointerAffine(Value *V, unsigned Depth,
       return parsePointerAffine(Phi->getIncomingValue(Index), Depth + 1,
                                 Header, Pred, PathPreds);
     }
+    // A frame pointer PHI may contain separately cloned GEPs for the same
+    // byte offset.  Treat it as one canonical address only when every
+    // incoming arm has the identical affine form; differing arms remain
+    // unknown and therefore fail closed.
+    if (!PathPreds && !Header && !Pred) {
+      IntAffine Common;
+      for (Value *Incoming : Phi->incoming_values()) {
+        IntAffine Arm = parsePointerAffine(Incoming, Depth + 1,
+                                           Header, Pred, PathPreds);
+        if (!Arm.Valid || Arm.Terms.empty()) return IntAffine();
+        if (!Common.Valid)
+          Common = Arm;
+        else if (!sameAffineTerms(Common, Arm) ||
+                 Common.Offset != Arm.Offset)
+          return IntAffine();
+      }
+      if (Common.Valid) return Common;
+    }
   }
   V = V->stripPointerCasts();
   if (isa<GlobalValue>(V) || isa<Argument>(V) || isa<AllocaInst>(V)) {

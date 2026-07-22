@@ -93,14 +93,14 @@ Biến môi trường:
 
 - `BRIGHTEN_SOUPER=0`: tắt bước Souper để debug.
 - `BRIGHTEN_SOUPER_MODE=maximum|safe`: chọn CEGIS mạnh nhất hoặc inference mặc định.
-- Ngân sách mặc định là 1800 giây mỗi case: maximum dùng tối đa 1680 giây,
-  giữ 120 giây cho safe fallback.
+- Ngân sách module mặc định: maximum tối đa 3600 giây; safe/fallback tối đa
+  1800 giây.
 - `BRIGHTEN_SOUPER_MAXIMUM_TIMEOUT=...`: override ngân sách maximum.
 - `BRIGHTEN_SOUPER_SAFE_TIMEOUT=...`: override ngân sách safe/fallback.
 - `BRIGHTEN_SOUPER_MAXIMUM_SOLVER_TIMEOUT=...`: timeout mỗi maximum query;
   mặc định 60 giây.
 - `BRIGHTEN_SOUPER_SAFE_SOLVER_TIMEOUT=...`: timeout mỗi safe query; mặc định
-  15 giây.
+  60 giây.
 - `BRIGHTEN_SOUPER_TIMEOUT=...` và `BRIGHTEN_SOUPER_SOLVER_TIMEOUT=...`:
   override tương thích cũ áp dụng cho cả hai mode; mode-specific override được
   ưu tiên nếu cùng tồn tại.

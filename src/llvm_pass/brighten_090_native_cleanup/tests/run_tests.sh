@@ -38,6 +38,7 @@ fi
 grep -Eq 'store i32 7, ptr (%frame\.slot|%native\.frame\.slot|getelementptr .*@frame_storage_backing\.main)' \
   "$STACK_DATA_SELECT_OUT"
 grep -Eq 'store i32 9, ptr %local\.frame\.slot' "$STACK_DATA_SELECT_OUT"
+grep -Eq 'store i32 13, ptr %dynamic\.frame\.slot' "$STACK_DATA_SELECT_OUT"
 grep -Eq 'store i32 11, ptr %argument\.frame\.slot' "$STACK_DATA_SELECT_OUT"
 
 SCANF_SEED_OUT="$(mktemp)"
@@ -102,9 +103,76 @@ grep -Eq 'define internal x86_64_sysvcc i32 @callback_sub_test\.qsort_callback\(
   "$QSORT_OUT"
 grep -Eq 'declare x86_64_sysvcc void @qsort\(ptr, i64, i64, ptr\)' \
   "$QSORT_OUT"
-grep -Eq 'call x86_64_sysvcc void @qsort\(ptr null, i64 0, i64 16, ptr @callback_sub_test\.qsort_callback\)' \
+grep -Eq 'call x86_64_sysvcc void @qsort\(ptr null, i64 0, i64 16, ptr (nonnull )?@callback_sub_test\.qsort_callback\)' \
+  "$QSORT_OUT"
+if [ "$(grep -Ec 'call x86_64_sysvcc void @qsort\(ptr null, i64 0, i64 16, ptr (nonnull )?@callback_sub_test\.qsort_callback\)' "$QSORT_OUT")" -ne 2 ]; then
+  echo "FAIL: repeated qsort uses did not share the native callback adapter" >&2
+  exit 1
+fi
+if grep -Eq '^define .*@callback_sub_test\(\)' "$QSORT_OUT"; then
+  echo "FAIL: lifted zero-argument qsort callback wrapper survived" >&2
+  exit 1
+fi
+grep -Eq 'store i32 7, ptr getelementptr .*@__mcsema_reg_state' \
   "$QSORT_OUT"
 rm -f "$QSORT_OUT"
+
+DYNAMIC_FRAME_OUT="$(mktemp)"
+trap 'rm -f "$DYNAMIC_FRAME_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/dynamic_frame_region_localization.ll" -o "$DYNAMIC_FRAME_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/dynamic_frame_region_localization.ll" \
+  < "$DYNAMIC_FRAME_OUT"
+rm -f "$DYNAMIC_FRAME_OUT"
+
+LOOP_FRAME_OUT="$(mktemp)"
+trap 'rm -f "$LOOP_FRAME_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/loop_carried_write_only_frame_slot.ll" -o "$LOOP_FRAME_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/loop_carried_write_only_frame_slot.ll" \
+  < "$LOOP_FRAME_OUT"
+rm -f "$LOOP_FRAME_OUT"
+
+FINITE_FRAME_MERGE_OUT="$(mktemp)"
+trap 'rm -f "$FINITE_FRAME_MERGE_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/finite_frame_pointer_merge_compaction.ll" \
+  -o "$FINITE_FRAME_MERGE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/finite_frame_pointer_merge_compaction.ll" \
+  < "$FINITE_FRAME_MERGE_OUT"
+rm -f "$FINITE_FRAME_MERGE_OUT"
+
+SIGNED_COMPARE_OUT="$(mktemp)"
+AGGREGATE_PASSTHROUGH_OUT="$(mktemp)"
+trap 'rm -f "$SIGNED_COMPARE_OUT" "$AGGREGATE_PASSTHROUGH_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/recovered_signed_compare_mba.ll" -o "$SIGNED_COMPARE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/recovered_signed_compare_mba.ll" < "$SIGNED_COMPARE_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/aggregate_passthrough_frame.ll" \
+  -o "$AGGREGATE_PASSTHROUGH_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/aggregate_passthrough_frame.ll" \
+  < "$AGGREGATE_PASSTHROUGH_OUT"
+rm -f "$SIGNED_COMPARE_OUT" "$AGGREGATE_PASSTHROUGH_OUT"
+
+AFFINE_CHAIN_OUT="$(mktemp)"
+trap 'rm -f "$AFFINE_CHAIN_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/affine_forwarding_chain.ll" -o "$AFFINE_CHAIN_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/affine_forwarding_chain.ll" < "$AFFINE_CHAIN_OUT"
+rm -f "$AFFINE_CHAIN_OUT"
 
 WORK_ARRAY_OUT="$(mktemp)"
 trap 'rm -f "$WORK_ARRAY_OUT"' EXIT
@@ -125,6 +193,17 @@ trap 'rm -f "$WORK_ARRAY_UNMAPPED_OUT"' EXIT
   "$ROOT/tests/recovered_work_array_unmapped_negative_fault.ll" \
   < "$WORK_ARRAY_UNMAPPED_OUT"
 rm -f "$WORK_ARRAY_UNMAPPED_OUT"
+
+UNUSED_SHUFFLE_OUT="$(mktemp)"
+trap 'rm -f "$UNUSED_SHUFFLE_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/unused_shuffle_second_operand.ll" \
+  -o "$UNUSED_SHUFFLE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/unused_shuffle_second_operand.ll" \
+  < "$UNUSED_SHUFFLE_OUT"
+rm -f "$UNUSED_SHUFFLE_OUT"
 
 MISSING_SCANF_OUT="$(mktemp)"
 trap 'rm -f "$MISSING_SCANF_OUT"' EXIT
@@ -346,6 +425,17 @@ if grep -Eq '__mcsema_reg_state|inttoptr|native_state_storage' \
 fi
 grep -Eq 'ret i32 7' "$NULL_BOUNDARY_OUT"
 
+MULTI_OWNER_STATE_OUT="$(mktemp)"
+trap 'rm -f "$MULTI_OWNER_STATE_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,default<O3>,brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/multi_owner_state_localization.ll" \
+  -o "$MULTI_OWNER_STATE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/multi_owner_state_localization.ll" \
+  < "$MULTI_OWNER_STATE_OUT"
+
 EXPLICIT_NATIVE_OUT="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
@@ -441,8 +531,16 @@ fi
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
   "$ROOT/tests/entry_rsp_seed_not_rbp.ll" -o "$ENTRY_RSP_SEED_OUT"
-grep -Eq 'native\.stack\.entry\.delta = sub i64 %(address|state_2312), %native\.boundary\.rsp' \
-  "$ENTRY_RSP_SEED_OUT"
+if grep -Eq 'native\.local\.region = alloca \[32 x i8\]' \
+    "$ENTRY_RSP_SEED_OUT"; then
+  grep -Eq 'getelementptr inbounds \[32 x i8\], ptr %native\.local\.region, i64 0, i64 32' \
+    "$ENTRY_RSP_SEED_OUT"
+  grep -Eq 'getelementptr i8, ptr %native\.local\.region\.top, i64 -32' \
+    "$ENTRY_RSP_SEED_OUT"
+else
+  grep -Eq 'native\.stack\.entry\.delta = sub i64 %(address|state_2312), %native\.boundary\.rsp' \
+    "$ENTRY_RSP_SEED_OUT"
+fi
 if grep -Eq 'native\.stack\.entry\.delta = sub i64 %state_2312, %native\.boundary\.rsp' \
     "$ENTRY_RSP_SEED_OUT"; then
   grep -Eq 'getelementptr i8, ptr %native\.stack\.gep, i64 -32' \
@@ -476,11 +574,15 @@ fi
   -brighten-native-state-ssa -S \
   "$ROOT/tests/scanf_absolute_frame_anchor_delta.ll" \
   -o "$SCANF_ABSOLUTE_FRAME_OUT"
-grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr (getelementptr .*@frame_storage_backing\.main, i64 16711680.*i64 -16|%native\.frame\.slot)' \
+grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr (getelementptr .*@frame_storage_backing\.main, i64 (16711664|16711680.*i64 -16)|%native\.frame\.slot)' \
   "$SCANF_ABSOLUTE_FRAME_OUT"
 if grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\)\)' \
     "$SCANF_ABSOLUTE_FRAME_OUT"; then
   echo "FAIL: scanf absolute frame-anchor delta collapsed to frame_top" >&2
+  exit 1
+fi
+if grep -Eq '\binttoptr\b' "$SCANF_ABSOLUTE_FRAME_OUT"; then
+  echo "FAIL: scanf absolute frame-anchor delta remained an integer pointer" >&2
   exit 1
 fi
 
@@ -529,6 +631,15 @@ if [[ "$ANCHOR_COUNT" -gt 2 ]]; then
   exit 1
 fi
 
+FALLBACK_DYNAMIC_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/fallback_dynamic_stack_index.ll" -o "$FALLBACK_DYNAMIC_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/fallback_dynamic_stack_index.ll" \
+  < "$FALLBACK_DYNAMIC_OUT"
+
 NESTED_FIXED_SLOT_OUT="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
@@ -539,7 +650,31 @@ grep -Eq 'frame\.frame\.rsp = add i64 %state_in_2312, -72' \
 grep -Eq 'frame\.local\.offset = add i64 %frame\.incoming\.depth, 16' \
   "$NESTED_FIXED_SLOT_OUT"
 
+PHI_FIXED_SLOT_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/phi_fixed_frame_slot.ll" -o "$PHI_FIXED_SLOT_OUT"
+grep -Eq '^left:' "$PHI_FIXED_SLOT_OUT"
+grep -Eq '^right:' "$PHI_FIXED_SLOT_OUT"
+grep -Eq '^  %slot = phi ptr' "$PHI_FIXED_SLOT_OUT"
+grep -Eq '\[ %frame\.local[^,]*, %left \]' "$PHI_FIXED_SLOT_OUT"
+grep -Eq '\[ %frame\.local[^,]*, %right \]' "$PHI_FIXED_SLOT_OUT"
+
+NESTED_OUTPUT_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/nested_callee_output_propagation.ll" \
+  -o "$NESTED_OUTPUT_OUT"
+if grep -Eq 'define .*@sub_(caller|callee)\.native' "$NESTED_OUTPUT_OUT"; then
+  echo "FAIL: nested callee State output caused native-State rollback" >&2
+  exit 1
+fi
+grep -Eq 'call .*@sub_callee\(' "$NESTED_OUTPUT_OUT"
+
 NESTED_STACK_ARG_OUT="$(mktemp)"
+STACK_ALIGNMENT_OUT="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
@@ -551,6 +686,13 @@ if grep -Eq 'frame\.frame\.rsp = add i64 %state_in_2312, -568' \
   echo "FAIL: incoming stack argument was rebased on allocated-frame RSP" >&2
   exit 1
 fi
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/recovered_stack_alignment_cap.ll" -o "$STACK_ALIGNMENT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/recovered_stack_alignment_cap.ll" < "$STACK_ALIGNMENT_OUT"
 
 EXACT_STATE_MEMSET_OUT="$(mktemp)"
 PARTIAL_STATE_MEMSET_OUT="$(mktemp)"
@@ -573,7 +715,7 @@ grep -Eq 'llvm\.memset.*i64 8' "$PARTIAL_STATE_MEMSET_OUT"
 grep -Eq 'define internal i128 @worker\.native' "$PARTIAL_STATE_MEMSET_OUT"
 
 DFA_OUT="$(mktemp)"
-trap 'rm -f "$NULL_BOUNDARY_OUT" "$EXPLICIT_NATIVE_OUT" "$MIXED_NATIVE_OUT" "$MIXED_VARARG_OUT" "$RELATIVE_STACK_OUT" "$RELATIVE_STACK_FRAME_TOP_OUT" "$CONSERVATIVE_STACK_OUT" "$ENTRY_RSP_SEED_OUT" "$NESTED_RSP_OUT" "$NESTED_RBP_OUT" "$NESTED_DYNAMIC_OUT" "$NESTED_FIXED_SLOT_OUT" "$NESTED_STACK_ARG_OUT" "$EXACT_STATE_MEMSET_OUT" "$PARTIAL_STATE_MEMSET_OUT" "$DFA_OUT"' EXIT
+trap 'rm -f "$NULL_BOUNDARY_OUT" "$EXPLICIT_NATIVE_OUT" "$MIXED_NATIVE_OUT" "$MIXED_VARARG_OUT" "$RELATIVE_STACK_OUT" "$RELATIVE_STACK_FRAME_TOP_OUT" "$CONSERVATIVE_STACK_OUT" "$ENTRY_RSP_SEED_OUT" "$NESTED_RSP_OUT" "$NESTED_RBP_OUT" "$NESTED_DYNAMIC_OUT" "$NESTED_FIXED_SLOT_OUT" "$PHI_FIXED_SLOT_OUT" "$NESTED_OUTPUT_OUT" "$NESTED_STACK_ARG_OUT" "$STACK_ALIGNMENT_OUT" "$EXACT_STATE_MEMSET_OUT" "$PARTIAL_STATE_MEMSET_OUT" "$DFA_OUT"' EXIT
 "$OPT" -passes='dfa-jump-threading,simplifycfg,adce,verify' -S \
   "$ROOT/tests/flattened_ssa.ll" -o "$DFA_OUT"
 if grep -Eq 'switch i32' "$DFA_OUT"; then
@@ -583,6 +725,7 @@ fi
 grep -Eq 'ret i32 7' "$DFA_OUT"
 
 FRAME_COMPACT_OUT="$(mktemp)"
+ALLOCA_FRAME_COMPACT_OUT="$(mktemp)"
 FRAME_REFUSE_OUT="$(mktemp)"
 FRAME_POS_BIN="$(mktemp)"
 FRAME_NEG_BIN="$(mktemp)"
@@ -595,6 +738,15 @@ if grep -Eq '@frame_storage_backing\.main' "$FRAME_COMPACT_OUT"; then
   exit 1
 fi
 grep -Eq 'alloca \[4 x i8\]' "$FRAME_COMPACT_OUT"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/proven_constant_alloca_frame_compaction.ll" \
+  -o "$ALLOCA_FRAME_COMPACT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/proven_constant_alloca_frame_compaction.ll" \
+  < "$ALLOCA_FRAME_COMPACT_OUT"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
@@ -621,7 +773,44 @@ if [[ "$FRAME_POS_STATUS" -ne 7 || "$FRAME_NEG_STATUS" -ne 0 ]]; then
   echo "FAIL: frame compaction executable semantics changed" >&2
   exit 1
 fi
-rm -f "$FRAME_COMPACT_OUT" "$FRAME_REFUSE_OUT" \
+rm -f "$FRAME_COMPACT_OUT" "$ALLOCA_FRAME_COMPACT_OUT" \
+  "$FRAME_REFUSE_OUT" \
   "$FRAME_POS_BIN" "$FRAME_NEG_BIN"
+
+DEAD_SEGMENT_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/dead_lifted_segment_retention.ll" -o "$DEAD_SEGMENT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/dead_lifted_segment_retention.ll" < "$DEAD_SEGMENT_OUT"
+rm -f "$DEAD_SEGMENT_OUT"
+
+LIVE_RESIDUAL_SEGMENT_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/live_native_residual_segment.ll" \
+  -o "$LIVE_RESIDUAL_SEGMENT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/live_native_residual_segment.ll" \
+  < "$LIVE_RESIDUAL_SEGMENT_OUT"
+rm -f "$LIVE_RESIDUAL_SEGMENT_OUT"
+
+POST_SOUPER_STACK_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/post_souper_stack_inttoptr.ll" -o "$POST_SOUPER_STACK_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/post_souper_stack_inttoptr.ll" < "$POST_SOUPER_STACK_OUT"
+rm -f "$POST_SOUPER_STACK_OUT"
+
+PRIVATE_FRAME_ABI_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-souper-pass,verify' -S \
+  "$ROOT/tests/private_frame_abi_localization.ll" \
+  -o "$PRIVATE_FRAME_ABI_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/private_frame_abi_localization.ll" \
+  < "$PRIVATE_FRAME_ABI_OUT"
+rm -f "$PRIVATE_FRAME_ABI_OUT"
 
 echo "Native State SSA tests: PASS"

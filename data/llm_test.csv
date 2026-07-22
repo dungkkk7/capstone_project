@@ -1,5 +1,2 @@
 case_id,submission_id,binary,seed_file,pilot_class,difficulty,evidence
-p00225,s166576559,data/obfuscated/p00225/s166576559_fla_bcf_instsub.elf,data/seeds/p00225/p00225_seed.txt,,hard,known-pipeline-risk
-p00230,s380322669,data/obfuscated/p00230/s380322669_fla_bcf_instsub.elf,data/seeds/p00230/p00230_seed.txt,,hard,known-pipeline-risk
-p00235,s478751282,data/obfuscated/p00235/s478751282_fla_bcf_instsub.elf,data/seeds/p00235/p00235_seed.txt,,hard,known-pipeline-risk
-p00238,s424404775,data/obfuscated/p00238/s424404775_fla_bcf_instsub.elf,data/seeds/p00238/p00238_seed.txt,,hard,known-pipeline-risk
+p00272,s737032661,data/obfuscated/p00272/s737032661_fla_bcf_instsub.elf,data/seeds/p00272/p00272_seed.txt,,medium,screening

@@ -1184,15 +1184,25 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       for (Instruction &I : instructions(F))
         if (auto *CI = dyn_cast<CallInst>(&I))
           if (Function *Callee = CI->getCalledFunction())
-            if ((Callee->getName() == "vprintf" ||
-                 Callee->getName() == "vscanf") && CI->arg_size() == 2)
+            if (((Callee->getName() == "vprintf" ||
+                  Callee->getName() == "vscanf") && CI->arg_size() == 2) ||
+                ((Callee->getName() == "vfprintf" ||
+                  Callee->getName() == "vfscanf" ||
+                  Callee->getName() == "__isoc99_vfscanf") &&
+                 CI->arg_size() == 3))
               Work.push_back(CI);
 
   bool Changed = false;
   for (CallInst *CI : Work) {
     Function *OldCallee = CI->getCalledFunction();
-    bool IsScanf = OldCallee->getName() == "vscanf";
-    AllocaInst *VAList = RootAlloca(CI->getArgOperand(1));
+    StringRef OldName = OldCallee->getName();
+    bool IsFile = OldName == "vfprintf" || OldName == "vfscanf" ||
+                  OldName == "__isoc99_vfscanf";
+    bool IsScanf = OldName == "vscanf" || OldName == "vfscanf" ||
+                   OldName == "__isoc99_vfscanf";
+    unsigned FormatIndex = IsFile ? 1 : 0;
+    unsigned VAListIndex = IsFile ? 2 : 1;
+    AllocaInst *VAList = RootAlloca(CI->getArgOperand(VAListIndex));
     if (!VAList) continue;
     Value *OverflowArea = FindLocalStoreValue(CI, VAList, 8, Ctx.DL);
     auto FrameAnchor = GetRecoveredFrameAnchor(OverflowArea, Ctx.DL);
@@ -1200,7 +1210,7 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       Changed |= NormalizeScanfOverflowSlots(CI, OverflowArea, *FrameAnchor,
                                              Ctx.DL);
 
-    std::string Format = ResolveFormatString(CI->getArgOperand(0));
+    std::string Format = ResolveFormatString(CI->getArgOperand(FormatIndex));
     if (Format.empty()) continue;
 
     SmallVector<VarargSpecifier, 16> Specs;
@@ -1218,18 +1228,47 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       GPOffset = GP->getZExtValue();
     }
 
+    uint64_t FPOffset = 48;
+    if (Value *StoredFP = FindLocalStoreValue(CI, VAList, 4, Ctx.DL)) {
+      auto *FP = dyn_cast<ConstantInt>(StoredFP);
+      if (!FP)
+        continue;
+      FPOffset = FP->getZExtValue();
+    }
+    TypeSize RegSaveSizeValue =
+        Ctx.DL.getTypeAllocSize(RegSave->getAllocatedType());
+    if (RegSaveSizeValue.isScalable())
+      continue;
+    uint64_t RegSaveSize = RegSaveSizeValue.getFixedValue();
+    // SysV AMD64 FP register save slots begin at byte 48 and have a 16-byte
+    // stride even though a promoted scalar double occupies only eight bytes.
+    // Validate the materialized va_list coordinate against the actual alloca;
+    // never infer an XMM value from a guessed or out-of-range slot.
+    if (FPOffset < 48 || ((FPOffset - 48) % 16) != 0 ||
+        FPOffset > RegSaveSize)
+      continue;
+
     IRBuilder<> B(CI);
     SmallVector<Value *, 8> Args;
-    Args.push_back(CI->getArgOperand(0));
+    if (IsFile)
+      Args.push_back(CI->getArgOperand(0));
+    Args.push_back(CI->getArgOperand(FormatIndex));
     bool Safe = true;
     for (const VarargSpecifier &Spec : Specs) {
       if (!Spec.ConsumesArg || Spec.Ty == VarargType::Percent ||
           Spec.Ty == VarargType::ScanfSuppressed)
         continue;
-      if (Spec.UsesXMMReg && !IsScanf) { Safe = false; break; }
       Value *Stored = nullptr;
-      bool FromOverflow = GPOffset > 40;
-      if (FromOverflow) {
+      bool UsesFP = Spec.UsesXMMReg && !IsScanf;
+      bool FromOverflow = !UsesFP && GPOffset > 40;
+      if (UsesFP) {
+        if (FPOffset > RegSaveSize || RegSaveSize - FPOffset < 8) {
+          Safe = false;
+          break;
+        }
+        Stored = FindLocalStoreValue(CI, RegSave, FPOffset, Ctx.DL);
+        FPOffset += 16;
+      } else if (FromOverflow) {
         if (!OverflowArea || !FrameAnchor) { Safe = false; break; }
         Stored = FindStoreRelativeTo(CI, OverflowArea, OverflowOffset, Ctx.DL);
         if (!Stored) {
@@ -1256,13 +1295,21 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
     }
     if (!Safe) continue;
 
-    FunctionType *FT = FunctionType::get(B.getInt32Ty(), {B.getPtrTy()}, true);
-    FunctionCallee Native = Ctx.M.getOrInsertFunction(
-        IsScanf ? "scanf" : "printf", FT);
+    SmallVector<Type *, 2> FixedTypes(IsFile ? 2 : 1, B.getPtrTy());
+    FunctionType *FT =
+        FunctionType::get(B.getInt32Ty(), FixedTypes, true);
+    StringRef NativeName = IsFile ? (IsScanf ? "fscanf" : "fprintf")
+                                  : (IsScanf ? "scanf" : "printf");
+    FunctionCallee Native = Ctx.M.getOrInsertFunction(NativeName, FT);
     CallInst *NewCall = B.CreateCall(FT, Native.getCallee(), Args,
                                      "native.vararg.direct");
     NewCall->setCallingConv(CI->getCallingConv());
-    CI->replaceAllUsesWith(NewCall);
+    Value *Replacement = CoerceToType(B, NewCall, CI->getType());
+    if (!Replacement) {
+      NewCall->eraseFromParent();
+      continue;
+    }
+    CI->replaceAllUsesWith(Replacement);
     CI->eraseFromParent();
     ++Ctx.Report.VarargRecovered;
     Changed = true;

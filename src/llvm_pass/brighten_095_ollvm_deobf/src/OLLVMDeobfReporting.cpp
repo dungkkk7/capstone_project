@@ -1,6 +1,71 @@
 #include "OLLVMDeobfInternal.h"
 
+#include "llvm/Transforms/Utils/Cloning.h"
+
 namespace brighten_ollvm_deobf {
+
+namespace {
+
+// Dispatcher engines perform large, proof-guided CFG rewrites.  Keep an exact
+// body snapshot around each candidate so a verifier rejection is local to that
+// candidate instead of aborting opt and losing the complete module.
+class FunctionBodyTransaction {
+  Function &Target;
+  Function *Backup = nullptr;
+  ValueToValueMapTy BackupMap;
+  GlobalValue::LinkageTypes OriginalLinkage;
+
+public:
+  explicit FunctionBodyTransaction(Function &F)
+      : Target(F), OriginalLinkage(F.getLinkage()) {
+    Backup = CloneFunction(&F, BackupMap);
+    Backup->setName(F.getName() + ".ollvm.deobf.rollback");
+  }
+
+  FunctionBodyTransaction(const FunctionBodyTransaction &) = delete;
+  FunctionBodyTransaction &operator=(const FunctionBodyTransaction &) = delete;
+
+  ~FunctionBodyTransaction() {
+    if (Backup) Backup->eraseFromParent();
+  }
+
+  template <typename T> T *backupValue(const T *Original) const {
+    return dyn_cast_or_null<T>(BackupMap.lookup(Original));
+  }
+
+  void commit() {
+    Backup->eraseFromParent();
+    Backup = nullptr;
+  }
+
+  void rollback() {
+    // CloneFunction maps recursive references to Backup and gives Backup its
+    // own arguments.  Retarget both before transferring the exact cloned body
+    // back into the original Function object.
+    if (Backup->arg_size() != Target.arg_size())
+      report_fatal_error("dispatcher rollback argument-count mismatch");
+    auto TargetArg = Target.arg_begin();
+    for (Argument &BackupArg : Backup->args()) {
+      BackupArg.replaceAllUsesWith(&*TargetArg);
+      ++TargetArg;
+    }
+    Backup->replaceAllUsesWith(&Target);
+
+    Target.deleteBody();
+    Target.setLinkage(OriginalLinkage);
+    Target.splice(Target.end(), Backup);
+    Backup->eraseFromParent();
+    Backup = nullptr;
+  }
+};
+
+void restoreProofSnapshot(SmallVectorImpl<ProofRecord> &Proofs,
+                          ArrayRef<ProofRecord> Snapshot) {
+  Proofs.clear();
+  Proofs.append(Snapshot.begin(), Snapshot.end());
+}
+
+} // namespace
 
 std::string describeDispatcherResidual(SwitchInst &SI) {
   PHINode *State = findStateRoot(SI.getCondition());
@@ -34,166 +99,350 @@ std::string describeDispatcherResidual(SwitchInst &SI) {
 }
 
 bool recoverCompareLadders(Function &F, Metrics &M,
-                                  SmallVectorImpl<ProofRecord> &Proofs) {
-  SmallVector<WeakTrackingVH, 16> Work;
-  for (BasicBlock &BB : F)
-    if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-        BI && BI->isConditional())
-      Work.emplace_back(BI);
+                           SmallVectorImpl<ProofRecord> &Proofs) {
   bool Changed = false;
-  for (WeakTrackingVH &Handle : Work) {
-    auto *FirstBranch = dyn_cast_or_null<BranchInst>(Handle);
-    if (!FirstBranch || !FirstBranch->isConditional()) continue;
-    BasicBlock *First = FirstBranch->getParent();
-    Value *Expression = nullptr;
-    SmallVector<LadderCase, 8> Cases;
-    SmallPtrSet<BasicBlock *, 8> LadderBlocks;
-    BasicBlock *Current = First;
-    BasicBlock *Tail = nullptr;
-    while (Cases.size() < 256) {
-      auto *BI = dyn_cast<BranchInst>(Current->getTerminator());
-      auto *Cmp = BI && BI->isConditional()
-                      ? dyn_cast<ICmpInst>(BI->getCondition())
-                      : nullptr;
-      if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
-                   Cmp->getPredicate() != ICmpInst::ICMP_NE)) {
-        Tail = Current;
-        break;
-      }
-      Value *Compared = nullptr;
-      ConstantInt *Key = dyn_cast<ConstantInt>(Cmp->getOperand(1));
-      if (Key) Compared = Cmp->getOperand(0);
-      else if ((Key = dyn_cast<ConstantInt>(Cmp->getOperand(0))))
-        Compared = Cmp->getOperand(1);
-      if (!Key || !Compared->getType()->isIntegerTy() ||
-          (Expression && Compared != Expression)) {
-        Tail = Current;
-        break;
-      }
-      if (!Expression) Expression = Compared;
-      bool EqualOnTrue = Cmp->getPredicate() == ICmpInst::ICMP_EQ;
-      BasicBlock *Target = BI->getSuccessor(EqualOnTrue ? 0 : 1);
-      BasicBlock *Next = BI->getSuccessor(EqualOnTrue ? 1 : 0);
-      if (!Target->phis().empty() || !LadderBlocks.insert(Current).second)
-        break;
-      bool Safe = true;
-      for (Instruction &I : *Current) {
-        if (&I == Cmp || I.isTerminator() || isa<DbgInfoIntrinsic>(I)) continue;
-        if (Current != First || I.mayHaveSideEffects()) {
-          Safe = false;
+  bool RecollectCandidates = true;
+  while (RecollectCandidates) {
+    RecollectCandidates = false;
+    SmallVector<WeakTrackingVH, 16> Work;
+    for (BasicBlock &BB : F)
+      if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
+          BI && BI->isConditional() &&
+          !BI->getMetadata("ollvm.deobf.verifier_rejected"))
+        Work.emplace_back(BI);
+
+    for (WeakTrackingVH &Handle : Work) {
+      auto *FirstBranch = dyn_cast_or_null<BranchInst>(Handle);
+      if (!FirstBranch || !FirstBranch->isConditional()) continue;
+      BasicBlock *First = FirstBranch->getParent();
+      Value *Expression = nullptr;
+      SmallVector<LadderCase, 8> Cases;
+      SmallPtrSet<BasicBlock *, 8> LadderBlocks;
+      BasicBlock *Current = First;
+      BasicBlock *Tail = nullptr;
+      while (Cases.size() < 256) {
+        auto *BI = dyn_cast<BranchInst>(Current->getTerminator());
+        auto *Cmp = BI && BI->isConditional()
+                        ? dyn_cast<ICmpInst>(BI->getCondition())
+                        : nullptr;
+        if (!Cmp || (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+                     Cmp->getPredicate() != ICmpInst::ICMP_NE)) {
+          Tail = Current;
           break;
         }
+        Value *Compared = nullptr;
+        ConstantInt *Key = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+        if (Key) Compared = Cmp->getOperand(0);
+        else if ((Key = dyn_cast<ConstantInt>(Cmp->getOperand(0))))
+          Compared = Cmp->getOperand(1);
+        if (!Key || !Compared->getType()->isIntegerTy() ||
+            (Expression && Compared != Expression)) {
+          Tail = Current;
+          break;
+        }
+        if (!Expression) Expression = Compared;
+        bool EqualOnTrue = Cmp->getPredicate() == ICmpInst::ICMP_EQ;
+        BasicBlock *Target = BI->getSuccessor(EqualOnTrue ? 0 : 1);
+        BasicBlock *Next = BI->getSuccessor(EqualOnTrue ? 1 : 0);
+        if (!Target->phis().empty() || !LadderBlocks.insert(Current).second)
+          break;
+        bool Safe = true;
+        for (Instruction &I : *Current) {
+          if (&I == Cmp || I.isTerminator() || isa<DbgInfoIntrinsic>(I)) continue;
+          if (Current != First || I.mayHaveSideEffects()) {
+            Safe = false;
+            break;
+          }
+        }
+        if (!Safe) break;
+        for (const LadderCase &Existing : Cases)
+          if (Existing.Key->getValue() == Key->getValue()) Safe = false;
+        if (!Safe) break;
+        Cases.push_back({Current, Key, Target});
+        if (!Next->hasNPredecessors(1)) {
+          Tail = Next;
+          break;
+        }
+        Current = Next;
       }
-      if (!Safe) break;
-      for (const LadderCase &Existing : Cases)
-        if (Existing.Key->getValue() == Key->getValue()) Safe = false;
-      if (!Safe) break;
-      Cases.push_back({Current, Key, Target});
-      if (!Next->hasNPredecessors(1)) {
-        Tail = Next;
-        break;
-      }
-      Current = Next;
-    }
-    if (Cases.size() < 4 || !Tail || !Tail->phis().empty()) continue;
-    bool TargetIsLadder = false;
-    for (const LadderCase &C : Cases)
-      TargetIsLadder |= LadderBlocks.contains(C.Target);
-    if (TargetIsLadder) continue;
+      if (Cases.size() < 4 || !Tail || !Tail->phis().empty()) continue;
+      bool TargetIsLadder = false;
+      for (const LadderCase &C : Cases)
+        TargetIsLadder |= LadderBlocks.contains(C.Target);
+      if (TargetIsLadder) continue;
 
-    Instruction *Old = First->getTerminator();
-    auto *NewSwitch = SwitchInst::Create(Expression, Tail, Cases.size(),
-                                         Old->getIterator());
-    for (const LadderCase &C : Cases)
-      NewSwitch->addCase(C.Key, C.Target);
-    for (unsigned I = 1; I != Cases.size(); ++I)
-      Cases[I].Target->removePredecessor(Cases[I].Block);
-    Tail->removePredecessor(Cases.back().Block);
-    Old->eraseFromParent();
-    removeUnreachableBlocks(F);
-    ++M.CompareLaddersRecovered;
-    Proofs.push_back({F.getName().str(), "compare_ladder",
-                      First->getName().str(),
-                      "same_bv_expression_exhaustive_chain", "proved"});
-    if (verifyFunction(F, &errs())) {
+      std::string Origin = First->getName().str();
+      std::string OldFunctionText = valueText(F);
+      Metrics MetricsBefore = M;
+      SmallVector<ProofRecord, 64> ProofsBefore(Proofs.begin(), Proofs.end());
+      FunctionBodyTransaction Transaction(F);
+      BranchInst *RestoredBranch = Transaction.backupValue(FirstBranch);
+
+      Instruction *Old = First->getTerminator();
+      auto *NewSwitch = SwitchInst::Create(Expression, Tail, Cases.size(),
+                                           Old->getIterator());
+      for (const LadderCase &C : Cases)
+        NewSwitch->addCase(C.Key, C.Target);
+      for (unsigned I = 1; I != Cases.size(); ++I)
+        Cases[I].Target->removePredecessor(Cases[I].Block);
+      Tail->removePredecessor(Cases.back().Block);
+      Old->eraseFromParent();
+      removeUnreachableBlocks(F);
+      ++M.CompareLaddersRecovered;
+      Proofs.push_back({F.getName().str(), "compare_ladder", Origin,
+                        "same_bv_expression_exhaustive_chain", "proved"});
+
+      std::string VerifierDiagnostic;
+      raw_string_ostream VerifierOS(VerifierDiagnostic);
+      bool Invalid = verifyFunction(F, &VerifierOS);
+      VerifierOS.flush();
+      if (!Invalid) {
+        Transaction.commit();
+        Changed = true;
+        continue;
+      }
+
+      std::string InvalidFunctionText = valueText(F);
+      Transaction.rollback();
+      M = MetricsBefore;
+      restoreProofSnapshot(Proofs, ProofsBefore);
+      if (!RestoredBranch || RestoredBranch->getFunction() != &F)
+        report_fatal_error("compare-ladder rollback lost the candidate branch");
+      RestoredBranch->setMetadata("ollvm.deobf.verifier_rejected",
+                                  MDNode::get(F.getContext(), {}));
       ++M.VerifierFailures;
-      report_fatal_error("compare-ladder rewrite produced invalid IR");
+      ProofRecord Rejected{F.getName().str(), "compare_ladder", Origin,
+                           "transactional_verifier_guard", "unresolved",
+                           "rewrite_verifier_rejected_and_rolled_back;"
+                           "diagnostic_hash=" + hashText(VerifierDiagnostic)};
+      Rejected.OldHash = hashText(OldFunctionText);
+      Rejected.NewHash = hashText(InvalidFunctionText);
+      Rejected.ProofQueryHash = hashText(VerifierDiagnostic);
+      Rejected.Dependencies.push_back("llvm_clone_function_snapshot");
+      Rejected.Dependencies.push_back("llvm_verify_function");
+      Rejected.Dependencies.push_back("exact_function_body_rollback");
+      Proofs.push_back(std::move(Rejected));
+      errs() << "ollvm-deobf: rolled back invalid compare-ladder rewrite in "
+             << F.getName() << ":" << Origin << '\n'
+             << VerifierDiagnostic;
+      if (verifyFunction(F, &errs()))
+        report_fatal_error(
+            "compare-ladder transactional rollback produced invalid IR");
+      Changed = true;
+      // rollback replaced the complete body, invalidating every remaining
+      // tracking handle in Work.  The rejected branch is metadata-marked, so
+      // recollect a fresh worklist and continue with independent ladders.
+      RecollectCandidates = true;
+      break;
     }
-    Changed = true;
   }
   return Changed;
 }
 
 bool recoverDispatchers(Function &F, Metrics &M,
-                               SmallVectorImpl<ProofRecord> &Proofs) {
-  // Full recovery can delete other unreachable dispatchers.  Tracking handles
-  // make the worklist deletion-safe instead of probing a dangling pointer.
-  SmallVector<WeakTrackingVH, 16> Candidates;
-  for (BasicBlock &BB : F)
-    if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
-        SI && SI->getNumCases() >= 4 &&
-        !SI->getMetadata("ollvm.deobf.dynamic_entry_dispatch")) {
-      SmallPtrSet<BasicBlock *, 16> Successors;
-      for (BasicBlock *Succ : successors(&BB)) Successors.insert(Succ);
-      unsigned Returning = 0;
-      for (BasicBlock *Succ : Successors)
-        Returning += Succ == &BB || isPotentiallyReachable(Succ, &BB);
-      // Acyclic application switches are not CFF candidates.  Require both a
-      // real recurrence and majority return coverage; this is classification
-      // only and is never used as a rewrite proof.
-      if (findStateRoot(SI->getCondition()) && Returning >= 2 &&
-          Returning * 2 >= Successors.size())
-        Candidates.emplace_back(SI);
-    }
+                        SmallVectorImpl<ProofRecord> &Proofs) {
   bool Changed = false;
-  for (WeakTrackingVH &Candidate : Candidates) {
-    auto *SI = dyn_cast_or_null<SwitchInst>(Candidate);
-    if (!SI) continue;
-    bool CandidateChanged = false;
-    std::string Origin = SI->getParent()->getName().str();
-    std::string SSAPlumbingRejection;
-    std::string RegionRejection;
-    if (tryRecoverCyclicStateFamilyDispatcher(*SI, M, Proofs,
-                                               &RegionRejection) ||
-        tryRecoverMultiIncomingSSADispatcher(*SI, M, Proofs) ||
-        tryRecoverPartitionedSSADispatcher(*SI, M, Proofs) ||
-        tryRecoverPartitionedSSAPlumbingDispatcher(*SI, M, Proofs) ||
-        tryRecoverSSAPlumbingDispatcher(*SI, M, Proofs,
-                                        &SSAPlumbingRejection) ||
-        tryRecoverSSADispatcher(*SI, M, Proofs) ||
-        tryRecoverGeneralFunnelPlumbingDispatcher(*SI, M, Proofs) ||
-        tryRecoverFunnelDispatcher(*SI, M, Proofs)) {
-      Changed = CandidateChanged = true;
-    } else {
-      // Capture the structural diagnosis before partial bypassing can simplify
-      // the state PHI into its sole remaining load.
-      std::string Residual = describeDispatcherResidual(*SI);
-      if (!RegionRejection.empty())
-        Residual += ";region_rejection=" + RegionRejection;
-      if (!SSAPlumbingRejection.empty())
-        Residual += ";ssa_plumbing_rejection=" + SSAPlumbingRejection;
-      unsigned ProvedTransitions = recoverMemoryJoinTransitions(*SI, Proofs);
-      Changed |= ProvedTransitions != 0;
-      CandidateChanged = ProvedTransitions != 0;
-      if (ProvedTransitions)
-        Residual += ";proved_direct_transitions=" +
-                    std::to_string(ProvedTransitions);
-      auto Existing = std::find_if(Proofs.begin(), Proofs.end(),
-                                   [&](const ProofRecord &P) {
-        return P.Function == F.getName() && P.Kind == "cff_candidate" &&
-               P.Origin == Origin && P.Result == "unresolved";
-      });
-      if (Existing != Proofs.end()) {
-        Existing->ResidualReason = Residual;
-      } else {
-        ++M.DispatchersUnresolved;
-        Proofs.push_back({F.getName().str(), "cff_candidate", Origin,
-                          "structural_ssa_analysis", "unresolved", Residual});
+  bool RecollectCandidates = true;
+  while (RecollectCandidates) {
+    RecollectCandidates = false;
+
+    // Full recovery can delete other unreachable dispatchers.  Tracking
+    // handles make the worklist deletion-safe.  A transactional rollback
+    // replaces the complete body, so that exceptional path explicitly
+    // recollects a fresh worklist below.
+    SmallVector<WeakTrackingVH, 16> Candidates;
+    for (BasicBlock &BB : F)
+      if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
+          SI && SI->getNumCases() >= 4 &&
+          !SI->getMetadata("ollvm.deobf.dynamic_entry_dispatch") &&
+          !SI->getMetadata("ollvm.deobf.verifier_rejected")) {
+        SmallPtrSet<BasicBlock *, 16> Successors;
+        for (BasicBlock *Succ : successors(&BB)) Successors.insert(Succ);
+        unsigned Returning = 0;
+        for (BasicBlock *Succ : Successors)
+          Returning += Succ == &BB || isPotentiallyReachable(Succ, &BB);
+        // Acyclic application switches are not CFF candidates.  Require both
+        // a real recurrence and majority return coverage; this is
+        // classification only and is never used as a rewrite proof.
+        if (findStateRoot(SI->getCondition()) && Returning >= 2 &&
+            Returning * 2 >= Successors.size())
+          Candidates.emplace_back(SI);
       }
-    }
-    if (CandidateChanged && verifyFunction(F, &errs())) {
+
+    for (WeakTrackingVH &Candidate : Candidates) {
+      auto *SI = dyn_cast_or_null<SwitchInst>(Candidate);
+      if (!SI) continue;
+
+      bool CandidateChanged = false;
+      std::string Origin = SI->getParent()->getName().str();
+      std::string OldFunctionText = valueText(F);
+      Metrics MetricsBefore = M;
+      SmallVector<ProofRecord, 64> ProofsBefore(Proofs.begin(), Proofs.end());
+      FunctionBodyTransaction Transaction(F);
+      SwitchInst *RestoredSwitch = Transaction.backupValue(SI);
+
+      std::string SSAPlumbingRejection;
+      std::string RegionRejection;
+      // The cyclic-state-family commit is the only engine that can begin a
+      // large CFG rewrite and then reject it on a late completeness invariant.
+      // Run it under a private transaction so an incomplete commit rolls back
+      // to the exact pre-attempt body -- and a valid switch handle -- instead
+      // of aborting opt or leaving mutated IR for the remaining engines.
+      SwitchInst *Cur = SI;
+      bool Recovered = false;
+      {
+        FunctionBodyTransaction CsfTransaction(F);
+        SwitchInst *CsfRollbackSwitch = CsfTransaction.backupValue(Cur);
+        if (tryRecoverCyclicStateFamilyDispatcher(*Cur, M, Proofs,
+                                                  &RegionRejection)) {
+          CsfTransaction.commit();
+          Recovered = true;
+        } else if (valueText(F) == OldFunctionText) {
+          // The engine failed without mutating (the common case): keep the
+          // exact original body and switch handle so the remaining engines see
+          // untouched IR and the outer mutation guard's text compare stays
+          // valid.  Discarding the identical backup avoids reclone churn.
+          CsfTransaction.commit();
+        } else {
+          // The engine began a large commit and then rejected it on a late
+          // completeness invariant.  Restore the exact pre-attempt body so no
+          // partial rewrite reaches the remaining engines or committed IR.
+          CsfTransaction.rollback();
+          if (!CsfRollbackSwitch || CsfRollbackSwitch->getFunction() != &F)
+            report_fatal_error("cyclic-state-family rollback lost the switch");
+          Cur = CsfRollbackSwitch;
+          M = MetricsBefore;
+          restoreProofSnapshot(Proofs, ProofsBefore);
+        }
+      }
+      if (!Recovered)
+        Recovered =
+            tryRecoverMultiIncomingSSADispatcher(*Cur, M, Proofs) ||
+            tryRecoverPartitionedSSADispatcher(*Cur, M, Proofs) ||
+            tryRecoverPartitionedSSAPlumbingDispatcher(*Cur, M, Proofs) ||
+            tryRecoverSSAPlumbingDispatcher(*Cur, M, Proofs,
+                                            &SSAPlumbingRejection) ||
+            tryRecoverSSADispatcher(*Cur, M, Proofs) ||
+            tryRecoverGeneralFunnelPlumbingDispatcher(*Cur, M, Proofs) ||
+            tryRecoverFunnelDispatcher(*Cur, M, Proofs);
+      if (Recovered) {
+        CandidateChanged = true;
+      } else {
+        // Capture the structural diagnosis before partial bypassing can
+        // simplify the state PHI into its sole remaining load.
+        std::string Residual = describeDispatcherResidual(*Cur);
+        if (!RegionRejection.empty())
+          Residual += ";region_rejection=" + RegionRejection;
+        if (!SSAPlumbingRejection.empty())
+          Residual += ";ssa_plumbing_rejection=" + SSAPlumbingRejection;
+        unsigned ProvedTransitions = recoverMemoryJoinTransitions(*Cur, Proofs);
+        CandidateChanged = ProvedTransitions != 0;
+        if (ProvedTransitions)
+          Residual += ";proved_direct_transitions=" +
+                      std::to_string(ProvedTransitions);
+        auto Existing = std::find_if(Proofs.begin(), Proofs.end(),
+                                     [&](const ProofRecord &P) {
+          return P.Function == F.getName() && P.Kind == "cff_candidate" &&
+                 P.Origin == Origin && P.Result == "unresolved";
+        });
+        if (Existing != Proofs.end()) {
+          Existing->ResidualReason = Residual;
+        } else {
+          ++M.DispatchersUnresolved;
+          Proofs.push_back({F.getName().str(), "cff_candidate", Origin,
+                            "structural_ssa_analysis", "unresolved", Residual});
+        }
+      }
+
+      if (!CandidateChanged) {
+        // Every recovery engine is required to be mutation-free when it
+        // returns false.  Enforce that contract here because a half-applied
+        // failed proof is just as dangerous as verifier-invalid IR.
+        std::string FailedAttemptText = valueText(F);
+        if (FailedAttemptText == OldFunctionText) {
+          Transaction.commit();
+          continue;
+        }
+
+        Transaction.rollback();
+        M = MetricsBefore;
+        restoreProofSnapshot(Proofs, ProofsBefore);
+        if (!RestoredSwitch || RestoredSwitch->getFunction() != &F)
+          report_fatal_error("dispatcher rollback lost the candidate switch");
+        RestoredSwitch->setMetadata("ollvm.deobf.verifier_rejected",
+                                    MDNode::get(F.getContext(), {}));
+        ++M.VerifierFailures;
+        ++M.DispatchersUnresolved;
+        ProofRecord Rejected{
+            F.getName().str(), "cff_candidate", Origin,
+            "transactional_mutation_guard", "unresolved",
+            "engine_reported_failure_after_mutation_and_was_rolled_back" +
+                (RegionRejection.empty()
+                     ? std::string()
+                     : ";region_rejection=" + RegionRejection)};
+        Rejected.OldHash = hashText(OldFunctionText);
+        Rejected.NewHash = hashText(FailedAttemptText);
+        Rejected.Dependencies.push_back("llvm_clone_function_snapshot");
+        Rejected.Dependencies.push_back("engine_failure_must_be_mutation_free");
+        Rejected.Dependencies.push_back("exact_function_body_rollback");
+        Proofs.push_back(std::move(Rejected));
+        errs() << "ollvm-deobf: rolled back mutating failed dispatcher "
+               << "attempt in " << F.getName() << ":" << Origin << '\n';
+        if (verifyFunction(F, &errs()))
+          report_fatal_error(
+              "dispatcher mutation-guard rollback produced invalid IR");
+        Changed = true;
+        RecollectCandidates = true;
+        break;
+      }
+
+      std::string VerifierDiagnostic;
+      raw_string_ostream VerifierOS(VerifierDiagnostic);
+      bool Invalid = verifyFunction(F, &VerifierOS);
+      VerifierOS.flush();
+      if (!Invalid) {
+        Transaction.commit();
+        Changed = true;
+        continue;
+      }
+
+      std::string InvalidFunctionText = valueText(F);
+      Transaction.rollback();
+      M = MetricsBefore;
+      restoreProofSnapshot(Proofs, ProofsBefore);
+
+      if (!RestoredSwitch || RestoredSwitch->getFunction() != &F)
+        report_fatal_error("dispatcher rollback lost the candidate switch");
+      RestoredSwitch->setMetadata("ollvm.deobf.verifier_rejected",
+                                  MDNode::get(F.getContext(), {}));
+
       ++M.VerifierFailures;
-      report_fatal_error("dispatcher rewrite produced invalid IR");
+      ++M.DispatchersUnresolved;
+      ProofRecord Rejected{F.getName().str(), "cff_candidate", Origin,
+                           "transactional_verifier_guard", "unresolved",
+                           "rewrite_verifier_rejected_and_rolled_back;"
+                           "diagnostic_hash=" +
+                               hashText(VerifierDiagnostic)};
+      Rejected.OldHash = hashText(OldFunctionText);
+      Rejected.NewHash = hashText(InvalidFunctionText);
+      Rejected.ProofQueryHash = hashText(VerifierDiagnostic);
+      Rejected.Dependencies.push_back("llvm_clone_function_snapshot");
+      Rejected.Dependencies.push_back("llvm_verify_function");
+      Rejected.Dependencies.push_back("exact_function_body_rollback");
+      Proofs.push_back(std::move(Rejected));
+
+      errs() << "ollvm-deobf: rolled back invalid dispatcher rewrite in "
+             << F.getName() << ":" << Origin << '\n'
+             << VerifierDiagnostic;
+      if (verifyFunction(F, &errs()))
+        report_fatal_error("dispatcher transactional rollback produced invalid IR");
+
+      // Every old WeakTrackingVH refers to the discarded body.  The restored
+      // switch is marked fail-closed, so safely recollect and continue with
+      // the other candidates in the exact pre-rewrite function.
+      Changed = true; // the rejection metadata and ledger obligation persist.
+      RecollectCandidates = true;
+      break;
     }
   }
   if (Changed) removeUnreachableBlocks(F);

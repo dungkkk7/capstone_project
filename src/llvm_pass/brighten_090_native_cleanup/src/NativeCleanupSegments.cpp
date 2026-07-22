@@ -13,9 +13,16 @@ bool readConstantByte(Constant *C, const DataLayout &DL,
     return true;
   }
   if (auto *CI = dyn_cast<ConstantInt>(C)) {
-    if (Offset != 0 || CI->getType()->getPrimitiveSizeInBits() != 8)
+    TypeSize StoreSize = DL.getTypeStoreSize(CI->getType());
+    if (StoreSize.isScalable() || Offset >= StoreSize.getFixedValue())
       return false;
-    Byte = static_cast<uint8_t>(CI->getZExtValue());
+    uint64_t StoreBytes = StoreSize.getFixedValue();
+    APInt Bits = CI->getValue().zextOrTrunc(StoreBytes * 8);
+    uint64_t ByteIndex =
+        DL.isLittleEndian() ? Offset : StoreBytes - Offset - 1;
+    Byte = static_cast<uint8_t>(Bits.lshr(ByteIndex * 8)
+                                    .trunc(8)
+                                    .getZExtValue());
     return true;
   }
   if (auto *CDS = dyn_cast<ConstantDataSequential>(C)) {
@@ -169,6 +176,90 @@ unsigned materializeNativeSegmentPointers(Module &M, bool &Changed) {
     }
   }
   return Replaced;
+}
+
+// A residual segment can remain live after global recovery when the program
+// indexes it with a runtime guest address.  It is not dead and must not be
+// erased, but retaining the lifter's identified `seg_*` aggregate type also
+// retains the raw lifted memory model in otherwise native IR.  Convert only a
+// completely readable initializer to an exactly sized native byte array.
+// Opaque pointers make all existing GEP/load users type-compatible, while the
+// byte-for-byte initializer, linkage, address space, alignment and metadata
+// preserve the allocation's behavior.  Relocations, undef bytes and scalable
+// layouts fail closed rather than being guessed.
+unsigned canonicalizeLiveNativeResidualSegments(Module &M, bool &Changed) {
+  const DataLayout &DL = M.getDataLayout();
+  SmallVector<GlobalVariable *, 8> Candidates;
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.getName().starts_with("native_residual_") ||
+        !GV.hasInitializer())
+      continue;
+    auto *ST = dyn_cast<StructType>(GV.getValueType());
+    if (!ST || !ST->hasName() || !ST->getName().starts_with("seg_"))
+      continue;
+    Candidates.push_back(&GV);
+  }
+
+  unsigned Rewritten = 0;
+  for (GlobalVariable *Old : Candidates) {
+    auto *ST = cast<StructType>(Old->getValueType());
+    TypeSize AllocSize = DL.getTypeAllocSize(Old->getValueType());
+    if (AllocSize.isScalable() || !AllocSize.getFixedValue() ||
+        AllocSize.getFixedValue() > std::numeric_limits<uint32_t>::max())
+      continue;
+
+    uint64_t NumBytes = AllocSize.getFixedValue();
+    SmallVector<uint8_t, 256> Bytes;
+    Bytes.reserve(static_cast<size_t>(NumBytes));
+    bool Complete = true;
+    for (uint64_t Offset = 0; Offset < NumBytes; ++Offset) {
+      uint8_t Byte = 0;
+      if (!readConstantByte(Old->getInitializer(), DL, Offset, Byte)) {
+        Complete = false;
+        break;
+      }
+      Bytes.push_back(Byte);
+    }
+    Constant *Init = nullptr;
+    if (Complete) {
+      Init = ConstantDataArray::get(M.getContext(), Bytes);
+    } else if (auto *CS = dyn_cast<ConstantStruct>(Old->getInitializer())) {
+      // Pointer relocations cannot be represented as constant i8 bytes.  Keep
+      // those typed relocation fields exactly, but move them into a literal
+      // native aggregate so the lifter-specific identified segment type no
+      // longer owns the allocation.  The element sequence and packedness make
+      // this layout-identical; this is not a guessed pointer serialization.
+      SmallVector<Type *, 32> ElementTypes;
+      SmallVector<Constant *, 32> Elements;
+      ElementTypes.reserve(CS->getNumOperands());
+      Elements.reserve(CS->getNumOperands());
+      for (Value *Operand : CS->operands()) {
+        auto *Element = cast<Constant>(Operand);
+        ElementTypes.push_back(Element->getType());
+        Elements.push_back(Element);
+      }
+      auto *Literal = StructType::get(M.getContext(), ElementTypes,
+                                      ST->isPacked());
+      if (DL.getTypeAllocSize(Literal) == AllocSize)
+        Init = ConstantStruct::get(Literal, Elements);
+    }
+    if (!Init)
+      continue;
+
+    std::string Name = Old->getName().str();
+    Old->setName(Name + ".lifted_type");
+    auto *Native = new GlobalVariable(
+        M, Init->getType(), Old->isConstant(), Old->getLinkage(), Init, Name,
+        Old, Old->getThreadLocalMode(), Old->getAddressSpace(),
+        Old->isExternallyInitialized());
+    Native->copyAttributesFrom(Old);
+    Native->copyMetadata(Old, 0);
+    Old->replaceAllUsesWith(Native);
+    Old->eraseFromParent();
+    ++Rewritten;
+    Changed = true;
+  }
+  return Rewritten;
 }
 
 unsigned rewriteExactNativeSegmentGEPs(Module &M, bool &Changed) {

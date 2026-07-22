@@ -1037,7 +1037,8 @@ class SemanticFuzzer:
         timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         compare_stderr: bool = False,
         num_workers: int = 1,
-        seed_inputs: Optional[List[bytes]] = None
+        seed_inputs: Optional[List[bytes]] = None,
+        fail_fast: bool = True,
     ) -> Dict[str, Any]:
         """Fallback differential testing loop using the default random/template generator."""
         report = {
@@ -1165,7 +1166,7 @@ class SemanticFuzzer:
                     fail_fast_key = None
                     if not result.get("oracle_inconclusive"):
                         fail_fast_key = fail_fast_execution_key(res1, res2)
-                    if fail_fast_key is not None:
+                    if fail_fast and fail_fast_key is not None:
                         report["total_runs"] = completed
                         report["early_stopped"] = True
                         report["early_stop_reason"] = fail_fast_key
@@ -1197,7 +1198,8 @@ class SemanticFuzzer:
         timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         compare_stderr: bool = False,
         num_workers: int = 1,
-        seed_inputs: Optional[List[bytes]] = None
+        seed_inputs: Optional[List[bytes]] = None,
+        fail_fast: bool = True,
     ) -> Dict[str, Any]:
         """Runs the differential testing loops using AFL++ if available, else falls back to default fuzzer."""
         use_afl = os.environ.get("BRIGHTEN_USE_AFL", "1").lower() in {
@@ -1244,6 +1246,7 @@ class SemanticFuzzer:
                 compare_stderr,
                 num_workers,
                 seed_inputs=seed_inputs,
+                fail_fast=fail_fast,
             )
             
         try:
@@ -1695,7 +1698,7 @@ int main(int argc, char** argv) {
                         fail_fast_key = None
                         if not result.get("oracle_inconclusive"):
                             fail_fast_key = fail_fast_execution_key(res1, res2)
-                        if fail_fast_key is not None:
+                        if fail_fast and fail_fast_key is not None:
                             report["total_runs"] = completed
                             report["early_stopped"] = True
                             report["early_stop_reason"] = fail_fast_key
@@ -1727,6 +1730,7 @@ int main(int argc, char** argv) {
                 compare_stderr,
                 num_workers,
                 seed_inputs=seed_inputs,
+                fail_fast=fail_fast,
             )
 
     def cleanup(self):

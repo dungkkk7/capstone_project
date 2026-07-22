@@ -2,7 +2,7 @@
 ; RUN: opt-21 -load-pass-plugin %plugin -ollvm-deobf-report=%t.json -passes=brighten-ollvm-deobf-pass,sroa,instcombine,simplifycfg,dce,verify -S %s -o %t.ll
 ; RUN: FileCheck-21 %s < %t.ll
 ; RUN: lli-21 %t.ll
-; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind'] in ('cff_dispatcher','cff_transition') and x['proof_engine'] in ('complete_ssa_transition_and_plumbing_set','ssa_phi_demotion_exact_plumbing')]; base={'llvm_phi_demotion','exact_latch_header_clone'}; assert d['status']=='pass_detected_scope' and d['metrics']['dispatchers_recovered']==1 and len(p)==4 and all(x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and base.issubset(x['dependencies']) for x in p) and any(x['kind']=='cff_dispatcher' and 'seed_reachable_transition_induction' in x['dependencies'] for x in p); assert not [x for x in d['proofs'] if x['result']!='proved']"
+; RUN: python3 -c "import json; d=json.load(open('%t.json')); p=[x for x in d['proofs'] if x['kind'] in ('cff_dispatcher','cff_transition') and x['proof_engine'] in ('complete_ssa_transition_and_plumbing_set','ssa_phi_demotion_exact_plumbing')]; base={'llvm_phi_demotion','exact_latch_header_clone'}; assert d['status']=='pass_detected_scope' and d['metrics']['dispatchers_recovered']==1 and sum(x['kind']=='cff_dispatcher' for x in p)==1 and sum(x['kind']=='cff_transition' for x in p)==4 and all(x['old_hash'] and x['new_hash'] and x['proof_query_hash'] and base.issubset(x['dependencies']) for x in p); assert not [x for x in d['proofs'] if x['result']!='proved']"
 
 @trace = internal global i32 0
 
@@ -20,6 +20,7 @@ dispatch.header:
   store i32 %acc, ptr @trace
   switch i32 %state, label %default [
     i32 10, label %case.10
+    i32 15, label %case.15
     i32 20, label %case.20
     i32 30, label %case.30
     i32 40, label %exit
@@ -29,7 +30,18 @@ case.10:
   %acc.10 = add i32 %acc, 1
   br label %latch
 
+; A case may execute a semantic prefix and then fall directly into another
+; switch case.  It has no independent latch transition; reachability closure
+; must transfer ownership to case.20 instead of rejecting or pruning it.
+case.15:
+  %case.15.side.effect = add i32 %acc, 0
+  store i32 %case.15.side.effect, ptr @trace
+  br label %case.20.shared
+
 case.20:
+  br label %case.20.shared
+
+case.20.shared:
   %acc.20 = mul i32 %acc, 2
   %selected = select i1 %take_long_path, i32 30, i32 40
   br i1 false, label %trap, label %case.20.cont
@@ -48,7 +60,7 @@ default:
   br label %latch
 
 latch:
-  %state.next = phi i32 [ 20, %case.10 ], [ %selected, %case.20.cont ],
+  %state.next = phi i32 [ 15, %case.10 ], [ %selected, %case.20.cont ],
                           [ 40, %case.30 ], [ 10, %default ]
   %acc.next = phi i32 [ %acc.10, %case.10 ], [ %acc.20, %case.20.cont ],
                         [ %acc.30, %case.30 ], [ %acc, %default ]

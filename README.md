@@ -71,7 +71,7 @@ flowchart TD
     E --> G[IR before Souper]
     G --> H{Souper maximum}
     H -->|pass| I[LLVM canonicalization + verify]
-    H -->|timeout/crash| J[Souper safe fallback]
+    H -->|timeout/crash| J[Verified passthrough]
     J --> I
     I --> F[Final native cleanup + contract audit]
     F --> K[Final brightened BC/LL]
@@ -389,7 +389,7 @@ zero-initialization thành hàng trăm `getelementptr + store`. Hai pass này go
 lại memory initialization để final IR giữ được simplification của Souper mà
 không phình vì các tên `.repack`.
 
-### Maximum → safe fallback
+### Maximum/Safe → verified passthrough
 
 Mặc định pipeline thử `maximum` trước:
 
@@ -401,23 +401,23 @@ Mặc định pipeline thử `maximum` trước:
 - LHS tối đa 4096 byte.
 - 100 constant-synthesis tries.
 
-Nếu maximum abort, timeout hoặc sinh IR không qua verifier, pipeline giữ nguyên
-input và chạy lại bằng `safe`. Safe dùng enumerative synthesis mặc định. Hai
-mode dùng thuật toán khác nhau nên maximum không phải superset toán học tuyệt
+Nếu maximum abort hoặc timeout, pipeline verify rồi giữ nguyên input, không
+chạy thêm safe fallback. Safe chỉ chạy khi được chọn tường minh bằng
+`BRIGHTEN_SOUPER_MODE=safe`; nếu Safe cũng timeout thì nó cũng giữ nguyên IR.
+Hai mode dùng thuật toán khác nhau nên maximum không phải superset toán học
 đối của safe.
 
 ### Ngân sách thời gian mặc định
 
-Tổng ngân sách Souper cho mỗi case là 30 phút:
+Ngân sách mặc định Souper cho mỗi case là 5 phút:
 
 | Stage | Module timeout | Query timeout |
 |---|---:|---:|
-| Maximum | 1680 giây / 28 phút | 60 giây |
-| Safe fallback | 120 giây / 2 phút | 15 giây |
-| Tổng | 1800 giây / 30 phút | — |
+| Maximum | 300 giây / 5 phút | 15 giây |
+| Safe | 300 giây / 5 phút | 15 giây |
 
-Việc giữ lại 2 phút bảo đảm maximum không ăn hết ngân sách rồi làm mất cơ hội
-cứu case bằng safe.
+Hết ngân sách thì case được đánh dấu `verified_passthrough`: giữ IR đã verify
+và đi tiếp pipeline, không bị treo vì cố giải một module quá phức tạp.
 
 ### Souper artifacts và diagnostics
 
@@ -528,7 +528,7 @@ Flow:
 
 1. Compile final brightened BC thành `<base>_brightened_ref.bin`.
 2. Ghidra headless decompile reference binary thành C-like pseudocode.
-3. Gửi pseudocode và brightened IR cho model.
+3. Gửi pseudocode làm evidence chính; không gửi lặp toàn bộ brightened IR mặc định.
 4. Parse JSON response và lấy mã C.
 5. Compile candidate.
 6. Differential fuzz candidate với binary reference.
@@ -564,6 +564,11 @@ python3 src/main.py data/llm_test.csv llm-recovery
 | `LLM_RECOVERY_REQUEST_TIMEOUT` | `900` | HTTP/request timeout. |
 | `LLM_RECOVERY_USE_FILE_API` | `1` | Cho phép file-backed request path. |
 | `LLM_RECOVERY_REQUIRE_JSON` | `1` | Bắt model trả schema JSON parse được. |
+| `LLM_RECOVERY_MAX_IR_CHARS` | `600000` | Giới hạn IR ở mode direct-IR. |
+| `LLM_RECOVERY_MAX_REQUEST_INPUT_BYTES` | `900000` | Chặn request quá lớn tại local trước khi gọi Vertex. |
+| `LLM_RECOVERY_MAX_CANDIDATE_CHARS` | `250000` | Giới hạn candidate được đưa lại vào repair prompt. |
+| `LLM_RECOVERY_MAX_FEEDBACK_CHARS` | `40000` | Giới hạn validation feedback trong repair prompt. |
+| `LLM_RECOVERY_ATTACH_IR_WITH_GHIDRA` | `0` | Opt-in gửi thêm IR cùng pseudocode; mặc định tắt để tránh evidence trùng. |
 
 Chi tiết prompt và validation loop:
 
@@ -620,6 +625,7 @@ Souper tối ưu atomically: final `*_brightened.bc` chỉ bị thay thế khi o
 - CSV đầu vào và pilot limit.
 - Tổng requested/lift failures.
 - Brightening outcomes.
+- Deobf complete/partial/unchecked counts and per-case residual counts.
 - Native contract pass/non-pass/unchecked.
 - Semantic pass/non-pass/unchecked.
 - Valid-domain pass/non-pass/unchecked.
@@ -699,14 +705,16 @@ python3 src/main.py data/regression_brightening_targeted.csv
 | Biến | Mặc định | Ý nghĩa |
 |---|---:|---|
 | `BRIGHTEN_SOUPER` | `1` | Bật/tắt Souper. |
-| `BRIGHTEN_SOUPER_MODE` | `maximum` | `maximum` hoặc `safe`. |
-| `BRIGHTEN_SOUPER_MAXIMUM_TIMEOUT` | `1680` | Maximum module budget. |
-| `BRIGHTEN_SOUPER_SAFE_TIMEOUT` | `120` | Safe/fallback module budget. |
-| `BRIGHTEN_SOUPER_MAXIMUM_SOLVER_TIMEOUT` | `60` | Timeout mỗi CEGIS query. |
+| `BRIGHTEN_SOUPER_MODE` | `safe` | `maximum` hoặc `safe`; cả hai mode hết 300 giây sẽ skip tối ưu. |
+| `BRIGHTEN_SOUPER_MAXIMUM_TIMEOUT` | `300` | Maximum module budget; hết giờ thì bỏ qua tối ưu và giữ IR đã verify. |
+| `BRIGHTEN_SOUPER_SAFE_TIMEOUT` | `300` | Safe module budget khi bật thủ công; hết giờ thì skip tối ưu. |
+| `BRIGHTEN_SOUPER_MAXIMUM_SOLVER_TIMEOUT` | `15` | Timeout mỗi CEGIS query trong Maximum. |
 | `BRIGHTEN_SOUPER_SAFE_SOLVER_TIMEOUT` | `15` | Timeout mỗi safe query. |
 | `BRIGHTEN_SOUPER_DEBUG_LEVEL` | `1` | `2` để ghi detailed candidates/replacements. |
+| `BRIGHTEN_SOUPER_CONSOLE_LOG` | `1` | Tee log Souper trực tiếp ra terminal; đặt `0` nếu chỉ muốn ghi file. |
 | `BRIGHTEN_SOUPER_PLUGIN` | bundled | Override `libsouperPass.so`. |
 | `BRIGHTEN_SOUPER_PIPELINE` | built-in | Override post-brightening Souper pipeline. |
+| `BRIGHTEN_SOUPER_PASSTHROUGH` | `1` | Khi Souper timeout/crash, giữ IR đầu vào đã verify thay vì chạy thêm fallback dài. |
 
 Legacy `BRIGHTEN_SOUPER_TIMEOUT` và `BRIGHTEN_SOUPER_SOLVER_TIMEOUT` vẫn được
 hỗ trợ cho cả hai mode; mode-specific variable có độ ưu tiên cao hơn.
@@ -764,9 +772,7 @@ Expected behavior:
 
 ```text
 maximum timeout/fail
-→ giữ nguyên pre-Souper bitcode
-→ safe fallback
-→ verify
+→ verify và giữ nguyên pre-Souper bitcode
 → tiếp tục compile/fuzz
 ```
 
