@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fuzzing_equi_check.fuzzing import (  # noqa: E402
     check_equivalence,
+    DEFAULT_AFL_FUZZ_SECONDS,
+    DEFAULT_AFL_INITIAL_CORPUS_LIMIT,
     DEFAULT_EXECUTION_TIMEOUT,
     finalize_equivalence_report,
     generate_structured_seed_inputs,
@@ -26,6 +28,10 @@ from fuzzing_equi_check.fuzzing import (  # noqa: E402
 class TimeoutSemanticsTests(unittest.TestCase):
     def test_default_execution_deadline_allows_normal_process_startup(self):
         self.assertEqual(DEFAULT_EXECUTION_TIMEOUT, 0.5)
+
+    def test_afl_campaign_budget_is_independent_from_execution_timeout(self):
+        self.assertEqual(DEFAULT_AFL_FUZZ_SECONDS, 1.0)
+        self.assertEqual(DEFAULT_AFL_INITIAL_CORPUS_LIMIT, 10)
 
     def test_shared_timeout_is_inconclusive_and_asymmetric_timeout_is_failure(self):
         shared = {"status": "timeout", "returncode": -1, "stdout": b"", "stderr": b""}

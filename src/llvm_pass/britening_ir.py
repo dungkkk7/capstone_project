@@ -83,7 +83,7 @@ PLUGINS = [
     "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,brighten-native-cleanup-final-pass,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-native-cleanup-final-pass,verify"
 )
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
@@ -315,6 +315,16 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
     print_after = os.environ.get("BRIGHTEN_PRINT_AFTER")
     if print_after:
         cmd.extend(["-print-after", print_after])
+    # Lifted modules carry the complete Remill runtime DWARF graph. It has no
+    # effect on program semantics, but llvm-dis prints thousands of !DI*
+    # records into the brightened IR and needlessly inflates LLM/recovery
+    # inputs. Strip it structurally in LLVM instead of deleting textual !N
+    # records, which may leave dangling metadata references. Keep an explicit
+    # opt-out for pass debugging.
+    if os.environ.get("BRIGHTEN_KEEP_DEBUG_INFO", "0").lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        cmd.append("-strip-debug")
     # Native ABI lowering is part of the production pipeline.  Keep an
     # explicit opt-out for debugging old lifted IR, but do not make the
     # dataset path depend on a hidden environment variable.

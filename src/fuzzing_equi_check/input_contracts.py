@@ -38,7 +38,7 @@ def _is_prime(value: int) -> bool:
 
 
 def _manifest_path(project_root: str) -> Path:
-    return Path(project_root) / "data" / "input_contracts" / "pilot_mix3_50.json"
+    return Path(project_root) / "data" / "input_contracts" / "custom_dataset.json"
 
 
 def _custom_manifest_path(project_root: str) -> Path:

@@ -39,6 +39,8 @@ except ImportError:  # pragma: no cover - supports direct CLI execution
 
 
 DEFAULT_EXECUTION_TIMEOUT = 0.5
+DEFAULT_AFL_FUZZ_SECONDS = 1.0
+DEFAULT_AFL_INITIAL_CORPUS_LIMIT = 10
 
 # -----------------------------------------------------------------------------
 # Color Definitions for Visual Polish
@@ -1356,7 +1358,7 @@ int main(int argc, char** argv) {
                 contract_corpus, contract_corpus_stats = generate_contract_inputs(
                     input_contract,
                     afl_seed_inputs,
-                    max(1, min(iterations, 50)),
+                    max(1, min(iterations, DEFAULT_AFL_INITIAL_CORPUS_LIMIT)),
                 )
                 afl_seed_inputs = _dedupe_bytes(afl_seed_inputs + contract_corpus)
             if afl_seed_inputs:
@@ -1380,7 +1382,7 @@ int main(int argc, char** argv) {
                     
             # 4. Run AFL++ Input Generator
             out_dir = os.path.join(self.tmp_dir, "out")
-            default_fuzz_time = timeout
+            default_fuzz_time = DEFAULT_AFL_FUZZ_SECONDS
             fuzz_time_env = os.environ.get("BRIGHTEN_AFL_FUZZ_SECONDS")
             if fuzz_time_env is not None:
                 try:
@@ -1408,8 +1410,9 @@ int main(int argc, char** argv) {
             generated_inputs = []
             queue_dir = os.path.join(out_dir, "default/queue")
             crashes_dir = os.path.join(out_dir, "default/crashes")
+            hangs_dir = os.path.join(out_dir, "default/hangs")
             
-            for d in [queue_dir, crashes_dir]:
+            for d in [queue_dir, crashes_dir, hangs_dir]:
                 if os.path.exists(d):
                     for filename in os.listdir(d):
                         filepath = os.path.join(d, filename)
@@ -1555,8 +1558,7 @@ int main(int argc, char** argv) {
             )
             
             total_inputs = len(generated_inputs)
-            max_runs = min(total_inputs, 500)
-            run_inputs = generated_inputs[:max_runs]
+            run_inputs = generated_inputs
             
             # Try to read AFL++ fuzzer stats
             afl_stats = {}
@@ -1590,6 +1592,7 @@ int main(int argc, char** argv) {
                 "engine": "afl++",
                 "seed_mutation_mode": "contract-afl" if input_contract else seed_mutation_mode,
                 "timeout_seconds": timeout,
+                "afl_fuzz_seconds": fuzz_time,
             }
             if input_contract is not None:
                 report["fuzz_config"].update({

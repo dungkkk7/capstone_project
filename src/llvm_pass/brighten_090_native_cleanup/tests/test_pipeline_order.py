@@ -19,10 +19,12 @@ late_state = passes.index("brighten-local-state-ssa-pass")
 region_unflatten = passes.index("brighten-region-ssa-unflatten-pass")
 late_jump_threading = max(i for i, name in enumerate(passes)
                           if name == "jump-threading")
+o3 = [i for i, name in enumerate(passes) if name == "default<O3>"]
 verify = passes.index("verify")
 
 assert len(cleanup) == 2, "production pipeline must have one cleanup retry"
-assert cleanup[0] < late_bridge < passes.index("default<O3>") < cleanup[1], (
+assert len(o3) == 2, "production pipeline must have mid-pipeline and tail O3"
+assert cleanup[0] < late_bridge < o3[0] < cleanup[1], (
     "cleanup retry must follow late extern lowering and dispatcher-removing O3"
 )
 assert cleanup[-1] < final, "the final cleanup pass must follow recovery"
@@ -32,8 +34,8 @@ assert cleanup[-1] < late_state < final, (
 assert late_state < region_unflatten < final, (
     "region-SSA unflattening must consume promoted state before final reporting"
 )
-assert region_unflatten < late_jump_threading < final < verify, (
-    "late CFG simplification must precede the final proof/report gate"
+assert region_unflatten < late_jump_threading < o3[1] < final < verify, (
+    "tail O3 and late CFG simplification must precede the final proof/report gate"
 )
 assert final + 1 == verify, (
     "no mutation pass may run after the final native contract report"
