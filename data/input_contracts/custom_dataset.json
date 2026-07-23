@@ -1,0 +1,599 @@
+{
+  "schema_version": 1,
+  "dataset": "data/custom_dataset.csv",
+  "purpose": "Source-derived input contracts for semantic fuzzing of filtered 40 cases.",
+  "default_policy": {
+    "listed_case": "contract_or_seed_shape",
+    "missing_contract": "exact_seed_only",
+    "raw_mutation": "opt_in_robustness_only"
+  },
+  "contracts": [
+    {
+      "case_id": "p04028",
+      "submission_id": "s626776881",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "L followed by string of length L",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 100000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p00001",
+      "submission_id": "s092364643",
+      "kind": "fixed_tuple_block",
+      "transport": "stdin",
+      "format": "10 mountain heights",
+      "termination": "eof",
+      "constraints": {
+        "records": 10,
+        "fields": 1
+      },
+      "mutation": "values_only"
+    },
+    {
+      "case_id": "p02814",
+      "submission_id": "s915631953",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N D followed by N integers",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 1,
+        "count_offset": 1,
+        "value_min": 2,
+        "scalar_max": 1000000000,
+        "even_values": true,
+        "min": 1,
+        "max": 1000000000
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p03510",
+      "submission_id": "s583362876",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N pairs",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 2,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p00788",
+      "submission_id": "s998194081",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "pairs of integers until 0 0",
+      "termination": "0 0 sentinel",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000,
+        "p_min": 1,
+        "p_max": 1000,
+        "n_min": 1,
+        "n_max": 1000,
+        "p_le_n": true
+      },
+      "mutation": "values_only_preserve_terminator"
+    },
+    {
+      "case_id": "p03430",
+      "submission_id": "s601450783",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "string followed by integer k",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p00678",
+      "submission_id": "s961523709",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "loops of N followed by N triples until N=0",
+      "termination": "n=0",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 1000,
+        "values_per_count": 3,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p00033",
+      "submission_id": "s763935897",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N 10-tuples",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 1000,
+        "values_per_count": 10,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p01315",
+      "submission_id": "s212409236",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "loops of N followed by strings and integers until N=0",
+      "termination": "n=0",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000,
+        "n_max": 50,
+        "name_max": 20,
+        "value_min": 0,
+        "value_max": 1000000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p02950",
+      "submission_id": "s864110221",
+      "kind": "primitive_modulus_stream",
+      "transport": "stdin",
+      "format": "p b0 followed by p-1 integers",
+      "termination": "eof",
+      "constraints": {
+        "p_min": 2,
+        "p_max": 97,
+        "value_min": 0,
+        "value_max": 2998,
+        "min": 0,
+        "max": 2998,
+        "prime": true,
+        "header_fields": [
+          {"min": 2, "max": 2999}
+        ]
+      },
+      "mutation": "value_only_preserve_header"
+    },
+    {
+      "case_id": "p00693",
+      "submission_id": "s746355550",
+      "kind": "rule_packet_batches",
+      "transport": "stdin",
+      "format": "rule_num packet_num followed by rules and packets until 0 0",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p00008",
+      "submission_id": "s771404612",
+      "kind": "repeated_int",
+      "transport": "stdin",
+      "format": "one integer per case",
+      "termination": "eof",
+      "constraints": {
+        "min": 0,
+        "max": 1000
+      },
+      "mutation": "value_only"
+    },
+    {
+      "case_id": "p00859",
+      "submission_id": "s595927985",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "loops of N M followed by M triples until N=0",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p01687",
+      "submission_id": "s146593197",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "single word string",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 2000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p02100",
+      "submission_id": "s624710482",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "polynomial expression string",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p01970",
+      "submission_id": "s660972586",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N integers",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 1,
+        "count_offset": 0,
+        "value_min": 2,
+        "value_max": 1000000,
+        "min": 2,
+        "max": 1000000
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p00165",
+      "submission_id": "s722254321",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "loops of N followed by N pairs until N=0",
+      "termination": "n=0",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 1000,
+        "values_per_count": 2,
+        "count_offset": 0,
+        "value_min": 0,
+        "value_max": 1000000
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p01766",
+      "submission_id": "s942434524",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N lines of 5 integers",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 10000,
+        "values_per_count": 5,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p02474",
+      "submission_id": "s383039486",
+      "kind": "big_integer_pair",
+      "transport": "stdin",
+      "format": "two large non-negative integers on one line",
+      "termination": "eof",
+      "constraints": {
+        "max_digits": 200000
+      },
+      "mutation": "digits_only_preserve_sign_and_separator"
+    },
+    {
+      "case_id": "p00327",
+      "submission_id": "s356526576",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N integers",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 1000,
+        "values_per_count": 1,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p03835",
+      "submission_id": "s836003439",
+      "kind": "fixed_tuple_block",
+      "transport": "stdin",
+      "format": "two integers K and S",
+      "termination": "eof",
+      "constraints": {
+        "records": 1,
+        "fields": 2
+      },
+      "mutation": "values_only"
+    },
+    {
+      "case_id": "p02289",
+      "submission_id": "s913513064",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "commands insert key or extract or end",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 100
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p00793",
+      "submission_id": "s729150918",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "six integer coordinates per case",
+      "termination": "six zero coordinates",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000,
+        "coordinate_min": 1,
+        "coordinate_max": 9999
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p03854",
+      "submission_id": "s574999050",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "single text string",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 100000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p03543",
+      "submission_id": "s082142762",
+      "kind": "single_int",
+      "transport": "stdin",
+      "format": "one 4-digit integer",
+      "termination": "eof",
+      "constraints": {
+        "min": 1000,
+        "max": 9999
+      },
+      "mutation": "value_only"
+    },
+    {
+      "case_id": "p03434",
+      "submission_id": "s567580506",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N integers",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 1,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p03493",
+      "submission_id": "s344335879",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "3-character binary string",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 10
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p03773",
+      "submission_id": "s799607332",
+      "kind": "fixed_tuple_block",
+      "transport": "stdin",
+      "format": "two integers a and b",
+      "termination": "eof",
+      "constraints": {
+        "records": 1,
+        "fields": 2
+      },
+      "mutation": "values_only"
+    },
+    {
+      "case_id": "p03199",
+      "submission_id": "s752471056",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "N M followed by M triples of integers",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p02788",
+      "submission_id": "s653265412",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N D A followed by N pairs",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 200000,
+        "values_per_count": 2,
+        "count_offset": 2,
+        "scalar_max": 1000000000,
+        "min": 0,
+        "max": 1000000000
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p01571",
+      "submission_id": "s327549193",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "N M followed by words and sentences",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p02029",
+      "submission_id": "s891773536",
+      "kind": "repeated_int",
+      "transport": "stdin",
+      "format": "N M followed by N pairs and variable trailing integers",
+      "termination": "eof",
+      "constraints": {
+        "min": 0,
+        "max": 1000000000,
+        "header_fields": [
+          {"min": 1, "max": 100000},
+          {"min": 1, "max": 100000}
+        ]
+      },
+      "mutation": "value_only_preserve_header"
+    },
+    {
+      "case_id": "p02477",
+      "submission_id": "s228971816",
+      "kind": "big_integer_pair",
+      "transport": "stdin",
+      "format": "two large non-negative integers",
+      "termination": "eof",
+      "constraints": {
+        "max_digits": 200000
+      },
+      "mutation": "digits_only_preserve_sign_and_separator"
+    },
+    {
+      "case_id": "p01296",
+      "submission_id": "s236329906",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "loops of N followed by N lines of ints and chars",
+      "termination": "n=0",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000,
+        "n_max": 20025,
+        "coordinate_max": 1000000000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p03006",
+      "submission_id": "s125302006",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N followed by N pairs of integers",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 2,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p03142",
+      "submission_id": "s710805295",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "N M followed by vertices and edges",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000,
+        "n_max": 115000,
+        "edge_max": 514000
+      },
+      "mutation": "graph_values_only"
+    },
+    {
+      "case_id": "p00867",
+      "submission_id": "s333068212",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "loops of N followed by N 4-tuples until N=0",
+      "termination": "n=0",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 4,
+        "count_offset": 0
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p03261",
+      "submission_id": "s577603531",
+      "kind": "encoded_line_stream",
+      "transport": "stdin",
+      "format": "N followed by N words",
+      "termination": "eof",
+      "constraints": {
+        "newline_required": true,
+        "max_line_length": 1000
+      },
+      "mutation": "alphabet_only"
+    },
+    {
+      "case_id": "p03776",
+      "submission_id": "s721771429",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N A B followed by N values",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 1,
+        "count_offset": 2
+      },
+      "mutation": "values_only_preserve_count"
+    },
+    {
+      "case_id": "p03111",
+      "submission_id": "s152042503",
+      "kind": "counted_long_list",
+      "transport": "stdin",
+      "format": "N A B C followed by N values",
+      "termination": "eof",
+      "constraints": {
+        "n_min": 1,
+        "n_max": 100000,
+        "values_per_count": 1,
+        "count_offset": 3
+      },
+      "mutation": "values_only_preserve_count"
+    }
+  ]
+}
