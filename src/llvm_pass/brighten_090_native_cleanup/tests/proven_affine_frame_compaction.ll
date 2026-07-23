@@ -4,6 +4,13 @@ target datalayout = "e-m:e-p:64:64-i64:64-n8:16:32:64-S128"
 
 define i32 @main() {
 entry:
+  store i64 0, ptr getelementptr (i8, ptr @frame_storage_backing.main, i64 880), align 16
+  %result = call i32 @worker()
+  ret i32 %result
+}
+
+define internal i32 @worker() {
+entry:
   store i32 0, ptr getelementptr (i8, ptr @frame_storage_backing.main, i64 900), align 4
   br label %dispatch
 
@@ -17,6 +24,8 @@ dispatch:
   %sp = phi i64 [ add (i64 ptrtoint (ptr getelementptr (i8, ptr @frame_storage_backing.main, i64 960) to i64), i64 -32), %entry ], [ %sp.next, %hub ]
   switch i32 %control, label %nested [
     i32 0, label %enter
+    i32 3, label %exit
+    i32 4, label %exit
   ]
 
 nested:

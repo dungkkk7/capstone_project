@@ -579,6 +579,10 @@ if grep -Eq '@frame_storage_backing\.main' "$AFFINE_FRAME_OUT"; then
   echo "FAIL: finite affine fake stack was not compacted" >&2
   exit 1
 fi
+if grep -Eq 'define internal i32 @worker' "$AFFINE_FRAME_OUT"; then
+  echo "FAIL: single-use affine frame worker was not inlined" >&2
+  exit 1
+fi
 grep -Eq 'native_frame = alloca \[[0-9]+ x i8\]' "$AFFINE_FRAME_OUT"
 grep -Eq 'call void @llvm\.memset' "$AFFINE_FRAME_OUT"
 

@@ -48,6 +48,11 @@ static cl::opt<bool> NativeStateSSA(
     cl::desc("Lower native functions from State pointer ABI to SSA slots"),
     cl::init(false));
 
+static cl::opt<bool> NativeAffineDebug(
+    "brighten-native-affine-debug", cl::Hidden,
+    cl::desc("Explain conservative affine frame-compaction refusals"),
+    cl::init(false));
+
 static bool isLiftedFunctionName(StringRef Name) {
   return Name.starts_with("__remill_") ||
          Name.starts_with("__mcsema_") ||
@@ -6326,6 +6331,52 @@ static unsigned eraseUnusedInternalGlobals(Module &M, bool &Changed) {
   return Dead.size();
 }
 
+// A residual segment may still use its original identified `seg_*` struct
+// after every guest alias has been removed. At that point the struct name is
+// no longer provenance: the global is native storage whose packed aggregate
+// initializer must merely retain the exact same layout. Replace only direct
+// constant-struct residuals with an equivalent literal struct.
+static unsigned canonicalizeResidualSegmentTypes(Module &M, bool &Changed) {
+  SmallVector<GlobalVariable *, 8> Work;
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.getName().starts_with("native_residual_") ||
+        !GV.hasInitializer())
+      continue;
+    auto *ST = dyn_cast<StructType>(GV.getValueType());
+    if (!ST || !ST->hasName() || !ST->getName().starts_with("seg_") ||
+        ST->isOpaque() || !isa<ConstantStruct>(GV.getInitializer()))
+      continue;
+    Work.push_back(&GV);
+  }
+
+  for (GlobalVariable *GV : Work) {
+    auto *OldTy = cast<StructType>(GV->getValueType());
+    auto *OldInit = cast<ConstantStruct>(GV->getInitializer());
+    StructType *NativeTy =
+        StructType::get(M.getContext(), OldTy->elements(), OldTy->isPacked());
+
+    SmallVector<Constant *, 32> Elements;
+    Elements.reserve(OldInit->getNumOperands());
+    for (Value *Operand : OldInit->operands())
+      Elements.push_back(cast<Constant>(Operand));
+    Constant *NativeInit = ConstantStruct::get(NativeTy, Elements);
+
+    auto *NativeGV = new GlobalVariable(
+        M, NativeTy, GV->isConstant(), GV->getLinkage(), NativeInit, "", GV,
+        GV->getThreadLocalMode(), GV->getAddressSpace(),
+        GV->isExternallyInitialized());
+    NativeGV->copyAttributesFrom(GV);
+    NativeGV->copyMetadata(GV, 0);
+    NativeGV->takeName(GV);
+    GV->replaceAllUsesWith(NativeGV);
+    GV->eraseFromParent();
+  }
+
+  if (!Work.empty())
+    Changed = true;
+  return Work.size();
+}
+
 static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
   unsigned Removed = 0;
 
@@ -7466,7 +7517,7 @@ static unsigned compactProvenConstantFrameBackings(Module &M, bool &Changed) {
                                         FrameSize);
     IRBuilder<> EntryBuilder(&*Owner->getEntryBlock().getFirstInsertionPt());
     AllocaInst *Frame = EntryBuilder.CreateAlloca(
-        FrameTy, nullptr, Backing->getName() + ".native_frame");
+        FrameTy, nullptr, "native_frame");
     Frame->setAlignment(FrameAlign);
 
     for (const ProvenFrameAccess &Access : Accesses) {
@@ -7671,7 +7722,32 @@ static bool dispatcherCaseExecutesAtMostOnce(BasicBlock *Target) {
         return It->second;
       }
       auto *BI = dyn_cast<BranchInst>(Term);
-      if (!BI || !BI->isUnconditional() || BI->getSuccessor(0) != Hub) {
+      if (!BI || !BI->isUnconditional()) {
+        GraphValid = false;
+        auto [It, Inserted] =
+            SuccessorCache.insert({Node, std::move(Next)});
+        return It->second;
+      }
+      if (BI->getSuccessor(0) != Hub) {
+        SmallVector<BasicBlock *, 16> Worklist{BI->getSuccessor(0)};
+        SmallPtrSet<BasicBlock *, 32> Seen;
+        bool CanReturnToTarget = false;
+        while (!Worklist.empty()) {
+          BasicBlock *CurrentBB = Worklist.pop_back_val();
+          if (CurrentBB == Target) {
+            CanReturnToTarget = true;
+            break;
+          }
+          if (!Seen.insert(CurrentBB).second)
+            continue;
+          for (BasicBlock *Successor : successors(CurrentBB))
+            Worklist.push_back(Successor);
+        }
+        if (!CanReturnToTarget) {
+          auto [It, Inserted] =
+              SuccessorCache.insert({Node, std::move(Next)});
+          return It->second;
+        }
         GraphValid = false;
         auto [It, Inserted] =
             SuccessorCache.insert({Node, std::move(Next)});
@@ -7742,6 +7818,28 @@ static bool dispatcherCaseExecutesAtMostOnce(BasicBlock *Target) {
   return false;
 }
 
+static bool hasUnresolvedFlattenedDispatcher(Function &F) {
+  for (BasicBlock &BB : F) {
+    auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
+    auto *StatePhi = SI ? dyn_cast<PHINode>(SI->getCondition()) : nullptr;
+    if (!SI || !StatePhi || SI->getNumCases() < 2 ||
+        SI->getDefaultDest() != &BB)
+      continue;
+    APInt Min = SI->case_begin()->getCaseValue()->getValue();
+    APInt Max = Min;
+    for (auto Case : SI->cases()) {
+      const APInt &V = Case.getCaseValue()->getValue();
+      if (V.slt(Min))
+        Min = V;
+      if (V.sgt(Max))
+        Max = V;
+    }
+    if ((Max - Min).ugt(SI->getNumCases() * 4))
+      return true;
+  }
+  return false;
+}
+
 class AffineFrameAnalyzer {
 public:
   AffineFrameAnalyzer(GlobalVariable &Backing, Function &Owner)
@@ -7782,6 +7880,12 @@ public:
       FrameAffineRange Operand;
       if (evaluate(FI->getOperand(0), Operand))
         Result = Operand;
+    } else if (auto *EVI = dyn_cast<ExtractValueInst>(V)) {
+      if (Value *Inserted = resolveExactInsertedValue(*EVI)) {
+        FrameAffineRange Operand;
+        if (evaluate(Inserted, Operand))
+          Result = Operand;
+      }
     } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
       FrameAffineRange Base;
       if (evaluate(GEP->getPointerOperand(), Base)) {
@@ -7852,7 +7956,64 @@ public:
   bool sawFinitePhi() const { return SawFinitePhi; }
 
 private:
+  static Value *resolveExactInsertedValue(ExtractValueInst &Extract) {
+    ArrayRef<unsigned> Wanted = Extract.getIndices();
+    Value *Aggregate = Extract.getAggregateOperand();
+    while (auto *Insert = dyn_cast<InsertValueInst>(Aggregate)) {
+      ArrayRef<unsigned> Inserted = Insert->getIndices();
+      if (Inserted.size() == Wanted.size() &&
+          std::equal(Inserted.begin(), Inserted.end(), Wanted.begin()))
+        return Insert->getInsertedValueOperand();
+
+      unsigned Common = 0;
+      unsigned Shorter = std::min(Inserted.size(), Wanted.size());
+      while (Common < Shorter && Inserted[Common] == Wanted[Common])
+        ++Common;
+      if (Common == Shorter)
+        return nullptr;
+      Aggregate = Insert->getAggregateOperand();
+    }
+    return nullptr;
+  }
+
+  static bool stripPhiPassthroughs(Value *V, Value *&Base, int64_t &Delta) {
+    Base = V;
+    Delta = 0;
+    SmallPtrSet<Value *, 8> Seen;
+    while (Seen.insert(Base).second) {
+      int64_t LocalDelta = 0;
+      Value *Stripped = stripIntegerConstantOffset(Base, LocalDelta);
+      if (!Stripped)
+        return false;
+      int64_t NextDelta = 0;
+      if (!addSignedOffset(Delta, LocalDelta, NextDelta))
+        return false;
+      Delta = NextDelta;
+      Base = Stripped;
+
+      auto *Extract = dyn_cast<ExtractValueInst>(Base);
+      if (!Extract)
+        return true;
+      Value *Inserted = resolveExactInsertedValue(*Extract);
+      if (!Inserted)
+        return true;
+      Base = Inserted;
+    }
+    return false;
+  }
+
   bool computePhiRange(PHINode *Start, FrameAffineRange &Out) {
+    auto RefusePhi = [&](StringRef Reason, Value *Incoming = nullptr) {
+      if (NativeAffineDebug) {
+        errs() << "brighten-native-cleanup: affine PHI refused: " << Reason;
+        if (Incoming) {
+          errs() << "\n  incoming: ";
+          Incoming->print(errs());
+        }
+        errs() << '\n';
+      }
+      return false;
+    };
     SmallVector<PHINode *, 8> Worklist{Start};
     SmallPtrSet<PHINode *, 8> Group;
     while (!Worklist.empty()) {
@@ -7861,9 +8022,9 @@ private:
         continue;
       for (Value *Incoming : PN->incoming_values()) {
         int64_t Delta = 0;
-        Value *Base = stripIntegerConstantOffset(Incoming, Delta);
-        if (!Base)
-          return false;
+        Value *Base = nullptr;
+        if (!stripPhiPassthroughs(Incoming, Base, Delta))
+          return RefusePhi("could not normalize incoming value", Incoming);
         if (auto *Other = dyn_cast<PHINode>(Base))
           if (!Group.contains(Other))
             Worklist.push_back(Other);
@@ -7877,33 +8038,37 @@ private:
       for (unsigned I = 0; I < PN->getNumIncomingValues(); ++I) {
         Value *Incoming = PN->getIncomingValue(I);
         int64_t Delta = 0;
-        Value *Base = stripIntegerConstantOffset(Incoming, Delta);
-        if (!Base)
-          return false;
+        Value *Base = nullptr;
+        if (!stripPhiPassthroughs(Incoming, Base, Delta))
+          return RefusePhi("could not normalize incoming value", Incoming);
         if (auto *BasePhi = dyn_cast<PHINode>(Base);
             BasePhi && Group.contains(BasePhi)) {
           if (!Delta)
             continue;
           if (!dispatcherCaseExecutesAtMostOnce(PN->getIncomingBlock(I)))
-            return false;
+            return RefusePhi("cyclic affine transition", Incoming);
           int64_t Next = 0;
           if (Delta < 0) {
             if (!addSignedOffset(NegativeTransitions, Delta, Next))
-              return false;
+              return RefusePhi("negative transition overflow", Incoming);
             NegativeTransitions = Next;
           } else {
             if (!addSignedOffset(PositiveTransitions, Delta, Next))
-              return false;
+              return RefusePhi("positive transition overflow", Incoming);
             PositiveTransitions = Next;
           }
           continue;
         }
 
         FrameAffineRange Seed;
-        if (!evaluate(Base, Seed) || Seed.Coeff != 1 ||
-            Seed.Min != Seed.Max ||
-            !addSignedOffset(Seed.Min, Delta, Seed.Min))
-          return false;
+        if (!evaluate(Base, Seed))
+          return RefusePhi("non-affine seed", Incoming);
+        if (Seed.Coeff != 1)
+          return RefusePhi("seed is not frame-relative", Incoming);
+        if (Seed.Min != Seed.Max)
+          return RefusePhi("seed is not exact", Incoming);
+        if (!addSignedOffset(Seed.Min, Delta, Seed.Min))
+          return RefusePhi("seed offset overflow", Incoming);
         Seed.Max = Seed.Min;
         if (!HasSeed) {
           SeedMin = SeedMax = Seed.Min;
@@ -7918,7 +8083,7 @@ private:
     if (!HasSeed ||
         !addSignedOffset(SeedMin, NegativeTransitions, Min) ||
         !addSignedOffset(SeedMax, PositiveTransitions, Max))
-      return false;
+      return RefusePhi("missing seed or final range overflow");
     FrameAffineRange Range{1, Min, Max};
     for (PHINode *PN : Group)
       Cache[PN] = Range;
@@ -7935,18 +8100,20 @@ private:
   bool SawFinitePhi = false;
 };
 
-static bool findSoleFrameBackingOwner(GlobalVariable &Backing,
-                                      Function *&Owner) {
+static bool collectFrameBackingOwners(GlobalVariable &Backing,
+                                      SmallVectorImpl<Function *> &Owners) {
   SmallVector<User *, 32> Worklist(Backing.user_begin(), Backing.user_end());
   SmallPtrSet<User *, 32> Seen;
+  SmallPtrSet<Function *, 8> OwnerSet;
   while (!Worklist.empty()) {
     User *U = Worklist.pop_back_val();
     if (!Seen.insert(U).second)
       continue;
     if (auto *I = dyn_cast<Instruction>(U)) {
-      if (!I->getFunction() || (Owner && Owner != I->getFunction()))
+      if (!I->getFunction())
         return false;
-      Owner = I->getFunction();
+      if (OwnerSet.insert(I->getFunction()).second)
+        Owners.push_back(I->getFunction());
       continue;
     }
     auto *C = dyn_cast<Constant>(U);
@@ -7954,7 +8121,90 @@ static bool findSoleFrameBackingOwner(GlobalVariable &Backing,
       return false;
     Worklist.append(C->user_begin(), C->user_end());
   }
-  return Owner != nullptr;
+  return !Owners.empty();
+}
+
+static bool findSoleFrameBackingOwner(GlobalVariable &Backing,
+                                      Function *&Owner) {
+  SmallVector<Function *, 4> Owners;
+  if (!collectFrameBackingOwners(Backing, Owners) || Owners.size() != 1)
+    return false;
+  Owner = Owners.front();
+  return true;
+}
+
+static bool hasDirectCallPath(Function &From, Function &To,
+                              SmallPtrSetImpl<Function *> &Seen) {
+  if (!Seen.insert(&From).second)
+    return false;
+  for (BasicBlock &BB : From) {
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+      if (!Callee)
+        continue;
+      if (Callee == &To)
+        return true;
+      if (!Callee->isDeclaration() && hasDirectCallPath(*Callee, To, Seen))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool inlineBoundedUseFrameBackingCallees(GlobalVariable &Backing,
+                                                bool &Changed) {
+  constexpr unsigned MaxFrameBackingInlineSites = 8;
+  while (true) {
+    SmallVector<Function *, 4> Owners;
+    if (!collectFrameBackingOwners(Backing, Owners))
+      return false;
+    if (Owners.size() == 1)
+      return true;
+
+    Function *Callee = nullptr;
+    SmallVector<CallBase *, MaxFrameBackingInlineSites> CallSites;
+    for (Function *F : Owners) {
+      if (!F->hasInternalLinkage() || F->isDeclaration())
+        continue;
+      SmallVector<CallBase *, MaxFrameBackingInlineSites> CandidateCalls;
+      bool Valid = true;
+      for (User *U : F->users()) {
+        auto *CB = dyn_cast<CallBase>(U);
+        if (!CB || CB->getCalledFunction() != F || !CB->getFunction() ||
+            CB->getFunction() == F ||
+            llvm::find(Owners, CB->getFunction()) == Owners.end() ||
+            CandidateCalls.size() == MaxFrameBackingInlineSites) {
+          Valid = false;
+          break;
+        }
+        SmallPtrSet<Function *, 32> Seen;
+        if (hasDirectCallPath(*F, *CB->getFunction(), Seen)) {
+          Valid = false;
+          break;
+        }
+        CandidateCalls.push_back(CB);
+      }
+      if (!Valid || CandidateCalls.empty())
+        continue;
+      Callee = F;
+      CallSites = std::move(CandidateCalls);
+      break;
+    }
+    if (!Callee)
+      return false;
+
+    for (CallBase *CallSite : CallSites) {
+      InlineFunctionInfo IFI;
+      InlineResult Result = InlineFunction(*CallSite, IFI, true);
+      if (!Result.isSuccess())
+        return false;
+      Changed = true;
+    }
+    if (!Callee->use_empty())
+      return false;
+    Callee->eraseFromParent();
+  }
 }
 
 static bool fixedAccessSize(const DataLayout &DL, Type *Ty, uint64_t &Size) {
@@ -7965,9 +8215,216 @@ static bool fixedAccessSize(const DataLayout &DL, Type *Ty, uint64_t &Size) {
   return Size <= uint64_t(std::numeric_limits<int64_t>::max());
 }
 
+static std::optional<uint64_t>
+boundedDirectScanfDestinationSize(CallBase &CB, Value *Pointer,
+                                  const DataLayout &DL) {
+  Function *Callee = CB.getCalledFunction();
+  if (!Callee || CB.arg_size() < 2)
+    return std::nullopt;
+  StringRef Name = Callee->getName();
+  if (Name != "scanf" && Name != "__isoc99_scanf")
+    return std::nullopt;
+
+  auto Format = readConstantFormatString(CB.getArgOperand(0), DL);
+  if (!Format)
+    return std::nullopt;
+
+  enum class Length {
+    None,
+    HH,
+    H,
+    L,
+    LL,
+    J,
+    Z,
+    T,
+    LongDouble,
+  };
+  auto IntegerSize = [&](Length Len) -> std::optional<uint64_t> {
+    switch (Len) {
+    case Length::None:
+      return 4;
+    case Length::HH:
+      return 1;
+    case Length::H:
+      return 2;
+    case Length::L:
+    case Length::LL:
+    case Length::J:
+    case Length::Z:
+    case Length::T:
+      // This pass targets the recovered x86-64 SysV ABI, where these scanf
+      // integer destinations are all eight-byte objects.
+      if (DL.getPointerSize() == 8)
+        return 8;
+      return std::nullopt;
+    case Length::LongDouble:
+      return std::nullopt;
+    }
+    llvm_unreachable("unknown scanf length modifier");
+  };
+
+  unsigned Argument = 1;
+  bool Matched = false;
+  uint64_t MaxSize = 0;
+  StringRef Text = *Format;
+  for (size_t I = 0; I < Text.size();) {
+    if (Text[I++] != '%')
+      continue;
+    if (I >= Text.size())
+      return std::nullopt;
+    if (Text[I] == '%') {
+      ++I;
+      continue;
+    }
+
+    bool Suppressed = false;
+    if (Text[I] == '*') {
+      Suppressed = true;
+      ++I;
+    }
+
+    bool HasWidth = false;
+    uint64_t Width = 0;
+    while (I < Text.size() && Text[I] >= '0' && Text[I] <= '9') {
+      HasWidth = true;
+      unsigned Digit = unsigned(Text[I++] - '0');
+      if (Width >
+          (uint64_t(std::numeric_limits<int64_t>::max()) - Digit) / 10)
+        return std::nullopt;
+      Width = Width * 10 + Digit;
+    }
+
+    Length Len = Length::None;
+    if (I < Text.size() && Text[I] == 'h') {
+      Len = Length::H;
+      if (++I < Text.size() && Text[I] == 'h') {
+        Len = Length::HH;
+        ++I;
+      }
+    } else if (I < Text.size() && Text[I] == 'l') {
+      Len = Length::L;
+      if (++I < Text.size() && Text[I] == 'l') {
+        Len = Length::LL;
+        ++I;
+      }
+    } else if (I < Text.size() && Text[I] == 'j') {
+      Len = Length::J;
+      ++I;
+    } else if (I < Text.size() && Text[I] == 'z') {
+      Len = Length::Z;
+      ++I;
+    } else if (I < Text.size() && Text[I] == 't') {
+      Len = Length::T;
+      ++I;
+    } else if (I < Text.size() && Text[I] == 'L') {
+      Len = Length::LongDouble;
+      ++I;
+    }
+    if (I >= Text.size())
+      return std::nullopt;
+
+    char Conversion = Text[I++];
+    if (Conversion == '[') {
+      if (I < Text.size() && Text[I] == '^')
+        ++I;
+      if (I < Text.size() && Text[I] == ']')
+        ++I;
+      while (I < Text.size() && Text[I] != ']')
+        ++I;
+      if (I >= Text.size())
+        return std::nullopt;
+      ++I;
+    }
+    if (Suppressed)
+      continue;
+    if (Argument >= CB.arg_size())
+      return std::nullopt;
+
+    Value *Destination = CB.getArgOperand(Argument++);
+    if (Destination != Pointer)
+      continue;
+    Matched = true;
+
+    std::optional<uint64_t> Size;
+    if (Conversion == 'd' || Conversion == 'i' || Conversion == 'o' ||
+        Conversion == 'u' || Conversion == 'x' || Conversion == 'X' ||
+        Conversion == 'n') {
+      Size = IntegerSize(Len);
+    } else if (Conversion == 'c' && Len == Length::None) {
+      Size = HasWidth ? Width : 1;
+    } else if ((Conversion == 's' || Conversion == '[') &&
+               Len == Length::None && HasWidth &&
+               Width < uint64_t(std::numeric_limits<int64_t>::max())) {
+      Size = Width + 1;
+    } else if (Conversion == 'p' && Len == Length::None) {
+      Size = DL.getPointerSize();
+    }
+    if (!Size || !*Size)
+      return std::nullopt;
+    MaxSize = std::max(MaxSize, *Size);
+  }
+  if (!Matched)
+    return std::nullopt;
+  return MaxSize;
+}
+
 static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
                                    uint64_t &MaxSize,
                                    SmallPtrSetImpl<Value *> &Seen);
+
+static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
+                                   uint64_t &MaxSize,
+                                   SmallPtrSetImpl<Value *> &Seen);
+
+static bool traceAffineAggregateElementUses(
+    Value *Aggregate, ArrayRef<unsigned> Path, const DataLayout &DL,
+    uint64_t &MaxSize, SmallPtrSetImpl<Value *> &Seen) {
+  if (!Seen.insert(Aggregate).second)
+    return true;
+  for (User *U : Aggregate->users()) {
+    if (auto *Extract = dyn_cast<ExtractValueInst>(U)) {
+      ArrayRef<unsigned> Extracted = Extract->getIndices();
+      unsigned Common = 0;
+      unsigned Shorter = std::min(Path.size(), Extracted.size());
+      while (Common < Shorter && Path[Common] == Extracted[Common])
+        ++Common;
+      if (Common != Shorter)
+        continue;
+      if (Path.size() != Extracted.size())
+        return false;
+      if (!traceAffineIntegerUses(Extract, DL, MaxSize, Seen))
+        return false;
+      continue;
+    }
+    if (auto *Insert = dyn_cast<InsertValueInst>(U)) {
+      if (Insert->getAggregateOperand() != Aggregate)
+        return false;
+      ArrayRef<unsigned> Inserted = Insert->getIndices();
+      unsigned Common = 0;
+      unsigned Shorter = std::min(Path.size(), Inserted.size());
+      while (Common < Shorter && Path[Common] == Inserted[Common])
+        ++Common;
+      if (Common == Shorter) {
+        if (Inserted.size() <= Path.size())
+          continue;
+        return false;
+      }
+      if (!traceAffineAggregateElementUses(Insert, Path, DL, MaxSize, Seen))
+        return false;
+      continue;
+    }
+    if (NativeAffineDebug) {
+      errs() << "brighten-native-cleanup: unbounded affine aggregate use of ";
+      Aggregate->printAsOperand(errs(), false);
+      errs() << " by ";
+      U->print(errs());
+      errs() << '\n';
+    }
+    return false;
+  }
+  return true;
+}
 
 static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
                                    uint64_t &MaxSize,
@@ -7982,6 +8439,13 @@ static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
     }
     if (isa<ICmpInst>(U))
       continue;
+    if (auto *Insert = dyn_cast<InsertValueInst>(U)) {
+      if (Insert->getInsertedValueOperand() != Integer ||
+          !traceAffineAggregateElementUses(Insert, Insert->getIndices(), DL,
+                                           MaxSize, Seen))
+        return false;
+      continue;
+    }
     if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getPointerOperand() == Integer)
         return false;
@@ -7997,6 +8461,13 @@ static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
       if (auto *SI = dyn_cast<StoreInst>(I))
         if (SI->getValueOperand() == Integer)
           return false;
+    }
+    if (NativeAffineDebug) {
+      errs() << "brighten-native-cleanup: unbounded affine integer use of ";
+      Integer->printAsOperand(errs(), false);
+      errs() << " by ";
+      U->print(errs());
+      errs() << '\n';
     }
     return false;
   }
@@ -8032,6 +8503,13 @@ static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
     }
     if (isa<ICmpInst>(U))
       continue;
+    if (auto *CB = dyn_cast<CallBase>(U)) {
+      auto Size = boundedDirectScanfDestinationSize(*CB, Pointer, DL);
+      if (!Size)
+        return false;
+      MaxSize = std::max(MaxSize, *Size);
+      continue;
+    }
     if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getPointerOperand() != Pointer ||
           !traceAffinePointerUses(GEP, DL, MaxSize, Seen))
@@ -8051,6 +8529,13 @@ static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
         continue;
       }
     }
+    if (NativeAffineDebug) {
+      errs() << "brighten-native-cleanup: unbounded affine pointer use of ";
+      Pointer->printAsOperand(errs(), false);
+      errs() << " by ";
+      U->print(errs());
+      errs() << '\n';
+    }
     return false;
   }
   return true;
@@ -8069,6 +8554,24 @@ struct AffineAddressStore {
   FrameAffineRange StoredAddress;
 };
 
+static bool syntacticallyDependsOnFrameBacking(
+    Value *V, GlobalVariable &Backing, SmallPtrSetImpl<Value *> &Seen) {
+  if (!V)
+    return false;
+  if (V == &Backing)
+    return true;
+  if (!Seen.insert(V).second || isa<Argument>(V) || isa<LoadInst>(V) ||
+      isa<CallBase>(V) || isa<AllocaInst>(V) || isa<GlobalValue>(V))
+    return false;
+  auto *U = dyn_cast<User>(V);
+  if (!U)
+    return false;
+  for (Value *Operand : U->operands())
+    if (syntacticallyDependsOnFrameBacking(Operand, Backing, Seen))
+      return true;
+  return false;
+}
+
 static bool affineIntervalsOverlap(const FrameAffineRange &A, uint64_t ASize,
                                    const FrameAffineRange &B, uint64_t BSize) {
   int64_t AEnd = 0, BEnd = 0;
@@ -8085,6 +8588,12 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
   SmallVector<AffineFrameLoad, 64> Loads;
   SmallVector<AffineAddressStore, 32> AddressStores;
   bool HasAccess = false;
+  auto Refuse = [&](StringRef Reason) {
+    if (NativeAffineDebug)
+      errs() << "brighten-native-cleanup: affine frame "
+             << Backing.getName() << " refused: " << Reason << "\n";
+    return false;
+  };
 
   auto AddAccess = [&](const FrameAffineRange &Pointer,
                        uint64_t Size) -> bool {
@@ -8111,13 +8620,18 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
         FrameAffineRange Pointer;
         if (!Analyzer.evaluate(LI->getPointerOperand(), Pointer) ||
-            Pointer.Coeff != 1)
+            Pointer.Coeff != 1) {
+          SmallPtrSet<Value *, 32> Seen;
+          if (syntacticallyDependsOnFrameBacking(
+                  LI->getPointerOperand(), Backing, Seen))
+            return Refuse("unproven backing-derived load");
           continue;
+        }
         uint64_t Size = 0;
         if (LI->isVolatile() || LI->isAtomic() ||
             !fixedAccessSize(DL, LI->getType(), Size) ||
             !AddAccess(Pointer, Size))
-          return false;
+          return Refuse("unbounded or unsupported direct load");
         FrameAlign = std::max(FrameAlign, LI->getAlign());
         Loads.push_back({LI, Pointer, Size});
         continue;
@@ -8127,19 +8641,51 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
         bool IsFrameStore =
             Analyzer.evaluate(SI->getPointerOperand(), Pointer) &&
             Pointer.Coeff == 1;
+        if (!IsFrameStore) {
+          SmallPtrSet<Value *, 32> Seen;
+          if (syntacticallyDependsOnFrameBacking(
+                  SI->getPointerOperand(), Backing, Seen)) {
+            if (NativeAffineDebug) {
+              errs() << "brighten-native-cleanup: unproven affine store: ";
+              SI->print(errs());
+              errs() << '\n';
+            }
+            return Refuse("unproven backing-derived store");
+          }
+        }
         uint64_t Size = 0;
         if (IsFrameStore) {
           if (SI->isVolatile() || SI->isAtomic() ||
               !fixedAccessSize(DL, SI->getValueOperand()->getType(), Size) ||
               !AddAccess(Pointer, Size))
-            return false;
+            return Refuse("unbounded or unsupported direct store");
           FrameAlign = std::max(FrameAlign, SI->getAlign());
         }
         FrameAffineRange Stored;
-        if (Analyzer.evaluate(SI->getValueOperand(), Stored) &&
-            Stored.Coeff == 1) {
-          if (!IsFrameStore)
-            return false;
+        bool IsStoredFrameAddress =
+            Analyzer.evaluate(SI->getValueOperand(), Stored) &&
+            Stored.Coeff == 1;
+        if (!IsStoredFrameAddress) {
+          SmallPtrSet<Value *, 32> Seen;
+          if (syntacticallyDependsOnFrameBacking(
+                  SI->getValueOperand(), Backing, Seen)) {
+            if (NativeAffineDebug) {
+              errs() << "brighten-native-cleanup: unproven stored affine "
+                        "value: ";
+              SI->print(errs());
+              errs() << '\n';
+            }
+            return Refuse("unproven backing-derived stored value");
+          }
+        } else {
+          if (!IsFrameStore) {
+            if (NativeAffineDebug) {
+              errs() << "brighten-native-cleanup: escaping affine store: ";
+              SI->print(errs());
+              errs() << '\n';
+            }
+            return Refuse("derived address stored outside its frame");
+          }
           AddressStores.push_back({SI, Pointer, Size, Stored});
         }
         continue;
@@ -8147,29 +8693,60 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
       if (auto *ITP = dyn_cast<IntToPtrInst>(&I)) {
         FrameAffineRange Address;
         if (!Analyzer.evaluate(ITP->getOperand(0), Address) ||
-            Address.Coeff != 1)
+            Address.Coeff != 1) {
+          SmallPtrSet<Value *, 32> DependencySeen;
+          if (syntacticallyDependsOnFrameBacking(
+                  ITP->getOperand(0), Backing, DependencySeen))
+            return Refuse("unproven backing-derived inttoptr");
           continue;
+        }
         uint64_t MaxSize = 1;
         SmallPtrSet<Value *, 32> Seen;
         if (!traceAffinePointerUses(ITP, DL, MaxSize, Seen) ||
             !AddAccess(Address, MaxSize))
-          return false;
+          return Refuse("unbounded direct inttoptr use");
         continue;
       }
       if (auto *CB = dyn_cast<CallBase>(&I)) {
         for (Value *Arg : CB->args()) {
           FrameAffineRange Address;
-          if (Analyzer.evaluate(Arg, Address) && Address.Coeff == 1)
-            return false;
+          bool IsFrameAddress =
+              Analyzer.evaluate(Arg, Address) && Address.Coeff == 1;
+          if (!IsFrameAddress) {
+            SmallPtrSet<Value *, 32> Seen;
+            if (syntacticallyDependsOnFrameBacking(Arg, Backing, Seen))
+              return Refuse("unproven backing-derived call argument");
+          } else {
+            if (auto Size =
+                    boundedDirectScanfDestinationSize(*CB, Arg, DL)) {
+              if (!AddAccess(Address, *Size))
+                return Refuse("bounded scanf destination is outside frame");
+              continue;
+            }
+            if (NativeAffineDebug) {
+              errs() << "brighten-native-cleanup: escaping affine call "
+                        "argument: ";
+              Arg->printAsOperand(errs(), false);
+              errs() << " in ";
+              CB->print(errs());
+              errs() << '\n';
+            }
+            return Refuse("derived address escapes through a call");
+          }
         }
         continue;
       }
       if (auto *RI = dyn_cast<ReturnInst>(&I)) {
         FrameAffineRange Address;
-        if (RI->getReturnValue() &&
-            Analyzer.evaluate(RI->getReturnValue(), Address) &&
-            Address.Coeff == 1)
-          return false;
+        if (Value *ReturnValue = RI->getReturnValue()) {
+          bool IsFrameAddress =
+              Analyzer.evaluate(ReturnValue, Address) && Address.Coeff == 1;
+          if (IsFrameAddress)
+            return Refuse("derived address escapes through return");
+          SmallPtrSet<Value *, 32> Seen;
+          if (syntacticallyDependsOnFrameBacking(ReturnValue, Backing, Seen))
+            return Refuse("unproven backing-derived return value");
+        }
       }
     }
   }
@@ -8182,12 +8759,16 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
         continue;
       SmallPtrSet<Value *, 32> Seen;
       if (!traceAffineIntegerUses(Load.Inst, DL, MaxSize, Seen))
-        return false;
+        return Refuse("stored address has an unbounded reloaded use");
     }
     if (!AddAccess(Store.StoredAddress, MaxSize))
-      return false;
+      return Refuse("stored address points outside the proven frame");
   }
-  return HasAccess && Analyzer.sawFinitePhi();
+  if (!HasAccess)
+    return Refuse("no bounded frame access");
+  if (!Analyzer.sawFinitePhi())
+    return Refuse("no finite affine stack-pointer PHI");
+  return true;
 }
 
 static unsigned compactProvenAffineFrameBackings(Module &M, bool &Changed) {
@@ -8209,8 +8790,27 @@ static unsigned compactProvenAffineFrameBackings(Module &M, bool &Changed) {
       continue;
 
     Function *Owner = nullptr;
-    if (!findSoleFrameBackingOwner(*Backing, Owner))
+    if (!inlineBoundedUseFrameBackingCallees(*Backing, Changed)) {
+      if (NativeAffineDebug)
+        errs() << "brighten-native-cleanup: affine frame "
+               << Backing->getName()
+               << " refused: frame-backing owner inlining failed\n";
       continue;
+    }
+    if (!findSoleFrameBackingOwner(*Backing, Owner)) {
+      if (NativeAffineDebug)
+        errs() << "brighten-native-cleanup: affine frame "
+               << Backing->getName()
+               << " refused: no sole frame-backing owner\n";
+      continue;
+    }
+    if (hasUnresolvedFlattenedDispatcher(*Owner)) {
+      if (NativeAffineDebug)
+        errs() << "brighten-native-cleanup: affine frame "
+               << Backing->getName()
+               << " refused: unresolved flattened dispatcher\n";
+      continue;
+    }
     int64_t Min = 0, Max = 0;
     Align FrameAlign = Backing->getAlign().valueOrOne();
     if (!proveAffineFrameBacking(*Backing, *Owner, ObjectSize, Min, Max,
@@ -8238,7 +8838,7 @@ static unsigned compactProvenAffineFrameBackings(Module &M, bool &Changed) {
         ArrayType::get(Type::getInt8Ty(M.getContext()), FrameSize);
     IRBuilder<> EntryBuilder(&*Owner->getEntryBlock().getFirstInsertionPt());
     AllocaInst *Frame = EntryBuilder.CreateAlloca(
-        FrameTy, nullptr, Backing->getName() + ".native_frame");
+        FrameTy, nullptr, "native_frame");
     Frame->setAlignment(FrameAlign);
     EntryBuilder.CreateMemSet(Frame, EntryBuilder.getInt8(0), FrameSize,
                               FrameAlign);
@@ -9508,6 +10108,12 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (DeadInlineAsm)
       errs() << "  final unused inline-asm calls erased: " << DeadInlineAsm
              << "\n";
+    unsigned FinalAffineCompactedFrames =
+        compactProvenAffineFrameBackings(M, Changed);
+    if (FinalAffineCompactedFrames)
+      errs() << "  final proven affine fake stack backings converted to "
+                "native frames: "
+             << FinalAffineCompactedFrames << "\n";
     stripRemillMetadata(M, Changed);
     reportNativeContract(M, 0, 0, true);
     return Changed;
@@ -10006,6 +10612,11 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   // strict verifier strips it once all rewrites are complete.
   stripRemillMetadata(M, Changed, false);
   foldExactPointerRoundTrips(M, Changed);
+  unsigned CanonicalResidualSegments =
+      canonicalizeResidualSegmentTypes(M, Changed);
+  if (CanonicalResidualSegments)
+    errs() << "  residual segment types canonicalized: "
+           << CanonicalResidualSegments << "\n";
   reportNativeContract(M, RemovedFunctions, RemovedGlobals, false);
 
   return Changed;
