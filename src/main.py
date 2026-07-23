@@ -90,6 +90,57 @@ def _resolve_seed_paths(project_root, binary_path):
     return (seed_paths, seed_dir)
 
 
+def _resolve_binary_path(raw_path: str, project_root: str) -> str:
+    """Resolve a CSV value (submission id, relative path, or absolute path) to an existing binary.
+
+    Supports:
+      - absolute paths
+      - relative paths under repo
+      - dataset paths like data/obfuscated/... and clean_src/...
+      - bare submission IDs (e.g., s152042503)
+    """
+    raw = (raw_path or "").strip()
+    if not raw:
+        return ""
+    value = raw.strip().strip("\"'")
+
+    candidates = []
+    if os.path.isabs(value):
+        candidates.append(value)
+    else:
+        candidates.extend([
+            value,
+            os.path.join(project_root, value),
+            os.path.join(project_root, value.lstrip("./")),
+            os.path.join(project_root, "data", value),
+            os.path.join(project_root, "data", "obfuscated", value),
+            os.path.join(project_root, "data", "clean_src", value),
+        ])
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+    base = os.path.basename(value)
+    if not base:
+        return ""
+
+    # bare id lookup
+    search_roots = [
+        os.path.join(project_root, "data", "obfuscated"),
+        os.path.join(project_root, "data", "clean_src"),
+    ]
+    wildcard = f"{base}*"
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for match in Path(root).rglob(wildcard):
+            if match.is_file():
+                return os.path.abspath(str(match))
+
+    return ""
+
+
 def _decode_tested_payloads(report: Mapping[str, Any]) -> List[bytes]:
     payloads = report.get("tested_payloads") if isinstance(report, Mapping) else None
     if not payloads or not isinstance(payloads, list):
@@ -404,7 +455,9 @@ def _run_llm_recovery_mode(list_path, project_root, use_cache=True, force_relift
             def _build_fuzzer():
                 generator, generator_reason = _select_generator(project_root, original_binary)
                 seed_paths, seed_dir = _resolve_seed_paths(project_root, original_binary)
-                input_contract = resolve_input_contract(project_root, original_binary)
+                input_contract = resolve_input_contract(
+                    project_root, original_binary, only_custom=use_only_custom_contract
+                )
                 return generator, generator_reason, seed_paths, seed_dir, input_contract
 
             fuzzer_callback = None
@@ -517,6 +570,11 @@ def main(argv=None):
         print(f"{Color.RED}[✗] Lỗi: Không tìm thấy tệp CSV tại '{list_obfuscated_bin}'{Color.END}")
         return 1
 
+    # Project root giúp resolve các đường dẫn tương đối trong CSV.
+    project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    list_basename = os.path.basename(os.path.abspath(list_obfuscated_bin)).lower()
+    use_only_custom_contract = "custom_dataset" in list_basename
+
     if llm_recovery_mode:
         print(f"{Color.BLUE}[*] Chế độ LLM recovery: bổ sung vòng recover + fuzz sau semantic baseline.{Color.END}")
         llm_config = RecoveryConfig()
@@ -547,7 +605,15 @@ def main(argv=None):
             # Xác định header nếu có
             header = [cell.strip().lower() for cell in rows[0]]
             path_col_index = -1
-            for name in ["binary_path", "binary", "path", "file", "filepath"]:
+            for name in [
+                "obfuscated_binary",
+                "binary_path",
+                "binary",
+                "path",
+                "file",
+                "filepath",
+                "submission_id",
+            ]:
                 if name in header:
                     path_col_index = header.index(name)
                     break
@@ -560,7 +626,11 @@ def main(argv=None):
             for row in rows[start_row:]:
                 if not row or len(row) <= path_col_index:
                     continue
-                path = row[path_col_index].strip()
+                raw_path = row[path_col_index].strip()
+                path = _resolve_binary_path(raw_path, project_root)
+                if not path:
+                    print(f"{Color.YELLOW}[!] Không giải mã được đường dẫn binary: '{raw_path}'. Bỏ qua.{Color.END}")
+                    continue
                 if path:
                     binary_paths.append(path)
     except Exception as e:
@@ -690,7 +760,9 @@ def main(argv=None):
                         print(f"{Color.BLUE}      [*] Input generator: {generator_reason}.{Color.END}")
 
                         seed_paths, seed_dir = _resolve_seed_paths(project_root, path)
-                        input_contract = resolve_input_contract(project_root, path)
+                        input_contract = resolve_input_contract(
+                            project_root, path, only_custom=use_only_custom_contract
+                        )
                         if seed_paths:
                             print(f"{Color.BLUE}    [*] Tìm thấy seed corpus riêng cho binary: {seed_paths[0]}{Color.END}")
                         elif seed_dir:

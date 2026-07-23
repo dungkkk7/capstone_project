@@ -1380,7 +1380,17 @@ int main(int argc, char** argv) {
                     
             # 4. Run AFL++ Input Generator
             out_dir = os.path.join(self.tmp_dir, "out")
-            fuzz_time = 5
+            default_fuzz_time = timeout
+            fuzz_time_env = os.environ.get("BRIGHTEN_AFL_FUZZ_SECONDS")
+            if fuzz_time_env is not None:
+                try:
+                    default_fuzz_time = float(fuzz_time_env)
+                except ValueError:
+                    print(
+                        f"{Color.YELLOW}[!] BRIGHTEN_AFL_FUZZ_SECONDS không hợp lệ ({fuzz_time_env}); "
+                        f"sử dụng timeout={timeout}s.{Color.END}"
+                    )
+            fuzz_time = max(0.1, default_fuzz_time)
             cmd_fuzz = [self.afl_fuzz, "-i", seeds_dir, "-o", out_dir, "-V", str(fuzz_time), "--", bin1_afl]
             
             fuzz_env = os.environ.copy()
@@ -1388,7 +1398,10 @@ int main(int argc, char** argv) {
             fuzz_env["AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"] = "1"
             fuzz_env["AFL_PATH"] = self.afl_path
             
-            print(f"{Color.BLUE}[*] Running AFL++ for {fuzz_time} seconds to generate inputs...{Color.END}")
+            print(
+                f"{Color.BLUE}[*] Running AFL++ for {fuzz_time} seconds to generate inputs "
+                f"(per-input timeout vẫn là {timeout}s, chạy mặc định bằng {timeout}s)...{Color.END}"
+            )
             subprocess.run(cmd_fuzz, env=fuzz_env, capture_output=True)
             
             # 5. Gather generated inputs

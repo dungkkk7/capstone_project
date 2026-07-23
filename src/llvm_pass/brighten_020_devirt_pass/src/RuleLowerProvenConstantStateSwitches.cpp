@@ -102,6 +102,33 @@ static ConstantInt *EvaluateSelector(ConstantInt *State,
   return ConstantInt::get(State->getContext(), Value);
 }
 
+static BasicBlock *ResolveDispatcherDestination(
+    SwitchInst *SW, ConstantInt *State, Value *SwitchCondition,
+    BasicBlock *&DispatchPred) {
+  SmallPtrSet<BasicBlock *, 8> Seen;
+  SwitchInst *Current = SW;
+  while (Seen.insert(Current->getParent()).second) {
+    auto Case = Current->findCaseValue(State);
+    if (Case != Current->case_default()) {
+      DispatchPred = Current->getParent();
+      return Case->getCaseSuccessor();
+    }
+
+    BasicBlock *Default = Current->getDefaultDest();
+    auto *Nested = dyn_cast<SwitchInst>(Default->getTerminator());
+    if (!Nested || Nested->getCondition() != SwitchCondition)
+      return nullptr;
+    // Threading directly to a nested case may bypass only a pure dispatch
+    // block.  Any PHI, calculation, or side effect requires region cloning
+    // and is left on the fallback path.
+    for (Instruction &I : *Default)
+      if (&I != Nested)
+        return nullptr;
+    Current = Nested;
+  }
+  return nullptr;
+}
+
 bool BrightenDevirtPass::LowerProvenConstantStateSwitches(Module &M) {
   SmallVector<SwitchInst *, 16> Worklist;
   for (Function &F : M) {
@@ -206,7 +233,11 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
   struct CandidateRewrite {
     BasicBlock *Pred = nullptr;
     BasicBlock *Dest = nullptr;
+    BasicBlock *DispatchPred = nullptr;
     BasicBlock *Thread = nullptr;
+    Value *BranchCondition = nullptr;
+    bool ConditionValue = false;
+    bool FromLatch = true;
     SmallVector<Value *, 16> Outgoing;
   };
 
@@ -264,11 +295,14 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
       Current = BO->getOperand(VariableOperand);
     }
     auto *Selector = Affine ? dyn_cast<PHINode>(Current) : nullptr;
-    BasicBlock *Header = Selector ? Selector->getParent() : nullptr;
-    auto *HeaderBr = Header ? dyn_cast<BranchInst>(Header->getTerminator())
-                            : nullptr;
-    if (!Selector || Header == Hub || !HeaderBr ||
-        !HeaderBr->isUnconditional() || HeaderBr->getSuccessor(0) != Hub)
+    if (!Selector)
+      continue;
+    BasicBlock *Header = Selector->getParent();
+    bool SelfHub = Header == Hub;
+    auto *HeaderBr = dyn_cast<BranchInst>(Header->getTerminator());
+    if (!SelfHub &&
+        (!HeaderBr || !HeaderBr->isUnconditional() ||
+         HeaderBr->getSuccessor(0) != Hub))
       continue;
 
     BasicBlock *Latch = nullptr;
@@ -305,60 +339,124 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
     }
     if (!Valid || HeaderPhis.empty())
       continue;
+    // Self-hub dispatchers that carry application values need parallel-copy
+    // reconstruction across every split select arm.  The pure one-PHI form
+    // is fully proven here; multi-PHI self-hubs stay on the conservative
+    // fallback handled by later work.
+    if (SelfHub && HeaderPhis.size() != 1)
+      continue;
 
     SmallVector<CandidateRewrite, 32> Rewrites;
+    auto AddArm = [&](BasicBlock *Pred, ConstantInt *State,
+                      Value *BranchCondition, bool ConditionValue,
+                      bool FromLatch) {
+        ConstantInt *Condition = EvaluateSelector(State, SelectorSteps);
+        BasicBlock *DispatchPred = nullptr;
+        BasicBlock *Dest = ResolveDispatcherDestination(
+            SW, Condition, SW->getCondition(), DispatchPred);
+        if (!Dest || !DispatchPred ||
+            Dest == Hub || Dest == Header || Dest == Latch)
+          return false;
+        // This region-SSA subset handles a single case block.  A case with
+        // internal successors needs region-wide renaming and stays on the
+        // fallback dispatcher.
+        auto *DestBr = dyn_cast<BranchInst>(Dest->getTerminator());
+        if (DestBr && (!DestBr->isUnconditional() ||
+                       DestBr->getSuccessor(0) != Latch))
+          return false;
+        if (!DestBr && !isa<ReturnInst>(Dest->getTerminator()) &&
+            !isa<ResumeInst>(Dest->getTerminator()))
+          return false;
+
+        CandidateRewrite R;
+        R.Pred = Pred;
+        R.Dest = Dest;
+        R.DispatchPred = DispatchPred;
+        R.BranchCondition = BranchCondition;
+        R.ConditionValue = ConditionValue;
+        R.FromLatch = FromLatch;
+        for (unsigned I = 0; I < HeaderPhis.size(); ++I) {
+          Value *Outgoing = nullptr;
+          if (HeaderPhis[I] == Selector)
+            Outgoing = State;
+          else if (FromLatch)
+            Outgoing = LatchPhis[I]->getIncomingValueForBlock(Pred);
+          else
+            Outgoing = HeaderPhis[I]->getIncomingValueForBlock(Pred);
+          if (!Outgoing)
+            return false;
+          // Cross-carried register swaps require simultaneous parallel-copy
+          // lowering.  Refuse them transactionally; self-carried and newly
+          // computed values are handled by SSAUpdater below.
+          if (auto *Other = dyn_cast_or_null<PHINode>(Outgoing))
+            if (Other->getParent() == Header && Other != HeaderPhis[I]) {
+              Valid = false;
+              return false;
+            }
+          R.Outgoing.push_back(Outgoing);
+        }
+        Rewrites.push_back(std::move(R));
+        return true;
+      };
+
     for (BasicBlock *Pred : predecessors(Latch)) {
       auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
-      auto *State = dyn_cast_or_null<ConstantInt>(
-          LatchSelector->getIncomingValueForBlock(Pred));
+      Value *NextState = LatchSelector->getIncomingValueForBlock(Pred);
       if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != Latch ||
-          !State)
-        continue;
-      ConstantInt *Condition = EvaluateSelector(State, SelectorSteps);
-      auto Case = SW->findCaseValue(Condition);
-      if (Case == SW->case_default())
-        continue;
-      BasicBlock *Dest = Case->getCaseSuccessor();
-      if (Dest == Hub || Dest == Header || Dest == Latch)
-        continue;
-      // This first region-SSA subset handles a single case block.  A case
-      // with internal successors needs region-wide renaming rather than a
-      // destination PHI and is deliberately left on the fallback dispatcher.
-      auto *DestBr = dyn_cast<BranchInst>(Dest->getTerminator());
-      if (DestBr && (!DestBr->isUnconditional() ||
-                     DestBr->getSuccessor(0) != Latch))
-        continue;
-      if (!DestBr && !isa<ReturnInst>(Dest->getTerminator()) &&
-          !isa<ResumeInst>(Dest->getTerminator()))
+          !NextState)
         continue;
 
-      CandidateRewrite R;
-      R.Pred = Pred;
-      R.Dest = Dest;
-      for (unsigned I = 0; I < HeaderPhis.size(); ++I) {
-        Value *Outgoing = LatchPhis[I]->getIncomingValueForBlock(Pred);
-        // Cross-carried register swaps require simultaneous parallel-copy
-        // lowering.  Refuse them transactionally; self-carried and newly
-        // computed values are handled by SSAUpdater below.
-        if (auto *Other = dyn_cast_or_null<PHINode>(Outgoing))
-          if (Other->getParent() == Header && Other != HeaderPhis[I]) {
-            Valid = false;
-            break;
-          }
-        R.Outgoing.push_back(Outgoing);
+      size_t RewriteBegin = Rewrites.size();
+      bool Added = false;
+      if (auto *State = dyn_cast<ConstantInt>(NextState)) {
+        Added = AddArm(Pred, State, nullptr, false, true);
+      } else if (auto *Select = dyn_cast<SelectInst>(NextState);
+                 SelfHub && HeaderPhis.size() == 1 &&
+                 Select && Select->getParent() == Pred) {
+        auto *TrueState = dyn_cast<ConstantInt>(Select->getTrueValue());
+        auto *FalseState = dyn_cast<ConstantInt>(Select->getFalseValue());
+        if (TrueState && FalseState) {
+          Added = AddArm(Pred, TrueState, Select->getCondition(), true, true) &&
+                  AddArm(Pred, FalseState, Select->getCondition(), false, true);
+        }
       }
+      if (!Added)
+        Rewrites.resize(RewriteBegin);
       if (!Valid)
         break;
-      Rewrites.push_back(std::move(R));
     }
+    if (!Valid)
+      continue;
+
+    // A constant entry state is just as provable as a constant latch
+    // transition.  Thread it through cloned header/hub side effects so that,
+    // once every reachable transition is direct, the residual default loop
+    // becomes unreachable and normal CFG cleanup can erase the dispatcher.
+    if (SelfHub)
+      for (unsigned I = 0; I < Selector->getNumIncomingValues(); ++I) {
+        BasicBlock *Pred = Selector->getIncomingBlock(I);
+        if (Pred == Latch)
+          continue;
+        auto *State = dyn_cast<ConstantInt>(Selector->getIncomingValue(I));
+        auto *Br = dyn_cast<BranchInst>(Pred->getTerminator());
+        if (!State || !Br || !Br->isUnconditional() ||
+            Br->getSuccessor(0) != Header)
+          continue;
+        size_t RewriteBegin = Rewrites.size();
+        if (!AddArm(Pred, State, nullptr, false, false))
+          Rewrites.resize(RewriteBegin);
+        if (!Valid)
+          break;
+      }
     if (!Valid || Rewrites.empty())
       continue;
 
     // Existing destination PHIs must have an unambiguous value on the old
-    // hub edge so the new threaded edge can be populated before mutation.
+    // dispatcher edge so the new threaded edge can be populated before
+    // mutation.  A nested default switch is itself the predecessor.
     for (CandidateRewrite &R : Rewrites)
       for (PHINode &PN : R.Dest->phis())
-        if (PN.getBasicBlockIndex(Hub) < 0)
+        if (PN.getBasicBlockIndex(R.DispatchPred) < 0)
           Valid = false;
     if (!Valid)
       continue;
@@ -368,10 +466,11 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
       R.Thread = BasicBlock::Create(M.getContext(), "region.thread", Hub->getParent(),
                                     R.Dest);
       ValueToValueMapTy VMap;
-      for (PHINode &LP : Latch->phis())
-        VMap[&LP] = LP.getIncomingValueForBlock(R.Pred);
-      for (unsigned I = 0; I < HeaderPhis.size(); ++I)
+      for (unsigned I = 0; I < HeaderPhis.size(); ++I) {
+        if (R.FromLatch)
+          VMap[LatchPhis[I]] = R.Outgoing[I];
         VMap[HeaderPhis[I]] = R.Outgoing[I];
+      }
 
       auto CloneBody = [&](BasicBlock *BB) {
         for (Instruction &I : *BB) {
@@ -384,24 +483,60 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
           VMap[&I] = Clone;
         }
       };
-      CloneBody(Latch);
-      CloneBody(Header);
+      if (R.FromLatch)
+        CloneBody(Latch);
+      if (!SelfHub)
+        CloneBody(Header);
       CloneBody(Hub);
 
       for (PHINode &PN : R.Dest->phis()) {
-        Value *Old = PN.getIncomingValueForBlock(Hub);
+        Value *Old = PN.getIncomingValueForBlock(R.DispatchPred);
         Value *Mapped = MapValue(Old, VMap,
                                  RF_NoModuleLevelChanges |
                                      RF_IgnoreMissingLocals);
         PN.addIncoming(Mapped ? Mapped : Old, R.Thread);
       }
       BranchInst::Create(R.Dest, R.Thread);
-      cast<BranchInst>(R.Pred->getTerminator())->setSuccessor(0, R.Thread);
     }
 
+    SmallPtrSet<BasicBlock *, 32> RewiredPreds;
+    for (CandidateRewrite &R : Rewrites) {
+      if (!RewiredPreds.insert(R.Pred).second)
+        continue;
+      auto *OldBr = cast<BranchInst>(R.Pred->getTerminator());
+      if (!R.BranchCondition) {
+        OldBr->setSuccessor(0, R.Thread);
+        continue;
+      }
+      CandidateRewrite *TrueArm = nullptr;
+      CandidateRewrite *FalseArm = nullptr;
+      for (CandidateRewrite &Arm : Rewrites) {
+        if (Arm.Pred != R.Pred ||
+            Arm.BranchCondition != R.BranchCondition)
+          continue;
+        (Arm.ConditionValue ? TrueArm : FalseArm) = &Arm;
+      }
+      assert(TrueArm && FalseArm &&
+             "validated select transition lost one branch arm");
+      BranchInst::Create(TrueArm->Thread, FalseArm->Thread,
+                         R.BranchCondition, OldBr);
+      OldBr->eraseFromParent();
+    }
+
+    SmallPtrSet<BasicBlock *, 32> RemovedLatchPreds;
+    for (CandidateRewrite &R : Rewrites)
+      if (R.FromLatch)
+        RemovedLatchPreds.insert(R.Pred);
     for (PHINode &LP : Latch->phis())
-      for (CandidateRewrite &R : Rewrites)
-        LP.removeIncomingValue(R.Pred, false);
+      for (BasicBlock *Pred : RemovedLatchPreds)
+        LP.removeIncomingValue(Pred, false);
+    SmallPtrSet<BasicBlock *, 8> RemovedHeaderPreds;
+    for (CandidateRewrite &R : Rewrites)
+      if (!R.FromLatch)
+        RemovedHeaderPreds.insert(R.Pred);
+    for (PHINode *HP : HeaderPhis)
+      for (BasicBlock *Pred : RemovedHeaderPreds)
+        HP->removeIncomingValue(Pred, false);
 
     // Materialize the carried value at each directly-entered case.  Header
     // still dominates the case syntactically through the preserved fallback,
@@ -440,7 +575,7 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
     }
 
     Changed = true;
-    errs() << "[devirt] threaded " << Rewrites.size()
+    errs() << "[devirt] threaded " << RewiredPreds.size()
            << " proven region-SSA transition(s) in @"
            << Hub->getParent()->getName() << "\n";
   }

@@ -463,20 +463,40 @@ static uint64_t DynamicRecordArrayEnd(GlobalDataContext &Ctx,
     return SegEnd;
 
   SmallVector<uint64_t, 16> Aliases;
-  bool HasAdjacentRecordAlias = false;
   for (GlobalAlias &GA : Ctx.M.aliases()) {
     auto AliasAddr = NamedGuestAddress(&GA);
     if (!AliasAddr || *AliasAddr <= Begin || *AliasAddr >= SegEnd)
       continue;
     Aliases.push_back(*AliasAddr);
-    if (Stride <= SegEnd - Begin && *AliasAddr == Begin + Stride)
-      HasAdjacentRecordAlias = true;
   }
 
   if (Aliases.empty())
     return SegEnd;
   std::sort(Aliases.begin(), Aliases.end());
-  if (!HasAdjacentRecordAlias) {
+
+  bool HasRecordAliasRun = false;
+  size_t RunStart = 0;
+  uint64_t Previous = Begin;
+  if (Stride <= SegEnd - Begin &&
+      llvm::is_contained(Aliases, Begin + Stride)) {
+    HasRecordAliasRun = true;
+  } else {
+    // Debug/data aliases do not necessarily name the first indexed element.
+    // Two later aliases on consecutive stride boundaries still prove that
+    // they are entries inside the same dynamically indexed object.
+    for (size_t I = 0; I + 1 < Aliases.size(); ++I) {
+      if ((Aliases[I] - Begin) % Stride == 0 &&
+          (Aliases[I + 1] - Begin) % Stride == 0 &&
+          Aliases[I + 1] - Aliases[I] == Stride) {
+        HasRecordAliasRun = true;
+        Previous = Aliases[I];
+        RunStart = I + 1;
+        break;
+      }
+    }
+  }
+
+  if (!HasRecordAliasRun) {
     // An alias inside the first stride is a field boundary, not the end of
     // the dynamically indexed record array.  Use the first alias at or beyond
     // the next record as the conservative object boundary.
@@ -486,8 +506,8 @@ static uint64_t DynamicRecordArrayEnd(GlobalDataContext &Ctx,
     return SegEnd;
   }
 
-  uint64_t Previous = Begin;
-  for (uint64_t AliasAddr : Aliases) {
+  for (size_t I = RunStart; I < Aliases.size(); ++I) {
+    uint64_t AliasAddr = Aliases[I];
     if (AliasAddr - Previous > Stride)
       return AliasAddr;
     Previous = AliasAddr;
@@ -919,12 +939,39 @@ static bool AliasFeedsDynamicAddress(Value *V,
   return false;
 }
 
+// A typed object at a dynamic guest base proves only the bytes inside that
+// object.  Treating "base is covered" as "dynamic range is covered" drops the
+// rest of large BSS arrays when the original segment is removed.  Advance
+// through only the candidate intervals that form one contiguous prefix; the
+// caller materializes the remaining tail as byte-preserving storage.
+static uint64_t ContiguousCandidateCoverageEnd(GlobalDataContext &Ctx,
+                                               uint64_t Begin,
+                                               uint64_t Limit) {
+  uint64_t CoveredEnd = Begin;
+  bool Progress = true;
+  while (Progress && CoveredEnd < Limit) {
+    Progress = false;
+    for (const auto &Existing : Ctx.Candidates) {
+      if (Existing->Begin <= CoveredEnd && Existing->End > CoveredEnd) {
+        uint64_t Next = std::min(Existing->End, Limit);
+        if (Next > CoveredEnd) {
+          CoveredEnd = Next;
+          Progress = true;
+        }
+      }
+    }
+  }
+  return CoveredEnd;
+}
+
 static void GenerateDynamicAliasBufferCandidates(GlobalDataContext &Ctx,
                                                  GuestSegment *Seg) {
   if (!Seg->Writable || Seg->Executable || Seg->Kind == SegmentKind::Unknown)
     return;
 
   const uint64_t SegEnd = Seg->GuestBase + Seg->Size;
+  const std::map<uint64_t, DynamicIndexBase> DynamicIndexBases =
+      CollectDynamicIndexBases(Ctx, Seg);
   std::set<uint64_t> SeenBases;
   for (GlobalAlias &GA : Ctx.M.aliases()) {
     auto Begin = NamedGuestAddress(&GA);
@@ -939,6 +986,17 @@ static void GenerateDynamicAliasBufferCandidates(GlobalDataContext &Ctx,
     auto NextBoundary = NamedAliasAddressInSegment(Ctx.M, Seg, *Begin);
     uint64_t End = NextBoundary && *NextBoundary > *Begin ? *NextBoundary
                                                            : SegEnd;
+    bool NeedsOpenEndedByteBacking = false;
+    if (auto It = DynamicIndexBases.find(*Begin);
+        It != DynamicIndexBases.end() && It->second.Stride == 1 &&
+        !It->second.MinimumByteExtent) {
+      // With no proven index bound, an interior data_<addr> alias is not an
+      // object boundary.  The original machine can legally address the
+      // following bytes in the same writable mapping even when source-level
+      // reconstruction would call that an out-of-bounds access.
+      End = SegEnd;
+      NeedsOpenEndedByteBacking = true;
+    }
     SmallPtrSet<Value *, 32> LookupSeen;
     if (auto Extent = AliasSignedByteLookupExtent(&GA, LookupSeen)) {
       uint64_t Available = SegEnd - *Begin;
@@ -947,29 +1005,30 @@ static void GenerateDynamicAliasBufferCandidates(GlobalDataContext &Ctx,
     if (End <= *Begin)
       continue;
 
-    bool AlreadyCovered = false;
-    for (const auto &Existing : Ctx.Candidates) {
-      if (*Begin >= Existing->Begin && *Begin < Existing->End) {
-        AlreadyCovered = true;
-        break;
-      }
-    }
-    if (AlreadyCovered)
+    uint64_t ResidualBegin =
+        NeedsOpenEndedByteBacking
+            ? *Begin
+            : ContiguousCandidateCoverageEnd(Ctx, *Begin, End);
+    if (ResidualBegin >= End)
       continue;
 
     auto Cand = std::make_unique<ObjectCandidate>();
-    Cand->Begin = *Begin;
+    Cand->Begin = ResidualBegin;
     Cand->End = End;
     Cand->Kind = ObjectKind::RawBytes;
     Cand->Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()),
-                              End - *Begin);
+                              End - ResidualBegin);
     Cand->SourceSegment = Seg;
-    Cand->Name = "dyn_bytes_" + Twine::utohexstr(*Begin).str();
+    Cand->Name =
+        "dyn_bytes_" + Twine::utohexstr(ResidualBegin).str();
     UseEvidence Ev;
     Ev.Kind = EvidenceKind::IndexedStrideAccess;
-    Ev.Confidence = 240;
-    Ev.Description =
-        "writable ELF alias used as base of dynamic guest pointer arithmetic";
+    Ev.Confidence = NeedsOpenEndedByteBacking ? 300 : 240;
+    Ev.Description = NeedsOpenEndedByteBacking
+                         ? "unbounded dynamic byte index requires writable "
+                           "guest-image backing"
+                         : "writable ELF alias used as base of dynamic guest "
+                           "pointer arithmetic";
     Cand->EvidenceList.push_back(Ev);
     Cand->Confidence = Ev.Confidence;
     Ctx.Candidates.push_back(std::move(Cand));
@@ -1011,29 +1070,23 @@ static void GenerateFoldedDynamicBufferCandidates(GlobalDataContext &Ctx,
   }
 
   for (uint64_t Begin : Bases) {
-    bool AlreadyCovered = false;
-    for (const auto &Existing : Ctx.Candidates) {
-      if (Begin >= Existing->Begin && Begin < Existing->End) {
-        AlreadyCovered = true;
-        break;
-      }
-    }
-    if (AlreadyCovered)
-      continue;
-
     auto NextBoundary = NamedAliasAddressInSegment(Ctx.M, Seg, Begin);
     uint64_t End = NextBoundary && *NextBoundary > Begin ? *NextBoundary
                                                           : SegEnd;
-    if (End <= Begin)
+    uint64_t ResidualBegin =
+        ContiguousCandidateCoverageEnd(Ctx, Begin, End);
+    if (ResidualBegin >= End)
       continue;
 
     auto Cand = std::make_unique<ObjectCandidate>();
-    Cand->Begin = Begin;
+    Cand->Begin = ResidualBegin;
     Cand->End = End;
     Cand->Kind = ObjectKind::RawBytes;
-    Cand->Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), End - Begin);
+    Cand->Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()),
+                              End - ResidualBegin);
     Cand->SourceSegment = Seg;
-    Cand->Name = "dyn_bytes_" + Twine::utohexstr(Begin).str();
+    Cand->Name =
+        "dyn_bytes_" + Twine::utohexstr(ResidualBegin).str();
     UseEvidence Ev;
     Ev.Kind = EvidenceKind::IndexedStrideAccess;
     Ev.Confidence = 240;
@@ -1376,6 +1429,7 @@ static void GeneratePointerTableCandidates(GlobalDataContext &Ctx, GuestSegment 
     uint64_t Curr = Addr;
     unsigned MaxEntries = 512;
     bool HasRelocs = false;
+    bool AllFunctionTargets = true;
 
     while (Curr + PtrSize <= SegEnd && Entries.size() < MaxEntries) {
       uint64_t Offset = Curr - Seg->GuestBase;
@@ -1397,6 +1451,8 @@ static void GeneratePointerTableCandidates(GlobalDataContext &Ctx, GuestSegment 
       bool Valid = false;
       if (FindFnByGuestAddr(Ctx.M, Val))
         Valid = true;
+      else
+        AllFunctionTargets = false;
       if (Ctx.findSegmentForAddr(Val))
         Valid = true;
       if (Seg->Relocations.count(Offset))
@@ -1409,7 +1465,10 @@ static void GeneratePointerTableCandidates(GlobalDataContext &Ctx, GuestSegment 
       Curr += PtrSize;
     }
 
-    if (Entries.size() < 2 || !HasRelocs)
+    // Relocations are the normal proof for a pointer table.  Stripped images
+    // can retain only raw addresses; accept that form when every non-zero
+    // entry resolves exactly to a recovered function.
+    if (Entries.size() < 2 || (!HasRelocs && !AllFunctionTargets))
       continue;
 
     auto Cand = std::make_unique<ObjectCandidate>();

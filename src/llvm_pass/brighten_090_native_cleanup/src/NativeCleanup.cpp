@@ -3,8 +3,10 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/IR/ReplaceConstant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/CFG.h"
@@ -363,6 +365,102 @@ static unsigned lowerFullyOverwrittenUndefinedScaffolds(Module &M) {
   return Lowered;
 }
 
+static unsigned lowerDirectFullyOverwrittenUndefinedScaffolds(Module &M) {
+  SmallVector<Instruction *, 32> Work;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        Value *Base = nullptr;
+        if (auto *IV = dyn_cast<InsertValueInst>(&I))
+          Base = IV->getAggregateOperand();
+        else if (auto *IE = dyn_cast<InsertElementInst>(&I))
+          Base = IE->getOperand(0);
+        auto *C = dyn_cast_or_null<Constant>(Base);
+        if (C && containsUndefined(C))
+          Work.push_back(&I);
+      }
+
+  auto MatchInsert = [](Instruction *I, Value *ExpectedAggregate,
+                        unsigned &Index, Value *&Inserted) {
+    if (auto *IV = dyn_cast<InsertValueInst>(I)) {
+      ArrayRef<unsigned> Indices = IV->getIndices();
+      if (IV->getAggregateOperand() != ExpectedAggregate ||
+          Indices.size() != 1)
+        return false;
+      Index = Indices.front();
+      Inserted = IV->getInsertedValueOperand();
+      return true;
+    }
+    if (auto *IE = dyn_cast<InsertElementInst>(I)) {
+      auto *CI = dyn_cast<ConstantInt>(IE->getOperand(2));
+      if (IE->getOperand(0) != ExpectedAggregate || !CI)
+        return false;
+      Index = CI->getZExtValue();
+      Inserted = IE->getOperand(1);
+      return true;
+    }
+    return false;
+  };
+
+  unsigned Lowered = 0;
+  for (Instruction *First : Work) {
+    auto *C = dyn_cast<Constant>(First->getOperand(0));
+    if (!C)
+      continue;
+
+    unsigned ElementCount = 0;
+    if (auto *ST = dyn_cast<StructType>(C->getType()))
+      ElementCount = ST->getNumElements();
+    else if (auto *VT = dyn_cast<FixedVectorType>(C->getType()))
+      ElementCount = VT->getNumElements();
+    else
+      continue;
+
+    SmallVector<bool, 16> NeedsOverwrite(ElementCount, false);
+    if (isa<UndefValue>(C) || isa<PoisonValue>(C)) {
+      std::fill(NeedsOverwrite.begin(), NeedsOverwrite.end(), true);
+    } else {
+      if (C->getNumOperands() != ElementCount)
+        continue;
+      for (unsigned I = 0; I < ElementCount; ++I)
+        NeedsOverwrite[I] = containsUndefined(C->getOperand(I));
+    }
+
+    unsigned Index = 0;
+    Value *Inserted = nullptr;
+    if (!MatchInsert(First, C, Index, Inserted) ||
+        Index >= ElementCount || containsUndefined(Inserted))
+      continue;
+    NeedsOverwrite[Index] = false;
+
+    auto HasPending = [&]() {
+      return llvm::any_of(NeedsOverwrite, [](bool V) { return V; });
+    };
+    Value *Current = First;
+    bool Proven = true;
+    while (HasPending()) {
+      if (!Current->hasOneUse()) {
+        Proven = false;
+        break;
+      }
+      auto *Next = dyn_cast<Instruction>(*Current->user_begin());
+      if (!Next || !MatchInsert(Next, Current, Index, Inserted) ||
+          Index >= ElementCount || containsUndefined(Inserted)) {
+        Proven = false;
+        break;
+      }
+      NeedsOverwrite[Index] = false;
+      Current = Next;
+    }
+    if (!Proven)
+      continue;
+
+    First->setOperand(0, definedScaffold(C));
+    ++Lowered;
+  }
+  return Lowered;
+}
+
 static bool isVectorLaneUnobserved(Value *V, unsigned Lane,
                                    std::set<std::pair<Value *, unsigned>> &Seen) {
   if (!Seen.insert({V, Lane}).second)
@@ -654,6 +752,30 @@ static Value *getDirectNativePointerCarrier(Value *V) {
   return nullptr;
 }
 
+static bool containsExplicitNativePointerInteger(
+    Value *V, SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return false;
+
+  if (Value *Carrier = getDirectNativePointerCarrier(V)) {
+    SmallPtrSet<Value *, 16> PointerSeen;
+    return isNativePointerValue(Carrier, PointerSeen);
+  }
+  if (auto *BO = dyn_cast<BinaryOperator>(V))
+    return containsExplicitNativePointerInteger(BO->getOperand(0), Seen) ||
+           containsExplicitNativePointerInteger(BO->getOperand(1), Seen);
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    return containsExplicitNativePointerInteger(Cast->getOperand(0), Seen);
+  if (auto *Freeze = dyn_cast<FreezeInst>(V))
+    return containsExplicitNativePointerInteger(Freeze->getOperand(0), Seen);
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    for (Value *Op : CE->operands())
+      if (containsExplicitNativePointerInteger(Op, Seen))
+        return true;
+  }
+  return false;
+}
+
 static Value *findNativeVarargAddressCarrier(Value *V,
                                              SmallPtrSetImpl<Value *> &Seen) {
   if (!V || !Seen.insert(V).second)
@@ -771,7 +893,8 @@ static Value *lowerNativeStackInteger(IRBuilder<> &B, Value *Integer,
                                       Function &F);
 
 static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
-                                              Value *Address);
+                                              Value *Address,
+                                              bool PreserveNativeInteger = true);
 
 static std::optional<uint64_t> parseGuestAddressPrefix(StringRef Name,
                                                        StringRef Prefix) {
@@ -2483,6 +2606,88 @@ static bool isProvenScalarLibcCallArgument(Value *V, CallBase &CB) {
   return Found;
 }
 
+static bool valueFeedsRecoveredPointerIndex(
+    Value *V, SmallPtrSetImpl<Value *> &Seen, unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  for (User *U : V->users()) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      for (Value *Index : GEP->indices())
+        if (Index == V)
+          return true;
+      continue;
+    }
+    if (isa<BinaryOperator>(U) || isa<CastInst>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<FreezeInst>(U)) {
+      if (valueFeedsRecoveredPointerIndex(cast<Value>(U), Seen, Depth + 1))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool isRecoveredPointerBitsConstant(Value *V) {
+  auto *PTI = dyn_cast_or_null<ConstantExpr>(V);
+  if (!PTI || PTI->getOpcode() != Instruction::PtrToInt)
+    return false;
+  Value *Pointer = PTI->getOperand(0);
+  for (unsigned Depth = 0; Pointer && Depth < 8; ++Depth) {
+    Pointer = Pointer->stripPointerCasts();
+    auto *GEP = dyn_cast<GEPOperator>(Pointer);
+    if (!GEP)
+      break;
+    Pointer = GEP->getPointerOperand();
+  }
+  auto *GV = dyn_cast_or_null<GlobalVariable>(
+      Pointer ? Pointer->stripPointerCasts() : nullptr);
+  return GV && GV->getMetadata("brighten.guest.range");
+}
+
+static bool isNegatedRecoveredPointerConstant(Value *V,
+                                               unsigned Depth = 0) {
+  if (!V || Depth > 8)
+    return false;
+  auto *CE = dyn_cast_or_null<ConstantExpr>(V);
+  if (!CE || CE->getNumOperands() == 0)
+    return false;
+
+  if (CE->isCast())
+    return isNegatedRecoveredPointerConstant(CE->getOperand(0), Depth + 1);
+
+  if (CE->getNumOperands() != 2)
+    return false;
+  if (CE->getOpcode() == Instruction::Sub) {
+    auto *Zero = dyn_cast<ConstantInt>(CE->getOperand(0));
+    if (Zero && Zero->isZero() &&
+        isRecoveredPointerBitsConstant(CE->getOperand(1)))
+      return true;
+    return isNegatedRecoveredPointerConstant(CE->getOperand(0), Depth + 1) &&
+           isa<ConstantInt>(CE->getOperand(1));
+  }
+  if (CE->getOpcode() == Instruction::Add)
+    return (isNegatedRecoveredPointerConstant(CE->getOperand(0), Depth + 1) &&
+            isa<ConstantInt>(CE->getOperand(1))) ||
+           (isNegatedRecoveredPointerConstant(CE->getOperand(1), Depth + 1) &&
+            isa<ConstantInt>(CE->getOperand(0)));
+  return false;
+}
+
+static bool isRecoveredPointerDifferenceUse(Value *Base, User *ImmediateUser) {
+  auto *BO = dyn_cast_or_null<BinaryOperator>(ImmediateUser);
+  if (!Base || !BO)
+    return false;
+  bool SubtractsBase =
+      BO->getOpcode() == Instruction::Sub && BO->getOperand(1) == Base;
+  bool AddsNegatedBase =
+      BO->getOpcode() == Instruction::Add &&
+      isNegatedRecoveredPointerConstant(Base) &&
+      (BO->getOperand(0) == Base || BO->getOperand(1) == Base);
+  if (!SubtractsBase && !AddsNegatedBase)
+    return false;
+  SmallPtrSet<Value *, 32> Seen;
+  return valueFeedsRecoveredPointerIndex(BO, Seen);
+}
+
 static unsigned rewriteGuestAddressIdentityAliasIntegers(Module &M,
                                                          bool &Changed) {
   unsigned Rewritten = 0;
@@ -2511,6 +2716,16 @@ static unsigned rewriteGuestAddressIdentityAliasIntegers(Module &M,
           if (!Seen.insert(V).second)
             continue;
           for (User *U : V->users()) {
+            // A libc pointer return minus the recovered object's base is a
+            // native pointer difference when its scaled result becomes a GEP
+            // index.  Keep both values in the host address space.
+            if (isRecoveredPointerDifferenceUse(V, U))
+              return true;
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+              for (Value *Index : GEP->indices())
+                if (Index == V)
+                  return true;
+            }
             // Integer pointer carriers commonly cross a recovered ABI call
             // boundary and are converted back to pointers in the callee.
             // Without interprocedural proof, treating such an argument as a
@@ -2827,6 +3042,8 @@ static unsigned rewriteRecoveredPointerIntegerIdentities(Module &M,
           if (Operand->getType()->isIntegerTy()) {
             if (isa<ConstantInt>(C))
               continue;
+            if (isRecoveredPointerDifferenceUse(C, &I))
+              continue;
             auto Evaluated = evaluateConstantGuestInteger(M, C);
             if (!Evaluated || !Evaluated->UsedRecoveredPointer)
               continue;
@@ -2863,11 +3080,18 @@ static unsigned rewriteRecoveredPointerIntegerIdentities(Module &M,
       continue;
     Constant *Replacement =
         ConstantInt::get(PTI->getType(), *GuestAddress);
-    PTI->replaceAllUsesWith(Replacement);
+    SmallVector<Use *, 8> Uses;
+    for (Use &U : PTI->uses())
+      Uses.push_back(&U);
+    for (Use *U : Uses) {
+      if (isRecoveredPointerDifferenceUse(PTI, U->getUser()))
+        continue;
+      U->set(Replacement);
+      ++Rewritten;
+      Changed = true;
+    }
     if (PTI->use_empty())
       PTI->eraseFromParent();
-    ++Rewritten;
-    Changed = true;
   }
   return Rewritten;
 }
@@ -2972,7 +3196,7 @@ static unsigned rewriteNativeScanfVarargAddresses(Module &M,
     // on Address->Segment creates pointers such as @g_arr_0 + 0x405xxx.
     // Dispatch the complete address through all proven guest ranges instead.
     Value *NativePtr =
-        materializeRecoveredDataPointer(M, B, SI->getValueOperand());
+        materializeRecoveredDataPointer(M, B, SI->getValueOperand(), false);
     if (!NativePtr)
       continue;
     Value *NativeAddr = B.CreatePtrToInt(NativePtr,
@@ -3047,7 +3271,7 @@ static unsigned rewriteDynamicGuestAddressIntToPtr(Module &M,
                                         Index->getSExtValue(), true),
                        "native.guest.gep.address");
       Value *AdjustedPtr =
-          materializeRecoveredDataPointer(M, GB, AdjustedAddress);
+          materializeRecoveredDataPointer(M, GB, AdjustedAddress, false);
       if (!AdjustedPtr)
         continue;
       if (AdjustedPtr->getType() != GEP->getType())
@@ -3065,7 +3289,13 @@ static unsigned rewriteDynamicGuestAddressIntToPtr(Module &M,
     // guest pointers loaded from memory, where the dynamic value is already a
     // full 0x40.... address.  Use the same range mapper as translator lowering
     // so all recovered globals and widened scalar ranges share one dispatch.
-    Value *NativePtr = materializeRecoveredDataPointer(M, B, ITP->getOperand(0));
+    // findGuestAddressExpression proved that this value is guest-address
+    // arithmetic anchored by a constant inside a recovered range.  ABI
+    // arguments used as the dynamic index are integers, not native pointer
+    // provenance; preserving them here would leave base+index as a raw
+    // absolute inttoptr.
+    Value *NativePtr =
+        materializeRecoveredDataPointer(M, B, ITP->getOperand(0), false);
     if (!NativePtr) {
       Value *Offset = Address->DynamicOffset;
       if (!Offset->getType()->isIntegerTy(64))
@@ -3119,6 +3349,19 @@ static bool isRecoveredPointerExternalArgument(StringRef Name,
   if (Name == "realloc")
     return Index == 0;
   return false;
+}
+
+static bool isDefinitelyPointerExternalArgument(StringRef Name,
+                                                unsigned Index) {
+  // printf's fixed format operand is a pointer, but its variadic operands can
+  // be ordinary integers.  scanf's non-suppressed variadic operands are all
+  // destinations and therefore pointers.  Every other position admitted by
+  // the whitelist above has a pointer type in the native libc ABI.
+  if (Name == "printf")
+    return Index == 0;
+  if (Name == "__isoc99_scanf" || Name == "scanf")
+    return true;
+  return isRecoveredPointerExternalArgument(Name, Index);
 }
 
 static Function *getOrCreateRecoveredDataPointerMapper(Module &M) {
@@ -3222,7 +3465,8 @@ static Value *createRecoveredOobScratchPointer(Module &M, IRBuilder<> &B,
 // the old guest address space; the final IR then contains ordinary native GEPs
 // and a dynamic native-pointer fallback for values that are already native.
 static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
-                                              Value *Address) {
+                                              Value *Address,
+                                              bool PreserveNativeInteger) {
   if (!Address || !Address->getType()->isIntegerTy())
     return nullptr;
 
@@ -3251,8 +3495,19 @@ static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
   if (containsNativeStackInteger(Address, StackSeen))
     return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
                             "native.stack.address.fallback");
+  // Recovered typed globals can flow through State as integer addresses:
+  //   ptrtoint(@global + fixed_offset) + index * stride + field_offset.
+  // Even callers that disable the broad native-integer heuristic must retain
+  // this explicit host base.  Rebasing only the dynamic arithmetic as a guest
+  // address drops the global and turns small indices into pointers such as
+  // 0x18.  Guest-base-plus-ABI-index expressions contain no ptrtoint carrier
+  // and therefore continue through the guest range mapper below.
+  SmallPtrSet<Value *, 32> ExplicitNativeSeen;
+  if (containsExplicitNativePointerInteger(Address, ExplicitNativeSeen))
+    return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
+                            "native.explicit.integer.pointer");
   SmallPtrSet<Value *, 32> NativeSeen;
-  if (isNativeInteger(Address, NativeSeen))
+  if (PreserveNativeInteger && isNativeInteger(Address, NativeSeen))
     return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
                             "native.integer.pointer");
 
@@ -3326,6 +3581,100 @@ static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
   return Result;
 }
 
+// A residual data segment can acquire brighten.guest.range only when its final
+// data_<addr> alias is removed.  scanf destinations may already contain an
+// inline range dispatch built by an earlier cleanup sweep, so merely making
+// materializeRecoveredDataPointer idempotent leaves that dispatch permanently
+// incomplete.  Track the recovered globals represented by an existing
+// dispatch and rebuild it from its raw guest-address fallback only when a new
+// range is missing.
+static void collectRecoveredDispatchCoverage(
+    Value *Pointer, SmallPtrSetImpl<Value *> &Seen,
+    SmallPtrSetImpl<GlobalVariable *> &Covered, bool &HasDataDispatch) {
+  if (!Pointer || !Pointer->getType()->isPointerTy() ||
+      !Seen.insert(Pointer).second)
+    return;
+  if (auto *GV = dyn_cast<GlobalVariable>(Pointer)) {
+    if (GV->getMetadata("brighten.guest.range"))
+      Covered.insert(GV);
+    return;
+  }
+  if (Pointer->hasName() &&
+      Pointer->getName().starts_with("native.data.pointer.select"))
+    HasDataDispatch = true;
+  auto *U = dyn_cast<User>(Pointer);
+  if (!U)
+    return;
+  for (Value *Operand : U->operands()) {
+    if (Operand->getType()->isPointerTy())
+      collectRecoveredDispatchCoverage(Operand, Seen, Covered,
+                                       HasDataDispatch);
+  }
+}
+
+static Value *findRecoveredDispatchRawGuestAddress(
+    Value *Pointer, SmallPtrSetImpl<Value *> &Seen) {
+  if (!Pointer || !Pointer->getType()->isPointerTy() ||
+      !Seen.insert(Pointer).second)
+    return nullptr;
+  if (auto *ITP = dyn_cast<IntToPtrInst>(Pointer)) {
+    if (ITP->getName().starts_with("native.address.fallback") &&
+        ITP->getOperand(0)->getType()->isIntegerTy())
+      return ITP->getOperand(0);
+  }
+  auto *U = dyn_cast<User>(Pointer);
+  if (!U)
+    return nullptr;
+  for (Value *Operand : U->operands()) {
+    if (!Operand->getType()->isPointerTy())
+      continue;
+    if (Value *Address =
+            findRecoveredDispatchRawGuestAddress(Operand, Seen))
+      return Address;
+  }
+  return nullptr;
+}
+
+static bool hasValidRecoveredGuestRange(GlobalVariable &GV) {
+  MDNode *RangeMD = GV.getMetadata("brighten.guest.range");
+  if (!RangeMD || RangeMD->getNumOperands() != 2)
+    return false;
+  auto *BeginMD = dyn_cast<ConstantAsMetadata>(RangeMD->getOperand(0));
+  auto *EndMD = dyn_cast<ConstantAsMetadata>(RangeMD->getOperand(1));
+  auto *Begin =
+      BeginMD ? dyn_cast<ConstantInt>(BeginMD->getValue()) : nullptr;
+  auto *End = EndMD ? dyn_cast<ConstantInt>(EndMD->getValue()) : nullptr;
+  return Begin && End && Begin->getZExtValue() < End->getZExtValue();
+}
+
+static Value *refreshRecoveredDataPointerDispatch(Module &M, IRBuilder<> &B,
+                                                  Value *Pointer) {
+  SmallPtrSet<Value *, 32> CoverageSeen;
+  SmallPtrSet<GlobalVariable *, 16> Covered;
+  bool HasDataDispatch = false;
+  collectRecoveredDispatchCoverage(Pointer, CoverageSeen, Covered,
+                                   HasDataDispatch);
+  if (!HasDataDispatch)
+    return nullptr;
+
+  bool MissingRange = false;
+  for (GlobalVariable &GV : M.globals()) {
+    if (hasValidRecoveredGuestRange(GV) && !Covered.contains(&GV)) {
+      MissingRange = true;
+      break;
+    }
+  }
+  if (!MissingRange)
+    return nullptr;
+
+  SmallPtrSet<Value *, 32> FallbackSeen;
+  Value *GuestAddress =
+      findRecoveredDispatchRawGuestAddress(Pointer, FallbackSeen);
+  if (!GuestAddress)
+    return nullptr;
+  return materializeRecoveredDataPointer(M, B, GuestAddress);
+}
+
 // Frame lowering preserves the contents of a guest stack slot, but that slot
 // can itself hold a guest BSS pointer.  The later load then becomes an
 // inttoptr whose operand has no remaining constant-expression provenance, so
@@ -3382,15 +3731,19 @@ static unsigned rewriteResidualRecoveredDataIntToPtrs(Module &M,
 }
 
 static Value *
-findMaterializedRecoveredGuestAddress(Value *V, SmallPtrSetImpl<Value *> &Seen) {
+findMaterializedRecoveredGuestAddress(Value *V,
+                                      SmallPtrSetImpl<Value *> &Seen,
+                                      IRBuilder<> &B) {
   if (!V || !Seen.insert(V).second)
     return nullptr;
   V = V->stripPointerCasts();
   if (auto *Sel = dyn_cast<SelectInst>(V)) {
     if (Value *Addr =
-            findMaterializedRecoveredGuestAddress(Sel->getTrueValue(), Seen))
+            findMaterializedRecoveredGuestAddress(Sel->getTrueValue(), Seen,
+                                                   B))
       return Addr;
-    return findMaterializedRecoveredGuestAddress(Sel->getFalseValue(), Seen);
+    return findMaterializedRecoveredGuestAddress(Sel->getFalseValue(), Seen,
+                                                 B);
   }
   auto *GEP = dyn_cast<GEPOperator>(V);
   if (!GEP ||
@@ -3433,7 +3786,26 @@ findMaterializedRecoveredGuestAddress(Value *V, SmallPtrSetImpl<Value *> &Seen) 
   if (!GV || GV->isDeclaration() ||
       !GV->getMetadata("brighten.guest.range"))
     return nullptr;
-  return Index;
+  auto *BaseOffset = cast<ConstantInt>(*BaseGEP->idx_begin());
+  MDNode *RangeMD = GV->getMetadata("brighten.guest.range");
+  auto *BeginMD = RangeMD && RangeMD->getNumOperands() == 2
+                      ? dyn_cast<ConstantAsMetadata>(RangeMD->getOperand(0))
+                      : nullptr;
+  auto *Begin =
+      BeginMD ? dyn_cast<ConstantInt>(BeginMD->getValue()) : nullptr;
+  if (!Begin)
+    return nullptr;
+
+  int64_t GuestBase = static_cast<int64_t>(Begin->getZExtValue()) +
+                      BaseOffset->getSExtValue();
+  if (GuestBase < 0)
+    return nullptr;
+  Value *Index64 = Index;
+  if (!Index64->getType()->isIntegerTy(64))
+    Index64 = B.CreateSExtOrTrunc(Index64, B.getInt64Ty(),
+                                 "native.recovered.index");
+  return B.CreateAdd(Index64, B.getInt64(static_cast<uint64_t>(GuestBase)),
+                     "native.recovered.guest.address");
 }
 
 // In flat guest memory, inttoptr(A) followed by byte GEP K means address A+K.
@@ -3460,14 +3832,15 @@ static unsigned rewriteMaterializedRecoveredPointerByteGEPs(Module &M,
   for (GetElementPtrInst *GEP : Candidates) {
     if (!GEP->getParent())
       continue;
+    IRBuilder<> B(GEP);
     SmallPtrSet<Value *, 16> Seen;
     Value *GuestAddress =
-        findMaterializedRecoveredGuestAddress(GEP->getPointerOperand(), Seen);
+        findMaterializedRecoveredGuestAddress(GEP->getPointerOperand(), Seen,
+                                              B);
     if (!GuestAddress)
       continue;
 
     auto *Index = cast<ConstantInt>(*GEP->idx_begin());
-    IRBuilder<> B(GEP);
     Value *Address64 = GuestAddress;
     if (!Address64->getType()->isIntegerTy(64))
       Address64 = B.CreateZExtOrTrunc(Address64, B.getInt64Ty(),
@@ -3627,6 +4000,17 @@ static unsigned rewriteRecoveredExternalPointerArguments(Module &M,
           Value *Arg = CB->getArgOperand(Index);
           IRBuilder<> B(CB);
           if (Arg->getType()->isPointerTy()) {
+            // A prior sweep may have materialized this data dispatch before a
+            // residual segment acquired its final guest range.  Refresh only
+            // incomplete generated dispatches; complete ones remain
+            // idempotent across repeated cleanup passes.
+            if (Value *Refreshed =
+                    refreshRecoveredDataPointerDispatch(M, B, Arg)) {
+              CB->setArgOperand(Index, Refreshed);
+              Arg = Refreshed;
+              ++Rewritten;
+              Changed = true;
+            }
             // scanf destinations can be a recovered-data select whose
             // fallback arm is an inttoptr carrying a guest stack address.
             // Normalize only proven stack arms; global/data arms remain
@@ -3675,7 +4059,9 @@ static unsigned rewriteRecoveredExternalPointerArguments(Module &M,
             Value *NativePtr = lowerNativeStackInteger(
                 B, GuestAddress, *CB->getFunction());
             if (!NativePtr)
-              NativePtr = materializeRecoveredDataPointer(M, B, GuestAddress);
+              NativePtr = materializeRecoveredDataPointer(
+                  M, B, GuestAddress,
+                  !isDefinitelyPointerExternalArgument(Name, Index));
             if (!NativePtr)
               continue;
             CB->setArgOperand(Index, NativePtr);
@@ -3703,7 +4089,9 @@ static unsigned rewriteRecoveredExternalPointerArguments(Module &M,
           Value *NativePtr = lowerNativeStackInteger(
               B, Arg, *CB->getFunction());
           if (!NativePtr)
-            NativePtr = materializeRecoveredDataPointer(M, B, Arg);
+            NativePtr = materializeRecoveredDataPointer(
+                M, B, Arg,
+                !isDefinitelyPointerExternalArgument(Name, Index));
           if (!NativePtr)
             continue;
           Value *NativeAddr = B.CreatePtrToInt(
@@ -3767,7 +4155,9 @@ static unsigned rewriteNativeVarargExternalPointerArguments(Module &M,
 static unsigned rewriteRecoveredVarargSaveSlots(Module &M, bool &Changed) {
   struct FormatRule {
     AllocaInst *RegSaveArea = nullptr;
+    StoreInst *OverflowArgAreaStore = nullptr;
     SmallVector<unsigned, 8> PointerOffsets;
+    SmallVector<unsigned, 8> OverflowPointerOffsets;
   };
 
   const DataLayout &DL = M.getDataLayout();
@@ -3813,6 +4203,7 @@ static unsigned rewriteRecoveredVarargSaveSlots(Module &M, bool &Changed) {
         if (!VAList)
           continue;
         AllocaInst *RegSaveArea = nullptr;
+        StoreInst *OverflowArgAreaStore = nullptr;
         for (BasicBlock &ScanBB : F) {
           for (Instruction &ScanI : ScanBB) {
             auto *SI = dyn_cast<StoreInst>(&ScanI);
@@ -3820,13 +4211,13 @@ static unsigned rewriteRecoveredVarargSaveSlots(Module &M, bool &Changed) {
               continue;
             auto Offset = getConstantGEPByteOffset(
                 SI->getPointerOperand(), VAList, DL);
+            if (Offset && *Offset == 8 &&
+                SI->getValueOperand()->getType()->isPointerTy())
+              OverflowArgAreaStore = SI;
             if (Offset && *Offset == 16) {
               RegSaveArea = getRootAlloca(SI->getValueOperand());
-              break;
             }
           }
-          if (RegSaveArea)
-            break;
         }
         if (!RegSaveArea) {
           // Some optimized lifted forms hide the store of va_list.reg_save_area
@@ -3850,6 +4241,7 @@ static unsigned rewriteRecoveredVarargSaveSlots(Module &M, bool &Changed) {
 
         FormatRule Rule;
         Rule.RegSaveArea = RegSaveArea;
+        Rule.OverflowArgAreaStore = OverflowArgAreaStore;
         collectFormatPointerSlots(*Format, IsScanf, FixedArguments * 8,
                                   Rule.PointerOffsets);
         if (IsPrintf && !formatHasAnyConversion(*Format))
@@ -3861,6 +4253,13 @@ static unsigned rewriteRecoveredVarargSaveSlots(Module &M, bool &Changed) {
           for (unsigned Offset = FixedArguments * 8; Offset <= 40;
                Offset += 8)
             Rule.PointerOffsets.push_back(Offset);
+          // The SysV GP save area ends at byte offset 48.  Every
+          // non-suppressed scanf conversion consumes a pointer, so slots at
+          // or beyond that boundary live in va_list.overflow_arg_area.
+          for (unsigned PointerOffset : Rule.PointerOffsets) {
+            if (PointerOffset >= 48)
+              Rule.OverflowPointerOffsets.push_back(PointerOffset - 48);
+          }
         }
         Rules.push_back(Rule);
       }
@@ -3868,6 +4267,58 @@ static unsigned rewriteRecoveredVarargSaveSlots(Module &M, bool &Changed) {
   }
 
   unsigned Rewritten = 0;
+  SmallPtrSet<StoreInst *, 16> RehomedOverflowAreas;
+  for (const FormatRule &Rule : Rules) {
+    StoreInst *OverflowStore = Rule.OverflowArgAreaStore;
+    if (!OverflowStore || Rule.OverflowPointerOffsets.empty() ||
+        !RehomedOverflowAreas.insert(OverflowStore).second)
+      continue;
+    Value *OriginalOverflow = OverflowStore->getValueOperand();
+    if (!OriginalOverflow || !OriginalOverflow->getType()->isPointerTy())
+      continue;
+    if (AllocaInst *Existing = getRootAlloca(OriginalOverflow);
+        Existing &&
+        Existing->getName().starts_with("native.vararg.overflow"))
+      continue;
+
+    unsigned MaxOffset =
+        *llvm::max_element(Rule.OverflowPointerOffsets);
+    uint64_t SlotCount = static_cast<uint64_t>(MaxOffset / 8) + 1;
+    Function *F = OverflowStore->getFunction();
+    IRBuilder<> EntryBuilder(&*F->getEntryBlock().getFirstInsertionPt());
+    auto *OverflowTy =
+        ArrayType::get(Type::getInt64Ty(M.getContext()), SlotCount);
+    AllocaInst *NativeOverflow = EntryBuilder.CreateAlloca(
+        OverflowTy, nullptr, "native.vararg.overflow");
+    NativeOverflow->setAlignment(Align(8));
+
+    IRBuilder<> B(OverflowStore->getNextNode());
+    for (unsigned Offset : Rule.OverflowPointerOffsets) {
+      Value *SourceSlot = B.CreateGEP(
+          B.getInt8Ty(), OriginalOverflow, B.getInt64(Offset),
+          "native.vararg.overflow.source");
+      LoadInst *GuestAddress = B.CreateAlignedLoad(
+          B.getInt64Ty(), SourceSlot, Align(8),
+          "native.vararg.overflow.guest.address");
+      Value *NativePtr =
+          materializeRecoveredDataPointer(M, B, GuestAddress);
+      if (!NativePtr)
+        NativePtr =
+            lowerNativeStackInteger(B, GuestAddress, *OverflowStore->getFunction());
+      if (!NativePtr)
+        continue;
+      Value *NativeAddress = B.CreatePtrToInt(
+          NativePtr, B.getInt64Ty(), "native.vararg.overflow.address");
+      Value *DestinationSlot = B.CreateGEP(
+          B.getInt8Ty(), NativeOverflow, B.getInt64(Offset),
+          "native.vararg.overflow.destination");
+      B.CreateAlignedStore(NativeAddress, DestinationSlot, Align(8));
+      ++Rewritten;
+    }
+    OverflowStore->setOperand(0, NativeOverflow);
+    Changed = true;
+  }
+
   SmallPtrSet<StoreInst *, 32> Seen;
   for (Function &F : M) {
     if (F.isDeclaration())
@@ -5140,10 +5591,6 @@ static void collectNativeContractViolations(
 
     bool HasDispatcherLikeCFG = false;
     for (BasicBlock &BB : F) {
-      if (BB.getName().starts_with("inst_")) {
-        HasDispatcherLikeCFG = true;
-        break;
-      }
       auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
       auto *StatePhi = SI ? dyn_cast<PHINode>(SI->getCondition()) : nullptr;
       if (!SI || !StatePhi || SI->getNumCases() < 2 ||
@@ -5152,7 +5599,9 @@ static void collectNativeContractViolations(
       // OLLVM-style flattening uses a loop-carried pseudo-random state and a
       // self-looping default arm.  A source-language switch may legitimately
       // be sparse, so require both that structural signature and a non-dense
-      // case set before rejecting it as a dispatcher.
+      // case set before rejecting it as a dispatcher.  Basic-block names are
+      // deliberately irrelevant: an `inst_*` label can survive correct CFG
+      // recovery and has no runtime semantics.
       APInt Min = SI->case_begin()->getCaseValue()->getValue();
       APInt Max = Min;
       for (auto Case : SI->cases()) {
@@ -5826,6 +6275,44 @@ static unsigned eraseUnusedInlineAsmCalls(Module &M, bool &Changed) {
   return Dead.size();
 }
 
+static unsigned lowerX86ThreadPointerInlineAsm(Module &M, bool &Changed) {
+  SmallVector<CallInst *, 16> Calls;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        auto *Asm = CI ? dyn_cast<InlineAsm>(CI->getCalledOperand()) : nullptr;
+        if (!CI || !Asm || CI->arg_size() != 0 ||
+            CI->use_empty() ||
+            !CI->getType()->isIntegerTy(64) ||
+            Asm->getAsmString() != "movq %fs:0, $0" ||
+            Asm->getConstraintString() != "=r")
+          continue;
+        Calls.push_back(CI);
+      }
+    }
+  }
+
+  Function *ThreadPointer = nullptr;
+  for (CallInst *CI : Calls) {
+    if (!ThreadPointer)
+      ThreadPointer = Intrinsic::getDeclaration(
+          &M, Intrinsic::thread_pointer,
+          {PointerType::getUnqual(M.getContext())});
+    IRBuilder<> B(CI);
+    Value *Pointer =
+        B.CreateCall(ThreadPointer, {}, "native.thread.pointer");
+    Value *Bits =
+        B.CreatePtrToInt(Pointer, CI->getType(), "native.thread.pointer.bits");
+    CI->replaceAllUsesWith(Bits);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+  return Calls.size();
+}
+
 static unsigned eraseUnusedInternalGlobals(Module &M, bool &Changed) {
   SmallVector<GlobalVariable *, 32> Dead;
   for (GlobalVariable &GV : M.globals()) {
@@ -5856,7 +6343,8 @@ static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
     for (Value *Operand : Array->operands()) {
       Value *Stripped = Operand->stripPointerCasts();
       auto *GV = dyn_cast<GlobalVariable>(Stripped);
-      if (GV && GV->getName().starts_with("native_data_"))
+      if (GV && (GV->getName().starts_with("native_data_") ||
+                 GV->getName().starts_with("seg_")))
         continue;
       Kept.push_back(cast<Constant>(Operand));
     }
@@ -5867,7 +6355,15 @@ static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
     } else {
       ArrayType *Ty = ArrayType::get(Array->getType()->getElementType(),
                                      Kept.size());
-      Used->setInitializer(ConstantArray::get(Ty, Kept));
+      Constant *Initializer = ConstantArray::get(Ty, Kept);
+      Used->setName(UsedName + ".discarded");
+      auto *Replacement = new GlobalVariable(
+          M, Ty, Used->isConstant(), Used->getLinkage(), Initializer,
+          UsedName, nullptr, Used->getThreadLocalMode(),
+          Used->getAddressSpace(), Used->isExternallyInitialized());
+      Replacement->copyAttributesFrom(Used);
+      Used->replaceAllUsesWith(Replacement);
+      Used->eraseFromParent();
     }
     Changed = true;
   }
@@ -5882,7 +6378,8 @@ static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
 
   SmallVector<GlobalVariable *, 32> DeadGlobals;
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.getName().starts_with("native_data_"))
+    if (!GV.getName().starts_with("native_data_") &&
+        !GV.getName().starts_with("seg_"))
       continue;
     GV.removeDeadConstantUsers();
     if (GV.use_empty())
@@ -6630,7 +7127,12 @@ static unsigned promoteStackDispatcherStateSlots(Module &M, bool &Changed) {
         LI->getParent() != Hub)
       continue;
     Value *SlotPtr = LI->getPointerOperand();
-    if (!isa<GetElementPtrInst>(SlotPtr))
+    // Late stack recovery commonly leaves a fully constant frame slot as a
+    // uniqued ConstantExpr GEP.  It has the same proven identity at every
+    // load/store as an instruction GEP, and materializeHubValueOnPred already
+    // accepts constants.  Requiring an instruction here prevented otherwise
+    // valid OLLVM dispatcher slots from ever reaching SSA promotion.
+    if (!isa<GEPOperator>(SlotPtr))
       continue;
 
     SmallVector<BasicBlock *, 4> HubPreds(predecessors(Hub));
@@ -6978,6 +7480,786 @@ static unsigned compactProvenConstantFrameBackings(Module &M, bool &Changed) {
     Backing->removeDeadConstantUsers();
     if (!Backing->use_empty())
       report_fatal_error("proven frame compaction left an unexpected use");
+    Backing->eraseFromParent();
+    ++Compacted;
+    Changed = true;
+  }
+  return Compacted;
+}
+
+// The remaining fake stacks are usually not truly dynamic objects.  Their
+// lifted stack pointer is an affine value based on one backing address, and
+// the only non-constant changes are call-frame adjustments in an otherwise
+// flattened dispatcher.  Recover a compact native frame only when:
+//   * every address is base-affine and has a finite range;
+//   * each non-zero PHI transition belongs to an acyclic dispatcher case;
+//   * all derived memory accesses are bounded; and
+//   * no derived address escapes through a call, return, or non-frame store.
+//
+// Replacing all backing roots by one translated logical base preserves pointer
+// differences and stored stack addresses.  The actual alloca covers only the
+// proven accessed interval.  It is zeroed because the old backing was a
+// zeroinitializer and affine control flow is not necessarily dominance-shaped.
+struct FrameAffineRange {
+  int Coeff = 0;
+  int64_t Min = 0;
+  int64_t Max = 0;
+};
+
+static bool addAffineBounds(int64_t A, int64_t B, int64_t &Out) {
+  return addSignedOffset(A, B, Out);
+}
+
+static Value *stripIntegerConstantOffset(Value *V, int64_t &Offset) {
+  while (V && V->getType()->isIntegerTy(64)) {
+    auto *Op = dyn_cast<Operator>(V);
+    if (!Op)
+      break;
+    unsigned Opcode = Op->getOpcode();
+    auto AddConstant = [&](const ConstantInt *CI, bool Negate) {
+      if (!CI || !CI->getValue().isSignedIntN(64))
+        return false;
+      int64_t Delta = CI->getSExtValue();
+      if (Negate) {
+        if (Delta == std::numeric_limits<int64_t>::min())
+          return false;
+        Delta = -Delta;
+      }
+      int64_t Next = 0;
+      if (!addSignedOffset(Offset, Delta, Next))
+        return false;
+      Offset = Next;
+      return true;
+    };
+    if (Opcode == Instruction::Add) {
+      if (auto *CI = dyn_cast<ConstantInt>(Op->getOperand(1))) {
+        if (!AddConstant(CI, false))
+          return nullptr;
+        V = Op->getOperand(0);
+        continue;
+      }
+      if (auto *CI = dyn_cast<ConstantInt>(Op->getOperand(0))) {
+        if (!AddConstant(CI, false))
+          return nullptr;
+        V = Op->getOperand(1);
+        continue;
+      }
+    } else if (Opcode == Instruction::Sub) {
+      if (auto *CI = dyn_cast<ConstantInt>(Op->getOperand(1))) {
+        if (!AddConstant(CI, true))
+          return nullptr;
+        V = Op->getOperand(0);
+        continue;
+      }
+    }
+    break;
+  }
+  return V;
+}
+
+static bool collectFiniteStateConstants(Value *V, std::set<int64_t> &Out,
+                                        SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !V->getType()->isIntegerTy() ||
+      V->getType()->getIntegerBitWidth() > 64 || !Seen.insert(V).second)
+    return false;
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    Out.insert(CI->getValue().sextOrTrunc(64).getSExtValue());
+    return Out.size() <= 32;
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V))
+    return collectFiniteStateConstants(SI->getTrueValue(), Out, Seen) &&
+           collectFiniteStateConstants(SI->getFalseValue(), Out, Seen);
+  if (auto *FI = dyn_cast<FreezeInst>(V))
+    return collectFiniteStateConstants(FI->getOperand(0), Out, Seen);
+  return false;
+}
+
+static bool dispatcherCaseExecutesAtMostOnce(BasicBlock *Target) {
+  if (!Target || !Target->getParent())
+    return false;
+  Function &F = *Target->getParent();
+
+  for (BasicBlock &RootBB : F) {
+    auto *Root = dyn_cast<SwitchInst>(RootBB.getTerminator());
+    if (!Root)
+      continue;
+    Value *Condition = Root->getCondition();
+
+    // Only analyze the root of a nested-default switch cascade.
+    bool HasParentSwitch = false;
+    for (BasicBlock &OtherBB : F) {
+      auto *Other = dyn_cast<SwitchInst>(OtherBB.getTerminator());
+      if (Other && Other != Root && Other->getCondition() == Condition &&
+          Other->getDefaultDest() == Root->getParent()) {
+        HasParentSwitch = true;
+        break;
+      }
+    }
+    if (HasParentSwitch)
+      continue;
+
+    std::map<int64_t, BasicBlock *> Cases;
+    SmallPtrSet<SwitchInst *, 4> CascadeSeen;
+    SwitchInst *Current = Root;
+    BasicBlock *Hub = nullptr;
+    bool ValidCascade = true;
+    while (Current && CascadeSeen.insert(Current).second) {
+      for (auto Case : Current->cases()) {
+        const APInt &Value = Case.getCaseValue()->getValue();
+        if (!Value.isSignedIntN(64)) {
+          ValidCascade = false;
+          break;
+        }
+        int64_t Key = Value.sextOrTrunc(64).getSExtValue();
+        auto [It, Inserted] = Cases.insert({Key, Case.getCaseSuccessor()});
+        if (!Inserted && It->second != Case.getCaseSuccessor()) {
+          ValidCascade = false;
+          break;
+        }
+      }
+      if (!ValidCascade)
+        break;
+      BasicBlock *Default = Current->getDefaultDest();
+      auto *Nested = dyn_cast<SwitchInst>(Default->getTerminator());
+      if (Nested && Nested->getCondition() == Condition &&
+          &*Default->getFirstInsertionPt() == Nested) {
+        Current = Nested;
+        continue;
+      }
+      Hub = Default;
+      break;
+    }
+    if (!ValidCascade || !Hub)
+      continue;
+
+    bool ContainsTarget = false;
+    for (auto [State, Dest] : Cases)
+      ContainsTarget |= Dest == Target;
+    if (!ContainsTarget)
+      continue;
+
+    auto *ConditionPhi = dyn_cast<PHINode>(Condition);
+    if (!ConditionPhi)
+      continue;
+    LoadInst *StateLoad = nullptr;
+    for (Value *Incoming : ConditionPhi->incoming_values()) {
+      auto *LI = dyn_cast<LoadInst>(Incoming);
+      if (!LI || LI->getParent() != Hub)
+        continue;
+      if (StateLoad && StateLoad != LI) {
+        StateLoad = nullptr;
+        break;
+      }
+      StateLoad = LI;
+    }
+    if (!StateLoad)
+      continue;
+    Value *StatePointer = StateLoad->getPointerOperand();
+
+    bool GraphValid = true;
+    std::map<BasicBlock *, SmallVector<BasicBlock *, 4>> SuccessorCache;
+    auto GetSemanticSuccessors =
+        [&](BasicBlock *Node) -> ArrayRef<BasicBlock *> {
+      auto Found = SuccessorCache.find(Node);
+      if (Found != SuccessorCache.end())
+        return Found->second;
+      SmallVector<BasicBlock *, 4> Next;
+      Instruction *Term = Node->getTerminator();
+      if (isa<ReturnInst>(Term) || isa<UnreachableInst>(Term)) {
+        auto [It, Inserted] =
+            SuccessorCache.insert({Node, std::move(Next)});
+        return It->second;
+      }
+      auto *BI = dyn_cast<BranchInst>(Term);
+      if (!BI || !BI->isUnconditional() || BI->getSuccessor(0) != Hub) {
+        GraphValid = false;
+        auto [It, Inserted] =
+            SuccessorCache.insert({Node, std::move(Next)});
+        return It->second;
+      }
+
+      StoreInst *LastStateStore = nullptr;
+      for (Instruction &I : *Node)
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+          if (SI->getPointerOperand() == StatePointer)
+            LastStateStore = SI;
+      if (!LastStateStore) {
+        GraphValid = false;
+        auto [It, Inserted] =
+            SuccessorCache.insert({Node, std::move(Next)});
+        return It->second;
+      }
+
+      std::set<int64_t> States;
+      SmallPtrSet<Value *, 16> Seen;
+      if (!collectFiniteStateConstants(LastStateStore->getValueOperand(),
+                                       States, Seen)) {
+        GraphValid = false;
+        auto [It, Inserted] =
+            SuccessorCache.insert({Node, std::move(Next)});
+        return It->second;
+      }
+      for (int64_t State : States)
+        if (auto It = Cases.find(State); It != Cases.end())
+          if (llvm::find(Next, It->second) == Next.end())
+            Next.push_back(It->second);
+      auto [It, Inserted] =
+          SuccessorCache.insert({Node, std::move(Next)});
+      return It->second;
+    };
+
+    SmallPtrSet<BasicBlock *, 32> Active;
+    std::map<BasicBlock *, bool> ReachMemo;
+    std::function<bool(BasicBlock *)> ReachesTarget =
+        [&](BasicBlock *Node) -> bool {
+      if (Node == Target)
+        return true;
+      if (auto It = ReachMemo.find(Node); It != ReachMemo.end())
+        return It->second;
+      if (!Active.insert(Node).second)
+        return false;
+      bool Reaches = false;
+      for (BasicBlock *Next : GetSemanticSuccessors(Node)) {
+        if (ReachesTarget(Next)) {
+          Reaches = true;
+          break;
+        }
+      }
+      Active.erase(Node);
+      ReachMemo[Node] = Reaches;
+      return Reaches;
+    };
+
+    bool Cyclic = false;
+    for (BasicBlock *Next : GetSemanticSuccessors(Target))
+      if (ReachesTarget(Next)) {
+        Cyclic = true;
+        break;
+      }
+    if (GraphValid && !Cyclic)
+      return true;
+  }
+  return false;
+}
+
+class AffineFrameAnalyzer {
+public:
+  AffineFrameAnalyzer(GlobalVariable &Backing, Function &Owner)
+      : Backing(Backing), Owner(Owner),
+        DL(Backing.getParent()->getDataLayout()) {}
+
+  bool evaluate(Value *V, FrameAffineRange &Out) {
+    if (!V)
+      return false;
+    if (auto It = Cache.find(V); It != Cache.end()) {
+      Out = It->second;
+      return true;
+    }
+    if (!Active.insert(V).second)
+      return false;
+
+    std::optional<FrameAffineRange> Result;
+    if (V == &Backing) {
+      Result = FrameAffineRange{1, 0, 0};
+    } else if (auto *CI = dyn_cast<ConstantInt>(V)) {
+      if (CI->getValue().isSignedIntN(64)) {
+        int64_t Value = CI->getSExtValue();
+        Result = FrameAffineRange{0, Value, Value};
+      }
+    } else if (auto *PN = dyn_cast<PHINode>(V)) {
+      FrameAffineRange PhiRange;
+      if (computePhiRange(PN, PhiRange))
+        Result = PhiRange;
+    } else if (auto *SI = dyn_cast<SelectInst>(V)) {
+      FrameAffineRange TrueRange, FalseRange;
+      if (evaluate(SI->getTrueValue(), TrueRange) &&
+          evaluate(SI->getFalseValue(), FalseRange) &&
+          TrueRange.Coeff == FalseRange.Coeff)
+        Result = FrameAffineRange{
+            TrueRange.Coeff, std::min(TrueRange.Min, FalseRange.Min),
+            std::max(TrueRange.Max, FalseRange.Max)};
+    } else if (auto *FI = dyn_cast<FreezeInst>(V)) {
+      FrameAffineRange Operand;
+      if (evaluate(FI->getOperand(0), Operand))
+        Result = Operand;
+    } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+      FrameAffineRange Base;
+      if (evaluate(GEP->getPointerOperand(), Base)) {
+        unsigned Bits =
+            DL.getIndexSizeInBits(GEP->getPointerAddressSpace());
+        APInt ConstantOffset(Bits, 0, true);
+        if (GEP->accumulateConstantOffset(DL, ConstantOffset) &&
+            ConstantOffset.isSignedIntN(64)) {
+          int64_t Min = 0, Max = 0;
+          if (addAffineBounds(Base.Min, ConstantOffset.getSExtValue(), Min) &&
+              addAffineBounds(Base.Max, ConstantOffset.getSExtValue(), Max))
+            Result = FrameAffineRange{Base.Coeff, Min, Max};
+        } else if (GEP->getSourceElementType()->isIntegerTy(8) &&
+                   GEP->getNumIndices() == 1) {
+          FrameAffineRange Index;
+          if (evaluate(GEP->getOperand(1), Index)) {
+            int Coeff = Base.Coeff + Index.Coeff;
+            int64_t Min = 0, Max = 0;
+            if (Coeff >= -8 && Coeff <= 8 &&
+                addAffineBounds(Base.Min, Index.Min, Min) &&
+                addAffineBounds(Base.Max, Index.Max, Max))
+              Result = FrameAffineRange{Coeff, Min, Max};
+          }
+        }
+      }
+    } else if (auto *BC = dyn_cast<BitCastOperator>(V)) {
+      FrameAffineRange Operand;
+      if (evaluate(BC->getOperand(0), Operand))
+        Result = Operand;
+    } else if (auto *Op = dyn_cast<Operator>(V)) {
+      unsigned Opcode = Op->getOpcode();
+      if (Opcode == Instruction::PtrToInt ||
+          Opcode == Instruction::IntToPtr) {
+        FrameAffineRange Operand;
+        if (evaluate(Op->getOperand(0), Operand))
+          Result = Operand;
+      } else if ((Opcode == Instruction::Add ||
+                  Opcode == Instruction::Sub) &&
+                 V->getType()->isIntegerTy(64)) {
+        FrameAffineRange Left, Right;
+        if (evaluate(Op->getOperand(0), Left) &&
+            evaluate(Op->getOperand(1), Right)) {
+          int Coeff = Opcode == Instruction::Add
+                          ? Left.Coeff + Right.Coeff
+                          : Left.Coeff - Right.Coeff;
+          int64_t Min = 0, Max = 0;
+          bool Valid =
+              Coeff >= -8 && Coeff <= 8 &&
+              (Opcode == Instruction::Add
+                   ? addAffineBounds(Left.Min, Right.Min, Min) &&
+                         addAffineBounds(Left.Max, Right.Max, Max)
+                   : addAffineBounds(Left.Min, -Right.Max, Min) &&
+                         addAffineBounds(Left.Max, -Right.Min, Max));
+          if (Valid)
+            Result = FrameAffineRange{Coeff, Min, Max};
+        }
+      }
+    }
+
+    Active.erase(V);
+    if (!Result)
+      return false;
+    Cache[V] = *Result;
+    Out = *Result;
+    return true;
+  }
+
+  bool sawFinitePhi() const { return SawFinitePhi; }
+
+private:
+  bool computePhiRange(PHINode *Start, FrameAffineRange &Out) {
+    SmallVector<PHINode *, 8> Worklist{Start};
+    SmallPtrSet<PHINode *, 8> Group;
+    while (!Worklist.empty()) {
+      PHINode *PN = Worklist.pop_back_val();
+      if (!PN->getType()->isIntegerTy(64) || !Group.insert(PN).second)
+        continue;
+      for (Value *Incoming : PN->incoming_values()) {
+        int64_t Delta = 0;
+        Value *Base = stripIntegerConstantOffset(Incoming, Delta);
+        if (!Base)
+          return false;
+        if (auto *Other = dyn_cast<PHINode>(Base))
+          if (!Group.contains(Other))
+            Worklist.push_back(Other);
+      }
+    }
+
+    bool HasSeed = false;
+    int64_t SeedMin = 0, SeedMax = 0;
+    int64_t NegativeTransitions = 0, PositiveTransitions = 0;
+    for (PHINode *PN : Group) {
+      for (unsigned I = 0; I < PN->getNumIncomingValues(); ++I) {
+        Value *Incoming = PN->getIncomingValue(I);
+        int64_t Delta = 0;
+        Value *Base = stripIntegerConstantOffset(Incoming, Delta);
+        if (!Base)
+          return false;
+        if (auto *BasePhi = dyn_cast<PHINode>(Base);
+            BasePhi && Group.contains(BasePhi)) {
+          if (!Delta)
+            continue;
+          if (!dispatcherCaseExecutesAtMostOnce(PN->getIncomingBlock(I)))
+            return false;
+          int64_t Next = 0;
+          if (Delta < 0) {
+            if (!addSignedOffset(NegativeTransitions, Delta, Next))
+              return false;
+            NegativeTransitions = Next;
+          } else {
+            if (!addSignedOffset(PositiveTransitions, Delta, Next))
+              return false;
+            PositiveTransitions = Next;
+          }
+          continue;
+        }
+
+        FrameAffineRange Seed;
+        if (!evaluate(Base, Seed) || Seed.Coeff != 1 ||
+            Seed.Min != Seed.Max ||
+            !addSignedOffset(Seed.Min, Delta, Seed.Min))
+          return false;
+        Seed.Max = Seed.Min;
+        if (!HasSeed) {
+          SeedMin = SeedMax = Seed.Min;
+          HasSeed = true;
+        } else {
+          SeedMin = std::min(SeedMin, Seed.Min);
+          SeedMax = std::max(SeedMax, Seed.Max);
+        }
+      }
+    }
+    int64_t Min = 0, Max = 0;
+    if (!HasSeed ||
+        !addSignedOffset(SeedMin, NegativeTransitions, Min) ||
+        !addSignedOffset(SeedMax, PositiveTransitions, Max))
+      return false;
+    FrameAffineRange Range{1, Min, Max};
+    for (PHINode *PN : Group)
+      Cache[PN] = Range;
+    SawFinitePhi = true;
+    Out = Range;
+    return true;
+  }
+
+  GlobalVariable &Backing;
+  Function &Owner;
+  const DataLayout &DL;
+  std::map<Value *, FrameAffineRange> Cache;
+  SmallPtrSet<Value *, 32> Active;
+  bool SawFinitePhi = false;
+};
+
+static bool findSoleFrameBackingOwner(GlobalVariable &Backing,
+                                      Function *&Owner) {
+  SmallVector<User *, 32> Worklist(Backing.user_begin(), Backing.user_end());
+  SmallPtrSet<User *, 32> Seen;
+  while (!Worklist.empty()) {
+    User *U = Worklist.pop_back_val();
+    if (!Seen.insert(U).second)
+      continue;
+    if (auto *I = dyn_cast<Instruction>(U)) {
+      if (!I->getFunction() || (Owner && Owner != I->getFunction()))
+        return false;
+      Owner = I->getFunction();
+      continue;
+    }
+    auto *C = dyn_cast<Constant>(U);
+    if (!C || isa<GlobalValue>(C))
+      return false;
+    Worklist.append(C->user_begin(), C->user_end());
+  }
+  return Owner != nullptr;
+}
+
+static bool fixedAccessSize(const DataLayout &DL, Type *Ty, uint64_t &Size) {
+  TypeSize TS = DL.getTypeStoreSize(Ty);
+  if (TS.isScalable() || !TS.getFixedValue())
+    return false;
+  Size = TS.getFixedValue();
+  return Size <= uint64_t(std::numeric_limits<int64_t>::max());
+}
+
+static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
+                                   uint64_t &MaxSize,
+                                   SmallPtrSetImpl<Value *> &Seen);
+
+static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
+                                   uint64_t &MaxSize,
+                                   SmallPtrSetImpl<Value *> &Seen) {
+  if (!Seen.insert(Integer).second)
+    return true;
+  for (User *U : Integer->users()) {
+    if (auto *ITP = dyn_cast<IntToPtrInst>(U)) {
+      if (!traceAffinePointerUses(ITP, DL, MaxSize, Seen))
+        return false;
+      continue;
+    }
+    if (isa<ICmpInst>(U))
+      continue;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (GEP->getPointerOperand() == Integer)
+        return false;
+      continue;
+    }
+    if (auto *I = dyn_cast<Instruction>(U)) {
+      if (isa<BinaryOperator>(I) || isa<CastInst>(I) ||
+          isa<SelectInst>(I) || isa<PHINode>(I) || isa<FreezeInst>(I)) {
+        if (!traceAffineIntegerUses(I, DL, MaxSize, Seen))
+          return false;
+        continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(I))
+        if (SI->getValueOperand() == Integer)
+          return false;
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
+                                   uint64_t &MaxSize,
+                                   SmallPtrSetImpl<Value *> &Seen) {
+  if (!Seen.insert(Pointer).second)
+    return true;
+  for (User *U : Pointer->users()) {
+    if (auto *LI = dyn_cast<LoadInst>(U)) {
+      if (LI->getPointerOperand() != Pointer || LI->isVolatile() ||
+          LI->isAtomic())
+        return false;
+      uint64_t Size = 0;
+      if (!fixedAccessSize(DL, LI->getType(), Size))
+        return false;
+      MaxSize = std::max(MaxSize, Size);
+      continue;
+    }
+    if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getValueOperand() == Pointer ||
+          SI->getPointerOperand() != Pointer || SI->isVolatile() ||
+          SI->isAtomic())
+        return false;
+      uint64_t Size = 0;
+      if (!fixedAccessSize(DL, SI->getValueOperand()->getType(), Size))
+        return false;
+      MaxSize = std::max(MaxSize, Size);
+      continue;
+    }
+    if (isa<ICmpInst>(U))
+      continue;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (GEP->getPointerOperand() != Pointer ||
+          !traceAffinePointerUses(GEP, DL, MaxSize, Seen))
+        return false;
+      continue;
+    }
+    if (auto *I = dyn_cast<Instruction>(U)) {
+      if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I) ||
+          isa<SelectInst>(I) || isa<PHINode>(I) || isa<FreezeInst>(I)) {
+        if (!traceAffinePointerUses(I, DL, MaxSize, Seen))
+          return false;
+        continue;
+      }
+      if (auto *PTI = dyn_cast<PtrToIntInst>(I)) {
+        if (!traceAffineIntegerUses(PTI, DL, MaxSize, Seen))
+          return false;
+        continue;
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+struct AffineFrameLoad {
+  LoadInst *Inst = nullptr;
+  FrameAffineRange Pointer;
+  uint64_t Size = 0;
+};
+
+struct AffineAddressStore {
+  StoreInst *Inst = nullptr;
+  FrameAffineRange Pointer;
+  uint64_t Size = 0;
+  FrameAffineRange StoredAddress;
+};
+
+static bool affineIntervalsOverlap(const FrameAffineRange &A, uint64_t ASize,
+                                   const FrameAffineRange &B, uint64_t BSize) {
+  int64_t AEnd = 0, BEnd = 0;
+  return addSignedOffset(A.Max, int64_t(ASize), AEnd) &&
+         addSignedOffset(B.Max, int64_t(BSize), BEnd) &&
+         A.Min < BEnd && B.Min < AEnd;
+}
+
+static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
+                                    uint64_t ObjectSize, int64_t &MinAccess,
+                                    int64_t &MaxAccess, Align &FrameAlign) {
+  const DataLayout &DL = Backing.getParent()->getDataLayout();
+  AffineFrameAnalyzer Analyzer(Backing, Owner);
+  SmallVector<AffineFrameLoad, 64> Loads;
+  SmallVector<AffineAddressStore, 32> AddressStores;
+  bool HasAccess = false;
+
+  auto AddAccess = [&](const FrameAffineRange &Pointer,
+                       uint64_t Size) -> bool {
+    if (Pointer.Coeff != 1 || Pointer.Min < 0 ||
+        Size > uint64_t(std::numeric_limits<int64_t>::max()))
+      return false;
+    int64_t End = 0;
+    if (!addSignedOffset(Pointer.Max, int64_t(Size), End) ||
+        End < Pointer.Min || uint64_t(End) > ObjectSize)
+      return false;
+    if (!HasAccess) {
+      MinAccess = Pointer.Min;
+      MaxAccess = End;
+      HasAccess = true;
+    } else {
+      MinAccess = std::min(MinAccess, Pointer.Min);
+      MaxAccess = std::max(MaxAccess, End);
+    }
+    return true;
+  };
+
+  for (BasicBlock &BB : Owner) {
+    for (Instruction &I : BB) {
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        FrameAffineRange Pointer;
+        if (!Analyzer.evaluate(LI->getPointerOperand(), Pointer) ||
+            Pointer.Coeff != 1)
+          continue;
+        uint64_t Size = 0;
+        if (LI->isVolatile() || LI->isAtomic() ||
+            !fixedAccessSize(DL, LI->getType(), Size) ||
+            !AddAccess(Pointer, Size))
+          return false;
+        FrameAlign = std::max(FrameAlign, LI->getAlign());
+        Loads.push_back({LI, Pointer, Size});
+        continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        FrameAffineRange Pointer;
+        bool IsFrameStore =
+            Analyzer.evaluate(SI->getPointerOperand(), Pointer) &&
+            Pointer.Coeff == 1;
+        uint64_t Size = 0;
+        if (IsFrameStore) {
+          if (SI->isVolatile() || SI->isAtomic() ||
+              !fixedAccessSize(DL, SI->getValueOperand()->getType(), Size) ||
+              !AddAccess(Pointer, Size))
+            return false;
+          FrameAlign = std::max(FrameAlign, SI->getAlign());
+        }
+        FrameAffineRange Stored;
+        if (Analyzer.evaluate(SI->getValueOperand(), Stored) &&
+            Stored.Coeff == 1) {
+          if (!IsFrameStore)
+            return false;
+          AddressStores.push_back({SI, Pointer, Size, Stored});
+        }
+        continue;
+      }
+      if (auto *ITP = dyn_cast<IntToPtrInst>(&I)) {
+        FrameAffineRange Address;
+        if (!Analyzer.evaluate(ITP->getOperand(0), Address) ||
+            Address.Coeff != 1)
+          continue;
+        uint64_t MaxSize = 1;
+        SmallPtrSet<Value *, 32> Seen;
+        if (!traceAffinePointerUses(ITP, DL, MaxSize, Seen) ||
+            !AddAccess(Address, MaxSize))
+          return false;
+        continue;
+      }
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        for (Value *Arg : CB->args()) {
+          FrameAffineRange Address;
+          if (Analyzer.evaluate(Arg, Address) && Address.Coeff == 1)
+            return false;
+        }
+        continue;
+      }
+      if (auto *RI = dyn_cast<ReturnInst>(&I)) {
+        FrameAffineRange Address;
+        if (RI->getReturnValue() &&
+            Analyzer.evaluate(RI->getReturnValue(), Address) &&
+            Address.Coeff == 1)
+          return false;
+      }
+    }
+  }
+
+  for (const AffineAddressStore &Store : AddressStores) {
+    uint64_t MaxSize = 1;
+    for (const AffineFrameLoad &Load : Loads) {
+      if (!affineIntervalsOverlap(Store.Pointer, Store.Size, Load.Pointer,
+                                  Load.Size))
+        continue;
+      SmallPtrSet<Value *, 32> Seen;
+      if (!traceAffineIntegerUses(Load.Inst, DL, MaxSize, Seen))
+        return false;
+    }
+    if (!AddAccess(Store.StoredAddress, MaxSize))
+      return false;
+  }
+  return HasAccess && Analyzer.sawFinitePhi();
+}
+
+static unsigned compactProvenAffineFrameBackings(Module &M, bool &Changed) {
+  SmallVector<GlobalVariable *, 8> Candidates;
+  for (GlobalVariable &GV : M.globals())
+    if (GV.getName().starts_with("frame_storage_backing."))
+      Candidates.push_back(&GV);
+
+  unsigned Compacted = 0;
+  for (GlobalVariable *Backing : Candidates) {
+    auto *AT = dyn_cast<ArrayType>(Backing->getValueType());
+    if (!AT || !AT->getElementType()->isIntegerTy(8) ||
+        !Backing->hasInternalLinkage() || !Backing->hasInitializer() ||
+        !Backing->getInitializer()->isNullValue())
+      continue;
+    uint64_t ObjectSize = AT->getNumElements();
+    if (!ObjectSize ||
+        ObjectSize > uint64_t(std::numeric_limits<int64_t>::max()))
+      continue;
+
+    Function *Owner = nullptr;
+    if (!findSoleFrameBackingOwner(*Backing, Owner))
+      continue;
+    int64_t Min = 0, Max = 0;
+    Align FrameAlign = Backing->getAlign().valueOrOne();
+    if (!proveAffineFrameBacking(*Backing, *Owner, ObjectSize, Min, Max,
+                                 FrameAlign))
+      continue;
+
+    uint64_t Alignment = FrameAlign.value();
+    uint64_t RoundedMin = uint64_t(Min) & ~(Alignment - 1);
+    uint64_t RoundedMax =
+        (uint64_t(Max) + Alignment - 1) & ~(Alignment - 1);
+    if (RoundedMax <= RoundedMin || RoundedMax > ObjectSize)
+      continue;
+    uint64_t FrameSize = RoundedMax - RoundedMin;
+    if (FrameSize >= ObjectSize || FrameSize > 1024 * 1024)
+      continue;
+
+    // Materialization may insert entry-block instructions for constant PHI
+    // operands.  Do it before choosing the alloca insertion point so the
+    // translated base dominates every newly-created root.
+    SmallVector<Constant *, 1> Constants{Backing};
+    convertUsersOfConstantsToInstructions(Constants, Owner);
+    Backing->removeDeadConstantUsers();
+
+    ArrayType *FrameTy =
+        ArrayType::get(Type::getInt8Ty(M.getContext()), FrameSize);
+    IRBuilder<> EntryBuilder(&*Owner->getEntryBlock().getFirstInsertionPt());
+    AllocaInst *Frame = EntryBuilder.CreateAlloca(
+        FrameTy, nullptr, Backing->getName() + ".native_frame");
+    Frame->setAlignment(FrameAlign);
+    EntryBuilder.CreateMemSet(Frame, EntryBuilder.getInt8(0), FrameSize,
+                              FrameAlign);
+    Value *LogicalBase = EntryBuilder.CreateGEP(
+        Type::getInt8Ty(M.getContext()), Frame,
+        EntryBuilder.getInt64(-int64_t(RoundedMin)),
+        "native.frame.logical.base");
+
+    SmallVector<GetElementPtrInst *, 64> RootGEPs;
+    for (User *U : Backing->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I || I->getFunction() != Owner)
+        report_fatal_error(
+            "affine frame materialization left a non-local constant use");
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(I))
+        if (GEP->getPointerOperand() == Backing)
+          RootGEPs.push_back(GEP);
+    }
+    for (GetElementPtrInst *GEP : RootGEPs)
+      GEP->setNoWrapFlags(GEPNoWrapFlags::none());
+    Backing->replaceAllUsesWith(LogicalBase);
     Backing->eraseFromParent();
     ++Compacted;
     Changed = true;
@@ -8199,6 +9481,15 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (FinalPointerIntegers)
       errs() << "  final recovered pointer integer identities lowered: "
              << FinalPointerIntegers << "\n";
+    // Pointer-identity normalization above intentionally turns
+    // ptrtoint(recovered_global) back into its guest address.  Re-run the
+    // dynamic mapper immediately so expressions that also carry an index or
+    // field offset cannot leave the final pass as raw absolute inttoptrs.
+    unsigned FinalDynamicGuestPointers =
+        rewriteDynamicGuestAddressIntToPtr(M, Changed);
+    if (FinalDynamicGuestPointers)
+      errs() << "  final normalized dynamic guest pointers lowered: "
+             << FinalDynamicGuestPointers << "\n";
     unsigned FinalStackRecoveredGEPs =
         rewriteRecoveredGlobalStackIndexedGEPs(M, Changed);
     if (FinalStackRecoveredGEPs)
@@ -8209,6 +9500,10 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (FinalVarargPointers)
       errs() << "  final recovered variadic pointer save slots lowered: "
              << FinalVarargPointers << "\n";
+    unsigned ThreadPointers = lowerX86ThreadPointerInlineAsm(M, Changed);
+    if (ThreadPointers)
+      errs() << "  final x86 TLS reads lowered to llvm.thread.pointer: "
+             << ThreadPointers << "\n";
     unsigned DeadInlineAsm = eraseUnusedInlineAsmCalls(M, Changed);
     if (DeadInlineAsm)
       errs() << "  final unused inline-asm calls erased: " << DeadInlineAsm
@@ -8260,6 +9555,8 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   // `freeze` makes an unknown register/flag stable but does not recover its
   // machine meaning; strict certification must observe and reject it instead.
   unsigned UndefinedScaffolds = lowerFullyOverwrittenUndefinedScaffolds(M);
+  UndefinedScaffolds +=
+      lowerDirectFullyOverwrittenUndefinedScaffolds(M);
   if (UndefinedScaffolds) {
     Changed = true;
     errs() << "  fully-overwritten undef/poison scaffolds normalized: "
@@ -8498,11 +9795,14 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   // sweep may legitimately roll its State transaction back).
   unsigned FinalDynamicGuestPointers = 0;
   unsigned FinalResidualGuestPointers = 0;
+  unsigned FinalExternalPointers = 0;
   if (DataAliases) {
     FinalDynamicGuestPointers =
         rewriteDynamicGuestAddressIntToPtr(M, Changed);
     FinalResidualGuestPointers =
         rewriteResidualRecoveredDataIntToPtrs(M, Changed);
+    FinalExternalPointers =
+        rewriteRecoveredExternalPointerArguments(M, Changed);
   }
   if (FinalDynamicGuestPointers)
     errs() << "  final dynamic guest pointers lowered: "
@@ -8510,6 +9810,9 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   if (FinalResidualGuestPointers)
     errs() << "  final residual guest data inttoptrs lowered: "
            << FinalResidualGuestPointers << "\n";
+  if (FinalExternalPointers)
+    errs() << "  final recovered external pointer arguments refreshed: "
+           << FinalExternalPointers << "\n";
 
   unsigned ConstantGuestPointers =
       rewriteConstantGuestPointerOperands(M, Changed);
@@ -8605,6 +9908,12 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   if (LateRawNativeStackPointers)
     errs() << "  late raw guest stack inttoptrs lowered: "
            << LateRawNativeStackPointers << "\n";
+  unsigned AffineCompactedFrames =
+      compactProvenAffineFrameBackings(M, Changed);
+  if (AffineCompactedFrames)
+    errs() << "  proven affine fake stack backings converted to native "
+              "frames: "
+           << AffineCompactedFrames << "\n";
   unsigned CompactedFrames = compactProvenConstantFrameBackings(M, Changed);
   if (CompactedFrames)
     errs() << "  proven fake stack backings converted to native frames: "

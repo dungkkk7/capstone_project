@@ -21,12 +21,31 @@ _INT_RE = re.compile(rb"[+-]?\d+")
 _FLOAT_RE = re.compile(rb"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?)")
 
 
+def _is_prime(value: int) -> bool:
+    if value < 2:
+        return False
+    if value == 2:
+        return True
+    if value % 2 == 0:
+        return False
+    limit = int(value**0.5)
+    factor = 3
+    while factor <= limit:
+        if value % factor == 0:
+            return False
+        factor += 2
+    return True
+
+
 def _manifest_path(project_root: str) -> Path:
     return Path(project_root) / "data" / "input_contracts" / "pilot_mix3_50.json"
 
 
-def load_contracts(project_root: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    path = _manifest_path(project_root)
+def _custom_manifest_path(project_root: str) -> Path:
+    return Path(project_root) / "data" / "input_contracts" / "custom_dataset.json"
+
+
+def _load_manifest(path: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
     if not path.is_file():
         return {}
     with path.open("r", encoding="utf-8") as handle:
@@ -37,14 +56,241 @@ def load_contracts(project_root: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
     }
 
 
-def resolve_input_contract(project_root: str, binary_path: str) -> Optional[Dict[str, Any]]:
-    """Resolve a contract from a dataset binary path such as p00183/s868*.elf."""
+def load_contracts(
+    project_root: str, *, prefer_custom: bool = False
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Load input contracts.
+
+    By default we keep historical behavior for existing pilot pipelines by using
+    ``pilot_mix3_50.json``.  For custom dataset runs, call with
+    ``prefer_custom=True`` to resolve only custom contracts first.
+    """
+    if prefer_custom:
+        custom_contracts = _load_manifest(_custom_manifest_path(project_root))
+        if custom_contracts:
+            return custom_contracts
+    return _load_manifest(_manifest_path(project_root))
+
+
+def resolve_input_contract(
+    project_root: str, binary_path: str, *, only_custom: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Resolve a contract from a dataset binary path such as p00183/s868*.elf.
+
+    By default, resolve using the standard manifest and fallback as before.
+    Set ``only_custom=True`` to restrict lookup to custom_dataset.json only.
+    """
     path = Path(binary_path)
     case_id = next((part for part in path.parts if re.fullmatch(r"p\d+", part)), None)
     submission_id = next((part for part in path.name.split("_", 1) if re.fullmatch(r"s\d+", part)), None)
     if not case_id or not submission_id:
         return None
-    return load_contracts(project_root).get((case_id, submission_id))
+
+    key = (case_id, submission_id)
+    custom_contract = load_contracts(project_root, prefer_custom=True).get(key)
+    if custom_contract is not None or only_custom:
+        return custom_contract
+    return load_contracts(project_root).get(key)
+
+
+def _random_ascii_token(length: int, alphabet: str) -> str:
+    if not alphabet:
+        return ""
+    return "".join(random.choice(alphabet) for _ in range(max(1, length)))
+
+
+def _validate_primitive_modulus_stream(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    constraints = contract.get("constraints", {})
+    tokens = payload.split()
+    if len(tokens) < 2 or any(not _INT_RE.fullmatch(token) for token in tokens):
+        return False, "primitive_modulus_shape"
+
+    p = int(tokens[0])
+    expected_min = int(constraints.get("p_min", 2))
+    expected_max = int(constraints.get("p_max", 2**31 - 1))
+    if p < expected_min or p > expected_max:
+        return False, "primitive_modulus_prime_bounds"
+
+    if bool(constraints.get("prime", False)) and not _is_prime(p):
+        return False, "primitive_modulus_prime_required"
+
+    body_count = p - 1
+    if len(tokens) != 1 + 1 + body_count:
+        return False, "primitive_modulus_payload_size"
+
+    value_min = int(constraints.get("value_min", -2**31))
+    value_max = int(constraints.get("value_max", 2**31 - 1))
+    values = [int(token) for token in tokens[1:]]
+    if any(v < value_min or v > value_max for v in values):
+        return False, "primitive_modulus_value_bounds"
+    return True, ""
+
+
+def _validate_packet_token(token: str, min_len: int, max_len: int, *, keep_wildcard: bool = False) -> bool:
+    if not token:
+        return False
+    if not (min_len <= len(token) <= max_len):
+        return False
+    pattern = r"[A-Za-z0-9?]+" if keep_wildcard else r"[A-Za-z0-9]+"
+    if not re.fullmatch(pattern, token):
+        return False
+    if keep_wildcard and any(ch in "#!" for ch in token):
+        return False
+    return True
+
+
+def _validate_rule_packet_batches(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    if not lines:
+        return False, "rule_packet_lines"
+
+    cursor = 0
+    while cursor < len(lines):
+        header = lines[cursor].split()
+        if len(header) != 2:
+            return False, "rule_packet_batch_header"
+
+        try:
+            rule_num = int(header[0])
+            packet_num = int(header[1])
+        except ValueError:
+            return False, "rule_packet_batch_header_ints"
+
+        if rule_num == 0 and packet_num == 0:
+            return (True, "") if cursor == len(lines) - 1 else (False, "rule_packet_trailing_data")
+
+        if rule_num < 0 or packet_num < 0:
+            return False, "rule_packet_negative_counts"
+
+        cursor += 1
+        if cursor + rule_num + packet_num > len(lines):
+            return False, "rule_packet_truncated_batch"
+
+        for _ in range(rule_num):
+            pieces = lines[cursor].split()
+            cursor += 1
+            if len(pieces) != 3:
+                return False, "rule_packet_rule_shape"
+            op, src, dst = pieces
+            if op not in {"permit", "deny"}:
+                return False, "rule_packet_rule_action"
+            if not _validate_packet_token(src, 1, 11, keep_wildcard=True):
+                return False, "rule_packet_rule_src"
+            if not _validate_packet_token(dst, 1, 11, keep_wildcard=True):
+                return False, "rule_packet_rule_dst"
+
+        for _ in range(packet_num):
+            pieces = lines[cursor].split()
+            cursor += 1
+            if len(pieces) != 3:
+                return False, "rule_packet_packet_shape"
+            src, dst, message = pieces
+            if not _validate_packet_token(src, 1, 11, keep_wildcard=True):
+                return False, "rule_packet_packet_src"
+            if not _validate_packet_token(dst, 1, 11, keep_wildcard=True):
+                return False, "rule_packet_packet_dst"
+            if not message:
+                return False, "rule_packet_packet_message"
+
+    return False, "rule_packet_missing_terminator"
+
+
+def _mutate_rule_packet_batches(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
+    lines = _lines(seed)
+    if not lines:
+        return None
+
+    cursor = 0
+    rule_lines: List[int] = []
+    packet_lines: List[int] = []
+    while cursor < len(lines):
+        header = lines[cursor].split()
+        if len(header) != 2:
+            return None
+        try:
+            rule_num = int(header[0])
+            packet_num = int(header[1])
+        except ValueError:
+            return None
+
+        cursor += 1
+        if rule_num == 0 and packet_num == 0:
+            if cursor != len(lines):
+                return None
+            break
+
+        block_end = cursor + rule_num + packet_num
+        if block_end > len(lines):
+            return None
+        if rule_num < 0 or packet_num < 0:
+            return None
+
+        for _ in range(rule_num):
+            pieces = lines[cursor].split()
+            cursor += 1
+            if len(pieces) != 3:
+                return None
+            rule_lines.append(cursor - 1)
+            action, source, destination = pieces
+            if action not in {"permit", "deny"}:
+                return None
+            if not _validate_packet_token(source, 1, 11, keep_wildcard=True):
+                return None
+            if not _validate_packet_token(destination, 1, 11, keep_wildcard=True):
+                return None
+
+        for _ in range(packet_num):
+            pieces = lines[cursor].split()
+            cursor += 1
+            if len(pieces) != 3:
+                return None
+            source, destination, message = pieces
+            packet_lines.append(cursor - 1)
+            if not _validate_packet_token(source, 1, 11, keep_wildcard=True):
+                return None
+            if not _validate_packet_token(destination, 1, 11, keep_wildcard=True):
+                return None
+            if not message:
+                return None
+
+    if not (rule_lines or packet_lines):
+        return None
+
+    def mutate_token(text: str, alphabet: str) -> Optional[str]:
+        if not text:
+            return None
+        index = random.randrange(len(text))
+        current = text[index]
+        choices = [char for char in alphabet if char != current]
+        if not choices:
+            return None
+        return text[:index] + random.choice(choices) + text[index + 1 :]
+
+    mutated = lines[:]
+    if random.random() < 0.5 and rule_lines:
+        target = random.choice(rule_lines)
+        action, source, destination = mutated[target].split()
+        if random.random() < 0.5:
+            action = "permit" if action == "deny" else "deny"
+        elif random.random() < 0.6:
+            source = mutate_token(source, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ?") or source
+        else:
+            destination = mutate_token(destination, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ?") or destination
+        mutated[target] = f"{action} {source} {destination}"
+    else:
+        if not packet_lines:
+            return None
+        target = random.choice(packet_lines)
+        source, destination, message = mutated[target].split()
+        if random.random() < 0.4:
+            source = mutate_token(source, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ?") or source
+        elif random.random() < 0.4:
+            destination = mutate_token(destination, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ?") or destination
+        else:
+            message = mutate_token(message, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") or message
+        mutated[target] = f"{source} {destination} {message}"
+
+    return ("\n".join(mutated) + "\n").encode()
 
 
 def _dedupe(payloads: Iterable[bytes]) -> List[bytes]:
@@ -830,6 +1076,350 @@ def _validate_triangular_integer_stream(payload: bytes) -> Tuple[bool, str]:
     return True, ""
 
 
+def _case_integer_values(payload: bytes, reason: str) -> Tuple[Optional[List[int]], str]:
+    tokens = payload.split()
+    if not tokens or any(not _INT_RE.fullmatch(token) for token in tokens):
+        return None, reason
+    return [int(token) for token in tokens], ""
+
+
+def _validate_p00788(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    constraints = contract.get("constraints", {})
+    if (
+        not lines
+        or (constraints.get("newline_required") and not payload.endswith(b"\n"))
+    ):
+        return False, "p00788_lines"
+
+    p_min = int(constraints.get("p_min", 1))
+    p_max = int(constraints.get("p_max", 1000))
+    n_min = int(constraints.get("n_min", 1))
+    n_max = int(constraints.get("n_max", 1000))
+    for index, line in enumerate(lines):
+        fields = line.split()
+        if len(fields) != 2 or any(not re.fullmatch(r"[+-]?\d+", field) for field in fields):
+            return False, "p00788_pair"
+        p, n = map(int, fields)
+        if (p, n) == (0, 0):
+            return (True, "") if index == len(lines) - 1 else (False, "p00788_trailing")
+        if not (p_min <= p <= p_max and n_min <= n <= n_max and p <= n):
+            return False, "p00788_bounds"
+    return False, "p00788_terminator"
+
+
+def _validate_p02788(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _case_integer_values(payload, "p02788_integer")
+    if values is None or len(values) < 3:
+        return False, reason or "p02788_header"
+    constraints = contract.get("constraints", {})
+    n, distance, attack = values[:3]
+    if not int(constraints.get("n_min", 1)) <= n <= int(
+        constraints.get("n_max", 200000)
+    ):
+        return False, "p02788_count"
+    if len(values) != 3 + 2 * n:
+        return False, "p02788_size"
+    scalar_max = int(constraints.get("scalar_max", 10**9))
+    if not (1 <= distance <= scalar_max and 1 <= attack <= scalar_max):
+        return False, "p02788_parameters"
+    positions = values[3::2]
+    health = values[4::2]
+    if (
+        any(not 0 <= position <= scalar_max for position in positions)
+        or len(set(positions)) != n
+        or any(not 1 <= value <= scalar_max for value in health)
+    ):
+        return False, "p02788_monsters"
+    return True, ""
+
+
+def _validate_p02814(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _case_integer_values(payload, "p02814_integer")
+    if values is None or len(values) < 2:
+        return False, reason or "p02814_header"
+    constraints = contract.get("constraints", {})
+    count, limit = values[:2]
+    if not int(constraints.get("n_min", 1)) <= count <= int(
+        constraints.get("n_max", 100000)
+    ):
+        return False, "p02814_count"
+    if len(values) != 2 + count:
+        return False, "p02814_size"
+    scalar_max = int(constraints.get("scalar_max", 10**9))
+    if not 1 <= limit <= scalar_max:
+        return False, "p02814_limit"
+    if any(not 2 <= value <= scalar_max or value % 2 for value in values[2:]):
+        return False, "p02814_even_values"
+    return True, ""
+
+
+def _validate_p03142(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _case_integer_values(payload, "p03142_integer")
+    if values is None or len(values) < 2:
+        return False, reason or "p03142_header"
+
+    constraints = contract.get("constraints", {})
+    nodes, extra_edges = values[:2]
+    edge_count = nodes + extra_edges - 1
+    if (
+        not 1 <= nodes <= int(constraints.get("n_max", 115000))
+        or extra_edges < 0
+        or edge_count < 0
+        or edge_count > int(constraints.get("edge_max", 514000))
+    ):
+        return False, "p03142_bounds"
+    if len(values) != 2 + 2 * edge_count:
+        return False, "p03142_size"
+
+    adjacency: List[List[int]] = [[] for _ in range(nodes)]
+    indegree = [0] * nodes
+    seen_edges = set()
+    for cursor in range(2, len(values), 2):
+        source, destination = values[cursor] - 1, values[cursor + 1] - 1
+        edge = (source, destination)
+        if (
+            not 0 <= source < nodes
+            or not 0 <= destination < nodes
+            or source == destination
+            or edge in seen_edges
+        ):
+            return False, "p03142_edge"
+        seen_edges.add(edge)
+        adjacency[source].append(destination)
+        indegree[destination] += 1
+
+    roots = [node for node, degree in enumerate(indegree) if degree == 0]
+    if len(roots) != 1:
+        return False, "p03142_root"
+    pending = roots
+    visited = 0
+    while pending:
+        node = pending.pop()
+        visited += 1
+        for destination in adjacency[node]:
+            indegree[destination] -= 1
+            if indegree[destination] == 0:
+                pending.append(destination)
+    if visited != nodes:
+        return False, "p03142_dag"
+    return True, ""
+
+
+def _validate_p00165(
+    payload: bytes, contract: Dict[str, Any]
+) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "p00165_integer")
+    if values is None:
+        return False, reason
+    constraints = contract.get("constraints", {})
+    n_min = int(constraints.get("n_min", 1))
+    n_max = int(constraints.get("n_max", 1000))
+    value_min = int(constraints.get("value_min", 0))
+    value_max = int(constraints.get("value_max", 1000000))
+    cursor = 0
+    while cursor < len(values):
+        count = values[cursor]
+        cursor += 1
+        if count == 0:
+            return (True, "") if cursor == len(values) else (
+                False,
+                "p00165_trailing",
+            )
+        if not n_min <= count <= n_max:
+            return False, "p00165_count"
+        end = cursor + count * 2
+        if end > len(values):
+            return False, "p00165_size"
+        if any(
+            not value_min <= value <= value_max
+            for value in values[cursor:end]
+        ):
+            return False, "p00165_value"
+        cursor = end
+    return False, "p00165_terminator"
+
+
+def _validate_p00793(
+    payload: bytes, contract: Dict[str, Any]
+) -> Tuple[bool, str]:
+    tokens = payload.split()
+    if not tokens or len(tokens) % 6 or any(
+        not _INT_RE.fullmatch(token) for token in tokens
+    ):
+        return False, "p00793_shape"
+    records = [
+        tuple(int(token) for token in tokens[index : index + 6])
+        for index in range(0, len(tokens), 6)
+    ]
+    if records[-1] != (0, 0, 0, 0, 0, 0):
+        return False, "p00793_terminator"
+    coordinate_min = int(
+        contract.get("constraints", {}).get("coordinate_min", 1)
+    )
+    coordinate_max = int(
+        contract.get("constraints", {}).get("coordinate_max", 9999)
+    )
+    for record in records[:-1]:
+        if any(
+            not coordinate_min <= value <= coordinate_max
+            for value in record
+        ):
+            return False, "p00793_coordinate"
+        points = {
+            (record[0], record[1]),
+            (record[2], record[3]),
+            (record[4], record[5]),
+        }
+        if len(points) != 3:
+            return False, "p00793_distinct_points"
+    return True, ""
+
+
+def _validate_p01296(
+    payload: bytes, contract: Dict[str, Any]
+) -> Tuple[bool, str]:
+    if not payload.endswith(b"\n"):
+        return False, "p01296_newline"
+    try:
+        lines = payload.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return False, "p01296_ascii"
+    constraints = contract.get("constraints", {})
+    n_max = int(constraints.get("n_max", 20025))
+    coordinate_max = int(constraints.get("coordinate_max", 1000000000))
+    cursor = 0
+    while cursor < len(lines):
+        if not re.fullmatch(r"\d+", lines[cursor]):
+            return False, "p01296_count"
+        count = int(lines[cursor])
+        cursor += 1
+        if count == 0:
+            return (True, "") if cursor == len(lines) else (
+                False,
+                "p01296_trailing",
+            )
+        if not 1 <= count <= n_max or cursor + count > len(lines):
+            return False, "p01296_size"
+        for line in lines[cursor : cursor + count]:
+            match = re.fullmatch(r"(\d+) (\d+) ([xy])", line)
+            if not match:
+                return False, "p01296_record"
+            if int(match.group(1)) > coordinate_max or int(
+                match.group(2)
+            ) > coordinate_max:
+                return False, "p01296_coordinate"
+        cursor += count
+    return False, "p01296_terminator"
+
+
+def _validate_p01315(
+    payload: bytes, contract: Dict[str, Any]
+) -> Tuple[bool, str]:
+    tokens = payload.split()
+    if not tokens:
+        return False, "p01315_empty"
+    constraints = contract.get("constraints", {})
+    n_max = int(constraints.get("n_max", 50))
+    name_max = int(constraints.get("name_max", 20))
+    value_min = int(constraints.get("value_min", 0))
+    value_max = int(constraints.get("value_max", 1000000))
+    cursor = 0
+    while cursor < len(tokens):
+        if not _INT_RE.fullmatch(tokens[cursor]):
+            return False, "p01315_count"
+        count = int(tokens[cursor])
+        cursor += 1
+        if count == 0:
+            return (True, "") if cursor == len(tokens) else (
+                False,
+                "p01315_trailing",
+            )
+        if not 1 <= count <= n_max:
+            return False, "p01315_count"
+        metrics = []
+        for _ in range(count):
+            if cursor + 10 > len(tokens):
+                return False, "p01315_size"
+            name = tokens[cursor]
+            numeric_tokens = tokens[cursor + 1 : cursor + 10]
+            if (
+                not 1 <= len(name) <= name_max
+                or any(byte < 33 or byte > 126 for byte in name)
+            ):
+                return False, "p01315_name"
+            if any(
+                not _INT_RE.fullmatch(token) for token in numeric_tokens
+            ):
+                return False, "p01315_integer"
+            numeric = [int(token) for token in numeric_tokens]
+            if any(
+                not value_min <= value <= value_max for value in numeric
+            ):
+                return False, "p01315_value"
+            p, a, b, c, d, e, f, s, m = numeric
+            elapsed = a + b + c + (d + e) * m
+            income = f * s * m - p
+            if (
+                not 0 < elapsed <= 2**31 - 1
+                or not -(2**31) <= income <= 2**31 - 1
+            ):
+                return False, "p01315_arithmetic"
+            metrics.append((income, elapsed))
+            cursor += 10
+        if metrics:
+            maximum_income = max(abs(income) for income, _ in metrics)
+            maximum_elapsed = max(elapsed for _, elapsed in metrics)
+            if maximum_income * maximum_elapsed > 2**63 - 1:
+                return False, "p01315_comparison_overflow"
+    return False, "p01315_terminator"
+
+
+def _validate_p02029(
+    payload: bytes, contract: Dict[str, Any]
+) -> Tuple[bool, str]:
+    values, reason = _integer_values(payload, "p02029_integer")
+    if values is None or len(values) < 2:
+        return False, reason or "p02029_header"
+    constraints = contract.get("constraints", {})
+    header_fields = constraints.get("header_fields", [{}, {}])
+    count, queries = values[:2]
+    if (
+        not int(header_fields[0].get("min", 1))
+        <= count
+        <= int(header_fields[0].get("max", 100000))
+        or not int(header_fields[1].get("min", 1))
+        <= queries
+        <= int(header_fields[1].get("max", 100000))
+    ):
+        return False, "p02029_header"
+    if len(values) != 2 + 2 * count + 2 * queries:
+        return False, "p02029_size"
+    value_min = int(constraints.get("min", 0))
+    value_max = int(constraints.get("max", 1000000000))
+    if any(
+        not value_min <= value <= value_max for value in values[2:]
+    ):
+        return False, "p02029_value"
+    positions = values[2 : 2 + 2 * count : 2]
+    if any(left > right for left, right in zip(positions, positions[1:])):
+        return False, "p02029_position_order"
+    return True, ""
+
+
+_CASE_VALIDATORS = {
+    "p00165": _validate_p00165,
+    "p00793": _validate_p00793,
+    "p00788": _validate_p00788,
+    "p01296": _validate_p01296,
+    "p01315": _validate_p01315,
+    "p02029": _validate_p02029,
+    "p02788": _validate_p02788,
+    "p02814": _validate_p02814,
+    "p03142": _validate_p03142,
+}
+
+
 def validate_contract_payload(
     contract: Dict[str, Any], payload: bytes, seed_inputs: Optional[List[bytes]] = None
 ) -> Tuple[bool, str]:
@@ -840,9 +1430,14 @@ def validate_contract_payload(
         return False, "embedded_nul"
     kind = contract.get("kind", "")
     constraints = contract.get("constraints", {})
+    case_validator = _CASE_VALIDATORS.get(str(contract.get("case_id", "")))
+    if case_validator is not None:
+        return case_validator(payload, contract)
 
     if kind == "board_stream":
         return _validate_board_stream(payload, contract)
+    if kind == "primitive_modulus_stream":
+        return _validate_primitive_modulus_stream(payload, contract)
     if kind == "triangular_string_matrix":
         return _validate_triangular_strings(payload)
     if kind in {"fixed_integer_grid", "layered_grid_block"}:
@@ -862,6 +1457,8 @@ def validate_contract_payload(
         if not lines or not alphabet or any(not line or any(char not in alphabet for char in line) for line in lines):
             return False, "token_alphabet"
         return True, ""
+    if kind == "rule_packet_batches":
+        return _validate_rule_packet_batches(payload, contract)
     if kind == "word_batches":
         lines = _lines(payload)
         if not lines:
@@ -918,6 +1515,15 @@ def validate_contract_payload(
                 return False, "counted_long_list_count"
             if len(tokens) != 1 + count * values_per_count + count_offset:
                 return False, "counted_long_list_size"
+            if "value_min" in constraints or "value_max" in constraints:
+                value_min = int(constraints.get("value_min", -(2**63)))
+                value_max = int(constraints.get("value_max", 2**63 - 1))
+                data_tokens = tokens[1 + count_offset :]
+                if any(
+                    not value_min <= int(token) <= value_max
+                    for token in data_tokens
+                ):
+                    return False, "counted_long_list_value_bounds"
             return True, ""
         cursor = 0
         while cursor < len(tokens):
@@ -930,9 +1536,19 @@ def validate_contract_payload(
                 )
             if count < minimum or count > maximum:
                 return False, "counted_long_list_count"
-            cursor += count * values_per_count + count_offset
-            if cursor > len(tokens):
+            record_end = cursor + count * values_per_count + count_offset
+            if record_end > len(tokens):
                 return False, "counted_long_list_size"
+            if "value_min" in constraints or "value_max" in constraints:
+                value_min = int(constraints.get("value_min", -(2**63)))
+                value_max = int(constraints.get("value_max", 2**63 - 1))
+                data_tokens = tokens[cursor + count_offset : record_end]
+                if any(
+                    not value_min <= int(token) <= value_max
+                    for token in data_tokens
+                ):
+                    return False, "counted_long_list_value_bounds"
+            cursor = record_end
         return False, "counted_long_list_terminator"
     if kind == "dimension_expression_batches":
         return _validate_dimension_expression_batches(payload)
@@ -1302,6 +1918,10 @@ def _mutate_payload(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
     mutation = str(contract.get("mutation", ""))
     if kind == "board_stream":
         return _mutate_board(seed, contract)
+    if kind == "primitive_modulus_stream":
+        return _mutate_numeric(seed, contract)
+    if kind == "rule_packet_batches":
+        return _mutate_rule_packet_batches(seed, contract)
     if kind == "layered_grid_block":
         return _mutate_layered_grid(seed, contract)
     if kind == "word_batches":
@@ -1339,15 +1959,175 @@ def _mutate_payload(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
     return _mutate_numeric(seed, contract)
 
 
+def _random_valid_case_payload(contract: Dict[str, Any]) -> Optional[bytes]:
+    case_id = str(contract.get("case_id", ""))
+    constraints = contract.get("constraints", {})
+    if case_id == "p00165":
+        output = []
+        for _ in range(random.randint(1, 3)):
+            count = random.randint(
+                int(constraints.get("n_min", 1)),
+                min(int(constraints.get("n_max", 1000)), 8),
+            )
+            output.append(str(count))
+            for _ in range(count):
+                output.append(
+                    f"{random.randint(2, 1000000)} "
+                    f"{random.randint(0, 1000000)}"
+                )
+        output.append("0")
+        return ("\n".join(output) + "\n").encode()
+    if case_id == "p00793":
+        output = []
+        for _ in range(random.randint(1, 4)):
+            points = set()
+            while len(points) < 3:
+                points.add(
+                    (
+                        random.randint(1, 9999),
+                        random.randint(1, 9999),
+                    )
+                )
+            output.append(
+                " ".join(
+                    str(coordinate)
+                    for point in points
+                    for coordinate in point
+                )
+            )
+        output.append("0 0 0 0 0 0")
+        return ("\n".join(output) + "\n").encode()
+    if case_id == "p00788":
+        pairs = []
+        for _ in range(random.randint(1, 5)):
+            n = random.randint(
+                int(constraints.get("n_min", 1)),
+                int(constraints.get("n_max", 1000)),
+            )
+            p = random.randint(
+                int(constraints.get("p_min", 1)),
+                min(int(constraints.get("p_max", 1000)), n),
+            )
+            pairs.append((p, n))
+        return ("\n".join(f"{p} {n}" for p, n in pairs) + "\n0 0\n").encode()
+    if case_id == "p01296":
+        output = []
+        for _ in range(random.randint(1, 3)):
+            count = random.randint(1, 10)
+            output.append(str(count))
+            output.extend(
+                f"{random.randint(0, 1000)} "
+                f"{random.randint(0, 1000)} "
+                f"{random.choice('xy')}"
+                for _ in range(count)
+            )
+        output.append("0")
+        return ("\n".join(output) + "\n").encode()
+    if case_id == "p01315":
+        output = []
+        for batch in range(random.randint(1, 3)):
+            count = random.randint(1, 5)
+            output.append(str(count))
+            for record in range(count):
+                name = f"item{batch}_{record}_{random.randint(0, 9999)}"
+                numeric = [random.randint(1, 20) for _ in range(9)]
+                output.append(
+                    f"{name} " + " ".join(map(str, numeric))
+                )
+        output.append("0")
+        return ("\n".join(output) + "\n").encode()
+    if case_id == "p02029":
+        count = random.randint(1, 12)
+        queries = random.randint(1, 8)
+        positions = sorted(random.sample(range(1, 1001), count))
+        output = [f"{count} {queries}"]
+        output.extend(
+            f"{position} {random.randint(0, 1000)}"
+            for position in positions
+        )
+        output.extend(
+            f"{random.randint(0, 1200)} {random.randint(1, count)}"
+            for _ in range(queries)
+        )
+        return ("\n".join(output) + "\n").encode()
+    if case_id == "p02788":
+        count = random.randint(1, 20)
+        scalar_max = int(constraints.get("scalar_max", 10**9))
+        distance = random.randint(1, scalar_max)
+        attack = random.randint(1, scalar_max)
+        positions = random.sample(range(0, max(100, count * 10)), count)
+        output = [f"{count} {distance} {attack}"]
+        output.extend(
+            f"{position} {random.randint(1, scalar_max)}" for position in positions
+        )
+        return ("\n".join(output) + "\n").encode()
+    if case_id == "p02814":
+        count = random.randint(1, 20)
+        scalar_max = int(constraints.get("scalar_max", 10**9))
+        limit = random.randint(1, scalar_max)
+        values = [2 * random.randint(1, scalar_max // 2) for _ in range(count)]
+        return (f"{count} {limit}\n" + " ".join(map(str, values)) + "\n").encode()
+    if case_id == "p03142":
+        nodes = random.randint(3, 12)
+        chain = {(node, node + 1) for node in range(1, nodes)}
+        available = [
+            (source, destination)
+            for source in range(1, nodes + 1)
+            for destination in range(source + 1, nodes + 1)
+            if (source, destination) not in chain
+        ]
+        extra_edges = random.randint(0, min(12, len(available)))
+        edges = list(chain)
+        edges.extend(random.sample(available, extra_edges))
+        random.shuffle(edges)
+        output = [f"{nodes} {extra_edges}"]
+        output.extend(f"{source} {destination}" for source, destination in edges)
+        return ("\n".join(output) + "\n").encode()
+    return None
+
+
 def _random_valid_payload(contract: Dict[str, Any]) -> Optional[bytes]:
     """Create a fresh valid instance for contracts whose seed shape is finite."""
     kind = contract.get("kind", "")
     constraints = contract.get("constraints", {})
+    case_payload = _random_valid_case_payload(contract)
+    if case_payload is not None:
+        return case_payload
     if kind == "board_stream":
         boards = random.randint(int(constraints.get("min_boards", 1)), int(constraints.get("max_boards", 4)))
         alphabet = str(constraints.get("alphabet", "bw+"))
         rows = ["".join(random.choice(alphabet) for _ in range(int(constraints.get("cols", 3)))) for _ in range(boards * int(constraints.get("rows", 3)))]
         return ("\n".join(rows) + "\n0\n").encode()
+    if kind == "primitive_modulus_stream":
+        p_min = int(constraints.get("p_min", 2))
+        p_max = int(constraints.get("p_max", 2999))
+        value_min = int(constraints.get("value_min", 0))
+        value_max = int(constraints.get("value_max", 2998))
+        while True:
+            p = random.randint(p_min, p_max)
+            if not bool(constraints.get("prime", False)) or _is_prime(p):
+                break
+        values = [random.randint(value_min, value_max) for _ in range(p - 1)]
+        b0 = random.randint(value_min, value_max)
+        return (f"{p} {b0}\n" + " ".join(map(str, values)) + "\n").encode()
+    if kind == "rule_packet_batches":
+        rule_num = random.randint(1, 4)
+        packet_num = random.randint(0, 6)
+        address_choices = "0123456789abcdef?xXyY"
+        message_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?_-"
+        output: List[str] = [f"{rule_num} {packet_num}"]
+        for _ in range(rule_num):
+            action = random.choice(["permit", "deny"])
+            source = "".join(random.choice(address_choices) for _ in range(8))
+            destination = "".join(random.choice(address_choices) for _ in range(8))
+            output.append(f"{action} {source} {destination}")
+        for _ in range(packet_num):
+            source = "".join(random.choice(address_choices) for _ in range(8))
+            destination = "".join(random.choice(address_choices) for _ in range(8))
+            message = "".join(random.choice(message_alphabet) for _ in range(random.randint(1, 12)))
+            output.append(f"{source} {destination} {message}")
+        output.append("0 0")
+        return ("\n".join(output) + "\n").encode()
     if kind == "layered_grid_block":
         height = random.randint(2, 5)
         width = random.randint(2, 5)

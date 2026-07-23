@@ -123,6 +123,17 @@ static std::optional<uint64_t> IdentifyStateOffset(Value *Ptr) {
 // Walk all users of the old call result and verify every use is a memory-token
 // position (arg2 of Remill call, return, or PHI that eventually feeds only
 // memory-token positions).
+static bool IsRecoveredNativeMemoryOperand(CallInst *CI, Value *V) {
+  if (!CI || CI->arg_empty() || CI->getArgOperand(0) != V)
+    return false;
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || !Callee->getName().ends_with(".native") ||
+      Callee->arg_empty() || !Callee->getArg(0)->getType()->isPointerTy())
+    return false;
+  StringRef Name = Callee->getArg(0)->getName();
+  return Name == "memory" || Name.starts_with("memory.");
+}
+
 static bool IsMemoryTokenUse(Value *V, SmallPtrSetImpl<Value *> &Visited,
                               unsigned Depth) {
   if (!V || Depth > 16)
@@ -133,7 +144,9 @@ static bool IsMemoryTokenUse(Value *V, SmallPtrSetImpl<Value *> &Visited,
   for (User *U : V->users()) {
     if (auto *CI = dyn_cast<CallInst>(U)) {
       // Used as arg[2] (memory) of Remill call
-      if (CI->arg_size() >= 3 && CI->getArgOperand(2) == V) continue;
+      if ((CI->arg_size() >= 3 && CI->getArgOperand(2) == V) ||
+          IsRecoveredNativeMemoryOperand(CI, V))
+        continue;
       return false;
     }
     if (auto *Ret = dyn_cast<ReturnInst>(U)) continue;

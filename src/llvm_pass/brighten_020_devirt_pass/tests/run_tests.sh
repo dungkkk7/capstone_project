@@ -20,8 +20,9 @@ PLUGIN="${PLUGIN:-$ROOT/build/BrightenDevirtPass.so}"
 
 TRANSFORMED="$(mktemp)"
 REGION_TRANSFORMED="$(mktemp)"
+SELF_HUB_TRANSFORMED="$(mktemp)"
 CROSS_TRANSFORMED="$(mktemp)"
-trap 'rm -f "$TRANSFORMED" "$REGION_TRANSFORMED" "$CROSS_TRANSFORMED"' EXIT
+trap 'rm -f "$TRANSFORMED" "$REGION_TRANSFORMED" "$SELF_HUB_TRANSFORMED" "$CROSS_TRANSFORMED"' EXIT
 "$OPT_BIN" -load-pass-plugin "$PLUGIN" -passes=brighten-devirt-pass,verify \
   -S "$ROOT/tests/proven_state_switch.ll" -o "$TRANSFORMED"
 "$FILECHECK_BIN" "$ROOT/tests/proven_state_switch.ll" < "$TRANSFORMED"
@@ -57,6 +58,20 @@ REGION_TRANSFORMED_STATUS=$?
 set -e
 test "$REGION_ORIGINAL_STATUS" -eq 3
 test "$REGION_TRANSFORMED_STATUS" -eq "$REGION_ORIGINAL_STATUS"
+
+"$OPT_BIN" -load-pass-plugin "$PLUGIN" \
+  -passes=brighten-region-ssa-unflatten-pass,simplifycfg,adce,verify \
+  -S "$ROOT/tests/region_ssa_self_hub.ll" -o "$SELF_HUB_TRANSFORMED"
+"$FILECHECK_BIN" "$ROOT/tests/region_ssa_self_hub.ll" \
+  < "$SELF_HUB_TRANSFORMED"
+set +e
+lli-21 "$ROOT/tests/region_ssa_self_hub.ll"
+SELF_HUB_ORIGINAL_STATUS=$?
+lli-21 "$SELF_HUB_TRANSFORMED"
+SELF_HUB_TRANSFORMED_STATUS=$?
+set -e
+test "$SELF_HUB_ORIGINAL_STATUS" -eq 3
+test "$SELF_HUB_TRANSFORMED_STATUS" -eq "$SELF_HUB_ORIGINAL_STATUS"
 
 "$OPT_BIN" -load-pass-plugin "$PLUGIN" \
   -passes=brighten-region-ssa-unflatten-pass,verify \

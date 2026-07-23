@@ -43,14 +43,29 @@ PreservedAnalyses BrightenGlobalDataRecoveryPass::run(Module &M,
       }
       if (Covered)
         continue;
-      if (Ref->ConsumerKind != DataConsumerKind::IntegerAddressConsumer &&
-          Ref->ConsumerKind != DataConsumerKind::ArithmeticOnly &&
-          Ref->ConsumerKind != DataConsumerKind::LibcStringArg &&
-          Ref->ConsumerKind != DataConsumerKind::LibcWriteBufferArg)
+      // The generated translator range-checks the guest address before this
+      // dynamic GEP and returns the resulting segment pointer.  It is storage
+      // infrastructure, not an uncovered program data consumer; all actual
+      // users of the translated pointer are analyzed independently.
+      if (Ref->UserInst->getFunction()->getName() ==
+          "__translate_guest_pointer")
+        continue;
+      // Address-identity comparisons and arithmetic-only intermediate bases
+      // do not themselves consume memory and therefore do not require a
+      // recovered object.  Their downstream pointer consumers are recorded
+      // independently.  Unknown dynamic GEP carriers and direct
+      // LoadStorePointer uses must remain covered: ignoring those categories
+      // allowed partial rewrites before strict validation found the gap.
+      if (Ref->ConsumerKind == DataConsumerKind::ComparisonOnly ||
+          Ref->ConsumerKind == DataConsumerKind::ArithmeticOnly)
         continue;
       errs() << "[brighten-global-data] preserving module: unresolved guest "
                 "address carrier at 0x"
-             << Twine::utohexstr(Ref->GuestAddr) << "\n";
+             << Twine::utohexstr(Ref->GuestAddr) << " kind="
+             << static_cast<unsigned>(Ref->ConsumerKind) << "\n";
+      errs() << "  instruction: ";
+      Ref->UserInst->print(errs());
+      errs() << "\n";
       return PreservedAnalyses::all();
     }
   }

@@ -126,7 +126,8 @@ static bool HasGuestAddressIdentityUse(Value *V,
   for (User *U : V->users()) {
     if (isa<ICmpInst>(U) || isa<SwitchInst>(U))
       return true;
-    if (isa<PtrToIntInst>(U) || isa<CastInst>(U) ||
+    if (isa<GetElementPtrInst>(U) || isa<PtrToIntInst>(U) ||
+        isa<CastInst>(U) ||
         isa<BinaryOperator>(U) || isa<PHINode>(U) ||
         isa<SelectInst>(U) || isa<FreezeInst>(U)) {
       if (HasGuestAddressIdentityUse(cast<Value>(U), Seen, Depth + 1))
@@ -162,6 +163,15 @@ static bool EventuallyFeedsPointerConsumer(Value *V,
   for (User *U : V->users()) {
     if (isa<IntToPtrInst>(U))
       return true;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      // An integer derived from ptrtoint(data_<base>) and consumed as a GEP
+      // index is pointer arithmetic even without an explicit inttoptr.  This
+      // includes source-level pointer differences such as
+      // cnt[strchr(moji, c) - moji].
+      for (Value *Index : GEP->indices())
+        if (Index == V)
+          return true;
+    }
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (Function *Callee = CI->getCalledFunction()) {
         if (Callee->getName() == "__translate_guest_pointer")
@@ -247,9 +257,19 @@ static bool IsAddressIdentitySensitive(GuestAddressRef *Ref) {
   // load.  Starting at UserInst incorrectly preserves essentially every
   // global scalar whose value later participates in a comparison, leaving
   // its lifted data_<addr> alias disconnected from the recovered object.
-  SmallPtrSet<Value *, 32> DirectIdentitySeen;
-  if (HasGuestAddressIdentityUse(Ref->OriginalValue, DirectIdentitySeen))
-    return true;
+  // Follow this reference's use edge rather than the shared producer.  A
+  // segment/global value can feed both a libc pointer use and an unrelated
+  // identity comparison; inspecting all producer users would preserve the
+  // safe libc use as well.  GEP/cast/arithmetic nodes propagate the address,
+  // while load/call nodes are data boundaries.
+  Instruction *Use = Ref->UserInst;
+  if (isa<GetElementPtrInst>(Use) || isa<CastInst>(Use) ||
+      isa<BinaryOperator>(Use) || isa<PHINode>(Use) ||
+      isa<SelectInst>(Use) || isa<FreezeInst>(Use)) {
+    SmallPtrSet<Value *, 32> DirectIdentitySeen;
+    if (HasGuestAddressIdentityUse(Use, DirectIdentitySeen))
+      return true;
+  }
   // McSema also represents an integer immediate as ptrtoint(data_<addr>)
   // whenever it falls inside a broad BSS mapping.  That symbolic form is not
   // proof of pointer intent: flattened dispatcher states routinely use it as

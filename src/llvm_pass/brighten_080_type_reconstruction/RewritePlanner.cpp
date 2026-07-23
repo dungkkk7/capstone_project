@@ -126,6 +126,11 @@ bool PlanAndRewrite(TypeReconstructionContext &Ctx, bool OnlyStruct, bool OnlyAr
                                                      nullptr, GV->getThreadLocalMode(), GV->getType()->getAddressSpace(),
                                                      GV->isExternallyInitialized());
           NewGV->copyAttributesFrom(GV);
+          // Retyping replaces the storage object, not its provenance.
+          // GlobalObject attributes do not include metadata, and dropping
+          // brighten.guest.range here makes later pointer recovery leave
+          // valid guest addresses as raw inttoptrs.
+          NewGV->copyMetadata(GV, 0);
           NewGV->takeName(GV);
 
           RewritePointerUses(GV, NewGV, *Plan, Ctx);

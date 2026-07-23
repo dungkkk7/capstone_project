@@ -217,6 +217,38 @@ if "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass
   exit 1
 fi
 
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/constant_expr_dispatcher_slot.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/constant_expr_dispatcher_slot.ll"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -disable-output \
+  "$ROOT/tests/native_inst_label.ll"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -S \
+  "$ROOT/tests/thread_pointer_inline_asm.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/thread_pointer_inline_asm.ll"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -S \
+  "$ROOT/tests/direct_overwritten_undefined_scaffold.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/direct_overwritten_undefined_scaffold.ll"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -S \
+  "$ROOT/tests/unused_lifted_segment_in_llvm_used.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/unused_lifted_segment_in_llvm_used.ll"
+
 echo "Native cleanup tests: PASS"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -255,6 +287,8 @@ EXPLICIT_OVERRIDE_OUT="$(mktemp)"
   -brighten-native-state-ssa -S \
   "$ROOT/tests/explicit_argument_overrides_state.ll" \
   -o "$EXPLICIT_OVERRIDE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/explicit_argument_overrides_state.ll" < "$EXPLICIT_OVERRIDE_OUT"
 grep -Eq 'define internal i64 @worker\(i64 %state_in_2280, i64 %arg_RSI\)' \
   "$EXPLICIT_OVERRIDE_OUT"
 grep -Eq 'add i64 %arg_RSI, %arg_RSI' "$EXPLICIT_OVERRIDE_OUT"
@@ -263,6 +297,19 @@ if grep -Eq 'add i64 %state_in_2280, %arg_RSI|add i64 %arg_RSI, %state_in_2280' 
   echo "FAIL: stale State snapshot remained authoritative over explicit argument" >&2
   exit 1
 fi
+
+EXPLICIT_OVERRIDE_FINAL_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/explicit_argument_overrides_state.ll" \
+  -o "$EXPLICIT_OVERRIDE_FINAL_OUT"
+if grep -Eq 'native\.explicit\.integer\.pointer' \
+    "$EXPLICIT_OVERRIDE_FINAL_OUT"; then
+  echo "FAIL: final pointer identity normalization left a raw native carrier" >&2
+  exit 1
+fi
+grep -Eq 'getelementptr i8, ptr @g_arr_2' "$EXPLICIT_OVERRIDE_FINAL_OUT"
 
 MIXED_NATIVE_OUT="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -292,6 +339,13 @@ if grep -Eq 'native\.vararg\.address' "$MIXED_VARARG_OUT"; then
   exit 1
 fi
 grep -Eq 'store i64 %numeric_value, ptr %integer_slot' "$MIXED_VARARG_OUT"
+VSCANF_OVERFLOW_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/vscanf_overflow_pointer.ll" -o "$VSCANF_OVERFLOW_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/vscanf_overflow_pointer.ll" < "$VSCANF_OVERFLOW_OUT"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
@@ -374,6 +428,23 @@ if grep -Eq 'call i32 \(ptr, \.\.\.\) @scanf\(ptr @fmt, ptr getelementptr \(i8, 
   echo "FAIL: scanf absolute frame-anchor delta collapsed to frame_top" >&2
   exit 1
 fi
+
+SCANF_LATE_RANGE_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/scanf_late_recovered_range.ll" \
+  -o "$SCANF_LATE_RANGE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/scanf_late_recovered_range.ll" < "$SCANF_LATE_RANGE_OUT"
+
+STRCMP_LATE_RANGE_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/strcmp_late_recovered_range.ll" \
+  -o "$STRCMP_LATE_RANGE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/strcmp_late_recovered_range.ll" < "$STRCMP_LATE_RANGE_OUT"
 
 python3 "$ROOT/tests/test_pipeline_order.py"
 python3 "$ROOT/tests/test_native_contract_report.py"
@@ -463,7 +534,7 @@ grep -Eq 'llvm\.memset.*i64 8' "$PARTIAL_STATE_MEMSET_OUT"
 grep -Eq 'define internal i128 @worker\.native' "$PARTIAL_STATE_MEMSET_OUT"
 
 DFA_OUT="$(mktemp)"
-trap 'rm -f "$NULL_BOUNDARY_OUT" "$EXPLICIT_NATIVE_OUT" "$MIXED_NATIVE_OUT" "$MIXED_VARARG_OUT" "$RELATIVE_STACK_OUT" "$RELATIVE_STACK_FRAME_TOP_OUT" "$CONSERVATIVE_STACK_OUT" "$ENTRY_RSP_SEED_OUT" "$NESTED_RSP_OUT" "$NESTED_RBP_OUT" "$NESTED_DYNAMIC_OUT" "$NESTED_FIXED_SLOT_OUT" "$NESTED_STACK_ARG_OUT" "$EXACT_STATE_MEMSET_OUT" "$PARTIAL_STATE_MEMSET_OUT" "$DFA_OUT"' EXIT
+trap 'rm -f "$NULL_BOUNDARY_OUT" "$EXPLICIT_NATIVE_OUT" "$EXPLICIT_OVERRIDE_FINAL_OUT" "$MIXED_NATIVE_OUT" "$MIXED_VARARG_OUT" "$RELATIVE_STACK_OUT" "$RELATIVE_STACK_FRAME_TOP_OUT" "$CONSERVATIVE_STACK_OUT" "$ENTRY_RSP_SEED_OUT" "$NESTED_RSP_OUT" "$NESTED_RBP_OUT" "$NESTED_DYNAMIC_OUT" "$NESTED_FIXED_SLOT_OUT" "$NESTED_STACK_ARG_OUT" "$EXACT_STATE_MEMSET_OUT" "$PARTIAL_STATE_MEMSET_OUT" "$DFA_OUT"' EXIT
 "$OPT" -passes='dfa-jump-threading,simplifycfg,adce,verify' -S \
   "$ROOT/tests/flattened_ssa.ll" -o "$DFA_OUT"
 if grep -Eq 'switch i32' "$DFA_OUT"; then
@@ -474,8 +545,11 @@ grep -Eq 'ret i32 7' "$DFA_OUT"
 
 FRAME_COMPACT_OUT="$(mktemp)"
 FRAME_REFUSE_OUT="$(mktemp)"
+AFFINE_FRAME_OUT="$(mktemp)"
+AFFINE_FRAME_REFUSE_OUT="$(mktemp)"
 FRAME_POS_BIN="$(mktemp)"
 FRAME_NEG_BIN="$(mktemp)"
+AFFINE_FRAME_BIN="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
@@ -497,20 +571,57 @@ if grep -Eq 'native_frame = alloca' "$FRAME_REFUSE_OUT"; then
   exit 1
 fi
 
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/proven_affine_frame_compaction.ll" -o "$AFFINE_FRAME_OUT"
+if grep -Eq '@frame_storage_backing\.main' "$AFFINE_FRAME_OUT"; then
+  echo "FAIL: finite affine fake stack was not compacted" >&2
+  exit 1
+fi
+grep -Eq 'native_frame = alloca \[[0-9]+ x i8\]' "$AFFINE_FRAME_OUT"
+grep -Eq 'call void @llvm\.memset' "$AFFINE_FRAME_OUT"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/cyclic_affine_frame_compaction_refused.ll" \
+  -o "$AFFINE_FRAME_REFUSE_OUT"
+grep -Eq '@frame_storage_backing\.main.*zeroinitializer' \
+  "$AFFINE_FRAME_REFUSE_OUT"
+if grep -Eq 'native_frame = alloca' "$AFFINE_FRAME_REFUSE_OUT"; then
+  echo "FAIL: cyclic affine stack was unsafely compacted" >&2
+  exit 1
+fi
+
 CLANG="${CLANG:-$(command -v clang-21 || command -v clang)}"
 "$CLANG" -x ir "$FRAME_COMPACT_OUT" -o "$FRAME_POS_BIN"
 "$CLANG" -x ir "$FRAME_REFUSE_OUT" -o "$FRAME_NEG_BIN"
+"$CLANG" -x ir "$AFFINE_FRAME_OUT" -o "$AFFINE_FRAME_BIN"
 set +e
 "$FRAME_POS_BIN"
 FRAME_POS_STATUS=$?
 "$FRAME_NEG_BIN"
 FRAME_NEG_STATUS=$?
+"$AFFINE_FRAME_BIN"
+AFFINE_FRAME_STATUS=$?
 set -e
-if [[ "$FRAME_POS_STATUS" -ne 7 || "$FRAME_NEG_STATUS" -ne 0 ]]; then
+if [[ "$FRAME_POS_STATUS" -ne 7 || "$FRAME_NEG_STATUS" -ne 0 ||
+      "$AFFINE_FRAME_STATUS" -ne 7 ]]; then
   echo "FAIL: frame compaction executable semantics changed" >&2
   exit 1
 fi
 rm -f "$FRAME_COMPACT_OUT" "$FRAME_REFUSE_OUT" \
-  "$FRAME_POS_BIN" "$FRAME_NEG_BIN"
+  "$AFFINE_FRAME_OUT" "$AFFINE_FRAME_REFUSE_OUT" \
+  "$FRAME_POS_BIN" "$FRAME_NEG_BIN" "$AFFINE_FRAME_BIN"
+
+POINTER_DIFFERENCE_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/recovered_pointer_difference.ll" \
+  -o "$POINTER_DIFFERENCE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/recovered_pointer_difference.ll" < "$POINTER_DIFFERENCE_OUT"
+rm -f "$POINTER_DIFFERENCE_OUT"
 
 echo "Native State SSA tests: PASS"
