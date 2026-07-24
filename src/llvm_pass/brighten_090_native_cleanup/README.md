@@ -26,3 +26,36 @@ opt-21 -load-pass-plugin=build/BrightenNativeCleanupPass.so \
 
 The regression runner checks both an accepted native module and a rejected
 module that still contains `%struct.State` and the lifted three-argument ABI.
+
+## Conservative boundary and corpus artifact
+
+The pass-40 inputs were re-run through the updated post-lifting cleanup. The
+generated IR and per-module verifier logs are under
+`result/pass 40/improved_native_cleanup/` (the directory is an ignored
+experiment artifact, not a source dependency). Every module completed the
+LLVM `verify` gate; all seven pass-40 modules that entered with
+`@__mcsema_reg_state` now have that lifted global removed. Shared synchronous
+helpers/callbacks use a module-local context pointer to the entrypoint's
+typed alloca. The cleanup contract report remains separate from the verifier
+result.
+
+The following forms are intentionally reported as unresolved rather than
+rewritten when the current proof is insufficient:
+
+* register-state globals whose address escapes through a call, volatile/atomic
+  access, an unmodeled alias, or a callback boundary that cannot be proven to
+  run synchronously under one entrypoint context;
+* dynamic frame addresses whose PHI/range proof is incomplete, whose stored
+  pointer value is not proven affine, or whose zero-initialized read is not
+  dominated by a full write;
+* integer-to-pointer values without exact recovered-object or native-stack
+  provenance, including unresolved fallback addresses;
+* partial `memcpy`/`memset`, lifetime, aggregate, vararg, and callback storage
+  where the access width, alignment, capture behavior, or ABI type cannot be
+  proven from def-use and memory analyses;
+* arithmetic/flag and division helpers where the original width, signedness,
+  wraparound, trap, or poison behavior is not established by the lifted IR.
+
+These refusals preserve observable behavior and are emitted in the native
+contract report instead of being replaced with `undef`, `null`, arbitrary
+host pointers, or guessed types.

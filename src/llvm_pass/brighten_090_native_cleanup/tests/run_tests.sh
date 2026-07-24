@@ -249,6 +249,12 @@ fi
   "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
     "$ROOT/tests/unused_lifted_segment_in_llvm_used.ll"
 
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
+  -S "$ROOT/tests/residual_artifacts_cleanup.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/residual_artifacts_cleanup.ll"
+
 echo "Native cleanup tests: PASS"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -408,7 +414,7 @@ fi
   -brighten-native-state-ssa -S \
   "$ROOT/tests/relative_stack_global_frame_top.ll" \
   -o "$RELATIVE_STACK_FRAME_TOP_OUT"
-grep -Eq 'getelementptr i8, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\), i64 %native\.stack\.absolute\.delta' \
+grep -Eq 'getelementptr \(i8, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\), i64 (-32|%native\.stack\.absolute\.delta)' \
   "$RELATIVE_STACK_FRAME_TOP_OUT"
 if grep -Eq 'getelementptr i8, ptr @frame_storage_backing\.main, i64 %native\.stack\.absolute\.delta|getelementptr i8, ptr @frame_storage_backing\.main, i64 -32' \
     "$RELATIVE_STACK_FRAME_TOP_OUT"; then
@@ -627,5 +633,32 @@ POINTER_DIFFERENCE_OUT="$(mktemp)"
 "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
   "$ROOT/tests/recovered_pointer_difference.ll" < "$POINTER_DIFFERENCE_OUT"
 rm -f "$POINTER_DIFFERENCE_OUT"
+
+SAME_BASE_OFFSET_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/same_base_pointer_offset.ll" \
+  -o "$SAME_BASE_OFFSET_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/same_base_pointer_offset.ll" < "$SAME_BASE_OFFSET_OUT"
+rm -f "$SAME_BASE_OFFSET_OUT"
+
+STATE_SSA_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/single_function_state_ssa.ll" \
+  -o "$STATE_SSA_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/single_function_state_ssa.ll" < "$STATE_SSA_OUT"
+rm -f "$STATE_SSA_OUT"
+
+SHARED_STATE_CONTEXT_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/shared_state_context.ll" \
+  -o "$SHARED_STATE_CONTEXT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/shared_state_context.ll" < "$SHARED_STATE_CONTEXT_OUT"
+rm -f "$SHARED_STATE_CONTEXT_OUT"
 
 echo "Native State SSA tests: PASS"

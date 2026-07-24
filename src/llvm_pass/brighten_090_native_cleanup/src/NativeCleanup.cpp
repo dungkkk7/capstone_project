@@ -6443,26 +6443,37 @@ static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
   }
 
   // LLVM keeps identified struct types in the module context even after their
-  // LLVM keeps identified struct types in the module context even after their
-  // last global/instruction reference is gone. Clear names of dead/unused
-  // State, segment, and result struct types so textual IR remains clean.
+  // last global/instruction reference is gone. Clear names only for genuinely
+  // dead types, including nested types reachable through live aggregates.
   SmallPtrSet<Type *, 32> UsedTypes;
+  std::function<void(Type *)> MarkUsedType = [&](Type *Ty) {
+    if (!Ty || !UsedTypes.insert(Ty).second)
+      return;
+    if (auto *ST = dyn_cast<StructType>(Ty)) {
+      for (Type *Element : ST->elements())
+        MarkUsedType(Element);
+    } else if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+      MarkUsedType(AT->getElementType());
+    } else if (auto *VT = dyn_cast<VectorType>(Ty)) {
+      MarkUsedType(VT->getElementType());
+    }
+  };
   for (GlobalVariable &GV : M.globals()) {
-    UsedTypes.insert(GV.getValueType());
+    MarkUsedType(GV.getValueType());
   }
   for (Function &F : M) {
-    UsedTypes.insert(F.getReturnType());
+    MarkUsedType(F.getReturnType());
     for (Argument &A : F.args())
-      UsedTypes.insert(A.getType());
+      MarkUsedType(A.getType());
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
-        UsedTypes.insert(I.getType());
+        MarkUsedType(I.getType());
         if (auto *AI = dyn_cast<AllocaInst>(&I))
-          UsedTypes.insert(AI->getAllocatedType());
+          MarkUsedType(AI->getAllocatedType());
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
-          UsedTypes.insert(GEP->getSourceElementType());
+          MarkUsedType(GEP->getSourceElementType());
         for (Value *Op : I.operands())
-          UsedTypes.insert(Op->getType());
+          MarkUsedType(Op->getType());
       }
     }
   }
@@ -7067,6 +7078,61 @@ static unsigned localizePrivateStateGlobals(Module &M, bool &Changed) {
     Changed = true;
   }
   return Localized;
+}
+
+// A callback ABI (qsort is the common example) cannot carry the explicit
+// State-SSA arguments because libc invokes the callback with its fixed
+// signature.  In that shape the McSema register file is genuinely shared by
+// the entry function and the callback.  Do not replace it with a pointer
+// context that is initialized from one function: the callback may run before
+// or after that function has established the pointer, and a null context then
+// turns a valid register access into a crash.
+//
+// The accesses in this late form are already byte-offset accesses.  Preserve
+// exactly that storage and linkage, but make the backing object an opaque byte
+// array.  This removes the aggregate State ABI and its identified type while
+// keeping every existing GEP offset and the shared callback semantics intact.
+static unsigned lowerSharedMcsemaStateBacking(Module &M, bool &Changed) {
+  SmallVector<GlobalVariable *, 8> Candidates;
+  const DataLayout &DL = M.getDataLayout();
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.getName().contains("__mcsema_reg_state") ||
+        GV.isThreadLocal() || !GV.hasInitializer() ||
+        !isa<ConstantAggregateZero>(GV.getInitializer()))
+      continue;
+    TypeSize Size = DL.getTypeAllocSize(GV.getValueType());
+    if (Size.isScalable() || Size.getFixedValue() == 0)
+      continue;
+    Candidates.push_back(&GV);
+  }
+
+  unsigned Lowered = 0;
+  for (GlobalVariable *GV : Candidates) {
+    TypeSize Size = DL.getTypeAllocSize(GV->getValueType());
+    if (Size.isScalable() || Size.getFixedValue() == 0)
+      continue;
+    uint64_t Bytes = Size.getFixedValue();
+    ArrayType *BackingTy = ArrayType::get(Type::getInt8Ty(M.getContext()),
+                                          Bytes);
+    Constant *Initializer = ConstantAggregateZero::get(BackingTy);
+    auto *Backing = new GlobalVariable(
+        M, BackingTy, GV->isConstant(), GV->getLinkage(), Initializer,
+        "native_register_storage", GV, GV->getThreadLocalMode(),
+        GV->getAddressSpace(), GV->isExternallyInitialized());
+    Backing->copyAttributesFrom(GV);
+    Backing->copyMetadata(GV, 0);
+    if (GV->getAlign())
+      Backing->setAlignment(GV->getAlign());
+
+    // Opaque pointers make the replacement type-independent: existing
+    // byte GEPs, aliases, ptrtoint users, and callback boundaries retain the
+    // exact same pointer value and offsets.
+    GV->replaceAllUsesWith(Backing);
+    GV->eraseFromParent();
+    ++Lowered;
+    Changed = true;
+  }
+  return Lowered;
 }
 
 static Value *materializeHubValueOnPred(Value *V, BasicBlock *Hub,
@@ -10547,6 +10613,10 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (!RemovedThisRound)
       break;
   }
+  unsigned SharedStateBackings = lowerSharedMcsemaStateBacking(M, Changed);
+  if (SharedStateBackings)
+    errs() << "  McSema State backing lowered to shared byte storage: "
+           << SharedStateBackings << "\n";
   unsigned LocalizedStateGlobals = localizePrivateStateGlobals(M, Changed);
   if (LocalizedStateGlobals)
     errs() << "  private State globals localized: "
