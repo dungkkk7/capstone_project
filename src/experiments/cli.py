@@ -44,6 +44,14 @@ def _parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument("--no-resume", action="store_true")
+        subparser.add_argument(
+            "--p0-backfill",
+            action="store_true",
+            help=(
+                "Rerun finalized/skipped P0 variants with a P0_* "
+                "failure code in an existing run"
+            ),
+        )
 
     run_parser = subparsers.add_parser("run")
     common(run_parser)
@@ -88,6 +96,8 @@ def _runner_from_args(args: argparse.Namespace) -> ExperimentRunner:
         config["llm"]["fake_response_path"] = str(fake_path.resolve())
     if args.no_resume:
         config["experiment"]["resume"] = False
+    if args.p0_backfill:
+        config["_p0_backfill"] = True
     if args.workers is not None:
         if args.workers < 1:
             raise SystemExit("--workers must be at least 1")

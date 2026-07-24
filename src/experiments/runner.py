@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import platform
 import re
+import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -335,15 +336,45 @@ class ExperimentRunner:
             for frozen_field in (
                 "protocols",
                 "model",
-                "environment",
                 "tool_versions",
-                "source_snapshot",
             ):
                 if existing.get(frozen_field) != manifest[frozen_field]:
                     raise RunIntegrityError(
                         "Refusing resume: frozen "
                         f"{frozen_field} fingerprint changed"
                     )
+            if existing.get("source_snapshot") != manifest["source_snapshot"]:
+                if not self.config.get("_p0_backfill", False):
+                    raise RunIntegrityError(
+                        "Refusing resume: frozen source_snapshot changed"
+                    )
+            if existing.get("environment") != manifest["environment"]:
+                if not self.config.get("_p0_backfill", False):
+                    raise RunIntegrityError(
+                        "Refusing resume: frozen environment changed"
+                    )
+                self.audit.log(
+                    "p0_backfill_environment_changed",
+                    stage=Stage.GENERATION.value,
+                    status="RUNNING",
+                    payload={
+                        "previous_environment": existing.get("environment"),
+                        "current_environment": manifest["environment"],
+                    },
+                )
+                self.audit.log(
+                    "p0_backfill_source_snapshot_changed",
+                    stage=Stage.GENERATION.value,
+                    status="RUNNING",
+                    payload={
+                        "previous_source_snapshot": existing.get(
+                            "source_snapshot"
+                        ),
+                        "current_source_snapshot": manifest[
+                            "source_snapshot"
+                        ],
+                    },
+                )
         else:
             atomic_write_json(manifest_path, manifest)
         atomic_write_json(
@@ -570,6 +601,8 @@ class ExperimentRunner:
     def _sample_complete(self, sample: SampleIdentity) -> bool:
         if not self.config["experiment"].get("resume", True):
             return False
+        if self._p0_backfill_eligible(sample):
+            return False
         for method in self.execution_order:
             path = self._result_path(sample, method)
             if not path.is_file():
@@ -586,9 +619,52 @@ class ExperimentRunner:
                 and str(data.get("failure_code") or "").endswith(
                     "_LLM_REQUEST_FAILED"
                 )
-            ):
+                ):
                 return False
         return True
+
+    def _p0_backfill_eligible(self, sample: SampleIdentity) -> bool:
+        """Return whether an existing finalized P0 result should be retried."""
+
+        if not self.config.get("_p0_backfill", False):
+            return False
+        result_path = self._result_path(sample, MethodId.P0)
+        if not result_path.is_file():
+            return False
+        data = load_json(result_path)
+        if data.get("final_stage") != Stage.FINALIZED.value:
+            return False
+        return str(data.get("failure_code") or "").startswith("P0_")
+
+    def _archive_p0_backfill(self, sample: SampleIdentity) -> None:
+        """Archive one skipped P0 attempt before rebuilding it in-place."""
+
+        p0_dir = self._sample_dir(sample) / MethodId.P0.value
+        stamp = dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y%m%dT%H%M%S%fZ"
+        )
+        history_dir = p0_dir / "backfill_history" / stamp
+        history_dir.mkdir(parents=True, exist_ok=True)
+        moved: list[str] = []
+        for name in ("result.json", "representation", "generation", "evaluation"):
+            source = p0_dir / name
+            if not source.exists():
+                continue
+            shutil.move(str(source), str(history_dir / name))
+            moved.append(name)
+        self.audit.log(
+            "p0_backfill_reset",
+            sample_id=sample.sample_id,
+            method=MethodId.P0.value,
+            stage=Stage.GENERATION.value,
+            status="RUNNING",
+            payload={"archived_path": str(history_dir), "moved": moved},
+        )
+        print(
+            f"[experiment] P0 backfill sample={sample.sample_id} "
+            f"archived={history_dir}",
+            flush=True,
+        )
 
     def _sample_evaluation_blockers(
         self, sample: SampleIdentity
@@ -850,6 +926,8 @@ class ExperimentRunner:
 
         for method in self.execution_order:
             existing_path = self._result_path(sample, method)
+            if method is MethodId.P0 and self._p0_backfill_eligible(sample):
+                self._archive_p0_backfill(sample)
             if self.config["experiment"].get("resume", True) and existing_path.is_file():
                 existing = load_json(existing_path)
                 retryable_llm_failure = (
