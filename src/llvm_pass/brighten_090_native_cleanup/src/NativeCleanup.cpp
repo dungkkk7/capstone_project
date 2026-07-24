@@ -6167,7 +6167,8 @@ static unsigned lowerNativeCallbackTrampolines(Module &M, bool &Changed) {
 // by the existing state materialization code.
 static unsigned lowerNativeQsortCallbacks(Module &M, bool &Changed) {
   GlobalVariable *State = M.getNamedGlobal("__mcsema_reg_state");
-  if (!State)
+  GlobalVariable *NativeStorage = M.getNamedGlobal("native_register_storage");
+  if (!State && !NativeStorage)
     return 0;
 
   SmallVector<CallBase *, 16> Calls;
@@ -6216,7 +6217,8 @@ static unsigned lowerNativeQsortCallbacks(Module &M, bool &Changed) {
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Adapter);
     IRBuilder<> B(Entry);
     auto StateSlot = [&](uint64_t Offset) {
-      return B.CreateGEP(B.getInt8Ty(), State, B.getInt64(Offset),
+      GlobalVariable *Backing = State ? State : NativeStorage;
+      return B.CreateGEP(B.getInt8Ty(), Backing, B.getInt64(Offset),
                          "qsort.state.slot");
     };
     B.CreateStore(B.CreatePtrToInt(Adapter->getArg(0), I64Ty), StateSlot(2296));

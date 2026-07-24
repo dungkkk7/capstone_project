@@ -1,7 +1,9 @@
 #include "Deobfuscate095.h"
 #include "Z3Prover.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ConstantFolding.h"
@@ -17,6 +19,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
@@ -304,6 +307,39 @@ static BasicBlock *resolveBlockTarget(Value *V) {
   return nullptr;
 }
 
+// Lifted native helpers commonly return a register tuple assembled with an
+// insertvalue chain.  LLVM does not normally propagate an extractvalue through
+// a call even when one tuple field is an exact passthrough of an argument.  In
+// this pipeline that loses the identity of RSP-derived frame addresses and
+// makes two syntactically different references to the dispatcher state appear
+// MayAlias.
+//
+// This summary is deliberately narrower than general interprocedural value
+// propagation: every reachable syntactic return must expose the requested
+// field as the same, unmodified formal argument.  The call itself is retained,
+// so memory effects and non-returning behaviour are unchanged.
+static std::optional<unsigned>
+returnedArgumentForField(Function &Callee, ArrayRef<unsigned> Indices) {
+  std::optional<unsigned> ArgumentNumber;
+  bool SawReturn = false;
+  for (BasicBlock &BB : Callee) {
+    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!RI)
+      continue;
+    SawReturn = true;
+    Value *Returned = RI->getReturnValue();
+    Value *Field =
+        Returned ? FindInsertedValue(Returned, Indices) : nullptr;
+    auto *Arg = dyn_cast_or_null<Argument>(Field);
+    if (!Arg || Arg->getParent() != &Callee)
+      return std::nullopt;
+    if (ArgumentNumber && *ArgumentNumber != Arg->getArgNo())
+      return std::nullopt;
+    ArgumentNumber = Arg->getArgNo();
+  }
+  return SawReturn ? ArgumentNumber : std::nullopt;
+}
+
 static bool resolveObjectsAndPointers(Function &F, Report &R) {
   bool Changed = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
@@ -326,6 +362,26 @@ static bool resolveObjectsAndPointers(Function &F, Report &R) {
         Changed = true;
         ++R.Stages["resolve_objects_pointers"].Changes;
         continue;
+      }
+    }
+
+    if (auto *EVI = dyn_cast<ExtractValueInst>(I)) {
+      auto *CB = dyn_cast<CallBase>(EVI->getAggregateOperand());
+      Function *Callee =
+          CB ? resolveFunctionTarget(CB->getCalledOperand()) : nullptr;
+      if (Callee && !Callee->isDeclaration()) {
+        if (std::optional<unsigned> ArgNo =
+                returnedArgumentForField(*Callee, EVI->getIndices());
+            ArgNo && *ArgNo < CB->arg_size()) {
+          Value *Replacement = CB->getArgOperand(*ArgNo);
+          if (Replacement->getType() == EVI->getType()) {
+            EVI->replaceAllUsesWith(Replacement);
+            Dead.push_back(EVI);
+            Changed = true;
+            ++R.Stages["resolve_objects_pointers"].Changes;
+            continue;
+          }
+        }
       }
     }
 
@@ -833,20 +889,210 @@ static bool expandLatchForwarder(Function &F, BasicBlock *Forwarder,
 //   state = load slot; switch state ...
 //   case: store next_state, slot; br dispatcher.backedge
 //
+struct AffineAddress {
+  explicit AffineAddress(unsigned Width) : Width(Width), Constant(Width, 0) {}
+
+  unsigned Width;
+  APInt Constant;
+  std::map<const Value *, APInt> Terms;
+
+  void addTerm(const Value *V, const APInt &Coefficient) {
+    assert(Coefficient.getBitWidth() == Width);
+    if (Coefficient.isZero())
+      return;
+    auto It = Terms.find(V);
+    if (It == Terms.end()) {
+      Terms.emplace(V, Coefficient);
+      return;
+    }
+    It->second += Coefficient;
+    if (It->second.isZero())
+      Terms.erase(It);
+  }
+
+  void addScaled(const AffineAddress &Other, const APInt &Scale) {
+    assert(Other.Width == Width && Scale.getBitWidth() == Width);
+    Constant += Other.Constant * Scale;
+    for (const auto &[V, Coefficient] : Other.Terms)
+      addTerm(V, Coefficient * Scale);
+  }
+};
+
+static AffineAddress affineLeaf(const Value *V, unsigned Width) {
+  AffineAddress Result(Width);
+  Result.addTerm(V, APInt(Width, 1));
+  return Result;
+}
+
+static std::optional<AffineAddress>
+affinePointer(const Value *V, const DataLayout &DL, unsigned Width,
+              unsigned Depth);
+
+// Normalize the integer subset used by the lifter for native addresses.  An
+// unsupported value remains one symbolic leaf; this still proves equality when
+// the same SSA value occurs on both sides without inventing facts about it.
+static std::optional<AffineAddress>
+affineInteger(const Value *V, const DataLayout &DL, unsigned Width,
+              unsigned Depth) {
+  if (!V || !V->getType()->isIntegerTy() || Depth > 48)
+    return std::nullopt;
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    AffineAddress Result(Width);
+    Result.Constant = CI->getValue().sextOrTrunc(Width);
+    return Result;
+  }
+  if (V->getType()->getIntegerBitWidth() != Width)
+    return affineLeaf(V, Width);
+  if (auto *P2I = dyn_cast<PtrToIntOperator>(V))
+    return affinePointer(P2I->getPointerOperand(), DL, Width, Depth + 1);
+
+  auto *Op = dyn_cast<Operator>(V);
+  if (!Op)
+    return affineLeaf(V, Width);
+  unsigned Opcode = Op->getOpcode();
+  if (Opcode == Instruction::Add || Opcode == Instruction::Sub) {
+    auto Left = affineInteger(Op->getOperand(0), DL, Width, Depth + 1);
+    auto Right = affineInteger(Op->getOperand(1), DL, Width, Depth + 1);
+    if (!Left || !Right)
+      return std::nullopt;
+    Left->addScaled(*Right,
+                    APInt(Width, Opcode == Instruction::Add ? 1 : -1, true));
+    return Left;
+  }
+  if (Opcode == Instruction::Mul) {
+    const ConstantInt *Scale = dyn_cast<ConstantInt>(Op->getOperand(1));
+    const Value *Input = Op->getOperand(0);
+    if (!Scale) {
+      Scale = dyn_cast<ConstantInt>(Op->getOperand(0));
+      Input = Op->getOperand(1);
+    }
+    if (!Scale)
+      return affineLeaf(V, Width);
+    auto Result = affineInteger(Input, DL, Width, Depth + 1);
+    if (!Result)
+      return std::nullopt;
+    AffineAddress Scaled(Width);
+    Scaled.addScaled(*Result, Scale->getValue().sextOrTrunc(Width));
+    return Scaled;
+  }
+  return affineLeaf(V, Width);
+}
+
+static std::optional<AffineAddress>
+affinePointer(const Value *V, const DataLayout &DL, unsigned Width,
+              unsigned Depth) {
+  if (!V || !V->getType()->isPointerTy() || Depth > 48)
+    return std::nullopt;
+  unsigned AddressSpace = V->getType()->getPointerAddressSpace();
+  if (DL.isNonIntegralAddressSpace(AddressSpace))
+    return std::nullopt;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    auto Result = affinePointer(GEP->getPointerOperand(), DL, Width, Depth + 1);
+    if (!Result)
+      return std::nullopt;
+    SmallMapVector<Value *, APInt, 4> VariableOffsets;
+    APInt ConstantOffset(Width, 0);
+    if (!GEP->collectOffset(DL, Width, VariableOffsets, ConstantOffset))
+      return affineLeaf(V, Width);
+    Result->Constant += ConstantOffset;
+    for (const auto &[Index, Scale] : VariableOffsets) {
+      auto Offset = affineInteger(Index, DL, Width, Depth + 1);
+      if (!Offset)
+        return std::nullopt;
+      Result->addScaled(*Offset, Scale);
+    }
+    return Result;
+  }
+  if (auto *I2P = dyn_cast<IntToPtrInst>(V))
+    return affineInteger(I2P->getOperand(0), DL, Width, Depth + 1);
+  if (auto *CE = dyn_cast<ConstantExpr>(V);
+      CE && CE->getOpcode() == Instruction::IntToPtr)
+    return affineInteger(CE->getOperand(0), DL, Width, Depth + 1);
+  if (auto *Op = dyn_cast<Operator>(V)) {
+    if (Op->getOpcode() == Instruction::BitCast)
+      return affinePointer(Op->getOperand(0), DL, Width, Depth + 1);
+    if (Op->getOpcode() == Instruction::AddrSpaceCast)
+      return std::nullopt;
+  }
+  return affineLeaf(V, Width);
+}
+
+static bool affineEqualPointers(const Value *A, const Value *B,
+                                const DataLayout &DL) {
+  if (!A || !B || !A->getType()->isPointerTy() ||
+      A->getType() != B->getType())
+    return false;
+  unsigned Width = DL.getIndexTypeSizeInBits(A->getType());
+  auto Left = affinePointer(A, DL, Width, 0);
+  auto Right = affinePointer(B, DL, Width, 0);
+  return Left && Right && Left->Constant == Right->Constant &&
+         Left->Terms == Right->Terms;
+}
+
+static bool hasFrameStorageOrigin(const Value *V,
+                                  SmallPtrSetImpl<const Value *> &Visited,
+                                  unsigned Depth = 0) {
+  if (!V || Depth > 32 || !Visited.insert(V).second)
+    return false;
+  if (auto *GV = dyn_cast<GlobalVariable>(V))
+    return GV->getName().starts_with("frame_storage_backing.");
+  auto *U = dyn_cast<User>(V);
+  if (!U)
+    return false;
+  for (const Use &Operand : U->operands())
+    if (hasFrameStorageOrigin(Operand.get(), Visited, Depth + 1))
+      return true;
+  return false;
+}
+
+// Native cleanup's recovered-data mapper is a select chain whose false arm is
+// the original native pointer and whose true arms translate concrete guest
+// ranges to LLVM globals.  Stack-backed addresses are outside that guest
+// domain by construction.  Older brightened IR can retain such a chain around
+// an RSP-derived address, so recover its false-arm pointer only when every node
+// has the cleanup pass's generated name and the fallback is visibly rooted in
+// frame_storage_backing.*.
+static Value *generatedNativeStackFallback(Value *Pointer) {
+  Value *Current = Pointer->stripPointerCasts();
+  bool SawMapper = false;
+  while (auto *Select = dyn_cast<SelectInst>(Current)) {
+    if (!Select->getName().starts_with("native.data.pointer.select"))
+      return nullptr;
+    SawMapper = true;
+    Current = Select->getFalseValue()->stripPointerCasts();
+  }
+  if (!SawMapper)
+    return nullptr;
+  SmallPtrSet<const Value *, 32> Visited;
+  return hasFrameStorageOrigin(Current, Visited) ? Current : nullptr;
+}
+
+static bool sameStateStorage(Value *Pointer, Value *StatePointer,
+                             const DataLayout &DL) {
+  Pointer = Pointer->stripPointerCasts();
+  StatePointer = StatePointer->stripPointerCasts();
+  if (Pointer == StatePointer || affineEqualPointers(Pointer, StatePointer, DL))
+    return true;
+  Value *Fallback = generatedNativeStackFallback(Pointer);
+  return Fallback && affineEqualPointers(Fallback, StatePointer, DL);
+}
+
 // As in Chernobog, only the final state write is actionable.  A call or an
 // intervening unknown memory write is a proof barrier; it is never guessed
-// through.  Pointer identity is intentionally exact here.  More general alias
-// reasoning belongs in the preceding native-cleanup pass, not in a CFG rewrite.
+// through.  The storage comparison handles the lifter's affine frame-address
+// forms and the strictly recognized native-data mapper contract above.
 static std::optional<StateChoice>
 solveFinalStoredState(BasicBlock *Source, Value *StatePointer,
                       LoadInst *StateLoad, AAResults &AA, Z3Prover &Prover) {
   StatePointer = StatePointer->stripPointerCasts();
+  const DataLayout &DL = Source->getModule()->getDataLayout();
   const MemoryLocation StateLocation = MemoryLocation::get(StateLoad);
   for (Instruction &I : llvm::reverse(*Source)) {
     if (I.isTerminator())
       continue;
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
-      if (SI->getPointerOperand()->stripPointerCasts() != StatePointer) {
+      if (!sameStateStorage(SI->getPointerOperand(), StatePointer, DL)) {
         if (AA.alias(MemoryLocation::get(SI), StateLocation) ==
             AliasResult::NoAlias)
           continue;
@@ -996,11 +1242,11 @@ static bool deflattenMemoryState(Function &F, SwitchInst *Root,
   for (BasicBlock *Source : predecessors(Latch))
     PlanSource(Source, Latch, true);
 
-  // The unique non-loop header edge carries the initial state.  It is proved
-  // with the same final-write rule and participates in the same transaction.
-  for (BasicBlock *Source : predecessors(Header))
-    if (Source != Latch)
-      PlanSource(Source, Header, false);
+  // Do not bypass the initial header edge in this transaction.  Flattened
+  // loops often compute values in their first real case which dominate all
+  // later cases only because entry still passes through the dispatcher.  Once
+  // every reachable return edge is gone, a separate one-shot transaction
+  // below removes the initial switch with a freshly rebuilt dominator tree.
 
   // Chernobog's production constant-state handler requires at least one third
   // of the case frontier (and at least three exact edges) before modifying the
@@ -1057,14 +1303,109 @@ static bool deflattenMemoryState(Function &F, SwitchInst *Root,
   return true;
 }
 
+// Finish a memory dispatcher after its loop-return frontier has been removed.
+// At this point only one reachable preheader enters the old switch.  Rewriting
+// that edge separately makes the selected initial case a real dominator before
+// any subsequent dispatcher root is considered.
+static bool deflattenMemoryEntry(Function &F, SwitchInst *Root,
+                                 LoadInst *StateLoad, DominatorTree &DT,
+                                 AAResults &AA, Z3Prover &Prover, Report &R) {
+  BasicBlock *Header = Root->getParent();
+  DispatchMap Map = collectDispatchMap(Root, StateLoad);
+  if (Map.Targets.size() < 3 || !dispatcherPayloadIsCloneable(Header, Header))
+    return false;
+  BasicBlock *Source = nullptr;
+  for (BasicBlock *Pred : predecessors(Header)) {
+    // A split dispatcher may route its final default back to the first switch.
+    // That edge is part of the dispatcher itself, not a program transition.
+    // Once the case frontier no longer returns here, bypassing the sole
+    // non-dispatch predecessor makes the whole switch cycle unreachable.
+    if (!DT.isReachableFromEntry(Pred) || Map.Blocks.contains(Pred))
+      continue;
+    if (Source)
+      return false;
+    Source = Pred;
+  }
+  auto *Old = Source ? dyn_cast_or_null<BranchInst>(Source->getTerminator())
+                     : nullptr;
+  if (!Old || !Old->isUnconditional() || Old->getSuccessor(0) != Header)
+    return false;
+  auto Choice = solveFinalStoredState(
+      Source, StateLoad->getPointerOperand(), StateLoad, AA, Prover);
+  if (!Choice)
+    return false;
+  auto TIt = Map.Targets.find(Choice->TrueState->getValue());
+  auto FIt = Map.Targets.find(Choice->FalseState->getValue());
+  if (TIt == Map.Targets.end() || FIt == Map.Targets.end())
+    return false;
+  BasicBlock *TrueTarget = TIt->second;
+  BasicBlock *FalseTarget = FIt->second;
+  BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
+  BasicBlock *FalseDispatch = Map.DispatchPredecessor.lookup(FalseTarget);
+  auto TransparentDispatch = [&](BasicBlock *Dispatch) {
+    return Dispatch == Header ||
+           (Dispatch && Dispatch->phis().empty() && Dispatch->size() == 1 &&
+            isa<SwitchInst>(Dispatch->getTerminator()));
+  };
+  if (!TransparentDispatch(TrueDispatch) ||
+      !TransparentDispatch(FalseDispatch) ||
+      (Choice->Condition &&
+       !valueDominatesEdge(Choice->Condition, Old, DT)))
+    return false;
+
+  auto VMap = std::make_unique<ValueToValueMapTy>();
+  if (!buildHeaderEntryValueMap(Source, Header, DT, *VMap) ||
+      !prepareTargetPHIs(TrueTarget, Source, TrueDispatch, DT, nullptr,
+                         false) ||
+      (FalseTarget != TrueTarget &&
+       !prepareTargetPHIs(FalseTarget, Source, FalseDispatch, DT, nullptr,
+                          false)))
+    return false;
+
+  BasicBlock *Bridge = BasicBlock::Create(
+      F.getContext(), "deobf.memory.entry", &F, Header);
+  IRBuilder<>(Bridge).CreateBr(TrueTarget);
+  cloneHeaderPayload(Bridge, Header, *VMap);
+  finalizeDispatcherCarrierMap(Header, *VMap);
+  if (!prepareTargetPHIs(TrueTarget, Bridge, TrueDispatch, DT, VMap.get(),
+                         true, Source) ||
+      (FalseTarget != TrueTarget &&
+       !prepareTargetPHIs(FalseTarget, Bridge, FalseDispatch, DT, VMap.get(),
+                          true, Source)))
+    report_fatal_error(
+        "095 internal error: memory-entry PHI mapping became invalid");
+  Header->removePredecessor(Source, true);
+  IRBuilder<>(Old).CreateBr(Bridge);
+  Old->eraseFromParent();
+  if (Choice->Condition && TrueTarget != FalseTarget) {
+    Instruction *BridgeTerm = Bridge->getTerminator();
+    IRBuilder<>(BridgeTerm)
+        .CreateCondBr(Choice->Condition, TrueTarget, FalseTarget);
+    BridgeTerm->eraseFromParent();
+  }
+  SmallVector<BasicBlock *, 1> Bridges{Bridge};
+  SmallVector<std::unique_ptr<ValueToValueMapTy>, 1> Maps;
+  Maps.push_back(std::move(VMap));
+  repairCarrierSSA(Header, Bridges, Maps);
+  ++R.Stages["deflatten"].Changes;
+  if (DeflattenDebug)
+    errs() << "095 memory entry: function=" << F.getName()
+           << " header=" << Header->getName()
+           << " source=" << Source->getName() << " result=rewrite\n";
+  return true;
+}
+
 static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
                          LoopInfo &LI, AAResults &AA, Z3Prover &Prover,
                          Report &R) {
   if (Root->getNumCases() < 3)
     return false;
   Value *State = stripIntegerCasts(Root->getCondition());
-  if (auto *StateLoad = dyn_cast<LoadInst>(State))
-    return deflattenMemoryState(F, Root, StateLoad, DT, AA, Prover, R);
+  if (auto *StateLoad = dyn_cast<LoadInst>(State)) {
+    if (deflattenMemoryState(F, Root, StateLoad, DT, AA, Prover, R))
+      return true;
+    return deflattenMemoryEntry(F, Root, StateLoad, DT, AA, Prover, R);
+  }
   auto *HeaderPhi = dyn_cast<PHINode>(State);
   if (!HeaderPhi || HeaderPhi->getParent() != Root->getParent())
     return false;
@@ -1502,6 +1843,9 @@ static bool runTransactionalDeflatten(Module &M, FunctionAnalysisManager &FAM,
       std::string VerifyError;
       raw_string_ostream VerifyOS(VerifyError);
       if (verifyFunction(F, &VerifyOS)) {
+        if (DeflattenDebug)
+          errs() << "095 deflatten verifier rollback: function="
+                 << F.getName() << "\n" << VerifyOS.str();
         restoreFunction(F, *Snapshot);
         R.Stages["deflatten"] = DeflattenMetricsBefore;
         R.UnresolvedReasons.resize(ReasonsBefore);
