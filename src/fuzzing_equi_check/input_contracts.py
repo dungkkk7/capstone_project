@@ -2314,10 +2314,108 @@ def _random_valid_payload(contract: Dict[str, Any]) -> Optional[bytes]:
     return None
 
 
+def _counted_long_list_boundary_payloads(
+    contract: Dict[str, Any],
+) -> List[bytes]:
+    """Build deterministic size probes that value-only mutation cannot reach.
+
+    Count-preserving mutation is useful after a seed has established a valid
+    shape, but it otherwise leaves the evaluator blind to behavior that changes
+    as the leading count grows.  Keep the probes bounded so they remain cheap
+    for every counted-list contract.
+    """
+    if contract.get("kind") != "counted_long_list":
+        return []
+
+    constraints = contract.get("constraints", {})
+    minimum = int(constraints.get("n_min", 0))
+    maximum = int(constraints.get("n_max", 2**31 - 1))
+    values_per_count = int(constraints.get("values_per_count", 1))
+    count_offset = int(constraints.get("count_offset", 0))
+    if minimum > maximum or values_per_count < 0 or count_offset < 0:
+        return []
+
+    counts = sorted(
+        {
+            count
+            for count in (minimum, 1, 2, 4, 8, 16, 64)
+            if minimum <= count <= maximum
+        }
+    )
+
+    value_min = int(
+        constraints.get("value_min", constraints.get("min", 0))
+    )
+    value_max = int(
+        constraints.get(
+            "value_max",
+            constraints.get("max", max(value_min, value_min + 16)),
+        )
+    )
+    if value_min > value_max:
+        return []
+
+    even_values = bool(constraints.get("even_values", False))
+    first_value = max(value_min, 1) if value_max >= 1 else value_min
+    if even_values and first_value % 2:
+        first_value += 1
+    if first_value > value_max:
+        first_value = value_min
+        if even_values and first_value % 2:
+            first_value += 1
+    if first_value > value_max:
+        return []
+
+    step = 2 if even_values else 1
+    available_steps = max(0, (value_max - first_value) // step)
+    cycle = min(8, available_steps + 1)
+
+    scalar_max = int(constraints.get("scalar_max", 2**31 - 1))
+    scalar_min = int(constraints.get("scalar_min", 1))
+    scalar = min(max(1, scalar_min), scalar_max)
+    if count_offset and scalar_min > scalar_max:
+        return []
+
+    payloads: List[bytes] = []
+    for count in counts:
+        data = [
+            first_value + step * (index % cycle)
+            for index in range(count * values_per_count)
+        ]
+        tokens = [count, *([scalar] * count_offset), *data]
+        if "n=0" in str(contract.get("termination", "")):
+            tokens.append(0)
+        payloads.append((" ".join(map(str, tokens)) + "\n").encode())
+    return payloads
+
+
 def generate_contract_inputs(
+    contract: Dict[str, Any],
+    seed_inputs: List[bytes],
+    iterations: int,
+    *,
+    rng_seed: Optional[int] = None,
+) -> Tuple[List[bytes], Dict[str, int]]:
+    """Generate validated inputs, retaining exact seeds as the first entries.
+
+    ``rng_seed`` gives experiment callers deterministic generation without
+    permanently mutating the module-level RNG used by the legacy fuzzer.
+    Existing callers that omit it retain the historical behavior.
+    """
+    previous_random_state = None
+    if rng_seed is not None:
+        previous_random_state = random.getstate()
+        random.seed(int(rng_seed))
+    try:
+        return _generate_contract_inputs_impl(contract, seed_inputs, iterations)
+    finally:
+        if previous_random_state is not None:
+            random.setstate(previous_random_state)
+
+
+def _generate_contract_inputs_impl(
     contract: Dict[str, Any], seed_inputs: List[bytes], iterations: int
 ) -> Tuple[List[bytes], Dict[str, int]]:
-    """Generate validated inputs, retaining exact seeds as the first corpus entries."""
     seeds = _dedupe(seed_inputs)
     if iterations <= 0:
         return [], {"accepted": 0, "rejected": 0}
@@ -2327,6 +2425,18 @@ def generate_contract_inputs(
         valid, _ = validate_contract_payload(contract, seed, seeds)
         if valid and seed not in accepted:
             accepted.append(seed)
+
+    for candidate in _counted_long_list_boundary_payloads(contract):
+        if len(accepted) >= iterations:
+            break
+        if candidate in accepted:
+            continue
+        valid, _ = validate_contract_payload(contract, candidate, seeds)
+        if valid:
+            accepted.append(candidate)
+        else:
+            rejected += 1
+
     attempts = 0
     max_attempts = max(100, iterations * 100)
     while len(accepted) < iterations and seeds and attempts < max_attempts:

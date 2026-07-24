@@ -128,7 +128,7 @@ LLM phai tra:
 
 Adapter se parse JSON, lay `source`, compile candidate va dua candidate vao semantic/fuzz check.
 Moi request gui day du system/task prompt va attach nguyen artifact. Input khong bi cat. Request
-dung output ceiling toi da theo model (`65,535` token voi `gemini-3.5-flash`), khong dung cap
+dung output ceiling toi da theo model (`65,535` token voi `gemini-2.5-pro`), khong dung cap
 32K rieng cua adapter. Gioi han recovery van la `max_iter=5`; loi parse/compile/semantic va
 `finishReason` cua provider duoc dua vao feedback cua vong ke tiep.
 

@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import codecs
 import base64
+import datetime as dt
+import email.utils
+import hashlib
 import json
 import os
 import re
@@ -27,11 +30,30 @@ class RecoveryError(RuntimeError):
     """Raised when the LLM recovery backend cannot produce a usable result."""
 
 
+class LLMRateLimitError(RecoveryError):
+    """Provider rejected an attempt because its request/token quota is exhausted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: Optional[float] = None,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.status_code = status_code
+
+
+class LLMEmptyResponseError(RecoveryError):
+    """Provider completed a generation but returned no usable text."""
+
+
 @dataclass
 class RecoveryConfig:
     """Runtime knobs for the recovery and validation loop."""
 
-    model: str = field(default_factory=lambda: os.environ.get("LLM_RECOVERY_MODEL", "gemini-3.5-flash"))
+    model: str = field(default_factory=lambda: os.environ.get("LLM_RECOVERY_MODEL", "gemini-2.5-pro"))
     project: Optional[str] = field(
         default_factory=lambda: os.environ.get("VERTEX_PROJECT")
         or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -53,7 +75,13 @@ class RecoveryConfig:
     temperature: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_TEMPERATURE", "0.05"))
     )
-    # Gemini 3.x uses thinkingLevel rather than the older numeric
+    top_p: float = field(
+        default_factory=lambda: float(os.environ.get("LLM_RECOVERY_TOP_P", "0.9"))
+    )
+    # The experiment protocol permits exactly one candidate per provider
+    # response.  Keep this explicit instead of relying on provider defaults.
+    candidate_count: int = 1
+    # Gemini 2.5 Pro uses thinkingLevel rather than the older numeric
     # thinkingBudget. HIGH is the maximum documented effort level.
     thinking_level: Optional[str] = field(
         default_factory=lambda: _optional_env("LLM_RECOVERY_THINKING_LEVEL", "HIGH")
@@ -1818,6 +1846,53 @@ def _vertex_api_base_url(location: str) -> str:
     return f"https://{normalized}-aiplatform.googleapis.com"
 
 
+def _retry_after_seconds(value: Any, detail: str = "") -> Optional[float]:
+    raw = _text(value).strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(raw)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+                return max(
+                    0.0,
+                    (
+                        retry_at
+                        - dt.datetime.now(dt.timezone.utc)
+                    ).total_seconds(),
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+    patterns = (
+        r'"retryDelay"\s*:\s*"(?P<seconds>\d+(?:\.\d+)?)s"',
+        r"retry\s+(?:after|in)\s+(?P<seconds>\d+(?:\.\d+)?)\s*s",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, detail, flags=re.IGNORECASE)
+        if match:
+            return max(0.0, float(match.group("seconds")))
+    return None
+
+
+def _is_rate_limit_detail(value: Any) -> bool:
+    detail = _text(value).lower()
+    return any(
+        marker in detail
+        for marker in (
+            "resource_exhausted",
+            "resourceexhausted",
+            "rate limit",
+            "ratelimit",
+            "quota exceeded",
+            "too many requests",
+            "http 429",
+            "statuscode.429",
+        )
+    )
+
+
 def _vertex_inline_mime_type(path: Path) -> str:
     """Return a Gemini-supported inline MIME type or reject opaque binaries."""
     suffix = path.suffix.lower()
@@ -1844,7 +1919,8 @@ def _vertex_inline_mime_type(path: Path) -> str:
 def _vertex_generation_config(config: RecoveryConfig) -> Dict[str, Any]:
     generation_config: Dict[str, Any] = {
         "temperature": config.temperature,
-        "topP": 0.9,
+        "topP": config.top_p,
+        "candidateCount": config.candidate_count,
     }
     if config.max_output_tokens:
         generation_config["maxOutputTokens"] = config.max_output_tokens
@@ -1889,6 +1965,7 @@ class VertexGemini:
         prompt: str,
         attachment_path: Optional[str] = None,
         attachment_paths: Optional[Sequence[str]] = None,
+        system_instruction: Optional[str] = None,
     ) -> str:
         """Call Vertex AI generateContent through REST with ADC credentials."""
         credentials = _load_adc_credentials()
@@ -1953,6 +2030,10 @@ class VertexGemini:
             ],
             "generationConfig": generation_config,
         }
+        if _text(system_instruction):
+            payload["systemInstruction"] = {
+                "parts": [{"text": str(system_instruction)}]
+            }
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -1981,15 +2062,31 @@ class VertexGemini:
                 detail = response.text[:500]
             except Exception:
                 detail = ""
+            if response.status_code == 429 or _is_rate_limit_detail(detail):
+                raise LLMRateLimitError(
+                    f"Vertex REST rate limited: HTTP {response.status_code}: {detail}",
+                    retry_after_seconds=_retry_after_seconds(
+                        response.headers.get("Retry-After"), detail
+                    ),
+                    status_code=response.status_code,
+                )
             raise RecoveryError(f"Vertex REST failed: HTTP {response.status_code}: {detail}")
 
         data = response.json()
+        usage = data.get("usageMetadata") or {}
         candidates = data.get("candidates") or []
         if not candidates:
-            raise RecoveryError("Vertex REST returned empty payload: missing candidates.")
+            self.last_response_meta = {
+                "model_version": _text(data.get("modelVersion")),
+                "finish_reason": "EMPTY",
+                "finish_message": "missing candidates",
+                "usage_metadata": usage,
+            }
+            raise LLMEmptyResponseError(
+                "Vertex REST returned empty payload: missing candidates."
+            )
 
         first_candidate = candidates[0]
-        usage = data.get("usageMetadata") or {}
         self.last_response_meta = {
             "model_version": _text(data.get("modelVersion")),
             "finish_reason": _text(first_candidate.get("finishReason")).upper(),
@@ -2007,7 +2104,7 @@ class VertexGemini:
                 texts.append(str(piece))
         result = "".join(texts).strip()
         if not result:
-            raise RecoveryError("Vertex REST returned empty response")
+            raise LLMEmptyResponseError("Vertex REST returned empty response")
         return result
 
     def generate(
@@ -2015,6 +2112,7 @@ class VertexGemini:
         prompt: str,
         attachment_path: Optional[str] = None,
         attachment_paths: Optional[Sequence[str]] = None,
+        system_instruction: Optional[str] = None,
     ) -> str:
         paths = list(attachment_paths or [])
         if attachment_path:
@@ -2024,19 +2122,30 @@ class VertexGemini:
             and bool([path for path in paths if _text(path)])
         )
         if use_file_api:
-            return self._generate_rest(prompt, attachment_paths=paths)
+            return self._generate_rest(
+                prompt,
+                attachment_paths=paths,
+                system_instruction=system_instruction,
+            )
 
         client = self._client_or_create()
         if client is None:
-            return self._generate_rest(prompt, attachment_path=None)
+            return self._generate_rest(
+                prompt,
+                attachment_path=None,
+                system_instruction=system_instruction,
+            )
         try:
             from google.genai import types
 
             _vertex_generation_config(self.config)
             generation_kwargs = {
                 "temperature": self.config.temperature,
-                "top_p": 0.9,
+                "top_p": self.config.top_p,
+                "candidate_count": self.config.candidate_count,
             }
+            if _text(system_instruction):
+                generation_kwargs["system_instruction"] = str(system_instruction)
             if self.config.max_output_tokens:
                 generation_kwargs["max_output_tokens"] = self.config.max_output_tokens
             if self.config.thinking_level:
@@ -2050,6 +2159,14 @@ class VertexGemini:
                 config=generation_config,
             )
         except Exception as exc:
+            if isinstance(exc, LLMRateLimitError):
+                raise
+            if _is_rate_limit_detail(exc):
+                raise LLMRateLimitError(
+                    f"Vertex Gemini rate limited: {exc}",
+                    retry_after_seconds=_retry_after_seconds(None, str(exc)),
+                    status_code=429,
+                ) from exc
             raise RecoveryError(f"Vertex Gemini request failed: {exc}") from exc
         candidates = getattr(response, "candidates", None) or []
         first_candidate = candidates[0] if candidates else None
@@ -2074,7 +2191,9 @@ class VertexGemini:
         }
         result = _text(getattr(response, "text", ""))
         if not result:
-            raise RecoveryError("Vertex Gemini returned an empty response")
+            raise LLMEmptyResponseError(
+                "Vertex Gemini returned an empty response"
+            )
         return result
 
 
@@ -2121,6 +2240,10 @@ def run_recovery_loop(
     fuzzer_callback: Optional[Callable[[str], Mapping[str, Any]]] = None,
     config: Optional[RecoveryConfig] = None,
     model_client: Optional[VertexGemini] = None,
+    request_executor: Optional[
+        Callable[[Callable[[], str], Mapping[str, Any]], str]
+    ] = None,
+    resume_state_path: Optional[str] = None,
 ) -> RecoveryResult:
     """Recover, compile-check, optionally fuzz, and repair the C candidate.
 
@@ -2134,6 +2257,12 @@ def run_recovery_loop(
     metadata = dict(metadata or {})
     output_dir = str(Path(case_output_dir).resolve())
     os.makedirs(output_dir, exist_ok=True)
+    recovery_state_path = Path(
+        resume_state_path or os.path.join(output_dir, "recovery_state.json")
+    )
+    recovery_identity_sha256 = hashlib.sha256(
+        ir_text.encode("utf-8", errors="replace")
+    ).hexdigest()
 
     candidate = ""
     pseudo_source = None
@@ -2209,7 +2338,74 @@ def run_recovery_loop(
         print("[LLM] Mode 2: gửi trực tiếp LLVM IR cho LLM.")
         pseudo_path_for_api = None
 
-    for iteration in range(1, config.max_iterations + 1):
+    start_iteration = 1
+    resumed_request_sha256: Optional[str] = None
+    if recovery_state_path.is_file():
+        try:
+            saved_state = json.loads(
+                recovery_state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            saved_state = {}
+        if (
+            saved_state.get("schema_version") == "1.0"
+            and saved_state.get("ir_sha256") == recovery_identity_sha256
+            and saved_state.get("max_iterations") == config.max_iterations
+            and saved_state.get("status") == "REQUEST_PENDING"
+        ):
+            saved_iteration = int(saved_state.get("iteration", 1))
+            if 1 <= saved_iteration <= config.max_iterations:
+                start_iteration = saved_iteration
+                candidate = _text(saved_state.get("candidate"))
+                last_error = saved_state.get("last_error")
+                saved_report = saved_state.get("last_report")
+                last_report = (
+                    dict(saved_report)
+                    if isinstance(saved_report, Mapping)
+                    else None
+                )
+                resumed_request_sha256 = _text(
+                    saved_state.get("request_sha256")
+                ) or None
+                print(
+                    "[LLM] Resume recovery state tại iteration "
+                    f"{start_iteration}/{config.max_iterations}."
+                )
+
+    def save_recovery_state(
+        *,
+        iteration: int,
+        status: str,
+        request_sha256: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "status": status,
+            "iteration": iteration,
+            "max_iterations": config.max_iterations,
+            "ir_sha256": recovery_identity_sha256,
+            "request_sha256": request_sha256,
+            "candidate": candidate,
+            "last_error": last_error,
+            "last_report": last_report,
+        }
+        temporary = recovery_state_path.with_name(
+            recovery_state_path.name + ".tmp"
+        )
+        temporary.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, recovery_state_path)
+
+    for iteration in range(start_iteration, config.max_iterations + 1):
         print(f"[LLM] --- Iteration {iteration}/{config.max_iterations} ---")
         def make_prompt(max_chars: Optional[int]) -> str:
             if iteration == 1:
@@ -2278,9 +2474,52 @@ def run_recovery_loop(
                     + ", ".join(os.path.basename(path) for path in attachment_paths)
                 )
 
-            response = client.generate(
-                build_system_prompt() + "\n\n" + make_prompt(None),
-                attachment_paths=attachment_paths,
+            model_prompt = build_system_prompt() + "\n\n" + make_prompt(None)
+            request_hasher = hashlib.sha256()
+            request_hasher.update(model_prompt.encode("utf-8"))
+            for attachment_path in attachment_paths:
+                request_hasher.update(b"\0")
+                request_hasher.update(
+                    os.path.basename(attachment_path).encode("utf-8")
+                )
+                request_hasher.update(b"\0")
+                with open(attachment_path, "rb") as attachment_handle:
+                    for chunk in iter(
+                        lambda: attachment_handle.read(1024 * 1024), b""
+                    ):
+                        request_hasher.update(chunk)
+            request_sha256 = request_hasher.hexdigest()
+            if (
+                iteration == start_iteration
+                and resumed_request_sha256 is not None
+                and request_sha256 != resumed_request_sha256
+            ):
+                raise RecoveryError(
+                    "Refusing recovery resume because the exact request hash "
+                    f"drifted: expected {resumed_request_sha256}, "
+                    f"computed {request_sha256}"
+                )
+            save_recovery_state(
+                iteration=iteration,
+                status="REQUEST_PENDING",
+                request_sha256=request_sha256,
+            )
+
+            def send_request() -> str:
+                return client.generate(
+                    model_prompt,
+                    attachment_paths=attachment_paths,
+                )
+
+            request_context = {
+                "iteration": iteration,
+                "request_sha256": request_sha256,
+                "max_iterations": config.max_iterations,
+            }
+            response = (
+                request_executor(send_request, request_context)
+                if request_executor is not None
+                else send_request()
             )
             response_meta = dict(getattr(client, "last_response_meta", {}) or {})
             finish_reason = _text(response_meta.get("finish_reason"))
@@ -2365,6 +2604,7 @@ def run_recovery_loop(
         if fuzzer_callback is None:
             shutil.copy2(candidate_path, output_recovered_c_path)
             print(f"[LLM] Iteration {iteration}: compile OK, no fuzz callback, mark success.")
+            save_recovery_state(iteration=iteration, status="COMPLETED")
             return RecoveryResult(True, output_recovered_c_path, iteration)
 
         try:
@@ -2384,6 +2624,7 @@ def run_recovery_loop(
         if last_report.get("is_fully_equivalent", False):
             print(f"[LLM] Iteration {iteration}: semantic pass, accept candidate.")
             shutil.copy2(candidate_path, output_recovered_c_path)
+            save_recovery_state(iteration=iteration, status="COMPLETED")
             return RecoveryResult(True, output_recovered_c_path, iteration, fuzz_report=last_report)
         last_error = _format_fuzz_feedback(last_report)
         print(f"[LLM] Iteration {iteration}: chưa pass semantic, tiếp tục sửa.")
@@ -2393,7 +2634,13 @@ def run_recovery_loop(
     if last_candidate_path and os.path.isfile(last_candidate_path):
         shutil.copy2(last_candidate_path, output_recovered_c_path)
         print("[LLM] Đã kết thúc loop mà chưa đạt semantic. Giữ candidate cuối cùng để debug.")
+        save_recovery_state(
+            iteration=config.max_iterations, status="COMPLETED"
+        )
         return RecoveryResult(False, output_recovered_c_path, config.max_iterations, last_error, last_report)
 
     print("[LLM] Không tạo được candidate hợp lệ trong toàn bộ vòng lặp.")
+    save_recovery_state(
+        iteration=config.max_iterations, status="COMPLETED"
+    )
     return RecoveryResult(False, None, config.max_iterations, last_error, last_report)

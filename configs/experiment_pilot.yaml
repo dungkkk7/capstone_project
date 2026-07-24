@@ -1,0 +1,85 @@
+schema_version: "2.0"
+
+experiment:
+  methods: [P0, A0, B0]
+  variant_order: [B0, A0, P0]
+  study_scope: pilot
+  run_seed: 4912026
+  resume: true
+  fail_fast: false
+  require_clean_git: false
+
+representation:
+  no_truncation: true
+  b0:
+    ghidra_timeout_sec: 900
+    use_cache: true
+  a0:
+    allow_passes: []
+    allow_optimizations: false
+
+llm:
+  provider: vertex_ai
+  model_id: gemini-2.5-pro
+  location: global
+  temperature: 0.0
+  top_p: 1.0
+  candidate_count: 1
+  max_output_tokens: 65535
+  thinking_level: null
+  request_timeout_sec: 900
+  # Official Gemini 3.5 Flash model card, verified 2026-07-24.
+  context_window_tokens: 1048576
+  model_spec_source: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/2-5-pro
+  model_spec_verified_date: "2026-07-24"
+  context_safety_margin_tokens: 1024
+  transport_retries: 2
+  rate_limit:
+    enabled: true
+    max_wait_seconds: 3600
+    # Used only when the provider omits Retry-After.
+    default_retry_after_seconds: 3600
+  # Standard PayGo, global endpoint; official pricing verified 2026-07-24.
+  pricing_plan: standard_paygo_global
+  pricing_usd_per_million_input_tokens: 1.25
+  pricing_usd_per_million_output_tokens: 10.00
+  pricing_long_context_threshold_tokens: 200000
+  pricing_usd_per_million_input_tokens_long_context: 2.50
+  pricing_usd_per_million_output_tokens_long_context: 15.00
+  pricing_source: https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
+  pricing_verified_date: "2026-07-24"
+
+p0:
+  max_iterations: 5
+  fuzz_iterations: 10
+  fuzz_timeout_sec: 0.5
+  use_lifting_cache: true
+
+corpus:
+  deterministic_supplement_count: 10
+  generator_seed: 4912026
+
+fuzz:
+  enabled: true
+  seconds_per_method: 1
+  target_accepted_inputs: 10
+  max_saved_unique_inputs: 100
+
+evaluation:
+  compare_stdout: true
+  compare_stderr: true
+  compare_exit_status: true
+  per_input_timeout_sec: 0.5
+  min_confirmed_inputs: 10
+  max_reference_inconclusive_fraction: 0.20
+  nondeterminism_repeats: 3
+  environment:
+    LC_ALL: C
+    LANG: C
+    TZ: UTC
+
+statistics:
+  bootstrap_resamples: 1000
+  bootstrap_seed: 4912026
+  confidence_level: 0.95
+  alpha: 0.05

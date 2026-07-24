@@ -1,0 +1,102 @@
+schema_version: "2.0"
+
+# Full primary-methodology budget for an explicitly scoped three-case study.
+# Dirty Git is allowed only because the user's pre-existing deletions must not
+# be committed, stashed, or restored by the experiment harness. The manifest
+# still records the commit, dirty flag, resolved config, and source hashes.
+experiment:
+  methods: [P0, A0, B0]
+  variant_order: [B0, A0, P0]
+  study_scope: scoped_three_case_full_budget
+  run_seed: 4912026
+  resume: true
+  fail_fast: false
+  require_clean_git: false
+
+paths:
+  result_root: result/experiments
+  ghidra_headless: /opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless
+  ida_disassembler: /opt/ida-pro-9.3/idat
+  llvm_dis: /usr/bin/llvm-dis-21
+  clang: /usr/bin/clang-21
+
+representation:
+  no_truncation: true
+  b0:
+    ghidra_timeout_sec: 900
+    use_cache: true
+  a0:
+    allow_passes: []
+    allow_optimizations: false
+
+llm:
+  provider: vertex_ai
+  model_id: gemini-2.5-pro
+  location: global
+  temperature: 0.0
+  top_p: 1.0
+  candidate_count: 1
+  max_output_tokens: 65535
+  # Gemini 2.5 Pro's Vertex REST endpoint rejects thinkingConfig; use provider default.
+  thinking_level: null
+  request_timeout_sec: 900
+  context_window_tokens: 1048576
+  model_spec_source: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/2-5-pro
+  model_spec_verified_date: "2026-07-24"
+  context_safety_margin_tokens: 1024
+  transport_retries: 2
+  rate_limit:
+    enabled: true
+    max_wait_seconds: 3600
+    default_retry_after_seconds: 3600
+  pricing_plan: standard_paygo_global
+  pricing_usd_per_million_input_tokens: 1.25
+  pricing_usd_per_million_output_tokens: 10.00
+  pricing_long_context_threshold_tokens: 200000
+  pricing_usd_per_million_input_tokens_long_context: 2.50
+  pricing_usd_per_million_output_tokens_long_context: 15.00
+  pricing_source: https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
+  pricing_verified_date: "2026-07-24"
+
+p0:
+  max_iterations: 5
+  fuzz_iterations: 100
+  fuzz_timeout_sec: 0.5
+  use_lifting_cache: true
+
+build:
+  compiler: /usr/bin/clang-21
+  flags: [-std=c11, -O0, -fno-strict-aliasing, -fwrapv, -Wno-everything]
+  link_flags: [-lm]
+  timeout_sec: 60
+
+corpus:
+  deterministic_supplement_count: 50
+  generator_seed: 4912026
+
+fuzz:
+  enabled: true
+  seconds_per_method: 60
+  target_accepted_inputs: 50
+  max_saved_unique_inputs: 5000
+
+evaluation:
+  compare_stdout: true
+  compare_stderr: true
+  compare_exit_status: true
+  # p00033's valid count-growth probes can take ~1.3s before the original
+  # ELF terminates with SIGABRT; 0.1s would misclassify them as unknown.
+  per_input_timeout_sec: 2.0
+  min_confirmed_inputs: 50
+  max_reference_inconclusive_fraction: 0.20
+  nondeterminism_repeats: 3
+  environment:
+    LC_ALL: C
+    LANG: C
+    TZ: UTC
+
+statistics:
+  bootstrap_resamples: 10000
+  bootstrap_seed: 4912026
+  confidence_level: 0.95
+  alpha: 0.05

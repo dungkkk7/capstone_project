@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,8 +9,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from llm_recovery.llm_recovery import (
+    LLMRateLimitError,
     RecoveryConfig,
     RecoveryError,
+    VertexGemini,
     _vertex_api_base_url,
     _vertex_generation_config,
     _vertex_inline_mime_type,
@@ -17,11 +20,11 @@ from llm_recovery.llm_recovery import (
 
 
 class VertexEndpointTests(unittest.TestCase):
-    def test_gemini_35_defaults_to_global_endpoint(self):
+    def test_gemini_25_pro_defaults_to_global_endpoint(self):
         with patch.dict(os.environ, {}, clear=True):
             config = RecoveryConfig()
 
-        self.assertEqual(config.model, "gemini-3.5-flash")
+        self.assertEqual(config.model, "gemini-2.5-pro")
         self.assertEqual(config.location, "global")
         self.assertEqual(config.thinking_level, "HIGH")
         self.assertEqual(
@@ -61,6 +64,78 @@ class VertexEndpointTests(unittest.TestCase):
         self.assertEqual(_vertex_inline_mime_type(Path("brightened.ll")), "text/plain")
         with self.assertRaisesRegex(RecoveryError, "application/octet-stream"):
             _vertex_inline_mime_type(Path("brightened_ref.bin"))
+
+    def test_rest_request_preserves_system_instruction_role(self):
+        captured = {}
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "candidates": [
+                        {
+                            "finishReason": "STOP",
+                            "content": {"parts": [{"text": "int main(void){return 0;}"}]},
+                        }
+                    ],
+                    "usageMetadata": {},
+                }
+
+        def post(url, json, headers, timeout):
+            captured["payload"] = json
+            return Response()
+
+        requests_module = types.SimpleNamespace(post=post)
+        client = VertexGemini(
+            RecoveryConfig(project="test-project", use_file_api=False)
+        )
+        with patch.dict(sys.modules, {"requests": requests_module}), patch(
+            "llm_recovery.llm_recovery._load_adc_credentials",
+            return_value={"quota_project_id": "test-project"},
+        ), patch(
+            "llm_recovery.llm_recovery._request_access_token_via_refresh",
+            return_value="token",
+        ):
+            response = client._generate_rest(
+                "USER",
+                system_instruction="SYSTEM",
+            )
+
+        self.assertIn("int main", response)
+        self.assertEqual(
+            captured["payload"]["systemInstruction"],
+            {"parts": [{"text": "SYSTEM"}]},
+        )
+        self.assertEqual(
+            captured["payload"]["contents"][0]["parts"],
+            [{"text": "USER"}],
+        )
+
+    def test_rest_429_preserves_retry_after(self):
+        class Response:
+            status_code = 429
+            text = '{"error":{"status":"RESOURCE_EXHAUSTED"}}'
+            headers = {"Retry-After": "3600"}
+
+        requests_module = types.SimpleNamespace(
+            post=lambda *args, **kwargs: Response()
+        )
+        client = VertexGemini(
+            RecoveryConfig(project="test-project", use_file_api=False)
+        )
+        with patch.dict(sys.modules, {"requests": requests_module}), patch(
+            "llm_recovery.llm_recovery._load_adc_credentials",
+            return_value={"quota_project_id": "test-project"},
+        ), patch(
+            "llm_recovery.llm_recovery._request_access_token_via_refresh",
+            return_value="token",
+        ):
+            with self.assertRaises(LLMRateLimitError) as raised:
+                client._generate_rest("USER")
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.retry_after_seconds, 3600)
 
 
 if __name__ == "__main__":
