@@ -6,6 +6,7 @@ import platform
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -442,7 +443,11 @@ class ExperimentRunner:
             result.timing["quota_wait_duration_ms"] = int(
                 payload.get("quota_wait_duration_ms", 0)
             )
-            if event_type in {"quota_throttled", "quota_wait_started"}:
+            if event_type in {
+                "quota_throttled",
+                "quota_wait_started",
+                "quota_deferred",
+            }:
                 result.terminal_status = TerminalStatus.WAITING_FOR_QUOTA
             elif event_type == "quota_resumed":
                 result.terminal_status = TerminalStatus.CANCELLED
@@ -471,6 +476,97 @@ class ExperimentRunner:
         self.initialize()
         self._seal_audit("prepare")
 
+    def precompute(self) -> None:
+        """Build representation caches without making any LLM request."""
+        self.initialize()
+        self.audit.log(
+            "command_started",
+            status="RUNNING",
+            payload={"command": "precompute", "llm_calls": 0},
+        )
+        self._run_samples(
+            "precompute",
+            self._precompute_sample,
+            lambda sample: self._precompute_complete(sample),
+        )
+        self.audit.log(
+            "command_work_completed",
+            status="COMPLETED",
+            payload={"command": "precompute", "llm_calls": 0},
+        )
+        self._seal_audit("precompute")
+
+    def _precompute_complete(self, sample: SampleIdentity) -> bool:
+        if not self.config["experiment"].get("resume", True):
+            return False
+        raw_manifest = self._sample_dir(sample) / "common" / "raw_lift" / "raw_lift_manifest.json"
+        a0_manifest = self._sample_dir(sample) / "A0" / "representation" / "representation_manifest.json"
+        b0_manifest = self._sample_dir(sample) / "B0" / "representation" / "representation_manifest.json"
+        return all(path.is_file() for path in (raw_manifest, a0_manifest, b0_manifest))
+
+    def _precompute_sample(self, sample: SampleIdentity) -> None:
+        print(f"[experiment] precompute sample={sample.sample_id}")
+        sample_dir = self._sample_dir(sample)
+        common_dir = sample_dir / "common"
+        started = time.perf_counter()
+        self.audit.log(
+            "sample_precompute_started",
+            sample_id=sample.sample_id,
+            stage=Stage.REPRESENTATION.value,
+            status="RUNNING",
+        )
+        try:
+            raw_lift = self.lift_service.build(
+                sample, common_dir / "raw_lift"
+            )
+            a0 = self.a0_builder.build(
+                sample,
+                common_dir,
+                sample_dir / "A0" / "representation",
+            )
+            b0 = self.b0_builder.build(
+                sample, sample_dir / "B0" / "representation"
+            )
+            atomic_write_json(
+                sample_dir / "precompute_manifest.json",
+                {
+                    "sample_id": sample.sample_id,
+                    "llm_calls": 0,
+                    "raw_lift_cache_key": raw_lift["cache_key"],
+                    "raw_lift_cache_hit": raw_lift["cache_hit"],
+                    "a0_representation_sha256": a0.primary_sha256,
+                    "b0_representation_sha256": b0.primary_sha256,
+                    "b0_cache_key": b0.provenance.get("cache_key"),
+                    "b0_cache_hit": b0.provenance.get("cache_hit"),
+                    "duration_ms": int(
+                        (time.perf_counter() - started) * 1000
+                    ),
+                },
+            )
+            self.audit.log(
+                "sample_precompute_completed",
+                sample_id=sample.sample_id,
+                stage=Stage.REPRESENTATION.value,
+                status="COMPLETED",
+                payload={
+                    "llm_calls": 0,
+                    "raw_lift_cache_hit": raw_lift["cache_hit"],
+                    "b0_cache_hit": b0.provenance.get("cache_hit"),
+                    "duration_ms": int(
+                        (time.perf_counter() - started) * 1000
+                    ),
+                },
+            )
+        except Exception as exc:
+            self.audit.log(
+                "sample_precompute_failed",
+                sample_id=sample.sample_id,
+                stage=Stage.REPRESENTATION.value,
+                status="FAILED",
+                payload={"llm_calls": 0, "error": str(exc)},
+            )
+            raise
+
     def _sample_complete(self, sample: SampleIdentity) -> bool:
         if not self.config["experiment"].get("resume", True):
             return False
@@ -480,6 +576,17 @@ class ExperimentRunner:
                 return False
             data = load_json(path)
             if data.get("final_stage") != Stage.FINALIZED.value:
+                return False
+            # A provider cancellation may have finalized the variant before
+            # the process can be resumed. Keep that sample eligible for a
+            # later run so a transient LLM failure is not treated as a final
+            # scientific outcome forever.
+            if (
+                data.get("terminal_status") == TerminalStatus.LLM_REQUEST_FAILED.value
+                and str(data.get("failure_code") or "").endswith(
+                    "_LLM_REQUEST_FAILED"
+                )
+            ):
                 return False
         return True
 
@@ -523,15 +630,36 @@ class ExperimentRunner:
     def run(self) -> None:
         self.initialize()
         self.audit.log("command_started", status="RUNNING", payload={"command": "run"})
-        for sample in self.samples:
-            if self._sample_complete(sample):
-                print(f"[experiment] resume: skip completed {sample.sample_id}")
-                continue
-            self._generate_sample(sample)
-        for sample in self.samples:
-            if self._sample_complete(sample):
-                continue
-            self._evaluate_sample(sample)
+        self._run_samples(
+            "generate",
+            self._generate_sample,
+            lambda sample: self._sample_complete(sample),
+        )
+        pending_generation = [
+            sample.sample_id
+            for sample in self.samples
+            if not self._sample_complete(sample)
+        ]
+        if pending_generation:
+            self.audit.log(
+                "generation_deferred",
+                stage=Stage.GENERATION.value,
+                status="WAITING_FOR_QUOTA",
+                payload={"pending_sample_ids": pending_generation},
+            )
+            print(
+                "[experiment] generation deferred; pending sample(s) saved "
+                "for backfill: "
+                + ", ".join(pending_generation),
+                flush=True,
+            )
+            self._seal_audit("run-deferred-generation")
+            return
+        self._run_samples(
+            "evaluate",
+            self._evaluate_sample,
+            lambda sample: self._sample_complete(sample),
+        )
         self._aggregate_outputs()
         self.audit.log(
             "command_work_completed",
@@ -539,16 +667,23 @@ class ExperimentRunner:
             payload={"command": "run"},
         )
         self._seal_audit("run")
-        verify_run_integrity(self.run_root, self.samples, self.methods)
+        verify_run_integrity(
+            self.run_root,
+            self.samples,
+            self.methods,
+            attach_clean_ir=bool(self.config["p0"].get("attach_clean_ir", False)),
+        )
 
     def generate(self) -> None:
         self.initialize()
         self.audit.log(
             "command_started", status="RUNNING", payload={"command": "generate"}
         )
-        for sample in self.samples:
-            if not self._sample_complete(sample):
-                self._generate_sample(sample)
+        self._run_samples(
+            "generate",
+            self._generate_sample,
+            lambda sample: self._sample_complete(sample),
+        )
         self.audit.log(
             "command_work_completed",
             status="COMPLETED",
@@ -561,9 +696,11 @@ class ExperimentRunner:
         self.audit.log(
             "command_started", status="RUNNING", payload={"command": "evaluate"}
         )
-        for sample in self.samples:
-            if not self._sample_complete(sample):
-                self._evaluate_sample(sample)
+        self._run_samples(
+            "evaluate",
+            self._evaluate_sample,
+            lambda sample: self._sample_complete(sample),
+        )
         self.audit.log(
             "command_work_completed",
             status="COMPLETED",
@@ -603,11 +740,76 @@ class ExperimentRunner:
 
     def verify(self) -> Dict[str, Any]:
         return verify_run_integrity(
-            self.run_root, self.samples, self.methods
+            self.run_root,
+            self.samples,
+            self.methods,
+            attach_clean_ir=bool(self.config["p0"].get("attach_clean_ir", False)),
         )
 
+    def _run_samples(self, phase: str, operation, is_complete) -> None:
+        """Run independent samples concurrently while preserving per-sample order.
+
+        ``operation`` is deliberately called once per sample. The operation
+        itself still executes the configured method order, so a sample cannot
+        observe a partially generated sibling method. Each sample owns its
+        artifact directories and quota checkpoints; AuditLogger serializes
+        append operations with its file lock.
+        """
+        pending = []
+        for sample in self.samples:
+            if is_complete(sample):
+                if phase == "generate":
+                    print(f"[experiment] resume: skip completed {sample.sample_id}")
+                continue
+            pending.append(sample)
+
+        workers = max(
+            1, int(self.config["experiment"].get("sample_workers", 1))
+        )
+        workers = min(workers, max(1, len(pending)))
+        print(
+            f"[experiment] {phase}: {len(pending)} pending sample(s), "
+            f"workers={workers}",
+            flush=True,
+        )
+        if not pending:
+            return
+        if workers == 1:
+            for sample in pending:
+                operation(sample)
+            return
+
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=f"experiment-{phase}",
+        ) as executor:
+            futures = {
+                executor.submit(operation, sample): sample
+                for sample in pending
+            }
+            for future in as_completed(futures):
+                sample = futures[future]
+                try:
+                    future.result()
+                    print(
+                        f"[experiment] {phase} complete sample={sample.sample_id}",
+                        flush=True,
+                    )
+                except Exception:
+                    # Keep the existing fail-fast behavior: an uncaught
+                    # sample-level failure aborts the command, while the
+                    # operation's own per-method failure handling remains
+                    # unchanged.
+                    for other in futures:
+                        if other is not future:
+                            other.cancel()
+                    raise
+
     def _generate_sample(self, sample: SampleIdentity) -> None:
-        print(f"[experiment] generate sample={sample.sample_id}")
+        print(
+            f"[experiment] generate sample={sample.sample_id} stage=base-corpus start",
+            flush=True,
+        )
         self.audit.log(
             "sample_generation_started",
             sample_id=sample.sample_id,
@@ -617,8 +819,13 @@ class ExperimentRunner:
         sample_dir = self._sample_dir(sample)
         common_dir = sample_dir / "common"
         try:
-            prepare_base_corpus(
+            base_inputs = prepare_base_corpus(
                 sample, common_dir / "base_corpus", self.config
+            )
+            print(
+                f"[experiment] sample={sample.sample_id} stage=base-corpus "
+                f"done inputs={len(base_inputs)}",
+                flush=True,
             )
         except Exception as exc:
             for method in self.methods:
@@ -645,13 +852,29 @@ class ExperimentRunner:
             existing_path = self._result_path(sample, method)
             if self.config["experiment"].get("resume", True) and existing_path.is_file():
                 existing = load_json(existing_path)
-                if existing.get("final_stage") == Stage.FINALIZED.value:
+                retryable_llm_failure = (
+                    existing.get("final_stage") == Stage.FINALIZED.value
+                    and existing.get("terminal_status")
+                    == TerminalStatus.LLM_REQUEST_FAILED.value
+                    and str(existing.get("failure_code") or "").endswith(
+                        "_LLM_REQUEST_FAILED"
+                    )
+                )
+                if (
+                    existing.get("final_stage") == Stage.FINALIZED.value
+                    and not retryable_llm_failure
+                ):
                     continue
                 if existing.get("generation") and (existing.get("build") or {}).get("ok"):
                     continue
             result = VariantResult.enrolled(self.run_id, sample, method)
             variant_dir = sample_dir / method.value
             started = time.perf_counter()
+            print(
+                f"[experiment] sample={sample.sample_id} method={method.value} "
+                "stage=representation start",
+                flush=True,
+            )
             self.audit.log(
                 "variant_generation_started",
                 sample_id=sample.sample_id,
@@ -683,6 +906,12 @@ class ExperimentRunner:
                             "internal_precheck_passed": True,
                         }
                     )
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=P0 "
+                        "stage=representation+llm done "
+                        f"duration_ms={result.timing['p0_legacy_pipeline_duration_ms']}",
+                        flush=True,
+                    )
                 elif method is MethodId.A0:
                     representation_started = time.perf_counter()
                     representation = self.a0_builder.build(
@@ -694,18 +923,37 @@ class ExperimentRunner:
                         (time.perf_counter() - representation_started) * 1000
                     )
                     result.representation = representation.to_dict()
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=A0 "
+                        "stage=representation done "
+                        f"duration_ms={result.timing['representation_duration_ms']} "
+                        f"cache_hit={(representation.provenance or {}).get('cache_hit')}",
+                        flush=True,
+                    )
                     generation_started = time.perf_counter()
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=A0 "
+                        "stage=llm start",
+                        flush=True,
+                    )
                     generation = generate_one_shot(
                         method,
                         representation,
                         variant_dir / "generation",
                         self.config,
+                        log_context=sample.sample_id,
                         quota_event_callback=self._quota_event_callback(
                             sample, result
                         ),
                     )
                     result.timing["generation_duration_ms"] = int(
                         (time.perf_counter() - generation_started) * 1000
+                    )
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=A0 "
+                        "stage=llm done "
+                        f"duration_ms={result.timing['generation_duration_ms']}",
+                        flush=True,
                     )
                     candidate_path = generation.candidate_path
                     result.provenance["protocol"] = "strict_one_shot"
@@ -718,12 +966,25 @@ class ExperimentRunner:
                         (time.perf_counter() - representation_started) * 1000
                     )
                     result.representation = representation.to_dict()
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=B0 "
+                        "stage=representation done "
+                        f"duration_ms={result.timing['representation_duration_ms']} "
+                        f"cache_hit={(representation.provenance or {}).get('cache_hit')}",
+                        flush=True,
+                    )
                     generation_started = time.perf_counter()
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=B0 "
+                        "stage=llm start",
+                        flush=True,
+                    )
                     generation = generate_one_shot(
                         method,
                         representation,
                         variant_dir / "generation",
                         self.config,
+                        log_context=sample.sample_id,
                         quota_event_callback=self._quota_event_callback(
                             sample, result
                         ),
@@ -731,18 +992,34 @@ class ExperimentRunner:
                     result.timing["generation_duration_ms"] = int(
                         (time.perf_counter() - generation_started) * 1000
                     )
+                    print(
+                        f"[experiment] sample={sample.sample_id} method=B0 "
+                        "stage=llm done "
+                        f"duration_ms={result.timing['generation_duration_ms']}",
+                        flush=True,
+                    )
                     candidate_path = generation.candidate_path
                     result.provenance["protocol"] = "strict_one_shot"
 
                 result.representation = representation.to_dict()
                 result.generation = generation.to_dict()
                 result.final_stage = Stage.BUILD
+                print(
+                    f"[experiment] sample={sample.sample_id} method={method.value} "
+                    "stage=build start",
+                    flush=True,
+                )
                 build = build_candidate(
                     candidate_path,
                     variant_dir / "build",
                     self.config,
                 )
                 result.build = build.to_dict()
+                print(
+                    f"[experiment] sample={sample.sample_id} method={method.value} "
+                    f"stage=build done ok={build.ok} duration_ms={build.duration_ms}",
+                    flush=True,
+                )
                 result.timing["generation_pipeline_duration_ms"] = int(
                     (time.perf_counter() - started) * 1000
                 )
@@ -813,6 +1090,11 @@ class ExperimentRunner:
         base_inputs = prepare_base_corpus(
             sample, common_dir / "base_corpus", self.config
         )
+        print(
+            f"[experiment] sample={sample.sample_id} stage=base-corpus "
+            f"ready inputs={len(base_inputs)}",
+            flush=True,
+        )
         active: Dict[MethodId, Dict[str, Any]] = {}
         for method in self.methods:
             result_path = self._result_path(sample, method)
@@ -873,6 +1155,11 @@ class ExperimentRunner:
         for method, state in active.items():
             variant_dir = sample_dir / method.value
             try:
+                print(
+                    f"[experiment] sample={sample.sample_id} method={method.value} "
+                    "stage=fuzz-discovery start",
+                    flush=True,
+                )
                 discovered = discover_inputs(
                     sample,
                     state["candidate_path"],
@@ -882,6 +1169,11 @@ class ExperimentRunner:
                     self.config,
                 )
                 discoveries.append(discovered)
+                print(
+                    f"[experiment] sample={sample.sample_id} method={method.value} "
+                    f"stage=fuzz-discovery done discovered={len(discovered)}",
+                    flush=True,
+                )
             except Exception as exc:
                 result = state["result"]
                 self._finalize_exception(
@@ -902,11 +1194,25 @@ class ExperimentRunner:
                 "union_corpus_sha256": corpus_hash,
             },
         )
+        print(
+            f"[experiment] sample={sample.sample_id} stage=union-corpus "
+            f"done inputs={len(union)}",
+            flush=True,
+        )
+        print(
+            f"[experiment] sample={sample.sample_id} stage=reference-execution start",
+            flush=True,
+        )
         reference = execute_reference(
             sample,
             union,
             common_dir / "reference_outputs",
             self.config,
+        )
+        print(
+            f"[experiment] sample={sample.sample_id} stage=reference-execution "
+            f"done inputs={len(reference)}",
+            flush=True,
         )
         for method, state in active.items():
             if state.get("evaluation_failed"):
@@ -914,6 +1220,11 @@ class ExperimentRunner:
             result: VariantResult = state["result"]
             build = state["build"]
             try:
+                print(
+                    f"[experiment] sample={sample.sample_id} method={method.value} "
+                    "stage=union-replay start",
+                    flush=True,
+                )
                 replay = replay_candidate(
                     build.executable_path,
                     build.executable_sha256,
@@ -922,6 +1233,13 @@ class ExperimentRunner:
                     reference,
                     sample_dir / method.value / "evaluation",
                     self.config,
+                )
+                print(
+                    f"[experiment] sample={sample.sample_id} method={method.value} "
+                    f"stage=union-replay done matches={replay['matches']} "
+                    f"mismatches={replay['mismatches']} "
+                    f"inconclusive={replay['inconclusive']}",
+                    flush=True,
                 )
                 result.evaluation = replay
                 result.integrity.update(
@@ -1040,8 +1358,13 @@ class ExperimentRunner:
             and brightened_ll.is_file()
             and pseudocode.is_file()
         ):
-            evidence_bytes = (
-                brightened_ll.stat().st_size + pseudocode.stat().st_size
+            attachment_paths = [str(pseudocode)]
+            attachment_hashes = [sha256_file(pseudocode)]
+            if self.config["p0"].get("attach_clean_ir", False):
+                attachment_paths.insert(0, str(brightened_ll))
+                attachment_hashes.insert(0, sha256_file(brightened_ll))
+            evidence_bytes = sum(
+                Path(path).stat().st_size for path in attachment_paths
             )
             result.representation = {
                 "method": MethodId.P0.value,
@@ -1052,14 +1375,8 @@ class ExperimentRunner:
                     1, (brightened_ll.stat().st_size + 2) // 3
                 ),
                 "builder_version": self.p0_adapter.VERSION,
-                "attachment_paths": [
-                    str(brightened_ll),
-                    str(pseudocode),
-                ],
-                "attachment_sha256": [
-                    sha256_file(brightened_ll),
-                    sha256_file(pseudocode),
-                ],
+                "attachment_paths": attachment_paths,
+                "attachment_sha256": attachment_hashes,
                 "tool_versions": {},
                 "provenance": {
                     "source_sha256": sample.original_elf_sha256,
@@ -1193,6 +1510,8 @@ def verify_run_integrity(
     run_root: str | Path,
     samples: list[SampleIdentity],
     methods: list[MethodId],
+    *,
+    attach_clean_ir: bool = False,
 ) -> Dict[str, Any]:
     root = Path(run_root)
     errors = []
@@ -1448,12 +1767,14 @@ def verify_run_integrity(
                     errors.append(
                         f"P0 exceeded five accepted calls: {sample.sample_id}"
                     )
-                if len(attachment_paths) != 2:
+                expected_p0_attachments = 2 if attach_clean_ir else 1
+                if len(attachment_paths) != expected_p0_attachments:
                     errors.append(
                         f"P0 strict representation incomplete: {sample.sample_id}"
                     )
-                elif not attachment_paths[0].endswith(".ll") or not (
-                    attachment_paths[1].endswith(".c")
+                elif not attachment_paths[-1].endswith(".c") or (
+                    expected_p0_attachments == 2
+                    and not attachment_paths[0].endswith(".ll")
                 ):
                     errors.append(
                         f"P0 strict attachment roles invalid: {sample.sample_id}"

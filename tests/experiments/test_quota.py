@@ -34,6 +34,7 @@ from experiments.storage import load_json  # noqa: E402
 from llm_recovery.llm_recovery import (  # noqa: E402
     LLMEmptyResponseError,
     LLMRateLimitError,
+    LLMTransientError,
     RecoveryConfig,
 )
 
@@ -108,6 +109,69 @@ def test_quota_controller_waits_and_counts_attempts(tmp_path):
     ]
     state = json.loads((tmp_path / "quota_state.json").read_text())
     assert state["status"] == "RESPONSE_ACCEPTED"
+
+
+def test_transient_provider_cancellation_retries_same_iteration(tmp_path):
+    clock = FakeClock()
+    controller = QuotaController(
+        quota_config(),
+        tmp_path,
+        method="P0",
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    calls = 0
+
+    def request():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise LLMTransientError("cancelled", status_code=499)
+        return '{"source":"int main(void){return 0;}"}'
+
+    context = {
+        "request_sha256": "d" * 64,
+        "iteration": 2,
+        "max_iterations": 5,
+    }
+    assert controller.execute(request, context).startswith("{")
+    assert calls == 2
+    assert clock.sleeps == [2]
+    assert controller.metrics()["api_attempt_count"] == 2
+    assert controller.metrics()["accepted_model_call_count"] == 1
+    state = json.loads((tmp_path / "quota_state.json").read_text())
+    assert state["status"] == "RESPONSE_ACCEPTED"
+    assert state["transient_retry_count"] == 1
+
+
+def test_transient_provider_cancellation_is_bounded(tmp_path):
+    clock = FakeClock()
+    policy = quota_config()
+    policy["rate_limit"]["transient_max_retries"] = 2
+    controller = QuotaController(
+        policy,
+        tmp_path,
+        method="P0",
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    context = {
+        "request_sha256": "e" * 64,
+        "iteration": 1,
+        "max_iterations": 5,
+    }
+    with pytest.raises(LLMTransientError):
+        controller.execute(
+            lambda: (_ for _ in ()).throw(
+                LLMTransientError("cancelled", status_code=499)
+            ),
+            context,
+        )
+    assert clock.sleeps == [2, 4]
+    assert controller.metrics()["api_attempt_count"] == 3
+    state = json.loads((tmp_path / "quota_state.json").read_text())
+    assert state["status"] == "REQUEST_FAILED"
+    assert state["transient_retry_exhausted"] is True
 
 
 def test_quota_checkpoint_resumes_same_request_after_interruption(tmp_path):
@@ -351,7 +415,7 @@ class P0RateLimitedClient:
         )
 
 
-def test_p0_uses_brightened_ir_and_generated_pseudocode_attachments(
+def test_p0_can_attach_brightened_ir_and_generated_pseudocode(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -400,8 +464,10 @@ def test_p0_uses_brightened_ir_and_generated_pseudocode_attachments(
             "recovery_reference_binary": str(reference),
         },
         fuzzer_callback=lambda _candidate: {
-            "is_fully_equivalent": True,
+            "is_fully_equivalent": False,
             "equivalence_ratio": 100.0,
+            "confirmed_equivalence_ratio": 100.0,
+            "confirmed_runs": 1,
             "matches": 1,
             "mismatches": 0,
             "inconclusive": 0,
@@ -410,6 +476,7 @@ def test_p0_uses_brightened_ir_and_generated_pseudocode_attachments(
             max_iterations=5,
             pseudo_backend="ghidra",
             use_file_api=True,
+            attach_clean_ir=True,
             require_json=True,
         ),
         model_client=client,
@@ -423,6 +490,64 @@ def test_p0_uses_brightened_ir_and_generated_pseudocode_attachments(
     assert client.kwargs[0]["attachment_paths"] == [
         str(generated_pseudo),
         str(brightened),
+    ]
+
+
+def test_p0_defaults_to_pseudocode_only_attachment(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        recovery, "_run_compile_check", lambda *_args, **_kwargs: (True, None)
+    )
+    monkeypatch.setattr(
+        recovery, "_find_ghidra_analyze_headless", lambda _configured=None: "/bin/true"
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_decompile_binary_with_ghidra",
+        lambda *_args, **_kwargs: "int main(void) { return 0; }\n",
+    )
+    brightened = tmp_path / "brightened.ll"
+    brightened.write_text("define i32 @main() { ret i32 0 }\n")
+    reference = tmp_path / "brightened_ref.bin"
+    reference.write_bytes(b"reference")
+
+    class Client:
+        def __init__(self):
+            self.kwargs = []
+            self.last_response_meta = {"finish_reason": "STOP", "usage_metadata": {}}
+
+        def generate(self, prompt, **kwargs):
+            self.kwargs.append(kwargs)
+            return json.dumps({"source": "int main(void) { return 0; }\n"})
+
+    client = Client()
+    result = recovery.run_recovery_loop(
+        ir_text=brightened.read_text(),
+        output_recovered_c_path=str(tmp_path / "candidate.c"),
+        case_output_dir=str(tmp_path),
+        metadata={
+            "input_ir": str(brightened),
+            "recovery_reference_binary": str(reference),
+        },
+        fuzzer_callback=lambda _candidate: {
+            "is_fully_equivalent": False,
+            "equivalence_ratio": 100.0,
+            "confirmed_equivalence_ratio": 100.0,
+            "confirmed_runs": 1,
+            "matches": 1,
+            "mismatches": 0,
+            "inconclusive": 0,
+        },
+        config=RecoveryConfig(
+            max_iterations=5,
+            pseudo_backend="ghidra",
+            use_file_api=True,
+            require_json=True,
+        ),
+        model_client=client,
+    )
+    assert result.success is True
+    assert client.kwargs[0]["attachment_paths"] == [
+        str(tmp_path / "ghidra_recovery_input.c")
     ]
 
 

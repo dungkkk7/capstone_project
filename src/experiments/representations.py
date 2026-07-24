@@ -110,6 +110,11 @@ class RawLiftService:
                     and sha256_file(cached_bc) == manifest["raw_bc_sha256"]
                     and sha256_file(cached_ll) == manifest["raw_ll_sha256"]
                 ):
+                    print(
+                        f"[cache] raw-lift HIT sample={sample.sample_id} "
+                        f"key={cache_key[:12]}",
+                        flush=True,
+                    )
                     shutil.copy2(cached_bc, raw_bc)
                     shutil.copy2(cached_ll, raw_ll)
                     if cached_cfg.is_file():
@@ -129,6 +134,11 @@ class RawLiftService:
             except (OSError, ValueError, KeyError):
                 pass
 
+        print(
+            f"[cache] raw-lift MISS sample={sample.sample_id} "
+            f"key={cache_key[:12]} -> running McSema",
+            flush=True,
+        )
         started = time.perf_counter()
         ok = lift_binary(
             binary_path=sample.original_elf_path,
@@ -318,6 +328,11 @@ class B0Builder:
                     and cached_manifest.get("representation_sha256")
                     == sha256_file(cached_pseudo)
                 ):
+                    print(
+                        f"[cache] B0-pseudocode HIT sample={sample.sample_id} "
+                        f"key={cache_key[:12]}",
+                        flush=True,
+                    )
                     shutil.copy2(cached_pseudo, pseudo)
                     text = pseudo.read_text(encoding="utf-8", errors="replace")
                     artifact = RepresentationArtifact(
@@ -352,6 +367,11 @@ class B0Builder:
                     return artifact
             except (OSError, ValueError, KeyError):
                 pass
+        print(
+            f"[cache] B0-pseudocode MISS sample={sample.sample_id} "
+            f"key={cache_key[:12]} -> running Ghidra",
+            flush=True,
+        )
         stdout_log = output / "ghidra_stdout.log"
         stderr_log = output / "ghidra_stderr.log"
         started = time.perf_counter()

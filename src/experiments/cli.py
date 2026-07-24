@@ -10,10 +10,9 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from .config import load_config, validate_config
+from .config import config_fingerprint, load_config, validate_config
 from .identity import read_dataset
 from .runner import ExperimentRunner
-from .storage import stable_json_sha256
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,6 +29,14 @@ def _parser() -> argparse.ArgumentParser:
         subparser.add_argument("--sample-id", action="append", default=[])
         subparser.add_argument("--methods")
         subparser.add_argument(
+            "--workers",
+            type=int,
+            help=(
+                "Number of samples to process concurrently; overrides "
+                "experiment.sample_workers"
+            ),
+        )
+        subparser.add_argument(
             "--fake-response-path",
             help=(
                 "Use a fixed local response for pipeline validation only; "
@@ -42,6 +49,11 @@ def _parser() -> argparse.ArgumentParser:
     common(run_parser)
     prepare_parser = subparsers.add_parser("prepare")
     common(prepare_parser)
+    precompute_parser = subparsers.add_parser(
+        "precompute",
+        help="Build raw-lift and Ghidra representation caches without LLM calls",
+    )
+    common(precompute_parser)
     generate_parser = subparsers.add_parser("generate")
     common(generate_parser)
     evaluate_parser = subparsers.add_parser("evaluate")
@@ -76,14 +88,12 @@ def _runner_from_args(args: argparse.Namespace) -> ExperimentRunner:
         config["llm"]["fake_response_path"] = str(fake_path.resolve())
     if args.no_resume:
         config["experiment"]["resume"] = False
+    if args.workers is not None:
+        if args.workers < 1:
+            raise SystemExit("--workers must be at least 1")
+        config["experiment"]["sample_workers"] = args.workers
     validate_config(config)
-    config["_config_sha256"] = stable_json_sha256(
-        {
-            key: value
-            for key, value in config.items()
-            if not key.startswith("_")
-        }
-    )
+    config["_config_sha256"] = config_fingerprint(config)
     return ExperimentRunner(
         args.dataset,
         config,
@@ -98,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
     runner = _runner_from_args(args)
     if args.command == "prepare":
         runner.prepare()
+        return 0
+    if args.command == "precompute":
+        runner.precompute()
         return 0
     if args.command == "run":
         runner.run()

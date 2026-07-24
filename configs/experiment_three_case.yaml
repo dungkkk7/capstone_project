@@ -12,6 +12,8 @@ experiment:
   resume: true
   fail_fast: false
   require_clean_git: false
+  # Parallelize independent samples; B0 -> A0 -> P0 stays ordered per sample.
+  sample_workers: 3
 
 paths:
   result_root: result/experiments
@@ -31,24 +33,32 @@ representation:
 
 llm:
   provider: vertex_ai
-  model_id: gemini-2.5-pro
+  model_id: gemini-3.5-flash
   location: global
   temperature: 0.0
   top_p: 1.0
   candidate_count: 1
   max_output_tokens: 65535
-  # Gemini 2.5 Pro's Vertex REST endpoint rejects thinkingConfig; use provider default.
+  # Use provider-default thinking behavior for Gemini 3.5 Flash.
   thinking_level: null
   request_timeout_sec: 900
   context_window_tokens: 1048576
-  model_spec_source: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/2-5-pro
+  model_spec_source: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-5-flash
   model_spec_verified_date: "2026-07-24"
   context_safety_margin_tokens: 1024
   transport_retries: 2
   rate_limit:
     enabled: true
-    max_wait_seconds: 3600
-    default_retry_after_seconds: 3600
+    # A single case gets at most 60s of inline quota recovery; then it is
+    # checkpointed as WAITING_FOR_QUOTA and picked up by a later backfill run.
+    max_wait_seconds: 60
+    default_retry_after_seconds: 60
+    retry_initial_seconds: 2
+    retry_max_delay_seconds: 60
+    transient_retry_enabled: true
+    transient_max_retries: 3
+    transient_initial_delay_seconds: 2
+    transient_max_delay_seconds: 30
   pricing_plan: standard_paygo_global
   pricing_usd_per_million_input_tokens: 1.25
   pricing_usd_per_million_output_tokens: 10.00
@@ -63,6 +73,8 @@ p0:
   fuzz_iterations: 100
   fuzz_timeout_sec: 0.5
   use_lifting_cache: true
+  # P0 sends only Ghidra pseudocode by default. Set true to also attach brightened.ll.
+  attach_clean_ir: false
 
 build:
   compiler: /usr/bin/clang-21

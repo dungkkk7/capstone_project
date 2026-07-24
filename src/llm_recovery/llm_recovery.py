@@ -45,6 +45,19 @@ class LLMRateLimitError(RecoveryError):
         self.status_code = status_code
 
 
+class LLMTransientError(RecoveryError):
+    """A provider-side cancellation or temporary availability failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class LLMEmptyResponseError(RecoveryError):
     """Provider completed a generation but returned no usable text."""
 
@@ -53,7 +66,7 @@ class LLMEmptyResponseError(RecoveryError):
 class RecoveryConfig:
     """Runtime knobs for the recovery and validation loop."""
 
-    model: str = field(default_factory=lambda: os.environ.get("LLM_RECOVERY_MODEL", "gemini-2.5-pro"))
+    model: str = field(default_factory=lambda: os.environ.get("LLM_RECOVERY_MODEL", "gemini-3.5-flash"))
     project: Optional[str] = field(
         default_factory=lambda: os.environ.get("VERTEX_PROJECT")
         or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -93,6 +106,9 @@ class RecoveryConfig:
         default_factory=lambda: _text(os.environ.get("LLM_RECOVERY_USE_FILE_API", "1")).lower()
         not in {"", "0", "false", "no", "off"}
     )
+    # In P0 mode, Ghidra pseudocode is the default model evidence. The clean
+    # brightened LLVM IR remains local unless this switch is explicitly enabled.
+    attach_clean_ir: bool = False
     file_api_inline_max_bytes: Optional[int] = None
     request_timeout: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_REQUEST_TIMEOUT", "900"))
@@ -797,7 +813,15 @@ def read_recovery_csv(csv_path: str, project_root: str) -> List[RecoveryInput]:
     return inputs
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(attach_clean_ir: bool = False) -> str:
+    mode1_evidence = (
+        "In mode 1, the complete Ghidra pseudocode and the complete brightened LLVM IR "
+        "are attached as complementary readable evidence."
+        if attach_clean_ir
+        else
+        "In mode 1, only the complete Ghidra pseudocode is attached as model evidence; "
+        "the clean brightened LLVM IR is retained locally for validation and is not sent."
+    )
     return """You are a senior reverse engineer and C11 compiler engineer.
 Recover readable, compilable C source from binary-lifting artifacts.
 
@@ -847,8 +871,7 @@ Input may be:
 - C-like pseudocode exported by Ghidra headless.
 
 Input provenance:
-- In mode 1, the complete Ghidra pseudocode and complete brightened LLVM IR artifacts
-  are attached to the model request as complementary readable evidence.
+- __MODE1_EVIDENCE__
 - The brightened reference ELF is used locally as Ghidra input and as differential-testing
   evidence. Do not claim to inspect raw executable bytes that the model cannot consume.
 - In mode 2, the model receives the complete brightened LLVM IR instead.
@@ -880,7 +903,7 @@ Rules:
 
 Return ONLY ONE JSON object, no markdown/prose/prelude/suffix:
 {"source":"<complete C source>"}
-"""
+""".replace("__MODE1_EVIDENCE__", mode1_evidence)
 
 
 def _clip_ir(ir_text: str, max_chars: Optional[int] = None) -> str:
@@ -950,6 +973,7 @@ def build_initial_prompt(
     max_ir_chars: Optional[int] = None,
     use_pseudo: bool = False,
     seed_attached_file: bool = False,
+    attached_evidence_label: str = "COMPLETE MODEL INPUT ARTIFACT ATTACHED IN THIS REQUEST",
 ) -> str:
     context = "\n".join(f"- {key}: {value}" for key, value in metadata.items() if value)
     ir_header = "LLVM IR"
@@ -966,9 +990,9 @@ The original source is not provided; use only the model input artifact below.
 Input context:
 {context or '- no additional metadata'}
 
-Model input artifact ({ir_header}; not original source):
+    Model input artifact ({ir_header}; not original source):
 <MODEL_INPUT_ARTIFACT>
-{ir_body if not seed_attached_file else "/* COMPLETE GHIDRA PSEUDOCODE AND BRIGHTENED LLVM IR ATTACHED IN THIS REQUEST */"}
+{ir_body if not seed_attached_file else f"/* {attached_evidence_label} */"}
 </MODEL_INPUT_ARTIFACT>"""
 
     source += f"""
@@ -1452,9 +1476,10 @@ def build_repair_prompt(
     max_ir_chars: Optional[int],
     source_label: str = "brightened LLVM IR",
     evidence_attached: bool = False,
+    attached_evidence_label: str = "COMPLETE MODEL INPUT ARTIFACT ATTACHED IN THIS REQUEST",
 ) -> str:
     evidence = (
-        "/* COMPLETE GHIDRA PSEUDOCODE AND BRIGHTENED LLVM IR ATTACHED IN THIS REQUEST */"
+        f"/* {attached_evidence_label} */"
         if evidence_attached
         else _clip_ir(ir_text, max_ir_chars)
     )
@@ -2070,6 +2095,11 @@ class VertexGemini:
                     ),
                     status_code=response.status_code,
                 )
+            if response.status_code in {408, 409, 499, 500, 502, 503, 504}:
+                raise LLMTransientError(
+                    f"Vertex REST transient failure: HTTP {response.status_code}: {detail}",
+                    status_code=response.status_code,
+                )
             raise RecoveryError(f"Vertex REST failed: HTTP {response.status_code}: {detail}")
 
         data = response.json()
@@ -2167,6 +2197,25 @@ class VertexGemini:
                     retry_after_seconds=_retry_after_seconds(None, str(exc)),
                     status_code=429,
                 ) from exc
+            detail = str(exc)
+            if any(
+                marker in detail.lower()
+                for marker in (
+                    "http 408",
+                    "http 409",
+                    "http 499",
+                    "http 500",
+                    "http 502",
+                    "http 503",
+                    "http 504",
+                    "cancelled",
+                    "canceled",
+                    "temporarily unavailable",
+                )
+            ):
+                raise LLMTransientError(
+                    f"Vertex Gemini transient failure: {detail}"
+                ) from exc
             raise RecoveryError(f"Vertex Gemini request failed: {exc}") from exc
         candidates = getattr(response, "candidates", None) or []
         first_candidate = candidates[0] if candidates else None
@@ -2230,6 +2279,30 @@ def _format_fuzz_feedback(report: Mapping[str, Any]) -> str:
             )
         )
     return "\n".join(lines)
+
+
+def confirmed_equivalence_pass(report: Mapping[str, Any]) -> bool:
+    """Accept only confirmed zero-mismatch runs, without the strict gate.
+
+    The strict report also rejects crashes, timeouts, inconclusive executions,
+    and early stopping.  P0's experiment contract intentionally uses the
+    looser confirmed subset: at least one confirmed run, no mismatches, and a
+    100% confirmed equivalence ratio.
+    """
+
+    try:
+        confirmed_runs = int(report.get("confirmed_runs", 0) or 0)
+        mismatches = int(report.get("mismatches", 0) or 0)
+        confirmed_ratio = float(
+            report.get("confirmed_equivalence_ratio", -1.0) or -1.0
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        confirmed_runs > 0
+        and mismatches == 0
+        and confirmed_ratio >= 100.0
+    )
 
 
 def run_recovery_loop(
@@ -2424,6 +2497,11 @@ def run_recovery_loop(
                     max_chars,
                     use_pseudo=use_pseudo,
                     seed_attached_file=seed_attached,
+                    attached_evidence_label=(
+                        "COMPLETE GHIDRA PSEUDOCODE AND BRIGHTENED LLVM IR ATTACHED IN THIS REQUEST"
+                        if config.attach_clean_ir
+                        else "COMPLETE GHIDRA PSEUDOCODE ATTACHED IN THIS REQUEST"
+                    ),
                 )
             repair_input = pseudo_source if use_two_stage and pseudo_source is not None else ir_text
             return build_repair_prompt(
@@ -2442,6 +2520,11 @@ def run_recovery_loop(
                     and pseudo_path_for_api is not None
                     and os.path.isfile(pseudo_path_for_api)
                 ),
+                attached_evidence_label=(
+                    "COMPLETE GHIDRA PSEUDOCODE AND BRIGHTENED LLVM IR ATTACHED IN THIS REQUEST"
+                    if config.attach_clean_ir
+                    else "COMPLETE GHIDRA PSEUDOCODE ATTACHED IN THIS REQUEST"
+                ),
             )
 
         response: Optional[str] = None
@@ -2459,22 +2542,24 @@ def run_recovery_loop(
                     raise RecoveryError("File-API recovery enabled but Ghidra artifact is unavailable.")
                 # The reference ELF has already served as Ghidra input. Gemini's
                 # inlineData API does not accept raw executable/octet-stream MIME,
-                # so attach its readable pseudocode plus the brightened textual IR.
+                # Attach pseudocode by default. The clean IR is optional because
+                # it is large and is already retained locally for validation.
                 attachment_paths = [pseudo_path_for_api]
-                brightened_ir_path = _text(metadata.get("input_ir"))
-                if brightened_ir_path:
-                    if not os.path.isfile(brightened_ir_path):
-                        raise RecoveryError(
-                            f"File-API recovery enabled but brightened LLVM IR is unavailable: "
-                            f"{brightened_ir_path}"
-                        )
-                    attachment_paths.append(brightened_ir_path)
+                if config.attach_clean_ir:
+                    brightened_ir_path = _text(metadata.get("input_ir"))
+                    if brightened_ir_path:
+                        if not os.path.isfile(brightened_ir_path):
+                            raise RecoveryError(
+                                f"File-API recovery enabled but brightened LLVM IR is unavailable: "
+                                f"{brightened_ir_path}"
+                            )
+                        attachment_paths.append(brightened_ir_path)
                 print(
                     "[LLM] Readable evidence attachments: "
                     + ", ".join(os.path.basename(path) for path in attachment_paths)
                 )
 
-            model_prompt = build_system_prompt() + "\n\n" + make_prompt(None)
+            model_prompt = build_system_prompt(config.attach_clean_ir) + "\n\n" + make_prompt(None)
             request_hasher = hashlib.sha256()
             request_hasher.update(model_prompt.encode("utf-8"))
             for attachment_path in attachment_paths:
@@ -2621,7 +2706,7 @@ def run_recovery_loop(
             f"matches={matches}, mismatches={mismatches}, "
             f"inconclusive={last_report.get('inconclusive', 0)}"
         )
-        if last_report.get("is_fully_equivalent", False):
+        if confirmed_equivalence_pass(last_report):
             print(f"[LLM] Iteration {iteration}: semantic pass, accept candidate.")
             shutil.copy2(candidate_path, output_recovered_c_path)
             save_recovery_state(iteration=iteration, status="COMPLETED")

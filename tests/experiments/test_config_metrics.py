@@ -39,6 +39,23 @@ def test_p0_must_remain_five_iterations():
         validate_config(config)
 
 
+def test_sample_workers_must_be_positive():
+    config = validated_config()
+    config["experiment"]["sample_workers"] = 0
+    with pytest.raises(ConfigError, match="sample_workers"):
+        validate_config(config)
+
+
+def test_sample_workers_do_not_change_scientific_config_fingerprint():
+    from experiments.config import config_fingerprint
+
+    first = validated_config()
+    second = copy.deepcopy(first)
+    first["experiment"]["sample_workers"] = 1
+    second["experiment"]["sample_workers"] = 8
+    assert config_fingerprint(first) == config_fingerprint(second)
+
+
 def test_a0_cannot_enable_passes():
     config = validated_config()
     config["representation"]["a0"]["allow_passes"] = ["instcombine"]

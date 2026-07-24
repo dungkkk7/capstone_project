@@ -13,6 +13,7 @@ from llm_recovery.llm_recovery import (
     RecoveryConfig,
     RecoveryResult,
     VertexGemini,
+    confirmed_equivalence_pass,
     run_recovery_loop,
 )
 from llvm_pass.britening_ir import brighten_ir, read_native_contract_report
@@ -57,6 +58,7 @@ def build_p0_recovery_config(config: Dict[str, Any]) -> RecoveryConfig:
             config["representation"]["b0"]["ghidra_timeout_sec"]
         ),
         two_stage_recovery=True,
+        attach_clean_ir=bool(config["p0"].get("attach_clean_ir", False)),
         require_json=True,
     )
 
@@ -177,7 +179,7 @@ class P0LegacyAdapter:
             timeout=float(self.config["p0"]["fuzz_timeout_sec"]),
         )
         atomic_write_json(variant / "p0_internal_precheck.json", precheck)
-        if not precheck.get("is_fully_equivalent", False):
+        if not confirmed_equivalence_pass(precheck):
             raise P0PrecheckFailed(precheck)
 
         brightened_reference = (
@@ -210,6 +212,7 @@ class P0LegacyAdapter:
                 self.config["llm"],
                 generation_dir,
                 method=MethodId.P0.value,
+                log_context=f"{sample.sample_id}/{MethodId.P0.value}",
                 event_callback=quota_event_callback,
                 response_metadata_getter=(
                     lambda: dict(model_client.last_response_meta or {})
@@ -345,6 +348,12 @@ class P0LegacyAdapter:
                 "quota": quota_metrics,
             },
         )
+        attach_clean_ir = legacy_config.attach_clean_ir
+        attachment_paths = [str(p0_pseudocode)]
+        attachment_hashes = [sha256_file(p0_pseudocode)]
+        if attach_clean_ir:
+            attachment_paths.insert(0, str(brightened_ll))
+            attachment_hashes.insert(0, sha256_file(brightened_ll))
         representation = RepresentationArtifact(
             method=MethodId.P0,
             primary_path=str(brightened_ll),
@@ -359,14 +368,8 @@ class P0LegacyAdapter:
                 // 3,
             ),
             builder_version=self.VERSION,
-            attachment_paths=[
-                str(brightened_ll),
-                str(p0_pseudocode),
-            ],
-            attachment_sha256=[
-                sha256_file(brightened_ll),
-                sha256_file(p0_pseudocode),
-            ],
+            attachment_paths=attachment_paths,
+            attachment_sha256=attachment_hashes,
             provenance={
                 "source_sha256": sample.original_elf_sha256,
                 "raw_lift_cache_key": lift["cache_key"],
@@ -378,21 +381,15 @@ class P0LegacyAdapter:
                 "max_iterations": 5,
                 "representation_contract": (
                     "brightened LLVM IR plus P0 Ghidra pseudocode"
+                    if attach_clean_ir
+                    else "P0 Ghidra pseudocode only; brightened LLVM IR retained locally"
                 ),
                 "model_freeze": model_freeze,
             },
-            evidence_byte_count=(
-                brightened_ll.stat().st_size
-                + p0_pseudocode.stat().st_size
-            ),
+            evidence_byte_count=sum(Path(path).stat().st_size for path in attachment_paths),
             evidence_token_count=max(
                 1,
-                (
-                    brightened_ll.stat().st_size
-                    + p0_pseudocode.stat().st_size
-                    + 2
-                )
-                // 3,
+                (sum(Path(path).stat().st_size for path in attachment_paths) + 2) // 3,
             ),
         )
         atomic_write_json(

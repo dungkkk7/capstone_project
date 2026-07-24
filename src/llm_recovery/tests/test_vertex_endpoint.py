@@ -20,11 +20,11 @@ from llm_recovery.llm_recovery import (
 
 
 class VertexEndpointTests(unittest.TestCase):
-    def test_gemini_25_pro_defaults_to_global_endpoint(self):
+    def test_gemini_35_flash_defaults_to_global_endpoint(self):
         with patch.dict(os.environ, {}, clear=True):
             config = RecoveryConfig()
 
-        self.assertEqual(config.model, "gemini-2.5-pro")
+        self.assertEqual(config.model, "gemini-3.5-flash")
         self.assertEqual(config.location, "global")
         self.assertEqual(config.thinking_level, "HIGH")
         self.assertEqual(

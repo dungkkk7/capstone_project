@@ -142,11 +142,13 @@ def generate_one_shot(
     config: Dict[str, Any],
     *,
     model_client: VertexGemini | None = None,
+    log_context: str | None = None,
     quota_event_callback: Callable[[str, Dict[str, Any]], None] | None = None,
     quota_controller: QuotaController | None = None,
 ) -> GenerationResult:
     if method not in {MethodId.A0, MethodId.B0}:
         raise ValueError("generate_one_shot only supports A0 and B0")
+    log_label = f"{log_context}/{method.value}" if log_context else method.value
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -245,6 +247,13 @@ def generate_one_shot(
             "token_count_kind": "conservative_estimate_3_utf8_bytes_per_token",
         },
     )
+    print(
+        f"[LLM] {log_label} one-shot prepared | "
+        f"estimated_input_tokens={input_tokens_estimated} | "
+        f"max_output_tokens={llm_config['max_output_tokens']} | "
+        f"request_sha256={request_sha256[:12]}",
+        flush=True,
+    )
 
     response_meta: Dict[str, Any] = {}
     accepted_calls = 0
@@ -296,6 +305,7 @@ def generate_one_shot(
                 llm_config,
                 output,
                 method=method.value,
+                log_context=log_label,
                 event_callback=quota_event_callback,
                 response_metadata_getter=(
                     lambda: dict(client.last_response_meta or {})
@@ -307,7 +317,13 @@ def generate_one_shot(
         attempts = 1 + int(llm_config.get("transport_retries", 0))
         last_error: Exception | None = None
         response = ""
-        for _ in range(attempts):
+        for transport_attempt in range(1, attempts + 1):
+            print(
+                f"[LLM] {log_label} request start | "
+                f"transport_attempt={transport_attempt}/{attempts} | "
+                f"timeout={llm_config['request_timeout_sec']}s",
+                flush=True,
+            )
             try:
                 response = quota.execute(
                     lambda: client.generate(
@@ -322,14 +338,29 @@ def generate_one_shot(
                 )
                 accepted_calls = 1
                 response_meta = dict(client.last_response_meta or {})
+                usage = response_meta.get("usage_metadata") or {}
+                print(
+                    f"[LLM] {log_label} response received | "
+                    f"finishReason={response_meta.get('finish_reason', 'UNSPECIFIED')} | "
+                    f"promptTokens={usage.get('prompt_token_count', usage.get('promptTokenCount', '?'))} | "
+                    f"outputTokens={usage.get('candidates_token_count', usage.get('candidatesTokenCount', '?'))} | "
+                    f"thinkingTokens={usage.get('thoughts_token_count', usage.get('thoughtsTokenCount', '?'))}",
+                    flush=True,
+                )
                 break
             except LLMEmptyResponseError as exc:
                 last_error = exc
                 empty_response_error = exc
                 response_meta = dict(client.last_response_meta or {})
+                print(f"[LLM] {log_label} empty response: {exc}", flush=True)
                 break
             except RecoveryError as exc:
                 last_error = exc
+                print(
+                    f"[LLM] {log_label} request failed on transport attempt "
+                    f"{transport_attempt}/{attempts}: {exc}",
+                    flush=True,
+                )
         quota_metrics = quota.metrics()
         accepted_calls = quota_metrics["accepted_model_call_count"]
         api_attempt_count = quota_metrics["api_attempt_count"]
@@ -337,6 +368,12 @@ def generate_one_shot(
         quota_wait_duration_ms = quota_metrics[
             "quota_wait_duration_ms"
         ]
+        print(
+            f"[LLM] {log_label} request summary | "
+            f"api_attempts={api_attempt_count} | accepted_calls={accepted_calls} | "
+            f"429s={quota_throttle_count} | quota_wait_ms={quota_wait_duration_ms}",
+            flush=True,
+        )
         if not response and accepted_calls == 0:
             raise RecoveryError(
                 "One-shot request failed after "
@@ -403,6 +440,10 @@ def generate_one_shot(
         },
     )
     candidate = extract_candidate(response)
+    print(
+        f"[LLM] {log_label} candidate extracted | chars={len(candidate)}",
+        flush=True,
+    )
     candidate_path = atomic_write_text(output / "candidate.c", candidate)
     usage = response_meta.get("usage_metadata") or {}
     input_tokens = _usage_value(

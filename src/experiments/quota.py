@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Mapping
 from llm_recovery.llm_recovery import (
     LLMEmptyResponseError,
     LLMRateLimitError,
+    LLMTransientError,
 )
 
 from .storage import (
@@ -33,6 +34,7 @@ class QuotaController:
         output_dir: str | Path,
         *,
         method: str,
+        log_context: str | None = None,
         event_callback: Callable[[str, Dict[str, Any]], None] | None = None,
         response_metadata_getter: Callable[[], Mapping[str, Any]] | None = None,
         response_metadata_setter: (
@@ -49,7 +51,30 @@ class QuotaController:
         self.default_retry_after_seconds = float(
             policy.get("default_retry_after_seconds", 3600)
         )
+        self.retry_initial_seconds = float(
+            policy.get(
+                "retry_initial_seconds", self.default_retry_after_seconds
+            )
+        )
+        self.retry_max_delay_seconds = float(
+            policy.get(
+                "retry_max_delay_seconds", self.default_retry_after_seconds
+            )
+        )
+        self.transient_retry_enabled = bool(
+            policy.get("transient_retry_enabled", True)
+        )
+        self.transient_max_retries = int(
+            policy.get("transient_max_retries", 3)
+        )
+        self.transient_initial_delay_seconds = float(
+            policy.get("transient_initial_delay_seconds", 2)
+        )
+        self.transient_max_delay_seconds = float(
+            policy.get("transient_max_delay_seconds", 30)
+        )
         self.method = method
+        self.log_context = log_context or method
         self.event_callback = event_callback
         self.response_metadata_getter = response_metadata_getter
         self.response_metadata_setter = response_metadata_setter
@@ -62,6 +87,7 @@ class QuotaController:
         self.accepted_model_call_count = 0
         self.quota_throttle_count = 0
         self.quota_wait_duration_ms = 0
+        self.transient_retry_count = 0
         self._state: Dict[str, Any] = {}
         self._load_checkpoint()
 
@@ -94,6 +120,9 @@ class QuotaController:
         self.quota_wait_duration_ms = int(
             state.get("quota_wait_duration_ms", 0)
         )
+        self.transient_retry_count = int(
+            state.get("transient_retry_count", 0)
+        )
 
     def _write_state(
         self,
@@ -113,6 +142,7 @@ class QuotaController:
             "accepted_model_call_count": self.accepted_model_call_count,
             "quota_throttle_count": self.quota_throttle_count,
             "quota_wait_duration_ms": self.quota_wait_duration_ms,
+            "transient_retry_count": self.transient_retry_count,
             "max_wait_seconds": self.max_wait_seconds,
             **extra,
         }
@@ -169,6 +199,22 @@ class QuotaController:
         ) or self._now()
         now = self._now()
         remaining = max(0.0, (retry_at - now).total_seconds())
+        if remaining > self.retry_max_delay_seconds:
+            print(
+                f"[LLM] {self.log_context} quota still deferred | "
+                f"retry_after={remaining:.1f}s; leaving checkpoint for backfill",
+                flush=True,
+            )
+            self._emit(
+                "quota_deferred",
+                context,
+                next_retry_at_utc=retry_at.isoformat(),
+                deferred_seconds=remaining,
+                resumed_from_checkpoint=resumed_from_checkpoint,
+            )
+            raise QuotaWaitExceeded(
+                f"{self.method} quota retry deferred until {retry_at.isoformat()}"
+            )
         self._emit(
             "quota_wait_started",
             context,
@@ -207,6 +253,27 @@ class QuotaController:
         self._complete_checkpointed_wait(
             context, resumed_from_checkpoint=True
         )
+
+    def _resume_transient_wait_if_needed(
+        self, context: Mapping[str, Any]
+    ) -> None:
+        if self._state.get("status") != "WAITING_FOR_TRANSIENT_RETRY":
+            return
+        if self._state.get("request_sha256") != context.get(
+            "request_sha256"
+        ):
+            return
+        if self._state.get("iteration") != context.get("iteration"):
+            return
+        retry_at = self._parse_utc(self._state.get("next_retry_at_utc"))
+        remaining = max(0.0, (retry_at - self._now()).total_seconds()) if retry_at else 0.0
+        print(
+            f"[LLM] {self.log_context} resume transient retry | "
+            f"iter={context.get('iteration')} | wait={remaining:.1f}s"
+        )
+        if remaining > 0:
+            self.sleep_fn(remaining)
+        self._write_state("RESUMED", context)
 
     def _response_cache_paths(
         self, context: Mapping[str, Any]
@@ -304,6 +371,8 @@ class QuotaController:
                 )
             return cached_response
         self._resume_wait_if_needed(context)
+        self._resume_transient_wait_if_needed(context)
+        transient_retries = 0
         while True:
             self.api_attempt_count += 1
             self._write_state("REQUESTING", context)
@@ -331,7 +400,11 @@ class QuotaController:
                 requested_wait = (
                     float(exc.retry_after_seconds)
                     if exc.retry_after_seconds is not None
-                    else self.default_retry_after_seconds
+                    else min(
+                        self.retry_initial_seconds
+                        * (2 ** max(0, self.quota_throttle_count - 1)),
+                        self.retry_max_delay_seconds,
+                    )
                 )
                 remaining_budget = max(
                     0.0,
@@ -363,9 +436,44 @@ class QuotaController:
                     max(1.0, requested_wait), remaining_budget
                 )
                 wait_started = self._now()
-                retry_at = wait_started + dt.timedelta(
-                    seconds=wait_seconds
+                deferred_wait = min(
+                    max(1.0, requested_wait), self.retry_max_delay_seconds
                 )
+                retry_at = wait_started + dt.timedelta(
+                    seconds=(
+                        deferred_wait
+                        if requested_wait > self.retry_max_delay_seconds
+                        else wait_seconds
+                    )
+                )
+                if requested_wait > self.retry_max_delay_seconds:
+                    self._write_state(
+                        "WAITING_FOR_QUOTA",
+                        context,
+                        wait_started_at_utc=wait_started.isoformat(),
+                        next_retry_at_utc=retry_at.isoformat(),
+                        provider_error=str(exc),
+                        provider_status_code=exc.status_code,
+                        provider_retry_after_seconds=exc.retry_after_seconds,
+                        requested_wait_seconds=requested_wait,
+                        deferred=True,
+                    )
+                    self._emit(
+                        "quota_deferred",
+                        context,
+                        provider_status_code=exc.status_code,
+                        provider_retry_after_seconds=exc.retry_after_seconds,
+                        requested_wait_seconds=requested_wait,
+                        next_retry_at_utc=retry_at.isoformat(),
+                    )
+                    print(
+                        f"[LLM] {self.log_context} quota HTTP {exc.status_code or 429}; "
+                        f"provider asks {requested_wait:.1f}s, deferred for backfill",
+                        flush=True,
+                    )
+                    raise QuotaWaitExceeded(
+                        f"{self.method} quota wait deferred for {requested_wait:.0f}s"
+                    ) from exc
                 self._write_state(
                     "WAITING_FOR_QUOTA",
                     context,
@@ -384,9 +492,66 @@ class QuotaController:
                     requested_wait_seconds=requested_wait,
                     remaining_wait_budget_seconds=remaining_budget,
                 )
+                print(
+                    f"[LLM] {self.log_context} quota HTTP {exc.status_code or 429}; "
+                    f"retry {self.quota_throttle_count} "
+                    f"in {wait_seconds:.1f}s"
+                )
                 self._complete_checkpointed_wait(
                     context, resumed_from_checkpoint=False
                 )
+                continue
+            except LLMTransientError as exc:
+                if (
+                    not self.transient_retry_enabled
+                    or transient_retries >= self.transient_max_retries
+                ):
+                    self._write_state(
+                        "REQUEST_FAILED",
+                        context,
+                        provider_status_code=exc.status_code,
+                        provider_error=str(exc),
+                        transient_retry_exhausted=True,
+                    )
+                    self._emit(
+                        "transient_retry_exhausted",
+                        context,
+                        provider_status_code=exc.status_code,
+                        provider_error=str(exc),
+                    )
+                    raise
+                delay = min(
+                    self.transient_initial_delay_seconds * (2 ** transient_retries),
+                    self.transient_max_delay_seconds,
+                )
+                transient_retries += 1
+                self.transient_retry_count += 1
+                retry_at = self._now() + dt.timedelta(seconds=delay)
+                self._write_state(
+                    "WAITING_FOR_TRANSIENT_RETRY",
+                    context,
+                    next_retry_at_utc=retry_at.isoformat(),
+                    provider_status_code=exc.status_code,
+                    provider_error=str(exc),
+                    transient_retry_attempt=transient_retries,
+                    transient_max_retries=self.transient_max_retries,
+                    transient_retry_delay_seconds=delay,
+                )
+                self._emit(
+                    "transient_retry_scheduled",
+                    context,
+                    provider_status_code=exc.status_code,
+                    retry_attempt=transient_retries,
+                    max_retries=self.transient_max_retries,
+                    retry_delay_seconds=delay,
+                )
+                print(
+                    f"[LLM] {self.log_context} transient HTTP {exc.status_code or '?'}; "
+                    f"retry {transient_retries}/{self.transient_max_retries} "
+                    f"in {delay:.1f}s (same iteration)"
+                )
+                self.sleep_fn(delay)
+                self._write_state("RESUMED", context)
                 continue
             except Exception:
                 self._write_state("REQUEST_FAILED", context)

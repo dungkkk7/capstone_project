@@ -21,6 +21,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "resume": True,
         "fail_fast": False,
         "require_clean_git": False,
+        # Samples are independent, but methods inside one sample remain
+        # ordered. Keep the default conservative for provider quotas.
+        "sample_workers": 1,
     },
     "paths": {
         "result_root": "result/experiments",
@@ -36,7 +39,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "llm": {
         "provider": "vertex_ai",
-        "model_id": "gemini-2.5-pro",
+        "model_id": "gemini-3.5-flash",
         "location": "global",
         "temperature": 0.0,
         "top_p": 1.0,
@@ -47,15 +50,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "context_window_tokens": 1048576,
         "model_spec_source": (
             "https://docs.cloud.google.com/"
-            "gemini-enterprise-agent-platform/models/gemini/2-5-pro"
+            "gemini-enterprise-agent-platform/models/gemini/3-5-flash"
         ),
         "model_spec_verified_date": "2026-07-24",
         "context_safety_margin_tokens": 1024,
         "transport_retries": 2,
         "rate_limit": {
             "enabled": True,
-            "max_wait_seconds": 3600,
-            "default_retry_after_seconds": 3600,
+            "max_wait_seconds": 60,
+            "default_retry_after_seconds": 60,
+            "retry_initial_seconds": 2,
+            "retry_max_delay_seconds": 60,
+            "transient_retry_enabled": True,
+            "transient_max_retries": 3,
+            "transient_initial_delay_seconds": 2,
+            "transient_max_delay_seconds": 30,
         },
         "fake_response_path": None,
         "pricing_plan": "standard_paygo_global",
@@ -75,6 +84,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fuzz_iterations": 100,
         "fuzz_timeout_sec": 0.5,
         "use_lifting_cache": True,
+        "attach_clean_ir": False,
     },
     "build": {
         "compiler": "/usr/bin/clang-21",
@@ -131,6 +141,15 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
+def config_fingerprint(config: Dict[str, Any]) -> str:
+    """Hash scientific/runtime settings, excluding scheduling-only knobs."""
+    payload = copy.deepcopy(
+        {key: value for key, value in config.items() if not key.startswith("_")}
+    )
+    payload.get("experiment", {}).pop("sample_workers", None)
+    return stable_json_sha256(payload)
+
+
 def _reject_unknown_keys(
     document: Dict[str, Any],
     schema: Dict[str, Any],
@@ -157,9 +176,7 @@ def load_config(path: str | Path, project_root: str | Path) -> Dict[str, Any]:
     config["_project_root"] = str(Path(project_root).resolve())
     _resolve_paths(config)
     validate_config(config)
-    config["_config_sha256"] = stable_json_sha256(
-        {key: value for key, value in config.items() if not key.startswith("_")}
-    )
+    config["_config_sha256"] = config_fingerprint(config)
     return config
 
 
@@ -214,6 +231,12 @@ def validate_config(config: Dict[str, Any]) -> None:
         config["experiment"].get("study_scope") or ""
     ).strip():
         raise ConfigError("experiment.study_scope must not be empty")
+    try:
+        sample_workers = int(config["experiment"].get("sample_workers", 1))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("experiment.sample_workers must be an integer") from exc
+    if sample_workers < 1:
+        raise ConfigError("experiment.sample_workers must be at least 1")
     if int(config["p0"]["max_iterations"]) != 5:
         raise ConfigError("P0 must preserve max_iterations=5")
     if config["representation"]["a0"].get("allow_passes"):
@@ -263,15 +286,25 @@ def validate_config(config: Dict[str, Any]) -> None:
     rate_limit = config["llm"].get("rate_limit") or {}
     max_wait = float(rate_limit.get("max_wait_seconds", 3600))
     default_wait = float(
-        rate_limit.get("default_retry_after_seconds", 3600)
+        rate_limit.get("default_retry_after_seconds", 60)
     )
     if max_wait <= 0 or max_wait > 3600:
         raise ConfigError(
             "llm.rate_limit.max_wait_seconds must be in (0, 3600]"
         )
+    retry_initial = float(rate_limit.get("retry_initial_seconds", 2))
+    retry_max_delay = float(rate_limit.get("retry_max_delay_seconds", 60))
     if default_wait <= 0 or default_wait > 3600:
         raise ConfigError(
             "llm.rate_limit.default_retry_after_seconds must be in (0, 3600]"
+        )
+    if retry_initial <= 0 or retry_initial > 3600:
+        raise ConfigError(
+            "llm.rate_limit.retry_initial_seconds must be in (0, 3600]"
+        )
+    if retry_max_delay <= 0 or retry_max_delay > 3600:
+        raise ConfigError(
+            "llm.rate_limit.retry_max_delay_seconds must be in (0, 3600]"
         )
     if int(config["evaluation"]["min_confirmed_inputs"]) < 1:
         raise ConfigError("evaluation.min_confirmed_inputs must be positive")

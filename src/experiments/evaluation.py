@@ -206,12 +206,25 @@ def discover_inputs(
             "DISCOVERY_REQUIRES_FROZEN_C_SOURCE"
         )
     if not config["fuzz"].get("enabled", True):
+        print(
+            f"[fuzz] sample={sample.sample_id} method={method} "
+            "discovery disabled",
+            flush=True,
+        )
         atomic_write_json(
             output / "fuzz_discovery.json",
             {"enabled": False, "method": method, "inputs": []},
         )
         return []
     seeds = [Path(item["path"]).read_bytes() for item in base_inputs]
+    target_inputs = int(config["fuzz"]["target_accepted_inputs"])
+    per_input_timeout = float(config["evaluation"]["per_input_timeout_sec"])
+    print(
+        f"[fuzz] sample={sample.sample_id} method={method} discovery start | "
+        f"base_inputs={len(seeds)} target={target_inputs} "
+        f"timeout={per_input_timeout}s",
+        flush=True,
+    )
     root = Path(config["_project_root"])
     contract = resolve_input_contract(
         str(root), sample.original_elf_path, only_custom=True
@@ -227,11 +240,20 @@ def discover_inputs(
         config["fuzz"]["seconds_per_method"]
     )
     try:
+        print(
+            f"[fuzz] sample={sample.sample_id} method={method} compile start",
+            flush=True,
+        )
         fuzzer.compile()
+        print(
+            f"[fuzz] sample={sample.sample_id} method={method} compile done; "
+            "differential run start",
+            flush=True,
+        )
         report = fuzzer.run_differential_test(
-            iterations=int(config["fuzz"]["target_accepted_inputs"]),
+            iterations=target_inputs,
             generator=make_bytes_generator(),
-            timeout=float(config["evaluation"]["per_input_timeout_sec"]),
+            timeout=per_input_timeout,
             compare_stderr=bool(config["evaluation"]["compare_stderr"]),
             num_workers=1,
             seed_inputs=seeds,
@@ -242,6 +264,14 @@ def discover_inputs(
         else:
             os.environ["BRIGHTEN_AFL_FUZZ_SECONDS"] = previous_fuzz_seconds
         fuzzer.cleanup()
+
+    print(
+        f"[fuzz] sample={sample.sample_id} method={method} discovery done | "
+        f"runs={report.get('total_runs', 0)} matches={report.get('matches', 0)} "
+        f"mismatches={report.get('mismatches', 0)} "
+        f"inconclusive={report.get('inconclusive', 0)}",
+        flush=True,
+    )
 
     decoded = []
     for encoded in report.get("tested_payloads", []):
@@ -283,6 +313,11 @@ def discover_inputs(
             "report": report,
             "inputs": discovered,
         },
+    )
+    print(
+        f"[fuzz] sample={sample.sample_id} method={method} discovered "
+        f"{len(discovered)} new input(s)",
+        flush=True,
     )
     return discovered
 

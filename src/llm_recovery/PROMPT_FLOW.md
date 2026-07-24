@@ -46,8 +46,10 @@ Mode 1 khong fallback tu dong sang mode 2. Neu Ghidra khong tao duoc pseudocode,
 run mode 1 dung lai de tranh vo tinh doi nguon bang chung. Muon dung IR thi chon
 mode 2 tu dau.
 
-`brightened_ref.bin` va pseudocode Ghidra deu duoc attach raw trong cung request mode 1.
-Pseudocode la bang chung doc chinh; ELF la bang chung binary bo sung de model co them context.
+Trong mode 1, pseudocode Ghidra la bang chung duy nhat duoc gui mac dinh. Clean brightened
+LLVM IR chi duoc attach khi bat `p0.attach_clean_ir: true`; neu khong, IR van duoc giu local
+de brighten/build/fuzz va khong gui cho LLM. ELF chi duoc dung local lam input cho Ghidra
+va differential-testing evidence.
 O mode 2 khong can binary hay Ghidra, chi gui brightened LLVM IR.
 
 ## 2. Cac lop prompt
@@ -74,8 +76,8 @@ Initial prompt dong vai tro task template va gan bang chung cu the:
 
 1. Gan metadata cua sample va mode dang chay.
 2. Dan model input artifact trong block `MODEL_INPUT_ARTIFACT`.
-   Day chi la pseudocode Ghidra co the sai/mat thong tin hoac LLVM IR da duoc tao cho case do,
-   khong phai original source.
+   Day la pseudocode Ghidra (mac dinh) hoac LLVM IR neu mode 2 / tuy chon attach clean IR,
+   co the sai/mat thong tin va khong phai original source.
 3. Tuyet doi khong dua original source, ground-truth C, source dung de semantic checker,
    hoac file tham chieu tu dataset vao request LLM.
 4. Neu la mode Ghidra, yeu cau normalize decompiler noise thanh C11 hop le thay vi copy
@@ -128,7 +130,7 @@ LLM phai tra:
 
 Adapter se parse JSON, lay `source`, compile candidate va dua candidate vao semantic/fuzz check.
 Moi request gui day du system/task prompt va attach nguyen artifact. Input khong bi cat. Request
-dung output ceiling toi da theo model (`65,535` token voi `gemini-2.5-pro`), khong dung cap
+dung output ceiling toi da theo model (`65,535` token voi `gemini-3.5-flash`), khong dung cap
 32K rieng cua adapter. Gioi han recovery van la `max_iter=5`; loi parse/compile/semantic va
 `finishReason` cua provider duoc dua vao feedback cua vong ke tiep.
 
@@ -173,5 +175,5 @@ duy nhat la mode `1`/`ghidra` hoac `2`/`ir`.
 - `recovery_iter*.candidate.c`: source da extract.
 - `recovery_iter*.parse.txt`: loi parse/compile/semantic dung lam feedback.
 
-File attach va message prompt cung nam trong cung request; message noi cach dung evidence,
-con file cung cap noi dung day du ma khong can cat IR.
+File attach va message prompt cung nam trong cung request; mac dinh mode 1 chi attach
+pseudocode Ghidra. Clean IR chi duoc gui khi `p0.attach_clean_ir: true`.
