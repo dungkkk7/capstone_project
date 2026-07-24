@@ -1,0 +1,3 @@
+submission_id,token_count,file_size_bytes,clean_source,obfuscated_binary
+s752471056,1075,2391,data/clean_src/p03199/s752471056.c,data/obfuscated/p03199/s752471056_fla_bcf_instsub.elf
+s333068212,2108,4363,data/clean_src/p00867/s333068212.c,data/obfuscated/p00867/s333068212_fla_bcf_instsub.elf
