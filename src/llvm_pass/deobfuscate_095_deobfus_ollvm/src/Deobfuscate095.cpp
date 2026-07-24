@@ -91,6 +91,16 @@ static cl::opt<bool> DeflattenDebug(
     "095-deflatten-debug", cl::desc("Log transactional dispatcher roots"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> DisableNativeStackMapper(
+    "095-disable-native-stack-mapper",
+    cl::desc("Diagnostic: disable recovered native-stack mapper matching"),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> DisableMemoryEntryFinalize(
+    "095-disable-memory-entry-finalize",
+    cl::desc("Diagnostic: retain the one-shot entry of memory dispatchers"),
+    cl::init(false), cl::Hidden);
+
 struct StageMetrics {
   uint64_t Changes = 0;
   uint64_t Unresolved = 0;
@@ -1074,6 +1084,8 @@ static bool sameStateStorage(Value *Pointer, Value *StatePointer,
   StatePointer = StatePointer->stripPointerCasts();
   if (Pointer == StatePointer || affineEqualPointers(Pointer, StatePointer, DL))
     return true;
+  if (DisableNativeStackMapper)
+    return false;
   Value *Fallback = generatedNativeStackFallback(Pointer);
   return Fallback && affineEqualPointers(Fallback, StatePointer, DL);
 }
@@ -1404,6 +1416,8 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
   if (auto *StateLoad = dyn_cast<LoadInst>(State)) {
     if (deflattenMemoryState(F, Root, StateLoad, DT, AA, Prover, R))
       return true;
+    if (DisableMemoryEntryFinalize)
+      return false;
     return deflattenMemoryEntry(F, Root, StateLoad, DT, AA, Prover, R);
   }
   auto *HeaderPhi = dyn_cast<PHINode>(State);
