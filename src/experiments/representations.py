@@ -95,6 +95,53 @@ class RawLiftService:
         cache_dir = self.cache_root / cache_key
         cache_manifest = cache_dir / "manifest.json"
 
+        # Prefer a complete, provenance-checked artifact already materialized
+        # in this run. This is the safest resume path after an interrupted
+        # preparation: it avoids relifting even when the global cache entry was
+        # not written before the interruption.
+        local_manifest_path = output / "raw_lift_manifest.json"
+        if self.config["p0"].get("use_lifting_cache", True) and local_manifest_path.is_file():
+            try:
+                local = json.loads(local_manifest_path.read_text(encoding="utf-8"))
+                local_bc = Path(str(local.get("raw_bc_path") or raw_bc))
+                local_ll = Path(str(local.get("raw_ll_path") or raw_ll))
+                if not local_bc.is_absolute():
+                    local_bc = output / local_bc
+                if not local_ll.is_absolute():
+                    local_ll = output / local_ll
+                if (
+                    local.get("original_elf_sha256") == sample.original_elf_sha256
+                    and local.get("cache_key") == cache_key
+                    and local_bc.is_file()
+                    and local_ll.is_file()
+                    and sha256_file(local_bc) == local.get("raw_bc_sha256")
+                    and sha256_file(local_ll) == local.get("raw_ll_sha256")
+                ):
+                    print(
+                        f"[cache] raw-lift RUN HIT sample={sample.sample_id} "
+                        f"key={cache_key[:12]}",
+                        flush=True,
+                    )
+                    if local_bc != raw_bc:
+                        shutil.copy2(local_bc, raw_bc)
+                    if local_ll != raw_ll:
+                        shutil.copy2(local_ll, raw_ll)
+                    local_cfg = Path(str(local.get("raw_cfg_path") or ""))
+                    if local_cfg and not local_cfg.is_absolute():
+                        local_cfg = output / local_cfg
+                    result = dict(local)
+                    result.update({
+                        "raw_bc_path": str(raw_bc),
+                        "raw_ll_path": str(raw_ll),
+                        "raw_cfg_path": str(raw_cfg) if raw_cfg.exists() else None,
+                        "cache_hit": True,
+                        "cache_key": cache_key,
+                    })
+                    atomic_write_json(local_manifest_path, result)
+                    return result
+            except (OSError, ValueError, TypeError):
+                pass
+
         if (
             self.config["p0"].get("use_lifting_cache", True)
             and cache_manifest.is_file()

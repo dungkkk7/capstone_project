@@ -62,10 +62,18 @@ def _load_results(run_root: Path) -> list[Dict[str, Any]]:
         result["_path"] = str(path)
         discovery_path = (
             path.parent
-            / "evaluation"
+            / "processing"
             / "discovery"
             / "fuzz_discovery.json"
         )
+        if not discovery_path.is_file():
+            # Compatibility with runs created before the three-phase split.
+            discovery_path = (
+                path.parent
+                / "evaluation"
+                / "discovery"
+                / "fuzz_discovery.json"
+            )
         if discovery_path.is_file():
             result["_discovery"] = load_json(discovery_path)
         results.append(result)

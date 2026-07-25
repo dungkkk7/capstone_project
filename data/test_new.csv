@@ -1,2 +1,8 @@
 submission_id,token_count,file_size_bytes,clean_source,obfuscated_binary
-s752471056,1075,2391,data/clean_src/p03199/s752471056.c,data/obfuscated/p03199/s752471056_fla_bcf_instsub.elf
+s660972586,357,1038,data/clean_src/p01970/s660972586.c,data/obfuscated/p01970/s660972586_fla_bcf_instsub.elf
+s722254321,282,816,data/clean_src/p00165/s722254321.c,data/obfuscated/p00165/s722254321_fla_bcf_instsub.elf
+s942434524,360,745,data/clean_src/p01766/s942434524.c,data/obfuscated/p01766/s942434524_fla_bcf_instsub.elf
+s383039486,319,636,data/clean_src/p02474/s383039486.c,data/obfuscated/p02474/s383039486_fla_bcf_instsub.elf
+s356526576,364,723,data/clean_src/p00327/s356526576.c,data/obfuscated/p00327/s356526576_fla_bcf_instsub.elf
+s836003439,1433,5503,data/clean_src/p03835/s836003439.c,data/obfuscated/p03835/s836003439_fla_bcf_instsub.elf
+s913513064,1103,12630,data/clean_src/p02289/s913513064.c,data/obfuscated/p02289/s913513064_fla_bcf_instsub.elf

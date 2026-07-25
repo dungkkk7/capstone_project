@@ -44,6 +44,49 @@ class Color:
     END = '\033[0m'
 
 
+def _run_experimental_delift_bundle(input_ll, case_output_dir, base_name):
+    """Run the opt-in post-brightening bundle before semantic/recovery stages.
+
+    The repository bundle is intentionally experimental and may reject IR
+    shapes it does not recognize.  Keep the batch moving by returning the
+    original candidate on failure, while preserving a per-case log so an
+    applied/skipped result is never ambiguous.
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bundle_dir = os.path.join(
+        project_root, "src", "llvm_pass", "brighten_100_delift_bundle"
+    )
+    runner = os.path.join(bundle_dir, "run_brighten_delift_pipeline.sh")
+    log_path = os.path.join(case_output_dir, f"{base_name}_delift_bundle.log")
+    output_prefix = os.path.join(case_output_dir, f"{base_name}_delifted")
+    if not os.path.isfile(runner):
+        return input_ll, "missing_runner", log_path
+    try:
+        result = subprocess.run(
+            ["bash", runner, input_ll, output_prefix],
+            capture_output=True,
+            text=True,
+            timeout=float(os.environ.get("BRIGHTEN_DELIFT_TIMEOUT", "180")),
+        )
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(result.stdout or "")
+            handle.write(result.stderr or "")
+        output_ll = f"{output_prefix}.ll"
+        if result.returncode == 0 and os.path.isfile(output_ll):
+            return output_ll, "applied", log_path
+        return input_ll, f"failed_rc_{result.returncode}", log_path
+    except subprocess.TimeoutExpired as exc:
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(exc.stdout or "")
+            handle.write(exc.stderr or "")
+            handle.write("\nexperimental delift bundle timed out\n")
+        return input_ll, "timeout", log_path
+    except Exception as exc:
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(f"experimental delift bundle error: {exc}\n")
+        return input_ll, "error", log_path
+
+
 def _resolve_seed_paths(project_root, binary_path):
     """Resolve seed sources for one binary from `data/seeds/<case>/`.
 
@@ -758,6 +801,41 @@ def main(argv=None):
                         f"{Color.BLUE}        Native contract report: "
                         f"{native_contract_report_path(output_brightened_bc)}{Color.END}"
                     )
+                    semantic_candidate_path = output_brightened_bc
+                    recovery_input_ll = output_brightened_ll
+                    delift_candidate_path = None
+                    if os.path.isfile(
+                        os.path.join(
+                            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "src",
+                            "llvm_pass",
+                            "brighten_100_delift_bundle",
+                            "run_brighten_delift_pipeline.sh",
+                        )
+                    ):
+                        (
+                            delift_candidate,
+                            delift_status,
+                            delift_log,
+                        ) = _run_experimental_delift_bundle(
+                            output_brightened_ll, case_output_dir, base_name
+                        )
+                        case_record["delift_bundle"] = delift_status
+                        case_record["delift_bundle_log"] = delift_log
+                        if delift_status == "applied":
+                            delift_candidate_path = delift_candidate
+                            semantic_candidate_path = delift_candidate
+                            recovery_input_ll = delift_candidate
+                            print(
+                                f"{Color.GREEN}    [✓] Experimental delift "
+                                f"bundle applied: {delift_candidate}{Color.END}"
+                            )
+                        else:
+                            print(
+                                f"{Color.YELLOW}    [!] Experimental delift "
+                                f"bundle {delift_status}; dùng brightened IR "
+                                f"gốc. Log: {delift_log}{Color.END}"
+                            )
                     brightened_count += 1
                     case_record["semantic"] = "unchecked"
                     
@@ -785,13 +863,16 @@ def main(argv=None):
                         # (đang là file1 của baseline semantic check) cho khâu Ghidra + recovery.
                         recovery_reference_binary = path
                         recovery_ref_label = "original"
-                        if os.path.isfile(output_brightened_bc):
+                        if os.path.isfile(semantic_candidate_path):
                             recovery_reference_candidate = os.path.join(case_output_dir, f"{base_name}_brightened_ref.bin")
                             try:
-                                compile_to_binary(output_brightened_bc, recovery_reference_candidate)
+                                compile_to_binary(
+                                    semantic_candidate_path,
+                                    recovery_reference_candidate,
+                                )
                                 if os.path.isfile(recovery_reference_candidate):
                                     recovery_reference_binary = recovery_reference_candidate
-                                    recovery_ref_label = "brightened.bc compiled"
+                                    recovery_ref_label = "post-brightening candidate compiled"
                                     print(f"{Color.BLUE}    [*] Dùng binary tham chiếu để recover: {recovery_reference_candidate}{Color.END}")
                             except Exception:
                                 print(f"{Color.YELLOW}    [!] Không thể biên dịch brightened IR làm reference, fallback về {path}{Color.END}")
@@ -811,7 +892,72 @@ def main(argv=None):
                                 timeout=DEFAULT_EXECUTION_TIMEOUT,
                             )
 
-                        fuzz_report = run_fuzz(output_brightened_bc)
+                        fuzz_report = run_fuzz(semantic_candidate_path)
+                        if delift_candidate_path is not None:
+                            delift_semantic_report_path = os.path.join(
+                                case_output_dir,
+                                f"{base_name}_delift_semantic_report.json",
+                            )
+                            _write_semantic_report(
+                                delift_semantic_report_path, fuzz_report
+                            )
+                            case_record["delift_semantic_report"] = (
+                                delift_semantic_report_path
+                            )
+                            if fuzz_report.get("is_fully_equivalent", False):
+                                case_record["delift_semantic"] = "pass"
+                            else:
+                                brightened_fuzz_report = run_fuzz(
+                                    output_brightened_bc
+                                )
+                                brightened_semantic_report_path = os.path.join(
+                                    case_output_dir,
+                                    f"{base_name}_brightened_semantic_report.json",
+                                )
+                                _write_semantic_report(
+                                    brightened_semantic_report_path,
+                                    brightened_fuzz_report,
+                                )
+                                case_record["brightened_semantic_report"] = (
+                                    brightened_semantic_report_path
+                                )
+                                semantic_candidate_path = output_brightened_bc
+                                recovery_input_ll = output_brightened_ll
+                                fuzz_report = brightened_fuzz_report
+                                if brightened_fuzz_report.get(
+                                    "is_fully_equivalent", False
+                                ):
+                                    case_record["delift_semantic"] = (
+                                        "rejected_regression"
+                                    )
+                                    print(
+                                        f"{Color.YELLOW}    [!] Delift tạo semantic "
+                                        f"regression; fallback về brightened IR."
+                                        f"{Color.END}"
+                                    )
+                                else:
+                                    case_record["delift_semantic"] = (
+                                        "inherited_brightening_nonpass"
+                                    )
+                                    print(
+                                        f"{Color.YELLOW}    [!] Delift non-pass, "
+                                        f"nhưng brightened baseline cũng non-pass; "
+                                        f"lỗi đã tồn tại trước delift.{Color.END}"
+                                    )
+                                try:
+                                    compile_to_binary(
+                                        semantic_candidate_path,
+                                        recovery_reference_candidate,
+                                    )
+                                    recovery_reference_binary = (
+                                        recovery_reference_candidate
+                                    )
+                                    recovery_ref_label = (
+                                        "semantic-gated brightened candidate"
+                                    )
+                                except Exception:
+                                    recovery_reference_binary = path
+                                    recovery_ref_label = "original"
                         # Keep the exact per-case evidence used by the batch
                         # summary.  Console-only reports made failed corpus
                         # runs impossible to audit after temporary fuzz
@@ -856,7 +1002,9 @@ def main(argv=None):
                             )
                             os.environ["BRIGHTEN_MUTATE_SEEDS"] = "structured"
                             try:
-                                valid_domain_report = run_fuzz(output_brightened_bc)
+                                valid_domain_report = run_fuzz(
+                                    semantic_candidate_path
+                                )
                             finally:
                                 if previous_mutation_mode is None:
                                     os.environ.pop("BRIGHTEN_MUTATE_SEEDS", None)
@@ -916,11 +1064,13 @@ def main(argv=None):
                                 "original_binary": path,
                                 "recovery_reference_binary": recovery_reference_binary,
                                 "recovery_reference_label": recovery_ref_label,
-                                "input_ir": output_brightened_ll,
+                                "input_ir": recovery_input_ll,
                                 "case": base_name,
                             }
                             result = run_recovery_loop(
-                                ir_text=_read_llm_ir(output_brightened_ll, case_output_dir),
+                                ir_text=_read_llm_ir(
+                                    recovery_input_ll, case_output_dir
+                                ),
                                 output_recovered_c_path=output_source,
                                 case_output_dir=case_output_dir,
                                 metadata=metadata,

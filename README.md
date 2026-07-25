@@ -75,16 +75,93 @@ Yêu cầu hệ thống đã cài đặt `opt-21`, `clang-21` và `analyzeHeadle
 bash tools/rebuid_pass.sh
 ```
 
-### 3. Chạy Toàn Bộ Chuỗi Thực Nghiệm
+### 3. Chạy Toàn Bộ Chuỗi Thực Nghiệm E2E
+
+Một lệnh dưới đây chạy đúng ba phase có ranh giới artifact rõ ràng:
+
+### Phase 1 — Preparation
+
+Phase này không gọi LLM hoặc fuzzer (`llm_calls=0`, `fuzz_calls=0`). Nó tạo và
+freeze toàn bộ đầu vào mà model sẽ nhận:
+
+- **B0:** Ghidra C-like pseudocode từ original obfuscated ELF;
+- **A0:** raw LLVM IR từ McSema, không chạy brightening/optimization pass;
+- **P0:** raw lift, brightened LLVM IR, internal reference binary và Ghidra
+  pseudocode của brightened reference;
+- deterministic base corpus dùng cho processing/fuzzing.
+
+Mỗi sample có `preparation_manifest.json`; mỗi method có
+`representation/representation_manifest.json`. Hash của primary artifact và
+mọi attachment được kiểm tra lại trước khi processing.
+
+### Phase 2 — Processing
+
+Phase này chỉ tiêu thụ representation đã freeze, không chạy lại lifting,
+brightening hoặc Ghidra:
+
+1. chạy P0 semantic precheck, sau đó gọi LLM (B0/A0 one-shot, P0 repair tối đa
+   5 vòng);
+2. extract và build candidate C;
+3. fuzz discovery từng method;
+4. hợp nhất common union corpus;
+5. chạy original ELF làm oracle và replay P0/A0/B0 trên cùng corpus;
+6. ghi raw comparison data vào `result.json` và `processing/`.
+
+### Phase 3 — Evaluation
+
+Phase này không gọi LLM, compiler hay fuzzer. Nó chỉ đọc raw processing data để:
+
+- tính metric/pass rate/failure funnel;
+- pairwise P0–A0 và P0–B0;
+- bootstrap confidence interval và exact McNemar;
+- tổng hợp token/cost và IR/CFG metrics;
+- sinh CSV, JSON, report Markdown, SVG và dashboard HTML;
+- seal artifact và verify integrity.
+
 Chạy thực nghiệm chuẩn cho tập dữ liệu 40 case:
+
+`experiment_primary.yaml` là chế độ nghiên cứu chính thức và yêu cầu Git
+worktree sạch (`require_clean_git: true`). Hãy commit đúng các thay đổi đã
+chốt trước khi chạy. Không commit artifact/generated files ngoài ý muốn.
+
 ```bash
-python3 -m src.experiments.cli run data/custom_dataset.csv configs/experiment_three_case.yaml --run-id=my_experiment_run
+python3 -m src.experiments.cli e2e data/custom_dataset.csv --config configs/experiment_primary.yaml --run-id=my_experiment_run
 ```
 
 Chạy thử nghiệm Pilot (2 case mẫu) để kiểm tra nhanh pipeline:
+
+Config này cho phép worktree dirty và phù hợp với development/pilot; kết quả
+không được gọi là primary full-dataset outcome.
+
 ```bash
-python3 -m src.experiments.cli run data/custom_dataset.csv configs/experiment_three_case.yaml --run-id=pilot_run --pilot=2
+python3 -m src.experiments.cli e2e data/custom_dataset.csv --config configs/experiment_three_case.yaml --run-id=pilot_run --pilot=2
 ```
+
+`run` vẫn là tên chính thức và tương đương hoàn toàn với alias `e2e`. Nếu bị
+gián đoạn hoặc chờ quota, chạy lại đúng lệnh với cùng `--run-id`; mặc định
+runner sẽ resume từ checkpoint. Lệnh trả exit code `0` khi hoàn tất và `75`
+khi generation đã checkpoint nhưng còn chờ resume. Kết quả cuối nằm tại
+`result/experiments/<run-id>/aggregate/`, còn báo cáo kiểm tra nằm tại
+`result/experiments/<run-id>/integrity_report.json`.
+
+Có thể chạy từng phase độc lập với cùng dataset/config/run-id:
+
+Khi worktree còn thay đổi, dùng `configs/experiment_three_case.yaml` hoặc
+`configs/experiment_pilot.yaml` cho cả ba lệnh dưới đây. Chỉ chuyển sang
+`experiment_primary.yaml` sau khi đã commit và bắt đầu một `run-id` mới.
+
+```bash
+python3 -m src.experiments.cli prepare  data/custom_dataset.csv --config configs/experiment_three_case.yaml --run-id=dev_phase_run
+python3 -m src.experiments.cli process  data/custom_dataset.csv --config configs/experiment_three_case.yaml --run-id=dev_phase_run
+python3 -m src.experiments.cli evaluate data/custom_dataset.csv --config configs/experiment_three_case.yaml --run-id=dev_phase_run
+```
+
+`precompute` là alias tương thích cũ của preparation; `generate` là alias tương
+thích cũ của processing.
+
+Phase contract này dùng experiment manifest schema `3.0`. Không resume run tạo
+bởi harness cũ qua ranh giới phase mới; phải dùng `--run-id` mới để artifact và
+metric provenance không bị trộn.
 
 ### 4. Chạy Hệ Thống Unit Tests
 ```bash

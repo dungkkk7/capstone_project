@@ -7,6 +7,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/CFG.h"
@@ -1856,6 +1857,262 @@ static std::optional<uint64_t> getConstantGEPByteOffset(Value *Ptr,
   return std::nullopt;
 }
 
+struct ConstantAllocaAddress {
+  AllocaInst *Root = nullptr;
+  uint64_t Offset = 0;
+};
+
+static std::optional<ConstantAllocaAddress>
+getConstantAllocaAddress(Value *Ptr, const DataLayout &DL) {
+  if (!Ptr || !Ptr->getType()->isPointerTy())
+    return std::nullopt;
+  APInt Offset(DL.getPointerSizeInBits(0), 0, true);
+  Value *Base =
+      Ptr->stripAndAccumulateConstantOffsets(DL, Offset, true);
+  auto *Root = dyn_cast<AllocaInst>(Base ? Base->stripPointerCasts()
+                                        : nullptr);
+  if (!Root || Offset.isNegative())
+    return std::nullopt;
+  return ConstantAllocaAddress{Root, Offset.getZExtValue()};
+}
+
+static bool instructionMayReach(Instruction *From, Instruction *To) {
+  if (!From || !To || From->getFunction() != To->getFunction())
+    return false;
+  BasicBlock *FromBlock = From->getParent();
+  BasicBlock *ToBlock = To->getParent();
+  if (FromBlock == ToBlock && From->comesBefore(To))
+    return true;
+
+  SmallVector<BasicBlock *, 16> Worklist;
+  SmallPtrSet<BasicBlock *, 32> Seen;
+  for (BasicBlock *Succ : successors(FromBlock))
+    Worklist.push_back(Succ);
+  while (!Worklist.empty()) {
+    BasicBlock *Block = Worklist.pop_back_val();
+    if (Block == ToBlock)
+      return true;
+    if (!Seen.insert(Block).second)
+      continue;
+    for (BasicBlock *Succ : successors(Block))
+      Worklist.push_back(Succ);
+  }
+  return false;
+}
+
+static bool unsignedIntervalsOverlap(uint64_t A, uint64_t ASize, uint64_t B,
+                                     uint64_t BSize) {
+  if (!ASize || !BSize)
+    return false;
+  uint64_t AEnd = 0, BEnd = 0;
+  if (__builtin_add_overflow(A, ASize, &AEnd) ||
+      __builtin_add_overflow(B, BSize, &BEnd))
+    return true;
+  return A < BEnd && B < AEnd;
+}
+
+// After fake-frame compaction, SROA may intentionally retain a byte-array
+// alloca because unrelated scalar fields overlap.  Recover native provenance
+// for an integer load only when a dominating full-width store wrote a native
+// ptrtoint and no later reachable write can clobber that exact frame slot.
+// This lets the final pass remove the guest-object dispatch around a real
+// malloc/callback pointer without classifying arbitrary loaded integers as
+// host pointers.
+static bool containsProvenNativePointerInteger(
+    Value *V, SmallPtrSetImpl<Value *> &Seen);
+
+static AllocaInst *findSyntacticAllocaRoot(
+    Value *V, SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return nullptr;
+  V = V->stripPointerCasts();
+  if (auto *Root = dyn_cast<AllocaInst>(V))
+    return Root;
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return findSyntacticAllocaRoot(GEP->getPointerOperand(), Seen);
+  return nullptr;
+}
+
+static bool isProvenNativeFramePointerIntegerLoad(
+    LoadInst *Load, SmallPtrSetImpl<Value *> &Seen) {
+  if (!Load || !Load->getType()->isIntegerTy() || Load->isVolatile() ||
+      Load->isAtomic())
+    return false;
+  Function *F = Load->getFunction();
+  Module *M = F ? F->getParent() : nullptr;
+  if (!F || !M)
+    return false;
+  const DataLayout &DL = M->getDataLayout();
+  auto LoadAddress = getConstantAllocaAddress(Load->getPointerOperand(), DL);
+  AllocaInst *Root = LoadAddress ? LoadAddress->Root : nullptr;
+  if (!Root) {
+    SmallPtrSet<Value *, 16> RootSeen;
+    Root = findSyntacticAllocaRoot(Load->getPointerOperand(), RootSeen);
+  }
+  if (!Root || !Root->getName().starts_with("native_frame"))
+    return false;
+  TypeSize LoadTypeSize = DL.getTypeStoreSize(Load->getType());
+  if (LoadTypeSize.isScalable())
+    return false;
+  uint64_t LoadSize = LoadTypeSize.getFixedValue();
+
+  DominatorTree DT(*F);
+  StoreInst *Candidate = nullptr;
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      auto *Store = dyn_cast<StoreInst>(&I);
+      if (!Store || Store->isVolatile() || Store->isAtomic() ||
+          Store->getValueOperand()->getType() != Load->getType())
+        continue;
+      if (LoadAddress) {
+        auto StoreAddress =
+            getConstantAllocaAddress(Store->getPointerOperand(), DL);
+        if (!StoreAddress || StoreAddress->Root != Root ||
+            StoreAddress->Offset != LoadAddress->Offset)
+          continue;
+      } else if (Store->getPointerOperand() != Load->getPointerOperand()) {
+        continue;
+      }
+      TypeSize StoreTypeSize =
+          DL.getTypeStoreSize(Store->getValueOperand()->getType());
+      if (StoreTypeSize.isScalable() ||
+          StoreTypeSize.getFixedValue() != LoadSize ||
+          !DT.dominates(Store, Load))
+        continue;
+      if (!containsProvenNativePointerInteger(Store->getValueOperand(), Seen))
+        continue;
+      if (!Candidate || DT.dominates(Candidate, Store))
+        Candidate = Store;
+    }
+  }
+  if (!Candidate)
+    return false;
+
+  auto IsHarmlessWrite = [&](Instruction *Write) {
+    return Write == Candidate || DT.dominates(Write, Candidate) ||
+           !instructionMayReach(Write, Load);
+  };
+
+  if (!LoadAddress) {
+    for (User *U : Load->getPointerOperand()->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I)
+        return false;
+      if (isa<LoadInst>(I))
+        continue;
+      auto *Store = dyn_cast<StoreInst>(I);
+      if (!Store || Store->getPointerOperand() != Load->getPointerOperand())
+        return false;
+      if (IsHarmlessWrite(Store))
+        continue;
+      TypeSize StoreSize =
+          DL.getTypeStoreSize(Store->getValueOperand()->getType());
+      if (StoreSize.isScalable() ||
+          StoreSize.getFixedValue() != LoadSize ||
+          Store->getValueOperand()->getType() != Load->getType() ||
+          !containsProvenNativePointerInteger(Store->getValueOperand(), Seen))
+        return false;
+    }
+    return true;
+  }
+
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        auto Address =
+            getConstantAllocaAddress(Store->getPointerOperand(), DL);
+        if (!Address || Address->Root != Root)
+          continue;
+        TypeSize StoreSize =
+            DL.getTypeStoreSize(Store->getValueOperand()->getType());
+        if (StoreSize.isScalable() ||
+            !unsignedIntervalsOverlap(Address->Offset,
+                                      StoreSize.getFixedValue(),
+                                      LoadAddress->Offset, LoadSize) ||
+            IsHarmlessWrite(Store))
+          continue;
+        if (Address->Offset == LoadAddress->Offset &&
+            StoreSize.getFixedValue() == LoadSize &&
+            Store->getValueOperand()->getType() == Load->getType()) {
+          SmallPtrSet<Value *, 32> NativeSeen;
+          if (containsExplicitNativePointerInteger(
+                  Store->getValueOperand(), NativeSeen))
+            continue;
+        }
+        return false;
+      }
+
+      auto *MI = dyn_cast<MemIntrinsic>(&I);
+      if (MI) {
+        auto Address = getConstantAllocaAddress(MI->getDest(), DL);
+        auto *Length = dyn_cast<ConstantInt>(MI->getLength());
+        if (!Address || Address->Root != Root || !Length ||
+            !unsignedIntervalsOverlap(Address->Offset,
+                                      Length->getZExtValue(),
+                                      LoadAddress->Offset, LoadSize) ||
+            IsHarmlessWrite(MI))
+          continue;
+        return false;
+      }
+
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->doesNotAccessMemory() || isa<MemIntrinsic>(CB) ||
+          IsHarmlessWrite(CB))
+        continue;
+      for (Value *Arg : CB->args()) {
+        auto Address = getConstantAllocaAddress(Arg, DL);
+        if (Address && Address->Root == Root)
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+static bool containsProvenNativePointerInteger(
+    Value *V, SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return false;
+  SmallPtrSet<Value *, 32> ExplicitSeen;
+  if (containsExplicitNativePointerInteger(V, ExplicitSeen))
+    return true;
+  if (auto *Load = dyn_cast<LoadInst>(V))
+    return isProvenNativeFramePointerIntegerLoad(Load, Seen);
+  if (auto *BO = dyn_cast<BinaryOperator>(V))
+    return containsProvenNativePointerInteger(BO->getOperand(0), Seen) ||
+           containsProvenNativePointerInteger(BO->getOperand(1), Seen);
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    return containsProvenNativePointerInteger(Cast->getOperand(0), Seen);
+  if (auto *Freeze = dyn_cast<FreezeInst>(V))
+    return containsProvenNativePointerInteger(Freeze->getOperand(0), Seen);
+  if (auto *Phi = dyn_cast<PHINode>(V)) {
+    bool HasNative = false;
+    for (Value *Incoming : Phi->incoming_values()) {
+      if (auto *CI = dyn_cast<ConstantInt>(Incoming);
+          CI && CI->isZero())
+        continue;
+      if (!containsProvenNativePointerInteger(Incoming, Seen))
+        return false;
+      HasNative = true;
+    }
+    return HasNative;
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    auto *TrueConstant = dyn_cast<Constant>(Sel->getTrueValue());
+    auto *FalseConstant = dyn_cast<Constant>(Sel->getFalseValue());
+    bool TrueNull = TrueConstant && TrueConstant->isNullValue();
+    bool FalseNull = FalseConstant && FalseConstant->isNullValue();
+    bool TrueNative =
+        TrueNull ||
+        containsProvenNativePointerInteger(Sel->getTrueValue(), Seen);
+    bool FalseNative =
+        FalseNull ||
+        containsProvenNativePointerInteger(Sel->getFalseValue(), Seen);
+    return TrueNative && FalseNative && !(TrueNull && FalseNull);
+  }
+  return false;
+}
+
 // Return the GP save-area offsets that are pointer arguments for one
 // printf/scanf format.  The bridge stores every GP register as i64, so the
 // cleanup pass must not translate numeric printf arguments as if they were
@@ -3638,6 +3895,103 @@ static Value *findRecoveredDispatchRawGuestAddress(
       return Address;
   }
   return nullptr;
+}
+
+// Range dispatches are sometimes materialized before the State/stack ABI has
+// exposed the real pointer provenance.  After inlining and SROA, their raw
+// fallback can become an ordinary native pointer (or an inttoptr whose
+// integer expression contains an explicit ptrtoint of one).  Keeping the
+// guest-range selects in that form is both redundant and actively harmful to
+// decompilation: a native `base + index * stride` access appears as a chain of
+// tests against every recovered ELF object.
+//
+// Collapse only dispatches created by materializeRecoveredDataPointer and
+// only when the complete fallback is proven native.  A bare integer ABI
+// argument is deliberately not enough: it may still carry a guest address.
+// The explicit ptrtoint/alloca/argument-pointer provenance below is the same
+// distinction materializeRecoveredDataPointer uses before optimization.
+static Value *findProvenNativeRecoveredDispatchFallback(
+    Value *Pointer, SmallPtrSetImpl<Value *> &Seen) {
+  if (!Pointer || !Pointer->getType()->isPointerTy() ||
+      !Seen.insert(Pointer).second)
+    return nullptr;
+
+  if (auto *Sel = dyn_cast<SelectInst>(Pointer)) {
+    if (!Sel->getName().starts_with("native.data.pointer.select"))
+      return nullptr;
+    return findProvenNativeRecoveredDispatchFallback(
+        Sel->getFalseValue(), Seen);
+  }
+
+  if (auto *ITP = dyn_cast<IntToPtrInst>(Pointer)) {
+    Value *Address = ITP->getOperand(0);
+    SmallPtrSet<Value *, 32> ProvenNativeSeen;
+    if (containsProvenNativePointerInteger(Address, ProvenNativeSeen))
+      return ITP;
+    SmallPtrSet<Value *, 32> StackSeen;
+    if (containsNativeStackInteger(Address, StackSeen))
+      return ITP;
+    if (NativeAffineDebug) {
+      errs() << "brighten-native-cleanup: recovered dispatch fallback lacks "
+                "explicit native provenance: ";
+      Address->printAsOperand(errs(), false);
+      errs() << "\n";
+    }
+    return nullptr;
+  }
+
+  if (auto *Phi = dyn_cast<PHINode>(Pointer)) {
+    for (Value *Incoming : Phi->incoming_values())
+      if (!findProvenNativeRecoveredDispatchFallback(Incoming, Seen))
+        return nullptr;
+    return Phi;
+  }
+
+  if (auto *Cast = dyn_cast<CastInst>(Pointer)) {
+    if (Cast->getType()->isPointerTy() &&
+        Cast->getOperand(0)->getType()->isPointerTy())
+      return findProvenNativeRecoveredDispatchFallback(
+          Cast->getOperand(0), Seen);
+    return nullptr;
+  }
+
+  SmallPtrSet<Value *, 32> NativeSeen;
+  return isNativePointerValue(Pointer, NativeSeen) ? Pointer : nullptr;
+}
+
+static unsigned collapseProvenNativeRecoveredPointerDispatches(
+    Module &M, bool &Changed) {
+  SmallVector<SelectInst *, 128> Dispatches;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *Sel = dyn_cast<SelectInst>(&I);
+            Sel &&
+            Sel->getName().starts_with("native.data.pointer.select"))
+          Dispatches.push_back(Sel);
+  }
+
+  unsigned Collapsed = 0;
+  // Visit outer dispatch arms first.  Replacing their uses exposes the whole
+  // now-dead select tree to cleanupNativeDeadInstructions in one sweep.
+  for (auto It = Dispatches.rbegin(); It != Dispatches.rend(); ++It) {
+    SelectInst *Sel = *It;
+    if (!Sel->getParent() || Sel->use_empty())
+      continue;
+    SmallPtrSet<Value *, 32> Seen;
+    Value *Fallback =
+        findProvenNativeRecoveredDispatchFallback(Sel, Seen);
+    if (!Fallback || Fallback == Sel)
+      continue;
+    if (Fallback->getType() != Sel->getType())
+      continue;
+    Sel->replaceAllUsesWith(Fallback);
+    ++Collapsed;
+    Changed = true;
+  }
+  return Collapsed;
 }
 
 static bool hasValidRecoveredGuestRange(GlobalVariable &GV) {
@@ -6379,8 +6733,17 @@ static unsigned canonicalizeResidualSegmentTypes(Module &M, bool &Changed) {
   return Work.size();
 }
 
-static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
+static unsigned eraseUnusedNativeDataArtifacts(
+    Module &M, bool &Changed, bool DropRecoveredKeepalives = false) {
   unsigned Removed = 0;
+  auto IsTemporaryArtifact = [&](GlobalVariable &GV) {
+    StringRef Name = GV.getName();
+    return Name.starts_with("native_data_") || Name.starts_with("seg_") ||
+           (DropRecoveredKeepalives &&
+            (Name.starts_with("native_residual_") ||
+             Name.starts_with("dyn_bytes_") ||
+             Name.starts_with("g_bytes_") || getGuestRange(GV)));
+  };
 
   // Global-data recovery keeps temporary segment copies alive through
   // llvm.used until this final pass.  Drop only those temporary entries; do
@@ -6396,8 +6759,7 @@ static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
     for (Value *Operand : Array->operands()) {
       Value *Stripped = Operand->stripPointerCasts();
       auto *GV = dyn_cast<GlobalVariable>(Stripped);
-      if (GV && (GV->getName().starts_with("native_data_") ||
-                 GV->getName().starts_with("seg_")))
+      if (GV && IsTemporaryArtifact(*GV))
         continue;
       Kept.push_back(cast<Constant>(Operand));
     }
@@ -6431,8 +6793,7 @@ static unsigned eraseUnusedNativeDataArtifacts(Module &M, bool &Changed) {
 
   SmallVector<GlobalVariable *, 32> DeadGlobals;
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.getName().starts_with("native_data_") &&
-        !GV.getName().starts_with("seg_"))
+    if (!IsTemporaryArtifact(GV))
       continue;
     GV.removeDeadConstantUsers();
     if (GV.use_empty())
@@ -7016,15 +7377,31 @@ static Value *materializeStateConstantForAlloca(Constant *C,
   return Materialized;
 }
 
+static bool isLocalizableStateStorage(const GlobalVariable &GV) {
+  if (GV.getName().contains("__mcsema_reg_state"))
+    return true;
+
+  // A State object can legitimately have several owners in the first cleanup
+  // sweep (for example, an entry wrapper plus a callback).  In that case it is
+  // first lowered to this opaque internal byte backing.  After inlining and
+  // global DCE, a later cleanup sweep may prove that only one owner remains.
+  // Recognize that lowered form as well instead of making the original State
+  // spelling a one-shot precondition for localization.
+  return GV.hasLocalLinkage() &&
+         GV.getName().starts_with("native_register_storage");
+}
+
 // Once startup/dispatcher functions have been removed, a private McSema State
 // object often has users in exactly one native entry function.  Keeping it as
 // a global prevents SROA and makes the final IR retain a hidden register file.
-// Localize only a non-escaping, single-owner object; O3 can then split its
-// constant slots and promote them to ordinary SSA values.
+// This applies both to the original typed object and to the internal byte
+// backing produced by an earlier cleanup sweep.  Localize only a non-escaping,
+// single-owner object; O3 can then split its constant slots and promote them to
+// ordinary SSA values.
 static unsigned localizePrivateStateGlobals(Module &M, bool &Changed) {
   SmallVector<GlobalVariable *, 8> Candidates;
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.getName().contains("__mcsema_reg_state") || GV.isThreadLocal() ||
+    if (!isLocalizableStateStorage(GV) || GV.isThreadLocal() ||
         !GV.hasInitializer() || containsUndefined(GV.getInitializer()))
       continue;
     Function *Owner = nullptr;
@@ -7117,12 +7494,20 @@ static unsigned lowerSharedMcsemaStateBacking(Module &M, bool &Changed) {
     ArrayType *BackingTy = ArrayType::get(Type::getInt8Ty(M.getContext()),
                                           Bytes);
     Constant *Initializer = ConstantAggregateZero::get(BackingTy);
+    // This is an implementation detail of the lifted module, not an exported
+    // ABI object.  Once native callback adapters carry their real arguments
+    // and return values, keeping external linkage prevents GlobalOpt from
+    // deleting write-only architectural outputs.  Those stores also make a
+    // recovered frame address appear to escape, which blocks the following
+    // affine frame compaction.  Internal linkage lets the normal O3 sweep
+    // prove the storage dead without changing any module-visible behavior.
     auto *Backing = new GlobalVariable(
-        M, BackingTy, GV->isConstant(), GV->getLinkage(), Initializer,
+        M, BackingTy, GV->isConstant(), GlobalValue::InternalLinkage, Initializer,
         "native_register_storage", GV, GV->getThreadLocalMode(),
         GV->getAddressSpace(), GV->isExternallyInitialized());
     Backing->copyAttributesFrom(GV);
     Backing->copyMetadata(GV, 0);
+    Backing->setDSOLocal(true);
     if (GV->getAlign())
       Backing->setAlignment(GV->getAlign());
 
@@ -8439,15 +8824,20 @@ boundedDirectScanfDestinationSize(CallBase &CB, Value *Pointer,
 
 static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
                                    uint64_t &MaxSize,
-                                   SmallPtrSetImpl<Value *> &Seen);
+                                   SmallPtrSetImpl<Value *> &Seen,
+                                   const std::function<bool(StoreInst *)>
+                                       *FollowFrameStore = nullptr);
 
 static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
                                    uint64_t &MaxSize,
-                                   SmallPtrSetImpl<Value *> &Seen);
+                                   SmallPtrSetImpl<Value *> &Seen,
+                                   const std::function<bool(StoreInst *)>
+                                       *FollowFrameStore = nullptr);
 
 static bool traceAffineAggregateElementUses(
     Value *Aggregate, ArrayRef<unsigned> Path, const DataLayout &DL,
-    uint64_t &MaxSize, SmallPtrSetImpl<Value *> &Seen) {
+    uint64_t &MaxSize, SmallPtrSetImpl<Value *> &Seen,
+    const std::function<bool(StoreInst *)> *FollowFrameStore) {
   if (!Seen.insert(Aggregate).second)
     return true;
   for (User *U : Aggregate->users()) {
@@ -8461,7 +8851,8 @@ static bool traceAffineAggregateElementUses(
         continue;
       if (Path.size() != Extracted.size())
         return false;
-      if (!traceAffineIntegerUses(Extract, DL, MaxSize, Seen))
+      if (!traceAffineIntegerUses(Extract, DL, MaxSize, Seen,
+                                  FollowFrameStore))
         return false;
       continue;
     }
@@ -8478,7 +8869,8 @@ static bool traceAffineAggregateElementUses(
           continue;
         return false;
       }
-      if (!traceAffineAggregateElementUses(Insert, Path, DL, MaxSize, Seen))
+      if (!traceAffineAggregateElementUses(Insert, Path, DL, MaxSize, Seen,
+                                           FollowFrameStore))
         return false;
       continue;
     }
@@ -8496,12 +8888,15 @@ static bool traceAffineAggregateElementUses(
 
 static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
                                    uint64_t &MaxSize,
-                                   SmallPtrSetImpl<Value *> &Seen) {
+                                   SmallPtrSetImpl<Value *> &Seen,
+                                   const std::function<bool(StoreInst *)>
+                                       *FollowFrameStore) {
   if (!Seen.insert(Integer).second)
     return true;
   for (User *U : Integer->users()) {
     if (auto *ITP = dyn_cast<IntToPtrInst>(U)) {
-      if (!traceAffinePointerUses(ITP, DL, MaxSize, Seen))
+      if (!traceAffinePointerUses(ITP, DL, MaxSize, Seen,
+                                  FollowFrameStore))
         return false;
       continue;
     }
@@ -8510,7 +8905,8 @@ static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
     if (auto *Insert = dyn_cast<InsertValueInst>(U)) {
       if (Insert->getInsertedValueOperand() != Integer ||
           !traceAffineAggregateElementUses(Insert, Insert->getIndices(), DL,
-                                           MaxSize, Seen))
+                                           MaxSize, Seen,
+                                           FollowFrameStore))
         return false;
       continue;
     }
@@ -8522,13 +8918,18 @@ static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
     if (auto *I = dyn_cast<Instruction>(U)) {
       if (isa<BinaryOperator>(I) || isa<CastInst>(I) ||
           isa<SelectInst>(I) || isa<PHINode>(I) || isa<FreezeInst>(I)) {
-        if (!traceAffineIntegerUses(I, DL, MaxSize, Seen))
+        if (!traceAffineIntegerUses(I, DL, MaxSize, Seen,
+                                    FollowFrameStore))
           return false;
         continue;
       }
-      if (auto *SI = dyn_cast<StoreInst>(I))
-        if (SI->getValueOperand() == Integer)
+      if (auto *SI = dyn_cast<StoreInst>(I)) {
+        if (SI->getValueOperand() == Integer) {
+          if (FollowFrameStore && (*FollowFrameStore)(SI))
+            continue;
           return false;
+        }
+      }
     }
     if (NativeAffineDebug) {
       errs() << "brighten-native-cleanup: unbounded affine integer use of ";
@@ -8544,7 +8945,9 @@ static bool traceAffineIntegerUses(Value *Integer, const DataLayout &DL,
 
 static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
                                    uint64_t &MaxSize,
-                                   SmallPtrSetImpl<Value *> &Seen) {
+                                   SmallPtrSetImpl<Value *> &Seen,
+                                   const std::function<bool(StoreInst *)>
+                                       *FollowFrameStore) {
   if (!Seen.insert(Pointer).second)
     return true;
   for (User *U : Pointer->users()) {
@@ -8580,19 +8983,22 @@ static bool traceAffinePointerUses(Value *Pointer, const DataLayout &DL,
     }
     if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getPointerOperand() != Pointer ||
-          !traceAffinePointerUses(GEP, DL, MaxSize, Seen))
+          !traceAffinePointerUses(GEP, DL, MaxSize, Seen,
+                                  FollowFrameStore))
         return false;
       continue;
     }
     if (auto *I = dyn_cast<Instruction>(U)) {
       if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I) ||
           isa<SelectInst>(I) || isa<PHINode>(I) || isa<FreezeInst>(I)) {
-        if (!traceAffinePointerUses(I, DL, MaxSize, Seen))
+        if (!traceAffinePointerUses(I, DL, MaxSize, Seen,
+                                    FollowFrameStore))
           return false;
         continue;
       }
       if (auto *PTI = dyn_cast<PtrToIntInst>(I)) {
-        if (!traceAffineIntegerUses(PTI, DL, MaxSize, Seen))
+        if (!traceAffineIntegerUses(PTI, DL, MaxSize, Seen,
+                                    FollowFrameStore))
           return false;
         continue;
       }
@@ -8646,6 +9052,10 @@ static bool affineIntervalsOverlap(const FrameAffineRange &A, uint64_t ASize,
   return addSignedOffset(A.Max, int64_t(ASize), AEnd) &&
          addSignedOffset(B.Max, int64_t(BSize), BEnd) &&
          A.Min < BEnd && B.Min < AEnd;
+}
+
+static bool affineLoadMayObserveStore(StoreInst *Store, LoadInst *Load) {
+  return instructionMayReach(Store, Load);
 }
 
 static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
@@ -8821,13 +9231,68 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
 
   for (const AffineAddressStore &Store : AddressStores) {
     uint64_t MaxSize = 1;
+    SmallPtrSet<StoreInst *, 16> ActiveFrameCopies;
+    std::function<bool(StoreInst *)> FollowFrameStore;
+    FollowFrameStore = [&](StoreInst *Copy) {
+      if (!ActiveFrameCopies.insert(Copy).second)
+        return true;
+      FrameAffineRange Destination;
+      uint64_t CopySize = 0;
+      if (!Analyzer.evaluate(Copy->getPointerOperand(), Destination) ||
+          Destination.Coeff != 1 ||
+          !fixedAccessSize(DL, Copy->getValueOperand()->getType(), CopySize) ||
+          !AddAccess(Destination, CopySize)) {
+        if (NativeAffineDebug)
+          errs() << "brighten-native-cleanup: affine frame address copy "
+                    "destination refused: "
+                 << *Copy << "\n";
+        ActiveFrameCopies.erase(Copy);
+        return false;
+      }
+      for (const AffineFrameLoad &Reload : Loads) {
+        if (!affineLoadMayObserveStore(Copy, Reload.Inst))
+          continue;
+        if (!affineIntervalsOverlap(Destination, CopySize, Reload.Pointer,
+                                    Reload.Size))
+          continue;
+        // An imprecisely ranged frame access may overlap this slot without
+        // loading the stored address.  Require a full-width integer reload
+        // before propagating address provenance through the copy.
+        if (Reload.Size != CopySize ||
+            Reload.Inst->getType() != Copy->getValueOperand()->getType())
+          continue;
+        SmallPtrSet<Value *, 32> ReloadSeen;
+        if (!traceAffineIntegerUses(Reload.Inst, DL, MaxSize, ReloadSeen,
+                                    &FollowFrameStore)) {
+          if (NativeAffineDebug)
+            errs() << "brighten-native-cleanup: affine frame address copy "
+                      "reload refused: "
+                   << *Reload.Inst << " after " << *Copy << "\n";
+          ActiveFrameCopies.erase(Copy);
+          return false;
+        }
+      }
+      ActiveFrameCopies.erase(Copy);
+      return true;
+    };
     for (const AffineFrameLoad &Load : Loads) {
+      if (!affineLoadMayObserveStore(Store.Inst, Load.Inst))
+        continue;
       if (!affineIntervalsOverlap(Store.Pointer, Store.Size, Load.Pointer,
                                   Load.Size))
         continue;
+      if (Load.Size != Store.Size ||
+          Load.Inst->getType() != Store.Inst->getValueOperand()->getType())
+        continue;
       SmallPtrSet<Value *, 32> Seen;
-      if (!traceAffineIntegerUses(Load.Inst, DL, MaxSize, Seen))
+      if (!traceAffineIntegerUses(Load.Inst, DL, MaxSize, Seen,
+                                  &FollowFrameStore)) {
+        if (NativeAffineDebug)
+          errs() << "brighten-native-cleanup: affine frame address reload "
+                    "refused: "
+                 << *Load.Inst << " from " << *Store.Inst << "\n";
         return Refuse("stored address has an unbounded reloaded use");
+      }
     }
     if (!AddAccess(Store.StoredAddress, MaxSize))
       return Refuse("stored address points outside the proven frame");
@@ -10135,7 +10600,34 @@ static unsigned rewriteResidualQsortArrayArguments(Module &M, bool &Changed) {
   return Work.size();
 }
 
-bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
+bool NativeCleanupPass::finalizeCompactedFrames(Module &M) {
+  bool Changed = false;
+  if (NamedMDNode *Marker =
+          M.getNamedMetadata("brighten.final.frame.compacted")) {
+    Marker->eraseFromParent();
+    Changed = true;
+  }
+
+  unsigned CollapsedNativeDispatches =
+      collapseProvenNativeRecoveredPointerDispatches(M, Changed);
+  if (CollapsedNativeDispatches) {
+    errs() << "  post-frame proven native pointer dispatches collapsed: "
+           << CollapsedNativeDispatches << "\n";
+    cleanupNativeDeadInstructions(M);
+  }
+  unsigned FinalNativeDataArtifacts =
+      eraseUnusedNativeDataArtifacts(M, Changed, true);
+  if (FinalNativeDataArtifacts)
+    errs() << "  final unused recovered data artifacts removed: "
+           << FinalNativeDataArtifacts << "\n";
+  stripRemillMetadata(M, Changed);
+  reportNativeContract(M, 0, 0, true);
+  return Changed;
+}
+
+bool NativeCleanupPass::cleanupModule(
+    Module &M, bool EnforceStrict,
+    bool DeferCompactedFrameFinalization) {
   // The final pipeline element is a verifier, not a second recovery pass.
   // Running the mutation pipeline again after O3 hides phase-ownership bugs.
   if (EnforceStrict) {
@@ -10158,6 +10650,13 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (FinalDynamicGuestPointers)
       errs() << "  final normalized dynamic guest pointers lowered: "
              << FinalDynamicGuestPointers << "\n";
+    unsigned CollapsedNativeDispatches =
+        collapseProvenNativeRecoveredPointerDispatches(M, Changed);
+    if (CollapsedNativeDispatches) {
+      errs() << "  final proven native pointer dispatches collapsed: "
+             << CollapsedNativeDispatches << "\n";
+      cleanupNativeDeadInstructions(M);
+    }
     unsigned FinalStackRecoveredGEPs =
         rewriteRecoveredGlobalStackIndexedGEPs(M, Changed);
     if (FinalStackRecoveredGEPs)
@@ -10182,6 +10681,15 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
       errs() << "  final proven affine fake stack backings converted to "
                 "native frames: "
              << FinalAffineCompactedFrames << "\n";
+    if (FinalAffineCompactedFrames && DeferCompactedFrameFinalization) {
+      M.getOrInsertNamedMetadata("brighten.final.frame.compacted");
+      return Changed;
+    }
+    unsigned FinalNativeDataArtifacts =
+        eraseUnusedNativeDataArtifacts(M, Changed, true);
+    if (FinalNativeDataArtifacts)
+      errs() << "  final unused recovered data artifacts removed: "
+             << FinalNativeDataArtifacts << "\n";
     stripRemillMetadata(M, Changed);
     reportNativeContract(M, 0, 0, true);
     return Changed;
@@ -10615,14 +11123,19 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
     if (!RemovedThisRound)
       break;
   }
-  unsigned SharedStateBackings = lowerSharedMcsemaStateBacking(M, Changed);
-  if (SharedStateBackings)
-    errs() << "  McSema State backing lowered to shared byte storage: "
-           << SharedStateBackings << "\n";
+  // Prefer localizing a single-owner State object before erasing its McSema
+  // identity.  A genuinely multi-owner callback State reaches the shared-byte
+  // fallback below.  If later inlining/DCE turns that internal backing into a
+  // single-owner object, the next cleanup sweep can now localize the lowered
+  // native_register_storage form as well.
   unsigned LocalizedStateGlobals = localizePrivateStateGlobals(M, Changed);
   if (LocalizedStateGlobals)
     errs() << "  private State globals localized: "
            << LocalizedStateGlobals << "\n";
+  unsigned SharedStateBackings = lowerSharedMcsemaStateBacking(M, Changed);
+  if (SharedStateBackings)
+    errs() << "  McSema State backing lowered to shared byte storage: "
+           << SharedStateBackings << "\n";
   unsigned RemovedGlobals = 0;
   unsigned RemovedStateGlobals = 0;
   for (;;) {
@@ -10676,6 +11189,13 @@ bool NativeCleanupPass::cleanupModule(Module &M, bool EnforceStrict) {
   if (LatePointerIntegers)
     errs() << "  late recovered pointer integer identities lowered: "
            << LatePointerIntegers << "\n";
+  unsigned CollapsedNativeDispatches =
+      collapseProvenNativeRecoveredPointerDispatches(M, Changed);
+  if (CollapsedNativeDispatches) {
+    errs() << "  proven native pointer dispatches collapsed: "
+           << CollapsedNativeDispatches << "\n";
+    cleanupNativeDeadInstructions(M);
+  }
   // No recovery step below this point consumes guest-range provenance; remove
   // it now so the final NativeStrict contract remains metadata-free.
   // Keep guest-range provenance across the intervening O3 pipeline.  A later

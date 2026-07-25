@@ -17,8 +17,8 @@ cd "$PASS_DIR"
 echo "==> PASS_DIR: $PASS_DIR"
 echo
 
-# Rebuild sạch toàn bộ pass brighten_*
-for d in brighten_*; do
+# Rebuild sạch toàn bộ pass brighten_* và deobfuscate_*
+for d in brighten_* deobfuscate_*; do
     [[ -d "$d" ]] || continue
     [[ -f "$d/CMakeLists.txt" ]] || {
         echo "==> Skipping $d: no CMakeLists.txt"
@@ -30,7 +30,9 @@ for d in brighten_*; do
     echo "============================================================"
 
     rm -rf "$d/build"
-    cmake -S "$d" -B "$d/build"
+    cmake -S "$d" -B "$d/build" -G Ninja \
+      -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build "$d/build" -j"$(nproc)"
 
     echo

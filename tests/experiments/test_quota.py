@@ -805,7 +805,7 @@ def test_waiting_variant_defers_union_corpus_freeze(tmp_path):
         .read_text()
         .splitlines()
     ]
-    assert events[-1]["event_type"] == "sample_evaluation_deferred"
+    assert events[-1]["event_type"] == "sample_processing_comparison_deferred"
     assert events[-1]["payload"]["blockers"] == [
         "B0:waiting_for_quota"
     ]

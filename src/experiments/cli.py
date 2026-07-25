@@ -53,18 +53,48 @@ def _parser() -> argparse.ArgumentParser:
             ),
         )
 
-    run_parser = subparsers.add_parser("run")
+    run_parser = subparsers.add_parser(
+        "run",
+        aliases=["e2e"],
+        help=(
+            "Run all three phases: freeze model inputs; run LLM/build/fuzz "
+            "processing; then compute metrics, analysis, and visualizations"
+        ),
+    )
     common(run_parser)
-    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser = subparsers.add_parser(
+        "prepare",
+        help=(
+            "Phase 1: freeze corpora and P0/A0/B0 model evidence without "
+            "calling the LLM or fuzzer"
+        ),
+    )
     common(prepare_parser)
     precompute_parser = subparsers.add_parser(
         "precompute",
-        help="Build raw-lift and Ghidra representation caches without LLM calls",
+        help="Backward-compatible alias for prepare (no LLM/fuzz calls)",
     )
     common(precompute_parser)
-    generate_parser = subparsers.add_parser("generate")
+    process_parser = subparsers.add_parser(
+        "process",
+        help=(
+            "Phase 2: consume frozen evidence, call the LLM, build, fuzz, "
+            "and save raw differential results"
+        ),
+    )
+    common(process_parser)
+    generate_parser = subparsers.add_parser(
+        "generate",
+        help="Deprecated alias for process",
+    )
     common(generate_parser)
-    evaluate_parser = subparsers.add_parser("evaluate")
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help=(
+            "Phase 3: compute metrics/statistics and generate reports and "
+            "visualizations from frozen raw results"
+        ),
+    )
     common(evaluate_parser)
     aggregate_parser = subparsers.add_parser("aggregate")
     common(aggregate_parser)
@@ -120,14 +150,16 @@ def main(argv: list[str] | None = None) -> int:
         runner.prepare()
         return 0
     if args.command == "precompute":
-        runner.precompute()
+        runner.prepare()
         return 0
-    if args.command == "run":
-        runner.run()
-        return 0
-    if args.command == "generate":
-        runner.generate()
-        return 0
+    if args.command in {"run", "e2e"}:
+        completed = runner.run()
+        # EX_TEMPFAIL: work is checkpointed but generation must be resumed,
+        # normally after the provider quota window resets.
+        return 0 if completed else 75
+    if args.command in {"process", "generate"}:
+        completed = runner.process()
+        return 0 if completed else 75
     if args.command == "evaluate":
         runner.evaluate()
         return 0

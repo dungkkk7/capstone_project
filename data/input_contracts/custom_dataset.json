@@ -197,15 +197,19 @@
     {
       "case_id": "p00859",
       "submission_id": "s595927985",
-      "kind": "encoded_line_stream",
+      "kind": "slim_span_batches",
       "transport": "stdin",
       "format": "loops of N M followed by M triples until N=0",
-      "termination": "eof",
+      "termination": "0 0",
       "constraints": {
-        "newline_required": true,
-        "max_line_length": 1000
+        "n_min": 1,
+        "n_max": 100,
+        "m_min": 0,
+        "m_max": 5000,
+        "weight_min": 0,
+        "weight_max": 10000000
       },
-      "mutation": "alphabet_only"
+      "mutation": "value_only"
     },
     {
       "case_id": "p01687",

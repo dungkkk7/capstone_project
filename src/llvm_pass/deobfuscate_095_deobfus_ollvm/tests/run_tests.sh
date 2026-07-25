@@ -40,4 +40,7 @@ if rg -q 'call i32 %' "${work_dir}/after.ll"; then
   exit 1
 fi
 
+"${root_dir}/tests/test_opaque_predicates.sh"
+"${root_dir}/tests/test_opaque_select.sh"
+
 echo "095 regression and differential test passed"

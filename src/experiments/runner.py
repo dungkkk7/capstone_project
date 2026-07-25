@@ -45,7 +45,7 @@ from .generation import (
     generate_one_shot,
 )
 from .identity import read_dataset
-from .models import SampleIdentity, VariantResult
+from .models import RepresentationArtifact, SampleIdentity, VariantResult
 from .p0_legacy import P0LegacyAdapter, P0PrecheckFailed
 from .quota import QuotaWaitExceeded
 from .representations import (
@@ -96,6 +96,7 @@ def _git_state(project_root: str) -> Dict[str, Any]:
         "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
         "git_dirty": bool(status_text.strip()),
         "git_status_sha256": sha256_text(status_text),
+        "git_status": status_text.splitlines(),
     }
 
 
@@ -190,11 +191,17 @@ class ExperimentRunner:
                     "Primary reproducibility mode requires a Git commit"
                 )
             if git_state.get("git_dirty"):
+                changed = git_state.get("git_status") or []
+                preview = "; ".join(changed[:12])
+                suffix = " ..." if len(changed) > 12 else ""
                 raise RunIntegrityError(
-                    "Primary reproducibility mode requires a clean Git worktree"
+                    "Primary reproducibility mode requires a clean Git worktree. "
+                    "Commit or stash the intended changes, or use "
+                    "configs/experiment_three_case.yaml for development. "
+                    f"Changed paths: {preview}{suffix}"
                 )
         manifest = {
-            "schema_version": "2.5",
+            "schema_version": "3.0",
             "run_id": self.run_id,
             "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "dataset_path": self.dataset_path,
@@ -211,6 +218,19 @@ class ExperimentRunner:
                 "P0": "legacy_iterative_repair_max_5",
                 "A0": "strict_one_shot",
                 "B0": "strict_one_shot",
+            },
+            "phase_contract": {
+                "preparation": (
+                    "freeze corpus and P0/A0/B0 model evidence; zero LLM calls"
+                ),
+                "processing": (
+                    "LLM generation, build, fuzz discovery, union replay, "
+                    "and raw differential results"
+                ),
+                "evaluation": (
+                    "metrics, statistics, analysis, reports, and visualization; "
+                    "zero LLM/fuzz calls"
+                ),
             },
             "config_sha256": self.config["_config_sha256"],
             "model": {
@@ -335,6 +355,7 @@ class ExperimentRunner:
                 )
             for frozen_field in (
                 "protocols",
+                "phase_contract",
                 "model",
                 "tool_versions",
             ):
@@ -505,102 +526,380 @@ class ExperimentRunner:
 
     def prepare(self) -> None:
         self.initialize()
-        self._seal_audit("prepare")
-
-    def precompute(self) -> None:
-        """Build representation caches without making any LLM request."""
-        self.initialize()
         self.audit.log(
             "command_started",
             status="RUNNING",
-            payload={"command": "precompute", "llm_calls": 0},
+            payload={"command": "prepare", "phase": "preparation"},
         )
         self._run_samples(
-            "precompute",
-            self._precompute_sample,
-            lambda sample: self._precompute_complete(sample),
+            "preparation",
+            self._prepare_input_sample,
+            lambda sample: self._sample_input_prepared(sample),
         )
         self.audit.log(
             "command_work_completed",
             status="COMPLETED",
-            payload={"command": "precompute", "llm_calls": 0},
+            payload={"command": "prepare", "phase": "preparation"},
         )
-        self._seal_audit("precompute")
+        self._seal_audit("prepare")
 
-    def _precompute_complete(self, sample: SampleIdentity) -> bool:
-        if not self.config["experiment"].get("resume", True):
-            return False
-        raw_manifest = self._sample_dir(sample) / "common" / "raw_lift" / "raw_lift_manifest.json"
-        a0_manifest = self._sample_dir(sample) / "A0" / "representation" / "representation_manifest.json"
-        b0_manifest = self._sample_dir(sample) / "B0" / "representation" / "representation_manifest.json"
-        return all(path.is_file() for path in (raw_manifest, a0_manifest, b0_manifest))
-
-    def _precompute_sample(self, sample: SampleIdentity) -> None:
-        print(f"[experiment] precompute sample={sample.sample_id}")
-        sample_dir = self._sample_dir(sample)
-        common_dir = sample_dir / "common"
-        started = time.perf_counter()
-        self.audit.log(
-            "sample_precompute_started",
-            sample_id=sample.sample_id,
-            stage=Stage.REPRESENTATION.value,
-            status="RUNNING",
+    def _base_corpus_manifest_path(self, sample: SampleIdentity) -> Path:
+        return (
+            self._sample_dir(sample)
+            / "common"
+            / "base_corpus"
+            / "corpus_manifest.json"
         )
+
+    def _representation_manifest_path(
+        self, sample: SampleIdentity, method: MethodId
+    ) -> Path:
+        return (
+            self._sample_dir(sample)
+            / method.value
+            / "representation"
+            / "representation_manifest.json"
+        )
+
+    def _load_prepared_representation(
+        self, sample: SampleIdentity, method: MethodId
+    ) -> RepresentationArtifact:
+        manifest_path = self._representation_manifest_path(sample, method)
+        if not manifest_path.is_file():
+            raise RepresentationError(
+                f"{method.value}_REPRESENTATION_MISSING",
+                f"Missing frozen representation: {manifest_path}",
+            )
+        payload = load_json(manifest_path)
+        if payload.get("method") != method.value:
+            raise RepresentationError(
+                f"{method.value}_REPRESENTATION_METHOD_MISMATCH",
+                f"Unexpected method in {manifest_path}",
+            )
+        primary_path = Path(str(payload.get("primary_path") or ""))
+        if (
+            not primary_path.is_file()
+            or sha256_file(primary_path) != payload.get("primary_sha256")
+        ):
+            raise RepresentationError(
+                f"{method.value}_REPRESENTATION_HASH_MISMATCH",
+                f"Frozen primary artifact is missing or changed: {primary_path}",
+            )
+        attachment_paths = payload.get("attachment_paths") or []
+        attachment_hashes = payload.get("attachment_sha256") or []
+        if len(attachment_paths) != len(attachment_hashes):
+            raise RepresentationError(
+                f"{method.value}_ATTACHMENT_MANIFEST_INVALID",
+                "Frozen evidence paths and hashes have different lengths",
+            )
+        for path_value, expected_hash in zip(
+            attachment_paths, attachment_hashes
+        ):
+            path = Path(str(path_value))
+            if not path.is_file() or sha256_file(path) != expected_hash:
+                raise RepresentationError(
+                    f"{method.value}_ATTACHMENT_HASH_MISMATCH",
+                    f"Frozen evidence is missing or changed: {path}",
+                )
+        data = dict(payload)
+        data["method"] = method
+        return RepresentationArtifact(**data)
+
+    def _load_prepared_base_inputs(
+        self, sample: SampleIdentity
+    ) -> list[Dict[str, Any]]:
+        """Load and validate the deterministic input corpus for one sample."""
+
+        manifest_path = self._base_corpus_manifest_path(sample)
+        if not manifest_path.is_file():
+            raise EvaluationError(
+                f"MISSING_BASE_CORPUS_MANIFEST: {manifest_path}"
+            )
+        payload = load_json(manifest_path)
+        if payload.get("sample_id") != sample.sample_id:
+            raise EvaluationError("BASE_CORPUS_SAMPLE_ID_MISMATCH")
+        inputs = payload.get("inputs")
+        if not isinstance(inputs, list) or not inputs:
+            raise EvaluationError("BASE_CORPUS_EMPTY")
+        for item in inputs:
+            if not isinstance(item, dict):
+                raise EvaluationError("BASE_CORPUS_ENTRY_INVALID")
+            path = Path(str(item.get("path") or ""))
+            if not path.is_file():
+                raise EvaluationError(
+                    f"BASE_CORPUS_INPUT_MISSING: {path}"
+                )
+            if sha256_file(path) != item.get("sha256"):
+                raise EvaluationError(
+                    f"BASE_CORPUS_INPUT_HASH_MISMATCH: {path}"
+                )
+            if path.stat().st_size != int(item.get("size", -1)):
+                raise EvaluationError(
+                    f"BASE_CORPUS_INPUT_SIZE_MISMATCH: {path}"
+                )
+        if stable_json_sha256(inputs) != payload.get("corpus_sha256"):
+            raise EvaluationError("BASE_CORPUS_MANIFEST_HASH_MISMATCH")
+        return inputs
+
+    def _prepared_input_available(self, sample: SampleIdentity) -> bool:
         try:
-            raw_lift = self.lift_service.build(
-                sample, common_dir / "raw_lift"
+            self._load_prepared_base_inputs(sample)
+        except (EvaluationError, OSError, TypeError, ValueError):
+            return False
+        return True
+
+    def _sample_input_prepared(self, sample: SampleIdentity) -> bool:
+        return bool(
+            self.config["experiment"].get("resume", True)
+            and self._sample_preparation_ready(sample)
+        )
+
+    def _sample_preparation_ready(self, sample: SampleIdentity) -> bool:
+        if self._p0_backfill_eligible(sample):
+            return False
+        if not self._prepared_input_available(sample):
+            return False
+        manifest_path = self._sample_dir(sample) / "preparation_manifest.json"
+        if not manifest_path.is_file():
+            return False
+        try:
+            manifest = load_json(manifest_path)
+        except (OSError, ValueError):
+            return False
+        if (
+            manifest.get("sample_id") != sample.sample_id
+            or manifest.get("llm_calls") != 0
+            or manifest.get("fuzz_calls") != 0
+            or not manifest.get("ready_for_processing")
+        ):
+            return False
+        for method in self.execution_order:
+            result_path = self._result_path(sample, method)
+            if not result_path.is_file():
+                return False
+            data = load_json(result_path)
+            if (
+                data.get("final_stage") == Stage.FINALIZED.value
+                and not self._is_retryable_llm_failure(data)
+            ):
+                continue
+            try:
+                representation = self._load_prepared_representation(
+                    sample, method
+                )
+            except RepresentationError:
+                return False
+            if not (representation.provenance or {}).get(
+                "prepared_without_llm", method is not MethodId.P0
+            ):
+                return False
+        return True
+
+    def _prepare_input_sample(self, sample: SampleIdentity) -> None:
+        print(
+            f"[experiment] prepare sample={sample.sample_id}",
+            flush=True,
+        )
+        self.audit.log(
+            "sample_preparation_started",
+            sample_id=sample.sample_id,
+            stage=Stage.ENROLLED.value,
+            status="RUNNING",
+            payload={"llm_calls": 0, "fuzz_calls": 0},
+        )
+        started = time.perf_counter()
+        try:
+            output_dir = (
+                self._sample_dir(sample) / "common" / "base_corpus"
             )
-            a0 = self.a0_builder.build(
-                sample,
-                common_dir,
-                sample_dir / "A0" / "representation",
-            )
-            b0 = self.b0_builder.build(
-                sample, sample_dir / "B0" / "representation"
-            )
-            atomic_write_json(
-                sample_dir / "precompute_manifest.json",
-                {
-                    "sample_id": sample.sample_id,
-                    "llm_calls": 0,
-                    "raw_lift_cache_key": raw_lift["cache_key"],
-                    "raw_lift_cache_hit": raw_lift["cache_hit"],
-                    "a0_representation_sha256": a0.primary_sha256,
-                    "b0_representation_sha256": b0.primary_sha256,
-                    "b0_cache_key": b0.provenance.get("cache_key"),
-                    "b0_cache_hit": b0.provenance.get("cache_hit"),
-                    "duration_ms": int(
-                        (time.perf_counter() - started) * 1000
-                    ),
-                },
-            )
-            self.audit.log(
-                "sample_precompute_completed",
-                sample_id=sample.sample_id,
-                stage=Stage.REPRESENTATION.value,
-                status="COMPLETED",
-                payload={
-                    "llm_calls": 0,
-                    "raw_lift_cache_hit": raw_lift["cache_hit"],
-                    "b0_cache_hit": b0.provenance.get("cache_hit"),
-                    "duration_ms": int(
-                        (time.perf_counter() - started) * 1000
-                    ),
-                },
-            )
+            inputs = prepare_base_corpus(sample, output_dir, self.config)
+            # Read back the persisted files so preparation cannot be marked
+            # complete when its manifest or payloads are inconsistent.
+            self._load_prepared_base_inputs(sample)
         except Exception as exc:
             self.audit.log(
-                "sample_precompute_failed",
+                "sample_preparation_failed",
                 sample_id=sample.sample_id,
-                stage=Stage.REPRESENTATION.value,
+                stage=Stage.ENROLLED.value,
                 status="FAILED",
-                payload={"llm_calls": 0, "error": str(exc)},
+                payload={
+                    "llm_calls": 0,
+                    "fuzz_calls": 0,
+                    "error": str(exc),
+                },
             )
             raise
+
+        representation_summary: Dict[str, Any] = {}
+        for method in self.execution_order:
+            result_path = self._result_path(sample, method)
+            if method is MethodId.P0 and self._p0_backfill_eligible(sample):
+                self._archive_p0_backfill(sample)
+            if (
+                self.config["experiment"].get("resume", True)
+                and result_path.is_file()
+            ):
+                existing = load_json(result_path)
+                if (
+                    existing.get("final_stage") == Stage.FINALIZED.value
+                    and not self._is_retryable_llm_failure(existing)
+                ):
+                    representation_summary[method.value] = {
+                        "status": "terminal",
+                        "failure_code": existing.get("failure_code"),
+                    }
+                    continue
+                try:
+                    frozen = self._load_prepared_representation(
+                        sample, method
+                    )
+                except RepresentationError:
+                    frozen = None
+                if frozen is not None:
+                    representation_summary[method.value] = {
+                        "status": "ready_for_llm",
+                        "representation_sha256": frozen.primary_sha256,
+                    }
+                    continue
+
+            result = VariantResult.enrolled(self.run_id, sample, method)
+            variant_dir = self._sample_dir(sample) / method.value
+            method_started = time.perf_counter()
+            self.audit.log(
+                "variant_preparation_started",
+                sample_id=sample.sample_id,
+                method=method.value,
+                stage=Stage.REPRESENTATION.value,
+                status="RUNNING",
+                payload={"llm_calls": 0, "fuzz_calls": 0},
+            )
+            try:
+                if method is MethodId.P0:
+                    representation = self.p0_adapter.prepare(
+                        sample,
+                        self._sample_dir(sample) / "common",
+                        variant_dir,
+                    )
+                elif method is MethodId.A0:
+                    representation = self.a0_builder.build(
+                        sample,
+                        self._sample_dir(sample) / "common",
+                        variant_dir / "representation",
+                    )
+                else:
+                    representation = self.b0_builder.build(
+                        sample, variant_dir / "representation"
+                    )
+                result.representation = representation.to_dict()
+                result.final_stage = Stage.GENERATION
+                result.provenance["prepared_without_llm"] = True
+                result.timing["preparation_duration_ms"] = int(
+                    (time.perf_counter() - method_started) * 1000
+                )
+                self._persist(sample, result)
+                representation_summary[method.value] = {
+                    "status": "ready_for_llm",
+                    "representation_sha256": representation.primary_sha256,
+                    "evidence_sha256": representation.attachment_sha256,
+                }
+                self.audit.log(
+                    "variant_preparation_completed",
+                    sample_id=sample.sample_id,
+                    method=method.value,
+                    stage=Stage.REPRESENTATION.value,
+                    status="READY_FOR_LLM",
+                    payload={
+                        "llm_calls": 0,
+                        "fuzz_calls": 0,
+                        "representation_sha256": (
+                            representation.primary_sha256
+                        ),
+                    },
+                )
+            except Exception as exc:
+                self._finalize_exception(
+                    sample, result, exc, method_started
+                )
+                representation_summary[method.value] = {
+                    "status": "terminal",
+                    "failure_code": result.failure_code,
+                }
+                if self.config["experiment"].get("fail_fast"):
+                    raise
+
+        preparation_manifest = {
+            "schema_version": "1.0",
+            "sample_id": sample.sample_id,
+            "llm_calls": 0,
+            "fuzz_calls": 0,
+            "base_corpus_manifest": str(
+                self._base_corpus_manifest_path(sample)
+            ),
+            "representations": representation_summary,
+            "ready_for_processing": True,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+        atomic_write_json(
+            self._sample_dir(sample) / "preparation_manifest.json",
+            preparation_manifest,
+        )
+        self.audit.log(
+            "sample_preparation_completed",
+            sample_id=sample.sample_id,
+            stage=Stage.REPRESENTATION.value,
+            status="READY_FOR_PROCESSING",
+            payload={
+                "llm_calls": 0,
+                "fuzz_calls": 0,
+                "input_count": len(inputs),
+                "representations": representation_summary,
+                "duration_ms": int(
+                    (time.perf_counter() - started) * 1000
+                ),
+            },
+        )
+
+    def precompute(self) -> None:
+        """Backward-compatible alias for the full preparation phase."""
+
+        self.prepare()
 
     def _sample_complete(self, sample: SampleIdentity) -> bool:
         if not self.config["experiment"].get("resume", True):
             return False
+        return self._sample_processing_output_ready(sample)
+
+    def _sample_processing_output_ready(
+        self, sample: SampleIdentity
+    ) -> bool:
+        return bool(
+            self._sample_processing_ready(sample)
+            and self._processing_manifest_ready(sample)
+        )
+
+    def _processing_manifest_ready(self, sample: SampleIdentity) -> bool:
+        path = self._sample_dir(sample) / "processing_manifest.json"
+        if not path.is_file():
+            return False
+        try:
+            payload = load_json(path)
+        except (OSError, ValueError):
+            return False
+        observed_methods = {
+            item.get("method")
+            for item in payload.get("raw_results") or []
+            if isinstance(item, dict)
+        }
+        return bool(
+            payload.get("sample_id") == sample.sample_id
+            and payload.get("ready_for_evaluation")
+            and observed_methods
+            == {method.value for method in self.methods}
+        )
+
+    def _sample_processing_ready(self, sample: SampleIdentity) -> bool:
+        """Return whether raw per-variant comparison data is finalized."""
+
         if self._p0_backfill_eligible(sample):
             return False
         for method in self.execution_order:
@@ -614,12 +913,55 @@ class ExperimentRunner:
             # the process can be resumed. Keep that sample eligible for a
             # later run so a transient LLM failure is not treated as a final
             # scientific outcome forever.
+            if self._is_retryable_llm_failure(data):
+                return False
+        return True
+
+    @staticmethod
+    def _is_retryable_llm_failure(data: Dict[str, Any]) -> bool:
+        return (
+            data.get("terminal_status")
+            == TerminalStatus.LLM_REQUEST_FAILED.value
+            and str(data.get("failure_code") or "").endswith(
+                "_LLM_REQUEST_FAILED"
+            )
+        )
+
+    def _sample_generation_complete(self, sample: SampleIdentity) -> bool:
+        """Return whether generation may be skipped during a resumed run."""
+        if not self.config["experiment"].get("resume", True):
+            return False
+        return self._sample_generation_ready(sample)
+
+    def _sample_generation_ready(self, sample: SampleIdentity) -> bool:
+        """Return whether every method is terminal or ready for evaluation."""
+
+        if self._p0_backfill_eligible(sample):
+            return False
+        for method in self.execution_order:
+            path = self._result_path(sample, method)
+            if not path.is_file():
+                return False
+            data = load_json(path)
+            if data.get("final_stage") == Stage.FINALIZED.value:
+                if self._is_retryable_llm_failure(data):
+                    return False
+                continue
+            if data.get("terminal_status") == (
+                TerminalStatus.WAITING_FOR_QUOTA.value
+            ):
+                return False
+            generation = data.get("generation") or {}
+            build = data.get("build") or {}
+            candidate_path = generation.get("candidate_path")
+            executable_path = build.get("executable_path")
             if (
-                data.get("terminal_status") == TerminalStatus.LLM_REQUEST_FAILED.value
-                and str(data.get("failure_code") or "").endswith(
-                    "_LLM_REQUEST_FAILED"
-                )
-                ):
+                not candidate_path
+                or not Path(candidate_path).is_file()
+                or not build.get("ok")
+                or not executable_path
+                or not Path(executable_path).is_file()
+            ):
                 return False
         return True
 
@@ -646,7 +988,13 @@ class ExperimentRunner:
         history_dir = p0_dir / "backfill_history" / stamp
         history_dir.mkdir(parents=True, exist_ok=True)
         moved: list[str] = []
-        for name in ("result.json", "representation", "generation", "evaluation"):
+        for name in (
+            "result.json",
+            "representation",
+            "generation",
+            "processing",
+            "evaluation",
+        ):
             source = p0_dir / name
             if not source.exists():
                 continue
@@ -666,7 +1014,7 @@ class ExperimentRunner:
             flush=True,
         )
 
-    def _sample_evaluation_blockers(
+    def _sample_processing_blockers(
         self, sample: SampleIdentity
     ) -> list[str]:
         """Return variants that could still contribute discovery inputs.
@@ -703,18 +1051,47 @@ class ExperimentRunner:
                 blockers.append(f"{method.value}:generation_not_ready")
         return blockers
 
-    def run(self) -> None:
+    def _sample_evaluation_blockers(
+        self, sample: SampleIdentity
+    ) -> list[str]:
+        """Compatibility alias for the former phase terminology."""
+
+        return self._sample_processing_blockers(sample)
+
+    def run(self) -> bool:
         self.initialize()
-        self.audit.log("command_started", status="RUNNING", payload={"command": "run"})
+        workflow = [
+            "preparation",
+            "processing",
+            "evaluation",
+        ]
+        self.audit.log(
+            "command_started",
+            status="RUNNING",
+            payload={"command": "run", "workflow": workflow},
+        )
+        print(
+            "[experiment] E2E phase 1/3 PREPARATION: corpus + frozen LLM evidence",
+            flush=True,
+        )
         self._run_samples(
-            "generate",
+            "preparation",
+            self._prepare_input_sample,
+            lambda sample: self._sample_input_prepared(sample),
+        )
+        print(
+            "[experiment] E2E phase 2/3 PROCESSING: LLM + build + fuzz/compare",
+            flush=True,
+        )
+        self._run_samples(
+            "llm-build",
             self._generate_sample,
-            lambda sample: self._sample_complete(sample),
+            lambda sample: self._sample_generation_complete(sample),
         )
         pending_generation = [
             sample.sample_id
             for sample in self.samples
-            if not self._sample_complete(sample)
+            if not self._sample_generation_ready(sample)
         ]
         if pending_generation:
             self.audit.log(
@@ -730,17 +1107,39 @@ class ExperimentRunner:
                 flush=True,
             )
             self._seal_audit("run-deferred-generation")
-            return
+            return False
         self._run_samples(
-            "evaluate",
-            self._evaluate_sample,
+            "fuzz-compare",
+            self._process_comparison_sample,
             lambda sample: self._sample_complete(sample),
+        )
+        pending_processing = [
+            sample.sample_id
+            for sample in self.samples
+            if not self._sample_processing_output_ready(sample)
+        ]
+        if pending_processing:
+            self.audit.log(
+                "processing_incomplete",
+                stage=Stage.UNION_REPLAY.value,
+                status="INCOMPLETE",
+                payload={"pending_sample_ids": pending_processing},
+            )
+            self._seal_audit("run-incomplete-processing")
+            return False
+        print(
+            "[experiment] E2E phase 3/3 EVALUATION: metrics + analysis + visualization",
+            flush=True,
         )
         self._aggregate_outputs()
         self.audit.log(
             "command_work_completed",
             status="COMPLETED",
-            payload={"command": "run"},
+            payload={"command": "run", "workflow": workflow},
+        )
+        print(
+            "[experiment] sealing artifacts and verifying integrity",
+            flush=True,
         )
         self._seal_audit("run")
         verify_run_integrity(
@@ -749,45 +1148,129 @@ class ExperimentRunner:
             self.methods,
             attach_clean_ir=bool(self.config["p0"].get("attach_clean_ir", False)),
         )
+        print(
+            f"[experiment] E2E complete: {self.run_root}",
+            flush=True,
+        )
+        return True
 
-    def generate(self) -> None:
+    def process(self) -> bool:
         self.initialize()
         self.audit.log(
-            "command_started", status="RUNNING", payload={"command": "generate"}
+            "command_started", status="RUNNING", payload={"command": "process"}
         )
+        unprepared = [
+            sample.sample_id
+            for sample in self.samples
+            if not self._sample_preparation_ready(sample)
+        ]
+        if unprepared:
+            raise RunIntegrityError(
+                "Processing requires frozen preparation artifacts for: "
+                + ", ".join(unprepared)
+            )
         self._run_samples(
-            "generate",
+            "llm-build",
             self._generate_sample,
+            lambda sample: self._sample_generation_complete(sample),
+        )
+        if not all(
+            self._sample_generation_ready(sample) for sample in self.samples
+        ):
+            self._seal_audit("process-deferred-generation")
+            return False
+        self._run_samples(
+            "fuzz-compare",
+            self._process_comparison_sample,
             lambda sample: self._sample_complete(sample),
+        )
+        completed = all(
+            self._sample_processing_output_ready(sample)
+            for sample in self.samples
         )
         self.audit.log(
             "command_work_completed",
-            status="COMPLETED",
-            payload={"command": "generate"},
+            status="COMPLETED" if completed else "INCOMPLETE",
+            payload={"command": "process"},
         )
-        self._seal_audit("generate")
+        self._seal_audit("process")
+        return completed
 
-    def evaluate(self) -> None:
+    def generate(self) -> bool:
+        """Backward-compatible alias for the standardized processing phase."""
+
+        return self.process()
+
+    def evaluate(self) -> Dict[str, Any]:
         self.initialize()
         self.audit.log(
             "command_started", status="RUNNING", payload={"command": "evaluate"}
         )
-        self._run_samples(
-            "evaluate",
-            self._evaluate_sample,
-            lambda sample: self._sample_complete(sample),
-        )
+        incomplete = [
+            sample.sample_id
+            for sample in self.samples
+            if not self._sample_processing_output_ready(sample)
+        ]
+        if incomplete:
+            raise RunIntegrityError(
+                "Evaluation requires finalized raw comparison data for: "
+                + ", ".join(incomplete)
+            )
+        aggregate = self._aggregate_outputs()
         self.audit.log(
             "command_work_completed",
             status="COMPLETED",
             payload={"command": "evaluate"},
         )
         self._seal_audit("evaluate")
+        verify_run_integrity(
+            self.run_root,
+            self.samples,
+            self.methods,
+            attach_clean_ir=bool(
+                self.config["p0"].get("attach_clean_ir", False)
+            ),
+        )
+        return aggregate
 
     def _aggregate_outputs(self) -> Dict[str, Any]:
         from .reporting import aggregate_run
 
+        started = time.perf_counter()
         aggregate = aggregate_run(self.run_root, self.config)
+        output_paths = [
+            self.run_root / "aggregate" / name
+            for name in (
+                "metrics.json",
+                "metrics_long.csv",
+                "statistics.json",
+                "report.md",
+                "dashboard.html",
+                "figures_manifest.json",
+            )
+        ]
+        atomic_write_json(
+            self.run_root / "evaluation_manifest.json",
+            {
+                "schema_version": "1.0",
+                "phase": "evaluation",
+                "input_scope": "frozen processing result.json files",
+                "llm_calls": 0,
+                "fuzz_calls": 0,
+                "duration_ms": int(
+                    (time.perf_counter() - started) * 1000
+                ),
+                "outputs": [
+                    {
+                        "path": str(path),
+                        "sha256": sha256_file(path),
+                        "size_bytes": path.stat().st_size,
+                    }
+                    for path in output_paths
+                    if path.is_file()
+                ],
+            },
+        )
         self.audit.log(
             "aggregate_generated",
             stage=Stage.FINALIZED.value,
@@ -883,60 +1366,27 @@ class ExperimentRunner:
 
     def _generate_sample(self, sample: SampleIdentity) -> None:
         print(
-            f"[experiment] generate sample={sample.sample_id} stage=base-corpus start",
+            f"[experiment] process sample={sample.sample_id} stage=llm start",
             flush=True,
         )
         self.audit.log(
-            "sample_generation_started",
+            "sample_processing_started",
             sample_id=sample.sample_id,
-            stage=Stage.REPRESENTATION.value,
+            stage=Stage.GENERATION.value,
             status="RUNNING",
         )
         sample_dir = self._sample_dir(sample)
-        common_dir = sample_dir / "common"
-        try:
-            base_inputs = prepare_base_corpus(
-                sample, common_dir / "base_corpus", self.config
+        if not self._sample_preparation_ready(sample):
+            raise RunIntegrityError(
+                f"Sample {sample.sample_id} is not prepared; run prepare first"
             )
-            print(
-                f"[experiment] sample={sample.sample_id} stage=base-corpus "
-                f"done inputs={len(base_inputs)}",
-                flush=True,
-            )
-        except Exception as exc:
-            for method in self.methods:
-                result_path = self._result_path(sample, method)
-                if result_path.is_file():
-                    existing = load_json(result_path)
-                    if existing.get("final_stage") == Stage.FINALIZED.value:
-                        continue
-                    result = VariantResult.from_dict(existing)
-                else:
-                    result = VariantResult.enrolled(
-                        self.run_id, sample, method
-                    )
-                result.provenance["common_corpus_error"] = str(exc)
-                self._finalize_exception(
-                    sample,
-                    result,
-                    EvaluationError("COMMON_BASE_CORPUS_PREPARE_FAILED"),
-                    time.perf_counter(),
-                )
-            return
 
         for method in self.execution_order:
             existing_path = self._result_path(sample, method)
-            if method is MethodId.P0 and self._p0_backfill_eligible(sample):
-                self._archive_p0_backfill(sample)
             if self.config["experiment"].get("resume", True) and existing_path.is_file():
                 existing = load_json(existing_path)
-                retryable_llm_failure = (
-                    existing.get("final_stage") == Stage.FINALIZED.value
-                    and existing.get("terminal_status")
-                    == TerminalStatus.LLM_REQUEST_FAILED.value
-                    and str(existing.get("failure_code") or "").endswith(
-                        "_LLM_REQUEST_FAILED"
-                    )
+                retryable_llm_failure = self._is_retryable_llm_failure(
+                    existing
                 )
                 if (
                     existing.get("final_stage") == Stage.FINALIZED.value
@@ -945,28 +1395,40 @@ class ExperimentRunner:
                     continue
                 if existing.get("generation") and (existing.get("build") or {}).get("ok"):
                     continue
+            existing = (
+                load_json(existing_path)
+                if existing_path.is_file()
+                else None
+            )
             result = VariantResult.enrolled(self.run_id, sample, method)
+            if existing and existing.get("representation"):
+                result.representation = existing["representation"]
+                result.timing.update(existing.get("timing") or {})
+                result.provenance.update(existing.get("provenance") or {})
             variant_dir = sample_dir / method.value
             started = time.perf_counter()
             print(
                 f"[experiment] sample={sample.sample_id} method={method.value} "
-                "stage=representation start",
+                "stage=llm start",
                 flush=True,
             )
             self.audit.log(
                 "variant_generation_started",
                 sample_id=sample.sample_id,
                 method=method.value,
-                stage=Stage.REPRESENTATION.value,
+                stage=Stage.GENERATION.value,
                 status="RUNNING",
             )
             try:
+                representation = self._load_prepared_representation(
+                    sample, method
+                )
                 if method is MethodId.P0:
                     p0_started = time.perf_counter()
-                    p0 = self.p0_adapter.run(
+                    p0 = self.p0_adapter.process(
                         sample,
-                        common_dir,
                         variant_dir,
+                        representation=representation,
                         quota_event_callback=self._quota_event_callback(
                             sample, result
                         ),
@@ -986,34 +1448,12 @@ class ExperimentRunner:
                     )
                     print(
                         f"[experiment] sample={sample.sample_id} method=P0 "
-                        "stage=representation+llm done "
+                        "stage=llm+repair done "
                         f"duration_ms={result.timing['p0_legacy_pipeline_duration_ms']}",
                         flush=True,
                     )
                 elif method is MethodId.A0:
-                    representation_started = time.perf_counter()
-                    representation = self.a0_builder.build(
-                        sample,
-                        common_dir,
-                        variant_dir / "representation",
-                    )
-                    result.timing["representation_duration_ms"] = int(
-                        (time.perf_counter() - representation_started) * 1000
-                    )
-                    result.representation = representation.to_dict()
-                    print(
-                        f"[experiment] sample={sample.sample_id} method=A0 "
-                        "stage=representation done "
-                        f"duration_ms={result.timing['representation_duration_ms']} "
-                        f"cache_hit={(representation.provenance or {}).get('cache_hit')}",
-                        flush=True,
-                    )
                     generation_started = time.perf_counter()
-                    print(
-                        f"[experiment] sample={sample.sample_id} method=A0 "
-                        "stage=llm start",
-                        flush=True,
-                    )
                     generation = generate_one_shot(
                         method,
                         representation,
@@ -1036,27 +1476,7 @@ class ExperimentRunner:
                     candidate_path = generation.candidate_path
                     result.provenance["protocol"] = "strict_one_shot"
                 else:
-                    representation_started = time.perf_counter()
-                    representation = self.b0_builder.build(
-                        sample, variant_dir / "representation"
-                    )
-                    result.timing["representation_duration_ms"] = int(
-                        (time.perf_counter() - representation_started) * 1000
-                    )
-                    result.representation = representation.to_dict()
-                    print(
-                        f"[experiment] sample={sample.sample_id} method=B0 "
-                        "stage=representation done "
-                        f"duration_ms={result.timing['representation_duration_ms']} "
-                        f"cache_hit={(representation.provenance or {}).get('cache_hit')}",
-                        flush=True,
-                    )
                     generation_started = time.perf_counter()
-                    print(
-                        f"[experiment] sample={sample.sample_id} method=B0 "
-                        "stage=llm start",
-                        flush=True,
-                    )
                     generation = generate_one_shot(
                         method,
                         representation,
@@ -1141,33 +1561,33 @@ class ExperimentRunner:
                 if self.config["experiment"].get("fail_fast"):
                     raise
 
-    def _evaluate_sample(self, sample: SampleIdentity) -> None:
-        blockers = self._sample_evaluation_blockers(sample)
+    def _process_comparison_sample(self, sample: SampleIdentity) -> None:
+        """Produce frozen raw differential data; do not aggregate metrics."""
+
+        blockers = self._sample_processing_blockers(sample)
         if blockers:
             self.audit.log(
-                "sample_evaluation_deferred",
+                "sample_processing_comparison_deferred",
                 sample_id=sample.sample_id,
                 stage=Stage.FUZZ_DISCOVERY.value,
                 status="WAITING_FOR_GENERATION",
                 payload={"blockers": blockers},
             )
             print(
-                f"[experiment] defer evaluation sample={sample.sample_id}: "
+                f"[experiment] defer processing sample={sample.sample_id}: "
                 + ", ".join(blockers)
             )
             return
-        print(f"[experiment] evaluate sample={sample.sample_id}")
+        print(f"[experiment] fuzz/compare sample={sample.sample_id}")
         self.audit.log(
-            "sample_evaluation_started",
+            "sample_processing_comparison_started",
             sample_id=sample.sample_id,
             stage=Stage.FUZZ_DISCOVERY.value,
             status="RUNNING",
         )
         sample_dir = self._sample_dir(sample)
         common_dir = sample_dir / "common"
-        base_inputs = prepare_base_corpus(
-            sample, common_dir / "base_corpus", self.config
-        )
+        base_inputs = self._load_prepared_base_inputs(sample)
         print(
             f"[experiment] sample={sample.sample_id} stage=base-corpus "
             f"ready inputs={len(base_inputs)}",
@@ -1243,7 +1663,7 @@ class ExperimentRunner:
                     state["candidate_path"],
                     base_inputs,
                     method.value,
-                    variant_dir / "evaluation" / "discovery",
+                    variant_dir / "processing" / "discovery",
                     self.config,
                 )
                 discoveries.append(discovered)
@@ -1257,7 +1677,8 @@ class ExperimentRunner:
                 self._finalize_exception(
                     sample, result, exc, state["started"]
                 )
-                state["evaluation_failed"] = True
+
+                state["comparison_failed"] = True
 
         union, corpus_hash = build_union_corpus(
             base_inputs, discoveries, common_dir
@@ -1293,7 +1714,7 @@ class ExperimentRunner:
             flush=True,
         )
         for method, state in active.items():
-            if state.get("evaluation_failed"):
+            if state.get("comparison_failed"):
                 continue
             result: VariantResult = state["result"]
             build = state["build"]
@@ -1309,7 +1730,7 @@ class ExperimentRunner:
                     union,
                     corpus_hash,
                     reference,
-                    sample_dir / method.value / "evaluation",
+                    sample_dir / method.value / "processing",
                     self.config,
                 )
                 print(
@@ -1342,6 +1763,9 @@ class ExperimentRunner:
                     (time.perf_counter() - state["started"]) * 1000
                 )
                 result.timing["evaluation_duration_ms"] = evaluation_duration
+                result.timing[
+                    "processing_comparison_duration_ms"
+                ] = evaluation_duration
                 result.timing["total_duration_ms"] = (
                     result.timing.get("generation_pipeline_duration_ms", 0)
                     + evaluation_duration
@@ -1351,6 +1775,48 @@ class ExperimentRunner:
                 self._finalize_exception(
                     sample, result, exc, state["started"]
                 )
+
+        raw_results = []
+        for method in self.methods:
+            result_path = self._result_path(sample, method)
+            data = load_json(result_path)
+            raw_results.append(
+                {
+                    "method": method.value,
+                    "result_path": str(result_path),
+                    "result_sha256": sha256_file(result_path),
+                    "terminal_status": data.get("terminal_status"),
+                    "failure_code": data.get("failure_code"),
+                    "has_differential_data": bool(data.get("evaluation")),
+                }
+            )
+        atomic_write_json(
+            sample_dir / "processing_manifest.json",
+            {
+                "schema_version": "1.0",
+                "sample_id": sample.sample_id,
+                "phase": "processing",
+                "union_corpus_sha256": corpus_hash,
+                "reference_sha256": sample.original_elf_sha256,
+                "raw_results": raw_results,
+                "ready_for_evaluation": True,
+            },
+        )
+        self.audit.log(
+            "sample_processing_completed",
+            sample_id=sample.sample_id,
+            stage=Stage.FINALIZED.value,
+            status="READY_FOR_EVALUATION",
+            payload={
+                "union_corpus_sha256": corpus_hash,
+                "raw_result_count": len(raw_results),
+            },
+        )
+
+    def _evaluate_sample(self, sample: SampleIdentity) -> None:
+        """Compatibility alias for callers using the former phase name."""
+
+        self._process_comparison_sample(sample)
 
     def _finalize_exception(
         self,
@@ -1639,6 +2105,52 @@ def verify_run_integrity(
     elif (root / ARTIFACT_MANIFEST_PATH).is_file():
         errors.append("artifact manifest exists without an audit event log")
     for sample in samples:
+        preparation_path = (
+            root / "samples" / sample.sample_id / "preparation_manifest.json"
+        )
+        if not preparation_path.is_file():
+            errors.append(
+                f"missing preparation manifest: {sample.sample_id}"
+            )
+        else:
+            preparation = load_json(preparation_path)
+            if preparation.get("llm_calls") != 0:
+                errors.append(
+                    f"preparation invoked LLM: {sample.sample_id}"
+                )
+            if preparation.get("fuzz_calls") != 0:
+                errors.append(
+                    f"preparation invoked fuzzer: {sample.sample_id}"
+                )
+            prepared_methods = set(
+                (preparation.get("representations") or {}).keys()
+            )
+            if prepared_methods != {method.value for method in methods}:
+                errors.append(
+                    f"preparation method set mismatch: {sample.sample_id}"
+                )
+        processing_path = (
+            root / "samples" / sample.sample_id / "processing_manifest.json"
+        )
+        if not processing_path.is_file():
+            errors.append(
+                f"missing processing manifest: {sample.sample_id}"
+            )
+        else:
+            processing = load_json(processing_path)
+            if not processing.get("ready_for_evaluation"):
+                errors.append(
+                    f"processing not ready for evaluation: {sample.sample_id}"
+                )
+            raw_methods = {
+                item.get("method")
+                for item in processing.get("raw_results") or []
+                if isinstance(item, dict)
+            }
+            if raw_methods != {method.value for method in methods}:
+                errors.append(
+                    f"processing method set mismatch: {sample.sample_id}"
+                )
         results = []
         for method in methods:
             path = root / "samples" / sample.sample_id / method.value / "result.json"
@@ -1931,6 +2443,17 @@ def verify_run_integrity(
             sample.original_elf_sha256
         }:
             errors.append(f"reference mismatch: {sample.sample_id}")
+    evaluation_manifest_path = root / "evaluation_manifest.json"
+    if not evaluation_manifest_path.is_file():
+        errors.append("missing evaluation manifest")
+    else:
+        evaluation_manifest = load_json(evaluation_manifest_path)
+        if evaluation_manifest.get("phase") != "evaluation":
+            errors.append("evaluation manifest phase mismatch")
+        if evaluation_manifest.get("llm_calls") != 0:
+            errors.append("evaluation manifest reports LLM calls")
+        if evaluation_manifest.get("fuzz_calls") != 0:
+            errors.append("evaluation manifest reports fuzz calls")
     report = {
         "passed": not errors,
         "errors": errors,

@@ -80,10 +80,11 @@ PLUGINS = [
     "brighten_060_extern_call_bridge/build/BrightenExternCallBridgePass.so",
     "brighten_070_global_data_recovery/build/BrightenGlobalDataRecoveryPass.so",
     "brighten_080_type_reconstruction/build/BrightenTypeReconstructionPass.so",
-    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so"
+    "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so",
+    "deobfuscate_095_deobfus_ollvm/build/lib095.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-native-cleanup-final-pass,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,095,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-native-cleanup-final-pass,verify"
 )
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
@@ -332,6 +333,31 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         "0", "false", "off", "no"
     }:
         cmd.append("-brighten-native-state-ssa")
+
+    # Keep deobfuscation proof budgets explicit in the production command.
+    # LLVM command-line option defaults from a dynamically loaded plugin are
+    # otherwise difficult to audit from batch logs.  Direct/native MBA rules
+    # stay enabled when the generic MBA SMT fallback budget is zero.
+    mba_z3_candidates = os.environ.get(
+        "BRIGHTEN_095_MBA_Z3_CANDIDATES", "0"
+    )
+    opaque_z3_candidates = os.environ.get(
+        "BRIGHTEN_095_OPAQUE_Z3_CANDIDATES", "256"
+    )
+    for name, value in {
+        "BRIGHTEN_095_MBA_Z3_CANDIDATES": mba_z3_candidates,
+        "BRIGHTEN_095_OPAQUE_Z3_CANDIDATES": opaque_z3_candidates,
+    }.items():
+        if not re.fullmatch(r"[0-9]+", value):
+            print(
+                f"{Color.RED}[✗] {name} phải là số nguyên không âm, "
+                f"nhận được: {value!r}{Color.END}"
+            )
+            return False
+    cmd.extend([
+        f"-095-max-z3-candidates={mba_z3_candidates}",
+        f"-095-max-opaque-z3-candidates={opaque_z3_candidates}",
+    ])
 
     # Thiết lập pipeline pass và file input/output
     pipeline = os.environ.get("BRIGHTEN_PASS_PIPELINE", PASS_PIPELINE)

@@ -1,3 +1,4 @@
+
 """LLM-assisted recovery of C source from brightened LLVM IR.
 
 This module deliberately has no side effects on import.  The normal pipeline does
@@ -751,6 +752,29 @@ public class ExportDecomp extends GhidraScript {
     return Path(output_path).read_text(encoding="utf-8", errors="replace")
 
 
+def export_ghidra_pseudocode(
+    binary_path: str,
+    output_path: str,
+    *,
+    ghidra_binary_path: Optional[str] = None,
+    timeout: float = 900.0,
+) -> str:
+    """Create a reusable Ghidra artifact without starting an LLM request."""
+
+    ghidra_binary = _find_ghidra_analyze_headless(ghidra_binary_path)
+    if not ghidra_binary:
+        raise RecoveryError("Không tìm thấy Ghidra analyzeHeadless.")
+    source = _decompile_binary_with_ghidra(
+        binary_path,
+        output_path,
+        ghidra_binary=ghidra_binary,
+        timeout=timeout,
+    )
+    if not source or not source.strip():
+        raise RecoveryError("Ghidra không trả về pseudocode.")
+    return source
+
+
 def read_recovery_csv(csv_path: str, project_root: str) -> List[RecoveryInput]:
     """Read both the current one-column CSV and explicit IR/binary columns.
 
@@ -823,86 +847,45 @@ def build_system_prompt(attach_clean_ir: bool = False) -> str:
         "the clean brightened LLVM IR is retained locally for validation and is not sent."
     )
     return """You are a senior reverse engineer and C11 compiler engineer.
-Recover readable, compilable C source from binary-lifting artifacts.
+Recover one readable, standalone, behavior-preserving C11 translation unit from the supplied
+binary-lifting artifact.
 
-This is source recovery, not deobfuscation:
-- Recover behavior-preserving C, not synthetic placeholders.
-- The original source and ground-truth implementation are never provided. The
-  supplied input is only a lossy decompiler artifact or transformed IR for the
-  current case. Recover the represented behavior; do not invent an additional
-  deobfuscation stage.
-- You may apply safe brightening/sanitization (renames, control-flow cleanup, dead-code removal,
-  minor normalization) when it is clearly implied by the input and does not alter
-  observable behavior (I/O, return codes, timing-independent side effects).
-- Do not invent behavior not present in the input.
-
-Reasoning policy:
-- Reason silently and do not output chain-of-thought, scratch work, or a plan.
-- Treat the supplied artifact as evidence, not as a request to explain the artifact.
-- Evidence priority is: explicit constants/control flow/calls, then declarations and
-  data-flow, then decompiler names/comments, then conservative inference.
-- Never treat Ghidra warning text, guessed names, or unknown types as program semantics.
-
-Semantic reconstruction protocol (perform this analysis internally before emitting C):
-1. Map the program: identify the real entry point, meaningful functions, lifting wrappers,
-   input handlers, core logic, output handlers, important globals/buffers, and real library APIs.
-2. Infer the exact input/output contract: values read, types, line/whitespace/EOF/error handling,
-   signedness, output bytes, newline behavior, exit codes, crashes, and timeouts.
-3. Reconstruct semantics instead of translating instructions mechanically. Use data-flow,
-   control-flow, memory access, constants, external calls, and observable execution evidence.
-4. Remove control-flow flattening, bogus blocks, opaque predicates, instruction substitution,
-   dead code, and lifted pointer arithmetic only when the evidence proves they are irrelevant
-   or equivalent. Recover arrays, structs, state, and high-level loops/branches.
-5. Infer the high-level algorithm before writing C. Prefer a clean equivalent algorithm over a
-   verbatim dump of LLVM instructions or decompiler temporaries.
-6. Check boundary cases mentally and use runtime/differential evidence when it is available.
-7. Produce the full translation unit only after the reconstruction is complete. Never stop at
-   pseudocode, declarations, a function fragment, or an unfinished JSON string.
-
-Evidence discipline:
-- Do not infer the original task, source, or algorithm from symbol names or isolated constants.
-- Every non-trivial conclusion must be supported by control-flow, data-flow, memory access,
-  external behavior, or an explicit validation result.
-- Distinguish source-like reconstruction from tested functional equivalence; never claim proven
-  equivalence without actual evidence.
-
-Input may be:
-- brightened LLVM IR, or
-- C-like pseudocode exported by Ghidra headless.
-
-Input provenance:
+Evidence and scope:
+- The original source and ground-truth implementation are not available.
+- Treat only the supplied Ghidra pseudocode or brightened LLVM IR as evidence.
 - __MODE1_EVIDENCE__
-- The brightened reference ELF is used locally as Ghidra input and as differential-testing
-  evidence. Do not claim to inspect raw executable bytes that the model cannot consume.
-- In mode 2, the model receives the complete brightened LLVM IR instead.
-- Never assume access to a local path, the original source, or the semantic-checker target.
+- Never claim access to local paths, raw executable bytes, hidden tests, or the original source.
+- Do not infer behavior from guessed symbol names, warning text, or isolated constants alone.
 
-Rules:
-1. Preserve observable behavior as much as the input allows:
-   stdin/stdout/stderr, exit status, return values, control flow, string bytes,
-   global state, pointer arithmetic, integer widths/signedness, and external calls.
-2. Do not invent semantics not supported by the input.
-3. Keep conservative types where the input is ambiguous.
-4. Output exactly one complete C11 translation unit, including required headers.
-5. If an entry point exists in the input, include a real `main` function.
-6. Safe brightening/sanitization is allowed (naming, structure cleanup, readability refactors)
-   only if behavior remains equivalent on observable outputs and control flow results.
-7. Do not use assembly, compiler-specific builtins, fake outputs, or test harnesses
-   that bypass recovered logic.
-8. The result will be compiled and differentially fuzzed. Treat compile or semantic
-   mismatches as hard feedback.
-9. Never return a partial translation unit, declarations-only output, or an unfinished
-   JSON string. The adapter rejects incomplete output before compilation.
-10. Do not spend output on explanations or long comments. Ignore CRT startup wrappers,
-    compiler registration helpers, and recursive libc thunks unless they affect the
-    program's observable input/output behavior. Reconstruct the actual program logic
-    and expose it through a real `main` function.
-11. Preserve externally visible strings, byte-level constants, parsing rules, error paths,
-    and exit behavior. Simplify lifted temporaries only when the simplification is
-    behavior-preserving.
+Perform this workflow silently before producing the answer:
+1. Identify the real entry point, behavior-relevant helpers, globals, buffers, and library calls.
+2. Recover the exact input/output contract: parsing, whitespace/EOF handling, output bytes,
+   newlines, stderr, exit status, integer widths/signedness, and error paths.
+3. Reconstruct semantics from control flow, data flow, memory accesses, constants, and calls.
+4. Remove lifting/decompiler noise only when doing so is behavior-preserving.
+5. Rebuild a clean high-level algorithm; do not mechanically transliterate instructions.
+6. Check boundary cases and ensure the final source is complete before returning it.
 
-Return ONLY ONE JSON object, no markdown/prose/prelude/suffix:
-{"source":"<complete C source>"}
+C11 requirements:
+- Emit exactly one complete translation unit with all required headers, declarations, globals,
+  function definitions, and a real `int main(...)` when the artifact contains an entry point.
+- Preserve observable behavior: stdin/stdout/stderr, exit codes, strings and byte constants,
+  parsing rules, global state, pointer arithmetic, signedness, and external calls.
+- Use standard C11 only. Do not emit Ghidra-only types/tokens such as `undefined8`, `byte`,
+  `code`, or C++ constructs such as type-inferred `auto` variables.
+- Do not emit assembly, compiler-specific builtins, placeholders, fake outputs, test harnesses,
+  patches, diffs, declarations-only fragments, or truncated code.
+- Ensure braces, parentheses, brackets, string literals, comments, and preprocessor directives are
+  syntactically complete. Every referenced helper/global must be declared or defined.
+- Keep comments short and only when they clarify recovered behavior.
+
+Structured response contract:
+- The API supplies a schema with one required string field named `source`.
+- Put only the complete C translation unit in `source`.
+- Do not place markdown fences, prose, analysis, a plan, JSON examples, or extra wrapper text
+  inside `source`.
+- Never return a partial source string. If uncertain, choose conservative compilable C that is
+  supported by the artifact rather than inventing missing behavior.
 """.replace("__MODE1_EVIDENCE__", mode1_evidence)
 
 
@@ -919,7 +902,7 @@ def _clip_ir(ir_text: str, max_chars: Optional[int] = None) -> str:
 
 
 def _build_synthetic_icl_example(use_pseudo: bool) -> str:
-    """Return one fixed, non-dataset demonstration for the initial prompt."""
+    """Return one fixed, non-dataset semantic demonstration for the initial prompt."""
     if use_pseudo:
         return r"""<IN_CONTEXT_DEMO type="synthetic_ghidra_to_c">
 This demonstration is synthetic. It is not from the dataset and is not evidence about the current case.
@@ -935,11 +918,19 @@ int FUN_demo(char *param_1)
 }
 </DEMO_INPUT>
 
-<DEMO_OUTPUT>
-{"source":"#include <stdio.h>\n#include <stdlib.h>\n\nint main(int argc, char **argv) {\n    int value = 0;\n    if (argc < 2) return 2;\n    if (sscanf(argv[1], \"%d\", &value) != 1) return 2;\n    printf(\"%d\\n\", value + 7);\n    return 0;\n}\n"}
-</DEMO_OUTPUT>
+<DEMO_RECOVERED_C>
+#include <stdio.h>
 
-Use this only as a format and normalization example. Do not copy its names, constants, strings, or logic.
+int main(int argc, char **argv) {
+    int value = 0;
+    if (argc < 2) return 2;
+    if (sscanf(argv[1], "%d", &value) != 1) return 2;
+    printf("%d\n", value + 7);
+    return 0;
+}
+</DEMO_RECOVERED_C>
+
+Use this only as a semantic normalization example. Do not copy its names, constants, strings, or logic.
 </IN_CONTEXT_DEMO>"""
     return r"""<IN_CONTEXT_DEMO type="synthetic_llvm_to_c">
 This demonstration is synthetic. It is not from the dataset and is not evidence about the current case.
@@ -959,11 +950,17 @@ bad:
 }
 </DEMO_INPUT>
 
-<DEMO_OUTPUT>
-{"source":"#include <stdio.h>\n\nint main(int argc, char **argv) {\n    if (argc <= 1) return 2;\n    printf(\"%d\\n\", 12);\n    return 0;\n}\n"}
-</DEMO_OUTPUT>
+<DEMO_RECOVERED_C>
+#include <stdio.h>
 
-Use this only as a format and normalization example. Do not copy its names, constants, strings, or logic.
+int main(int argc, char **argv) {
+    if (argc <= 1) return 2;
+    printf("%d\n", 12);
+    return 0;
+}
+</DEMO_RECOVERED_C>
+
+Use this only as a semantic normalization example. Do not copy its names, constants, strings, or logic.
 </IN_CONTEXT_DEMO>"""
 
 
@@ -976,79 +973,49 @@ def build_initial_prompt(
     attached_evidence_label: str = "COMPLETE MODEL INPUT ARTIFACT ATTACHED IN THIS REQUEST",
 ) -> str:
     context = "\n".join(f"- {key}: {value}" for key, value in metadata.items() if value)
-    ir_header = "LLVM IR"
-    # For decompiled pseudo input, keep the full content so LLM receives the
-    # complete seed file as-is (no clipping).
-    ir_body = ir_text if use_pseudo else _clip_ir(ir_text, max_ir_chars)
-    if use_pseudo:
-        ir_header = "Ghidra decompiler C-like pseudocode"
-        ir_body = ir_text
-    icl_example = _build_synthetic_icl_example(use_pseudo)
-    source = f"""Recover a behavior-preserving standalone C11 program from this {ir_header}.
-The original source is not provided; use only the model input artifact below.
+    artifact_label = "Ghidra decompiler C-like pseudocode" if use_pseudo else "brightened LLVM IR"
+    artifact_body = ir_text if use_pseudo else _clip_ir(ir_text, max_ir_chars)
+    if seed_attached_file:
+        artifact_body = f"/* {attached_evidence_label} */"
 
-Input context:
+    mode_rules = (
+        """Use the Ghidra pseudocode as decompiler evidence, not as valid final C. Recover the
+actual program logic, convert decompiler-only types and calling artifacts to standard C11,
+and ignore CRT/startup/library-thunk boilerplate unless it changes observable behavior."""
+        if use_pseudo
+        else
+        """Use the LLVM IR as semantic evidence. Reconstruct high-level control flow, types,
+memory behavior, and I/O instead of translating SSA instructions one by one."""
+    )
+
+    return f"""Recover a behavior-preserving standalone C11 program from the artifact below.
+The original source is not provided. Use no facts that are absent from the artifact or explicit
+validation feedback.
+
+<INPUT_CONTEXT>
 {context or '- no additional metadata'}
+</INPUT_CONTEXT>
 
-    Model input artifact ({ir_header}; not original source):
-<MODEL_INPUT_ARTIFACT>
-{ir_body if not seed_attached_file else f"/* {attached_evidence_label} */"}
-</MODEL_INPUT_ARTIFACT>"""
+<MODEL_INPUT_ARTIFACT type="{artifact_label}">
+{artifact_body}
+</MODEL_INPUT_ARTIFACT>
 
-    source += f"""
+{_build_synthetic_icl_example(use_pseudo)}
 
-{icl_example}
-"""
+<MODE_SPECIFIC_RULES>
+{mode_rules}
+</MODE_SPECIFIC_RULES>
 
-    if use_pseudo:
-        return f"""{source}
+Before returning, silently verify all of the following:
+- the result is one complete C11 translation unit, not pseudocode or a fragment;
+- a real `int main(...)` exists when an executable entry point is present;
+- all headers, typedefs, globals, prototypes, helpers, and called functions are available;
+- braces/parentheses/brackets and all string/character literals are balanced and terminated;
+- format strings and argument types are compatible;
+- no Ghidra-only token, LLVM syntax, C++ syntax, placeholder, markdown fence, prose, or diff remains;
+- exact input parsing, output bytes/newlines, error paths, and exit status are preserved.
 
-[{ir_header}] Build from Ghidra pseudocode, not LLVM syntax.
-
-    Reconstruct the exact executable C behavior into a complete standalone C11
-    translation unit. Keep function boundaries, control flow, and all observable
-    behavior that is visible from the pseudocode. This step is expected to expand
-    and normalize the pseudocode into valid C, not to follow LLVM syntax.
-    You may do safe brightening/sanitization (readable renames, minor control-flow
-    cleanup, dead-code pruning) when it does not change behavior.
-
-    Return exactly one JSON object and nothing else:
-    {{"source":"<complete C source>"}}
-
-    Constraints:
-    - Strict JSON only; no markdown code fences.
-    - Do not invent extra keys.
-    - Return one complete compilable C translation unit only.
-    - Return only a top-level JSON object with key `source`; no markdown fences or prose.
-    - Include required headers explicitly (e.g. <stdio.h>, <stdint.h>) and never emit placeholder comments as code.
-    - Use width-safe types exactly as valid C identifiers (prefer uint*_t / int*_t when relevant).
-    - If any helper type is ambiguous, prefer conservative typedef-style names already in headers.
-    - The source must contain the complete implementation and a real `int main(...)` entry point.
-    - Do not guess missing globals, strings, constants, or behavior with dummy/placeholder values.
-    - Emit code only inside the JSON string; do not explain decisions in C comments.
-    - Do not emit reasoning, chain-of-thought, a patch, or a diff; silently perform the reconstruction.
-    - Do not reproduce `_start`, `.init`, `.fini`, `__cxa_finalize`, or libc thunk boilerplate
-      when they are not part of the observable program behavior.
-    - Reconstruct the high-level algorithm before emitting C. Do not translate LLVM instructions
-      one by one or copy a Ghidra function dump as the final source.
-    - Preserve exact input parsing, output bytes, newline behavior, exit status, error paths,
-      and relevant undefined/crash behavior supported by the artifact.
-    - Collapse Ghidra's lifted state/temporary variables into concise idiomatic C when
-      observable behavior remains equivalent; do not copy decompiler noise verbatim.
-"""
-
-    return f"""{source}
-
-    First internally complete the program map, I/O analysis, deobfuscation cleanup, and
-    high-level algorithm reconstruction. Then emit the complete standalone C translation unit as JSON:
-    {{"source":"<complete C source>"}}.
-
-    Output requirement:
-    - Return ONLY JSON object with top-level `source`.
-    - Do not use fragments, stubs, or placeholders.
-    - If the IR has an entry function equivalent to main, include a full executable function named main.
-    - If uncertain, prefer conservative, compilable code that matches observable behavior.
-    - Do not claim equivalence or report tests that were not actually performed.
+Return the complete source only through the structured response field `source`.
 """
 
 
@@ -1483,80 +1450,91 @@ def build_repair_prompt(
         if evidence_attached
         else _clip_ir(ir_text, max_ir_chars)
     )
-    return f"""Repair the C recovery candidate below using the validation feedback.
+    candidate_text = candidate.strip() or "/* EMPTY OR DISCARDED CANDIDATE: regenerate from the artifact. */"
+    return f"""Repair or regenerate the recovered C program using the validation feedback and the
+original model evidence. The feedback is authoritative about the observed failure, but it does
+not authorize invented behavior.
 
 <VALIDATION_FEEDBACK>
 {feedback}
 </VALIDATION_FEEDBACK>
 
 <CANDIDATE_SOURCE>
-```c
-{candidate}
-```
+{candidate_text}
 </CANDIDATE_SOURCE>
 
-Model input artifact ({source_label}; not original source):
-<MODEL_INPUT_ARTIFACT>
+<MODEL_INPUT_ARTIFACT type="{source_label}">
 {evidence}
 </MODEL_INPUT_ARTIFACT>
 
-    Change only what is needed to restore behavior. Return the complete corrected
-    source as exactly one JSON object:
-    {{"source":"<complete C source>"}}.
-    If compilation/fuzz failed previously, fix the exact error and return a full
-    program (never partial). Remove any unfinished/placeholder tail from the
-    candidate and produce a valid translation unit.
-    The previous candidate is invalid unless it contains a complete `int main(...)`
-    definition. If the candidate is truncated, rewrite the entire source from the
-    original input; do not return only declarations or a patch/diff.
-    Do not omit behavior-relevant functions, globals, wrappers, or thunks. You may omit
-    only code that is provably unrelated to observable behavior. Do not add explanations
-    or long comments to the source, but return the complete translation unit.
-    Re-run the internal reconstruction checklist before repairing: program map, exact I/O
-    contract, data-flow/control-flow semantics, obfuscation cleanup, high-level algorithm,
-    and observable error behavior. Repair the behavior, not just the compiler diagnostic.
-    Reason silently; do not output chain-of-thought or describe the repair.
-    Return strict JSON only, no markdown or prose.
+Repair policy:
+- Fix the root semantic or compilation cause, not merely the displayed diagnostic.
+- If the candidate is empty, malformed, truncated, placeholder-heavy, or lacks a complete
+  `int main(...)`, regenerate the entire translation unit from the model evidence.
+- Return the whole corrected program, never a patch, diff, function fragment, or declarations-only file.
+- Preserve every behavior-relevant helper, global, string, constant, parsing rule, error path,
+  output byte, newline, and exit status supported by the evidence.
+- Use standard C11. Remove Ghidra/LLVM/C++ syntax and ensure every identifier/type/function is declared.
+- Do not add explanations or long comments.
+
+Before returning, silently check compilation-level completeness: balanced delimiters, terminated
+literals/comments, required headers, valid declarations, compatible format strings, and one complete
+translation unit. Put only that source code in the structured response field `source`.
 """
 
+
 def _extract_json_payload(response_text: str) -> Optional[str]:
-    """Try to extract the first complete JSON object from model output."""
+    """Extract the first complete, parseable JSON object from model output.
+
+    Markdown fences are stripped before balanced scanning. The old non-greedy
+    fence regex stopped at the first C closing brace inside the JSON string.
+    """
     text = _text(response_text)
     if not text:
         return None
 
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.IGNORECASE | re.DOTALL)
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     if fenced:
-        return fenced.group(1).strip()
+        text = fenced.group(1).strip()
 
-    depth = 0
-    start = None
-    in_string = False
-    escape = False
-
-    for idx, ch in enumerate(text):
-        if in_string:
-            if escape:
-                escape = False
+    for start, start_ch in enumerate(text):
+        if start_ch != "{":
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
                 continue
-            if ch == "\\":
-                escape = True
-            elif ch == "\"":
-                in_string = False
-            continue
 
-        if ch == "\"":
-            in_string = True
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = idx
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
                 depth -= 1
-                if depth == 0 and start is not None:
-                    return text[start : idx + 1].strip()
+                if depth < 0:
+                    break
+                if depth == 0:
+                    candidate = text[start : idx + 1].strip()
+                    for strict in (True, False):
+                        try:
+                            json.loads(candidate, strict=strict)
+                            return candidate
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            pass
+                    break
     return None
 
 
@@ -1624,8 +1602,11 @@ def _extract_source_from_json(
         return None
     try:
         decoded = json.loads(payload)
-    except (json.JSONDecodeError, TypeError):
-        return None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        try:
+            decoded = json.loads(payload, strict=False)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
 
     if isinstance(decoded, dict):
         source = None
@@ -1941,6 +1922,24 @@ def _vertex_inline_mime_type(path: Path) -> str:
     )
 
 
+def _recovery_response_schema() -> Dict[str, Any]:
+    """Schema-enforce the one-field recovery response at the provider boundary."""
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "source": {
+                "type": "STRING",
+                "description": (
+                    "One complete standalone compilable C11 translation unit. "
+                    "Code only; no markdown fences, prose, patch, or JSON wrapper inside this string."
+                ),
+            }
+        },
+        "required": ["source"],
+        "propertyOrdering": ["source"],
+    }
+
+
 def _vertex_generation_config(config: RecoveryConfig) -> Dict[str, Any]:
     generation_config: Dict[str, Any] = {
         "temperature": config.temperature,
@@ -1949,6 +1948,9 @@ def _vertex_generation_config(config: RecoveryConfig) -> Dict[str, Any]:
     }
     if config.max_output_tokens:
         generation_config["maxOutputTokens"] = config.max_output_tokens
+    if config.require_json:
+        generation_config["responseMimeType"] = "application/json"
+        generation_config["responseSchema"] = _recovery_response_schema()
     thinking_level = _text(config.thinking_level).upper()
     if thinking_level:
         allowed = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
@@ -2178,6 +2180,9 @@ class VertexGemini:
                 generation_kwargs["system_instruction"] = str(system_instruction)
             if self.config.max_output_tokens:
                 generation_kwargs["max_output_tokens"] = self.config.max_output_tokens
+            if self.config.require_json:
+                generation_kwargs["response_mime_type"] = "application/json"
+                generation_kwargs["response_schema"] = _recovery_response_schema()
             if self.config.thinking_level:
                 generation_kwargs["thinking_config"] = types.ThinkingConfig(
                     thinking_level=_text(self.config.thinking_level).upper()
@@ -2367,25 +2372,62 @@ def run_recovery_loop(
         print("[LLM] Mode 1: decompile bằng Ghidra rồi gửi C-like pseudocode cho LLM.")
         pseudo_path = os.path.join(output_dir, "ghidra_recovery_input.c")
         binary_path = ""
+        prepared_pseudo_path = ""
+        prepared_pseudo_sha256 = ""
         if isinstance(metadata, Mapping):
             binary_path = _text(
                 metadata.get("recovery_reference_binary")
             )
-        ghidra_binary = _find_ghidra_analyze_headless(config.ghidra_binary_path)
+            prepared_pseudo_path = _text(
+                metadata.get("precomputed_ghidra_pseudocode_path")
+            )
+            prepared_pseudo_sha256 = _text(
+                metadata.get("precomputed_ghidra_pseudocode_sha256")
+            )
         print(f"[LLM] Mục tiêu decompile: {binary_path or '<missing>'}")
-        print(f"[LLM] Ghidra analyzeHeadless: {ghidra_binary or '<missing>'}")
         ghidra_failed: Optional[str] = None
-        if not binary_path:
-            ghidra_failed = "Mode 1 yêu cầu recovery_reference_binary nhưng không có metadata."
-        elif not ghidra_binary:
-            ghidra_failed = "Không tìm thấy Ghidra analyzeHeadless."
-        elif not os.path.isfile(binary_path):
-            ghidra_failed = f"Không tìm thấy binary cho Ghidra: {binary_path}"
+        persisted_pseudo = os.path.join(output_dir, "ghidra_pseudocode.c")
+        if prepared_pseudo_path:
+            print(
+                "[LLM] Dùng Ghidra pseudocode đã freeze từ preparation: "
+                f"{prepared_pseudo_path}"
+            )
+            if not os.path.isfile(prepared_pseudo_path):
+                ghidra_failed = (
+                    "Không tìm thấy Ghidra pseudocode đã chuẩn bị: "
+                    f"{prepared_pseudo_path}"
+                )
+            elif prepared_pseudo_sha256 and hashlib.sha256(
+                Path(prepared_pseudo_path).read_bytes()
+            ).hexdigest() != prepared_pseudo_sha256:
+                ghidra_failed = "Ghidra pseudocode đã chuẩn bị bị thay đổi hash."
+            else:
+                pseudo_source = Path(prepared_pseudo_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                Path(persisted_pseudo).write_text(
+                    pseudo_source, encoding="utf-8"
+                )
         else:
+            ghidra_binary = _find_ghidra_analyze_headless(
+                config.ghidra_binary_path
+            )
+            print(
+                f"[LLM] Ghidra analyzeHeadless: {ghidra_binary or '<missing>'}"
+            )
+            if not binary_path:
+                ghidra_failed = (
+                    "Mode 1 yêu cầu recovery_reference_binary nhưng không có metadata."
+                )
+            elif not ghidra_binary:
+                ghidra_failed = "Không tìm thấy Ghidra analyzeHeadless."
+            elif not os.path.isfile(binary_path):
+                ghidra_failed = f"Không tìm thấy binary cho Ghidra: {binary_path}"
+        if not prepared_pseudo_path and ghidra_failed is None:
             try:
                 pseudo_source = _decompile_binary_with_ghidra(
                     binary_path,
-                    os.path.join(output_dir, "ghidra_pseudocode.c"),
+                    persisted_pseudo,
                     ghidra_binary=ghidra_binary,
                     timeout=config.ghidra_timeout,
                 )
@@ -2559,8 +2601,11 @@ def run_recovery_loop(
                     + ", ".join(os.path.basename(path) for path in attachment_paths)
                 )
 
-            model_prompt = build_system_prompt(config.attach_clean_ir) + "\n\n" + make_prompt(None)
+            system_prompt = build_system_prompt(config.attach_clean_ir)
+            model_prompt = make_prompt(None)
             request_hasher = hashlib.sha256()
+            request_hasher.update(system_prompt.encode("utf-8"))
+            request_hasher.update(b"\0")
             request_hasher.update(model_prompt.encode("utf-8"))
             for attachment_path in attachment_paths:
                 request_hasher.update(b"\0")
@@ -2594,6 +2639,7 @@ def run_recovery_loop(
                 return client.generate(
                     model_prompt,
                     attachment_paths=attachment_paths,
+                    system_instruction=system_prompt,
                 )
 
             request_context = {

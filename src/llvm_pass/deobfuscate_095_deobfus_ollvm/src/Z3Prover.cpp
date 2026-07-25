@@ -8,6 +8,8 @@
 
 #include <z3++.h>
 
+#include <algorithm>
+
 using namespace llvm;
 
 namespace deobfuscate095 {
@@ -53,7 +55,13 @@ private:
     unsigned Index;
     if (It == T.LeafIndex.end()) {
       Index = T.Leaves.size();
-      if (Index >= 4)
+      // Chernobog's rule registry is not limited to binary MBA trees: a
+      // number of OLLVM/Hackers-Delight identities contain three or more
+      // independent leaves which cancel algebraically.  Keep those leaves
+      // in the proof model even though the compact replacement vocabulary
+      // below is intentionally small; Z3 will only accept a replacement if
+      // all omitted leaves provably cancel.
+      if (Index >= 8)
         return std::nullopt;
       T.Leaves.push_back(V);
       T.LeafIndex[V] = Index;
@@ -110,6 +118,14 @@ private:
       case Instruction::Add: E = *L + *R; break;
       case Instruction::Sub: E = *L - *R; break;
       case Instruction::Mul: E = *L * *R; break;
+      // Chernobog's opaque-predicate and MBA rules explicitly cover modular
+      // arithmetic identities (for example x*(x+1) % 2 == 0).  Keep the
+      // divisor symbolic in the proof model, but reject a zero divisor just
+      // as LLVM's defined execution would do for a proven nonzero operand.
+      case Instruction::UDiv: E = z3::udiv(*L, *R); break;
+      case Instruction::URem: E = z3::urem(*L, *R); break;
+      case Instruction::SDiv: E = *L / *R; break;
+      case Instruction::SRem: E = z3::srem(*L, *R); break;
       case Instruction::And: E = *L & *R; break;
       case Instruction::Or:  E = *L | *R; break;
       case Instruction::Xor: E = *L ^ *R; break;
@@ -209,10 +225,19 @@ Z3Prover::~Z3Prover() = default;
 std::optional<bool> Z3Prover::proveBooleanConstant(Value *V) {
   if (!V || !V->getType()->isIntegerTy(1))
     return std::nullopt;
+  if (auto It = BooleanCache.find(V); It != BooleanCache.end()) {
+    if (It->second == 1)
+      return true;
+    if (It->second == 0)
+      return false;
+    return std::nullopt;
+  }
   Translator X(P->Context);
   auto T = X.translate(V);
-  if (!T)
+  if (!T) {
+    BooleanCache[V] = -1;
     return std::nullopt;
+  }
 
   auto Check = [&](const z3::expr &Constraint) {
     ++Stats.Queries;
@@ -233,64 +258,126 @@ std::optional<bool> Z3Prover::proveBooleanConstant(Value *V) {
 
   z3::expr One = P->Context.bv_val(1, 1);
   z3::expr Zero = P->Context.bv_val(0, 1);
-  if (Check(T->Expr != One) == ProofResult::Proved)
+  if (Check(T->Expr != One) == ProofResult::Proved) {
+    BooleanCache[V] = 1;
     return true;
-  if (Check(T->Expr != Zero) == ProofResult::Proved)
+  }
+  if (Check(T->Expr != Zero) == ProofResult::Proved) {
+    BooleanCache[V] = 0;
     return false;
+  }
+  BooleanCache[V] = -1;
   return std::nullopt;
 }
 
 std::optional<SimplificationProof>
-Z3Prover::proveSimplerInteger(Value *V, unsigned MinOps) {
+Z3Prover::proveSimplerInteger(Value *V, unsigned MinOps,
+                             unsigned MaxChecks) {
   if (!V || !V->getType()->isIntegerTy() ||
       V->getType()->getIntegerBitWidth() == 1)
     return std::nullopt;
   Translator X(P->Context);
   auto T = X.translate(V);
-  if (!T || T->Operations < MinOps || T->Leaves.size() > 2)
+  if (!T || T->Operations < MinOps)
     return std::nullopt;
 
   unsigned Width = V->getType()->getIntegerBitWidth();
   z3::expr Zero = P->Context.bv_val(0, Width);
   z3::expr One = P->Context.bv_val(1, Width);
   z3::expr Ones = P->Context.bv_val(-1, Width);
-  SmallVector<std::pair<CandidateKind, z3::expr>, 16> Candidates;
-  Candidates.emplace_back(CandidateKind::ConstantZero, Zero);
-  Candidates.emplace_back(CandidateKind::ConstantOne, One);
-  Candidates.emplace_back(CandidateKind::ConstantAllOnes, Ones);
+  struct Candidate {
+    CandidateKind Kind;
+    z3::expr Expr;
+    unsigned Left = 0;
+    unsigned Right = 1;
+    uint64_t Constant = 0;
+  };
+  SmallVector<Candidate, 96> Candidates;
+  Candidates.push_back({CandidateKind::ConstantZero, Zero});
+  Candidates.push_back({CandidateKind::ConstantOne, One});
+  Candidates.push_back({CandidateKind::ConstantAllOnes, Ones});
   if (!T->Leaves.empty()) {
-    z3::expr A = P->Context.bv_const(
-        ("v0_" + std::to_string(reinterpret_cast<uintptr_t>(T->Leaves[0])))
-            .c_str(), Width);
-    Candidates.emplace_back(CandidateKind::Leaf0, A);
-    Candidates.emplace_back(CandidateKind::Not0, ~A);
-    Candidates.emplace_back(CandidateKind::Neg0, -A);
-    if (T->Leaves.size() == 2) {
-      z3::expr B = P->Context.bv_const(
-          ("v1_" + std::to_string(reinterpret_cast<uintptr_t>(T->Leaves[1])))
-              .c_str(), Width);
-      Candidates.emplace_back(CandidateKind::Leaf1, B);
-      Candidates.emplace_back(CandidateKind::Not1, ~B);
-      Candidates.emplace_back(CandidateKind::Neg1, -B);
-      Candidates.emplace_back(CandidateKind::Add, A + B);
-      Candidates.emplace_back(CandidateKind::Sub01, A - B);
-      Candidates.emplace_back(CandidateKind::Sub10, B - A);
-      Candidates.emplace_back(CandidateKind::Xor, A ^ B);
-      Candidates.emplace_back(CandidateKind::And, A & B);
-      Candidates.emplace_back(CandidateKind::Or, A | B);
+    SmallVector<z3::expr, 8> Vars;
+    const unsigned MaxRecipeVars = std::min<unsigned>(T->Leaves.size(), 4);
+    for (unsigned LeafNo = 0; LeafNo < MaxRecipeVars; ++LeafNo) {
+      Value *V = T->Leaves[LeafNo];
+      Vars.push_back(P->Context.bv_const(
+          ("v" + std::to_string(T->LeafIndex.lookup(V)) + "_" +
+           std::to_string(reinterpret_cast<uintptr_t>(V))).c_str(), Width));
+    }
+    Candidates.push_back({CandidateKind::Leaf0, Vars[0]});
+    // The lifted dataset overwhelmingly exposes binary OLLVM identities.
+    // Keep those recipes inside the small residual-query budget; unary and
+    // special-constant forms are appended afterwards.
+    if (Vars.size() >= 2) {
+      Candidates.push_back({CandidateKind::Leaf1, Vars[1]});
+      Candidates.push_back({CandidateKind::Add, Vars[0] + Vars[1]});
+      Candidates.push_back({CandidateKind::Sub01, Vars[0] - Vars[1]});
+      Candidates.push_back({CandidateKind::Sub10, Vars[1] - Vars[0]});
+      Candidates.push_back({CandidateKind::Xor, Vars[0] ^ Vars[1]});
+      Candidates.push_back({CandidateKind::And, Vars[0] & Vars[1]});
+      Candidates.push_back({CandidateKind::Or, Vars[0] | Vars[1]});
+      Candidates.push_back({CandidateKind::PairMul, Vars[0] * Vars[1], 0, 1});
+    }
+    Candidates.push_back({CandidateKind::Not0, ~Vars[0]});
+    Candidates.push_back({CandidateKind::Neg0, -Vars[0]});
+    Candidates.push_back({CandidateKind::UnaryNot, ~Vars[0], 0, 1});
+    Candidates.push_back({CandidateKind::UnaryNeg, -Vars[0], 0, 1});
+    if (Vars.size() >= 2) {
+      Candidates.push_back({CandidateKind::Not1, ~Vars[1]});
+      Candidates.push_back({CandidateKind::Neg1, -Vars[1]});
+      Candidates.push_back({CandidateKind::UnaryNot, ~Vars[1], 1, 1});
+      Candidates.push_back({CandidateKind::UnaryNeg, -Vars[1], 1, 1});
+    }
+    for (unsigned I = 0; I < Vars.size(); ++I) {
+      // Chernobog's special-constant/factor families use 0, 1, 2, -1 and
+      // -2 heavily.  Keep the constants width-masked by bv_val.
+      for (uint64_t C : {uint64_t(0), uint64_t(1), uint64_t(2),
+                         ~uint64_t(0), ~uint64_t(1)}) {
+        z3::expr K = P->Context.bv_val(C, Width);
+        Candidates.push_back({CandidateKind::AddConst, Vars[I] + K, I, 1, C});
+        Candidates.push_back({CandidateKind::SubConst, Vars[I] - K, I, 1, C});
+        Candidates.push_back({CandidateKind::XorConst, Vars[I] ^ K, I, 1, C});
+        Candidates.push_back({CandidateKind::AndConst, Vars[I] & K, I, 1, C});
+        Candidates.push_back({CandidateKind::OrConst, Vars[I] | K, I, 1, C});
+        Candidates.push_back({CandidateKind::MulConst, Vars[I] * K, I, 1, C});
+        if (C < Width) {
+          z3::expr Shift = P->Context.bv_val(C, Width);
+          Candidates.push_back({CandidateKind::ShlConst, z3::shl(Vars[I], Shift), I, 1, C});
+          Candidates.push_back({CandidateKind::LShrConst, z3::lshr(Vars[I], Shift), I, 1, C});
+          Candidates.push_back({CandidateKind::AShrConst, z3::ashr(Vars[I], Shift), I, 1, C});
+        }
+      }
+    }
+    for (unsigned I = 0; I < Vars.size(); ++I) {
+      for (unsigned J = 0; J < Vars.size(); ++J) {
+        if (I == J) continue;
+        Candidates.push_back({CandidateKind::PairAdd, Vars[I] + Vars[J], I, J});
+        Candidates.push_back({CandidateKind::PairSub, Vars[I] - Vars[J], I, J});
+        Candidates.push_back({CandidateKind::PairMul, Vars[I] * Vars[J], I, J});
+        Candidates.push_back({CandidateKind::PairXor, Vars[I] ^ Vars[J], I, J});
+        Candidates.push_back({CandidateKind::PairAnd, Vars[I] & Vars[J], I, J});
+        Candidates.push_back({CandidateKind::PairOr, Vars[I] | Vars[J], I, J});
+      }
     }
   }
 
+  unsigned Checks = 0;
   for (const auto &Candidate : Candidates) {
+    if (Checks++ >= MaxChecks)
+      break;
     ++Stats.Queries;
     P->Solver.reset();
-    P->Solver.add(T->Expr != Candidate.second);
+    P->Solver.add(T->Expr != Candidate.Expr);
     z3::check_result R = P->Solver.check();
     if (R == z3::unsat) {
       ++Stats.Proved;
       SimplificationProof Proof;
-      Proof.Kind = Candidate.first;
-      Proof.Leaves.append(T->Leaves.begin(), T->Leaves.end());
+    Proof.Kind = Candidate.Kind;
+    Proof.Leaves.append(T->Leaves.begin(), T->Leaves.end());
+    Proof.LeftIndex = Candidate.Left;
+    Proof.RightIndex = Candidate.Right;
+    Proof.Constant = Candidate.Constant;
       return Proof;
     }
     if (R == z3::unknown)

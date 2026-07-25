@@ -15,7 +15,9 @@ public:
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &AM);
 
-  static bool cleanupModule(llvm::Module &M, bool EnforceStrict = false);
+  static bool cleanupModule(llvm::Module &M, bool EnforceStrict = false,
+                            bool DeferCompactedFrameFinalization = false);
+  static bool finalizeCompactedFrames(llvm::Module &M);
 
 private:
   bool EnforceStrict;

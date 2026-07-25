@@ -668,6 +668,50 @@ def _validate_weighted_graph_batches(payload: bytes) -> Tuple[bool, str]:
     return False, "weighted_graph_terminator"
 
 
+def _validate_slim_span_batches(payload: bytes) -> Tuple[bool, str]:
+    """Validate AOJ 1280's ``N M`` plus ``M`` weighted-edge batches.
+
+    Keep this line-aware: the target parser reads one edge per ``fgets`` call,
+    so accepting a merely token-equivalent layout can exercise parser failure
+    rather than program semantics.
+    """
+    lines = payload.splitlines()
+    if not lines or not payload.endswith(b"\n"):
+        return False, "slim_span_newline"
+
+    cursor = 0
+    while cursor < len(lines):
+        header = lines[cursor].split()
+        cursor += 1
+        if len(header) != 2 or any(not _INT_RE.fullmatch(token) for token in header):
+            return False, "slim_span_header"
+        nodes, edges = (int(token) for token in header)
+        if nodes == 0:
+            return (True, "") if edges == 0 and cursor == len(lines) else (
+                False,
+                "slim_span_terminator",
+            )
+        if not (1 <= nodes <= 100 and 0 <= edges <= 5000):
+            return False, "slim_span_bounds"
+        if cursor + edges > len(lines):
+            return False, "slim_span_edges"
+        for edge_line in lines[cursor : cursor + edges]:
+            fields = edge_line.split()
+            if len(fields) != 3 or any(
+                not _INT_RE.fullmatch(token) for token in fields
+            ):
+                return False, "slim_span_edge_integer"
+            left, right, weight = (int(token) for token in fields)
+            if not (
+                1 <= left <= nodes
+                and 1 <= right <= nodes
+                and 0 <= weight <= 10_000_000
+            ):
+                return False, "slim_span_edge_value"
+        cursor += edges
+    return False, "slim_span_terminator"
+
+
 def _validate_bit_vectors(payload: bytes) -> Tuple[bool, str]:
     values = _integer_tokens(payload)
     if values is None or len(values) < 2:
@@ -1562,6 +1606,8 @@ def validate_contract_payload(
         return _validate_fixed_vector_block(payload)
     if kind == "weighted_graph_batches":
         return _validate_weighted_graph_batches(payload)
+    if kind == "slim_span_batches":
+        return _validate_slim_span_batches(payload)
     if kind == "bit_vectors":
         return _validate_bit_vectors(payload)
     if kind == "circle_batches":
@@ -2226,6 +2272,17 @@ def _random_valid_payload(contract: Dict[str, Any]) -> Optional[bytes]:
                 f"{random.randint(1, cities)} {random.randint(1, cities)} {random.randint(0, 100000)}"
             )
         output.append("0 0 0 0 0")
+        return ("\n".join(output) + "\n").encode()
+    if kind == "slim_span_batches":
+        nodes = random.randint(2, 12)
+        edges = random.randint(0, min(20, nodes * (nodes - 1) // 2))
+        output = [f"{nodes} {edges}"]
+        for _ in range(edges):
+            output.append(
+                f"{random.randint(1, nodes)} {random.randint(1, nodes)} "
+                f"{random.randint(0, 100000)}"
+            )
+        output.append("0 0")
         return ("\n".join(output) + "\n").encode()
     if kind == "two_row_integer_batches":
         count = random.randint(1, 20)

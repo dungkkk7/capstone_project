@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -14,10 +12,16 @@ from llm_recovery.llm_recovery import (
     RecoveryResult,
     VertexGemini,
     confirmed_equivalence_pass,
+    export_ghidra_pseudocode,
     run_recovery_loop,
 )
 from llvm_pass.britening_ir import brighten_ir, read_native_contract_report
-from main import _resolve_seed_paths, _run_fuzzer_sync, _select_generator
+from main import (
+    _resolve_seed_paths,
+    _run_experimental_delift_bundle,
+    _run_fuzzer_sync,
+    _select_generator,
+)
 
 from .enums import MethodId
 from .models import GenerationResult, RepresentationArtifact, SampleIdentity
@@ -89,7 +93,7 @@ class P0LegacyRun:
 class P0LegacyAdapter:
     """Run the current five-iteration P0 protocol without redefining it."""
 
-    VERSION = "p0-legacy-adapter-v1"
+    VERSION = "p0-legacy-adapter-v2-split-phases"
 
     def __init__(self, config: Dict[str, Any], lift_service: RawLiftService):
         self.config = config
@@ -107,11 +111,25 @@ class P0LegacyAdapter:
             Callable[[str, Dict[str, Any]], None] | None
         ) = None,
     ) -> P0LegacyRun:
+        representation = self.prepare(sample, common_dir, variant_dir)
+        return self.process(
+            sample,
+            variant_dir,
+            representation=representation,
+            quota_event_callback=quota_event_callback,
+        )
+
+    def prepare(
+        self,
+        sample: SampleIdentity,
+        common_dir: str | Path,
+        variant_dir: str | Path,
+    ) -> RepresentationArtifact:
+        """Freeze all P0 evidence required by the later LLM phase."""
+
         variant = Path(variant_dir)
         representation_dir = variant / "representation"
-        generation_dir = variant / "generation"
         representation_dir.mkdir(parents=True, exist_ok=True)
-        generation_dir.mkdir(parents=True, exist_ok=True)
 
         lift = self.lift_service.build(sample, Path(common_dir) / "raw_lift")
         raw_bc = Path(lift["raw_bc_path"])
@@ -127,10 +145,172 @@ class P0LegacyAdapter:
             raise RepresentationError(
                 "P0_BRIGHTENED_LL_MISSING", "P0 did not produce brightened.ll"
             )
+        delifted_ll_text, delift_status, delift_log = _run_experimental_delift_bundle(
+            str(brightened_ll), str(representation_dir), "delifted"
+        )
+        delifted_ll = Path(delifted_ll_text)
+        if delift_status == "applied":
+            primary_ll = delifted_ll
+        else:
+            primary_ll = brightened_ll
         native_report = read_native_contract_report(str(brightened_bc))
         if native_report:
             atomic_write_json(
                 representation_dir / "native_contract_report.json", native_report
+            )
+
+        # Freeze provider/decoding knobs from the experiment config for every
+        # method.  This preserves P0's current representation, prompt,
+        # compiler/fuzz-feedback loop and five-iteration bound while preventing
+        # ambient LLM_RECOVERY_* variables from silently giving P0 a different
+        # model or sampling policy than A0/B0.
+        legacy_config = build_p0_recovery_config(self.config)
+
+        brightened_reference = representation_dir / "brightened_ref.bin"
+        compile_to_binary(str(primary_ll), str(brightened_reference))
+        recovery_reference = (
+            str(brightened_reference)
+            if brightened_reference.is_file()
+            else sample.original_elf_path
+        )
+
+        p0_pseudocode = representation_dir / "ghidra_pseudocode.c"
+        export_ghidra_pseudocode(
+            recovery_reference,
+            str(p0_pseudocode),
+            ghidra_binary_path=legacy_config.ghidra_binary_path,
+            timeout=legacy_config.ghidra_timeout,
+        )
+        if not p0_pseudocode.is_file() or not p0_pseudocode.stat().st_size:
+            raise RepresentationError(
+                "P0_PSEUDOCODE_MISSING",
+                "P0 preparation produced no Ghidra pseudocode",
+            )
+
+        model_freeze = {
+            "model_id": legacy_config.model,
+            "location": legacy_config.location,
+            "temperature": legacy_config.temperature,
+            "top_p": legacy_config.top_p,
+            "candidate_count": legacy_config.candidate_count,
+            "max_output_tokens": legacy_config.max_output_tokens,
+            "thinking_level": legacy_config.thinking_level,
+        }
+        attach_clean_ir = legacy_config.attach_clean_ir
+        attachment_paths = [str(p0_pseudocode)]
+        attachment_hashes = [sha256_file(p0_pseudocode)]
+        if attach_clean_ir:
+            attachment_paths.insert(0, str(primary_ll))
+            attachment_hashes.insert(0, sha256_file(primary_ll))
+        representation = RepresentationArtifact(
+            method=MethodId.P0,
+            primary_path=str(primary_ll),
+            primary_sha256=sha256_file(primary_ll),
+            byte_count=primary_ll.stat().st_size,
+            token_count=max(1, (primary_ll.stat().st_size + 2) // 3),
+            builder_version=self.VERSION,
+            attachment_paths=attachment_paths,
+            attachment_sha256=attachment_hashes,
+            provenance={
+                "source_sha256": sample.original_elf_sha256,
+                "raw_lift_cache_key": lift["cache_key"],
+                "brightened_bc_path": str(brightened_bc),
+                "brightened_bc_sha256": sha256_file(brightened_bc),
+                "delift_bundle": delift_status,
+                "delift_bundle_log": delift_log,
+                "delifted_ll_path": str(primary_ll),
+                "delifted_ll_sha256": sha256_file(primary_ll),
+                "pseudocode_path": str(p0_pseudocode),
+                "pseudocode_sha256": sha256_file(p0_pseudocode),
+                "internal_precheck_path": str(
+                    variant / "p0_internal_precheck.json"
+                ),
+                "internal_reference": recovery_reference,
+                "internal_reference_sha256": sha256_file(
+                    recovery_reference
+                ),
+                "native_contract": native_report,
+                "protocol": "legacy_iterative_repair",
+                "max_iterations": 5,
+                "representation_contract": (
+                    "delifted LLVM IR plus P0 Ghidra pseudocode"
+                    if attach_clean_ir
+                    else "P0 Ghidra pseudocode only; delifted LLVM IR retained locally"
+                ),
+                "model_freeze": model_freeze,
+                "prepared_without_llm": True,
+            },
+            evidence_byte_count=sum(
+                Path(path).stat().st_size for path in attachment_paths
+            ),
+            evidence_token_count=max(
+                1,
+                (
+                    sum(
+                        Path(path).stat().st_size
+                        for path in attachment_paths
+                    )
+                    + 2
+                )
+                // 3,
+            ),
+        )
+        atomic_write_json(
+            representation_dir / "representation_manifest.json",
+            representation.to_dict(),
+        )
+        return representation
+
+    def process(
+        self,
+        sample: SampleIdentity,
+        variant_dir: str | Path,
+        *,
+        representation: RepresentationArtifact,
+        quota_event_callback: (
+            Callable[[str, Dict[str, Any]], None] | None
+        ) = None,
+    ) -> P0LegacyRun:
+        """Consume frozen P0 evidence and run LLM recovery/repair."""
+
+        variant = Path(variant_dir)
+        generation_dir = variant / "generation"
+        generation_dir.mkdir(parents=True, exist_ok=True)
+        if representation.method is not MethodId.P0:
+            raise RepresentationError(
+                "P0_REPRESENTATION_METHOD_MISMATCH",
+                "P0 processing received another method's representation",
+            )
+        brightened_ll = Path(representation.primary_path)
+        if (
+            not brightened_ll.is_file()
+            or sha256_file(brightened_ll) != representation.primary_sha256
+        ):
+            raise RepresentationError(
+                "P0_REPRESENTATION_HASH_MISMATCH",
+                "Frozen P0 brightened LLVM IR is missing or changed",
+            )
+        provenance = representation.provenance or {}
+        p0_pseudocode = Path(str(provenance.get("pseudocode_path") or ""))
+        if (
+            not p0_pseudocode.is_file()
+            or sha256_file(p0_pseudocode)
+            != provenance.get("pseudocode_sha256")
+        ):
+            raise RepresentationError(
+                "P0_PSEUDOCODE_HASH_MISMATCH",
+                "Frozen P0 Ghidra pseudocode is missing or changed",
+            )
+        prepared_pseudocode = p0_pseudocode
+        recovery_reference = str(provenance.get("internal_reference") or "")
+        if (
+            not Path(recovery_reference).is_file()
+            or sha256_file(recovery_reference)
+            != provenance.get("internal_reference_sha256")
+        ):
+            raise RepresentationError(
+                "P0_REFERENCE_HASH_MISMATCH",
+                "Frozen P0 recovery reference is missing or changed",
             )
 
         root = self.config["_project_root"]
@@ -143,12 +323,6 @@ class P0LegacyAdapter:
         contract = resolve_input_contract(
             root, sample.original_elf_path, only_custom=True
         )
-
-        # Freeze provider/decoding knobs from the experiment config for every
-        # method.  This preserves P0's current representation, prompt,
-        # compiler/fuzz-feedback loop and five-iteration bound while preventing
-        # ambient LLM_RECOVERY_* variables from silently giving P0 a different
-        # model or sampling policy than A0/B0.
         legacy_config = build_p0_recovery_config(self.config)
 
         def run_legacy_fuzz(
@@ -172,25 +346,28 @@ class P0LegacyAdapter:
                 timeout=timeout,
             )
 
+        brightened_bc = Path(
+            str(provenance.get("brightened_bc_path") or "")
+        )
+        if (
+            not brightened_bc.is_file()
+            or sha256_file(brightened_bc)
+            != provenance.get("brightened_bc_sha256")
+        ):
+            raise RepresentationError(
+                "P0_BRIGHTENED_BC_HASH_MISMATCH",
+                "Frozen P0 brightened bitcode is missing or changed",
+            )
         precheck = run_legacy_fuzz(
-            str(brightened_bc),
+            recovery_reference,
             sample.original_elf_path,
             iterations=int(self.config["p0"]["fuzz_iterations"]),
             timeout=float(self.config["p0"]["fuzz_timeout_sec"]),
         )
-        atomic_write_json(variant / "p0_internal_precheck.json", precheck)
+        precheck_path = variant / "p0_internal_precheck.json"
+        atomic_write_json(precheck_path, precheck)
         if not confirmed_equivalence_pass(precheck):
             raise P0PrecheckFailed(precheck)
-
-        brightened_reference = (
-            representation_dir / "brightened_ref.bin"
-        )
-        compile_to_binary(str(brightened_bc), str(brightened_reference))
-        recovery_reference = (
-            str(brightened_reference)
-            if brightened_reference.is_file()
-            else sample.original_elf_path
-        )
 
         def recovery_fuzz(candidate_path: str) -> Dict[str, Any]:
             return run_legacy_fuzz(
@@ -234,10 +411,16 @@ class P0LegacyAdapter:
                 "recovery_reference_binary": recovery_reference,
                 "recovery_reference_label": (
                     "brightened.bc compiled"
-                    if recovery_reference == str(brightened_reference)
+                    if recovery_reference != sample.original_elf_path
                     else "original"
                 ),
                 "input_ir": str(brightened_ll),
+                "precomputed_ghidra_pseudocode_path": str(
+                    prepared_pseudocode
+                ),
+                "precomputed_ghidra_pseudocode_sha256": sha256_file(
+                    prepared_pseudocode
+                ),
                 "case": sample.sample_id,
             },
             fuzzer_callback=recovery_fuzz,
@@ -248,11 +431,15 @@ class P0LegacyAdapter:
         )
         if not result.source_path or not Path(result.source_path).is_file():
             raise RuntimeError("P0 legacy recovery produced no candidate")
-        p0_pseudocode = generation_dir / "ghidra_pseudocode.c"
-        if not p0_pseudocode.is_file() or not p0_pseudocode.stat().st_size:
+        persisted_pseudocode = generation_dir / "ghidra_pseudocode.c"
+        if (
+            not persisted_pseudocode.is_file()
+            or sha256_file(persisted_pseudocode)
+            != sha256_file(prepared_pseudocode)
+        ):
             raise RepresentationError(
-                "P0_PSEUDOCODE_MISSING",
-                "P0 strict representation requires its Ghidra pseudocode",
+                "P0_PSEUDOCODE_PROCESSING_DRIFT",
+                "P0 processing did not consume the frozen Ghidra pseudocode",
             )
 
         responses = sorted(generation_dir.glob("recovery_iter*.response.txt"))
@@ -300,7 +487,7 @@ class P0LegacyAdapter:
             "max_iterations": 5,
             **model_freeze,
             "representation_sha256": sha256_file(brightened_ll),
-            "pseudocode_sha256": sha256_file(p0_pseudocode),
+            "pseudocode_sha256": sha256_file(prepared_pseudocode),
             "recovery_reference_sha256": sha256_file(recovery_reference),
         }
         quota_metrics = (
@@ -347,54 +534,6 @@ class P0LegacyAdapter:
                 "model_freeze": model_freeze,
                 "quota": quota_metrics,
             },
-        )
-        attach_clean_ir = legacy_config.attach_clean_ir
-        attachment_paths = [str(p0_pseudocode)]
-        attachment_hashes = [sha256_file(p0_pseudocode)]
-        if attach_clean_ir:
-            attachment_paths.insert(0, str(brightened_ll))
-            attachment_hashes.insert(0, sha256_file(brightened_ll))
-        representation = RepresentationArtifact(
-            method=MethodId.P0,
-            primary_path=str(brightened_ll),
-            primary_sha256=sha256_file(brightened_ll),
-            byte_count=brightened_ll.stat().st_size,
-            token_count=max(
-                1,
-                (
-                    len(brightened_ll.read_bytes())
-                    + 2
-                )
-                // 3,
-            ),
-            builder_version=self.VERSION,
-            attachment_paths=attachment_paths,
-            attachment_sha256=attachment_hashes,
-            provenance={
-                "source_sha256": sample.original_elf_sha256,
-                "raw_lift_cache_key": lift["cache_key"],
-                "brightened_bc_sha256": sha256_file(brightened_bc),
-                "internal_reference": recovery_reference,
-                "internal_reference_sha256": sha256_file(recovery_reference),
-                "native_contract": native_report,
-                "protocol": "legacy_iterative_repair",
-                "max_iterations": 5,
-                "representation_contract": (
-                    "brightened LLVM IR plus P0 Ghidra pseudocode"
-                    if attach_clean_ir
-                    else "P0 Ghidra pseudocode only; brightened LLVM IR retained locally"
-                ),
-                "model_freeze": model_freeze,
-            },
-            evidence_byte_count=sum(Path(path).stat().st_size for path in attachment_paths),
-            evidence_token_count=max(
-                1,
-                (sum(Path(path).stat().st_size for path in attachment_paths) + 2) // 3,
-            ),
-        )
-        atomic_write_json(
-            representation_dir / "representation_manifest.json",
-            representation.to_dict(),
         )
         atomic_write_json(
             generation_dir / "generation_manifest.json",

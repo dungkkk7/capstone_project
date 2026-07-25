@@ -143,6 +143,39 @@ if grep -Eq 'call i32 @puts\(ptr %arg\)|native\.data\.pointer\.select|native\.ad
 fi
 rm -f "$VARARG_EXTERNAL_PTR_OUT"
 
+NATIVE_DISPATCH_OUT="$(mktemp)"
+trap 'rm -f "$NATIVE_DISPATCH_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
+  -o "$NATIVE_DISPATCH_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
+  < "$NATIVE_DISPATCH_OUT"
+rm -f "$NATIVE_DISPATCH_OUT"
+
+SHARED_STATE_FRAME_OUT="$(mktemp)"
+trap 'rm -f "$SHARED_STATE_FRAME_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,default<O3>,brighten-native-cleanup-final-pass,verify' \
+  -S "$ROOT/tests/shared_state_unblocks_frame_compaction.ll" \
+  -o "$SHARED_STATE_FRAME_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/shared_state_unblocks_frame_compaction.ll" \
+  < "$SHARED_STATE_FRAME_OUT"
+rm -f "$SHARED_STATE_FRAME_OUT"
+
+LOWERED_STATE_OUT="$(mktemp)"
+trap 'rm -f "$LOWERED_STATE_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -S "$ROOT/tests/lowered_state_localization.ll" \
+  -o "$LOWERED_STATE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/lowered_state_localization.ll" \
+  < "$LOWERED_STATE_OUT"
+rm -f "$LOWERED_STATE_OUT"
+
 "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass \
   -brighten-native-strict -disable-output "$ROOT/tests/clean_native.ll"
 
@@ -592,6 +625,14 @@ fi
 grep -Eq 'native_frame = alloca \[[0-9]+ x i8\]' "$AFFINE_FRAME_OUT"
 grep -Eq 'call void @llvm\.memset' "$AFFINE_FRAME_OUT"
 
+POST_FRAME_OUT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/proven_affine_frame_compaction.ll" -o "$POST_FRAME_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  --check-prefix=POST "$ROOT/tests/proven_affine_frame_compaction.ll" \
+  < "$POST_FRAME_OUT"
+
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
   -brighten-native-state-ssa -S \
@@ -622,7 +663,7 @@ if [[ "$FRAME_POS_STATUS" -ne 7 || "$FRAME_NEG_STATUS" -ne 0 ||
   exit 1
 fi
 rm -f "$FRAME_COMPACT_OUT" "$FRAME_REFUSE_OUT" \
-  "$AFFINE_FRAME_OUT" "$AFFINE_FRAME_REFUSE_OUT" \
+  "$AFFINE_FRAME_OUT" "$AFFINE_FRAME_REFUSE_OUT" "$POST_FRAME_OUT" \
   "$FRAME_POS_BIN" "$FRAME_NEG_BIN" "$AFFINE_FRAME_BIN"
 
 POINTER_DIFFERENCE_OUT="$(mktemp)"

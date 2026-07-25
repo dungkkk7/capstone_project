@@ -16,6 +16,10 @@ rtk env PYTHONPATH=src python3 -m pytest -q
 Nếu worktree có thay đổi chưa được ghi nhận, lưu lại `git diff` cùng run ID để
 audit. Không xoá các run cũ.
 
+`configs/experiment_primary.yaml` yêu cầu worktree sạch. Nếu đang phát triển
+hoặc pilot trên code chưa commit, dùng `configs/experiment_three_case.yaml`
+hoặc `configs/experiment_pilot.yaml`; không gọi kết quả đó là primary outcome.
+
 ## 2. Cấu hình ADC và Vertex
 
 Đăng nhập đúng tài khoản Google Cloud và tạo ADC:
@@ -55,7 +59,7 @@ Không truyền `--pilot`; khi đó runner lấy toàn bộ sample trong
 RUN_ID="real_full_$(date -u +%Y%m%dT%H%M%SZ)_gemini25pro"
 rtk env GOOGLE_APPLICATION_CREDENTIALS="$GOOGLE_APPLICATION_CREDENTIALS" \
   VERTEX_PROJECT="$VERTEX_PROJECT" VERTEX_LOCATION="$VERTEX_LOCATION" \
-  PYTHONUNBUFFERED=1 python3 -m src.experiments.cli run \
+  PYTHONUNBUFFERED=1 python3 -m src.experiments.cli e2e \
   data/custom_dataset.csv \
   --config configs/experiment_three_case.yaml \
   --run-id "$RUN_ID"
@@ -64,6 +68,19 @@ rtk env GOOGLE_APPLICATION_CREDENTIALS="$GOOGLE_APPLICATION_CREDENTIALS" \
 Lưu lại `RUN_ID`; mọi artifact nằm dưới
 `result/experiments/$RUN_ID/`.
 
+Lệnh trên có ba phase cố định:
+
+1. `PREPARATION`: tạo/freeze B0 Ghidra pseudocode, A0 raw IR, P0
+   brightened/Ghidra evidence và base corpus, không gọi LLM/fuzzer;
+2. `PROCESSING`: LLM, build, fuzz discovery và common-corpus differential
+   comparison, sinh raw result;
+3. `EVALUATION`: tính metrics/statistics, phân tích, visualization, seal và
+   integrity verification, không gọi lại LLM/fuzzer.
+
+Có thể chạy riêng ba phase bằng `prepare`, `process`, `evaluate` với cùng
+dataset/config/run-id. Lệnh `e2e` chỉ là orchestration tuần tự của đúng ba phase
+này.
+
 ## 4. Resume khi bị gián đoạn hoặc 429
 
 Chạy lại **cùng** `RUN_ID` và không dùng `--no-resume`:
@@ -71,7 +88,7 @@ Chạy lại **cùng** `RUN_ID` và không dùng `--no-resume`:
 ```bash
 rtk env GOOGLE_APPLICATION_CREDENTIALS="$GOOGLE_APPLICATION_CREDENTIALS" \
   VERTEX_PROJECT="$VERTEX_PROJECT" VERTEX_LOCATION="$VERTEX_LOCATION" \
-  PYTHONUNBUFFERED=1 python3 -m src.experiments.cli run \
+  PYTHONUNBUFFERED=1 python3 -m src.experiments.cli e2e \
   data/custom_dataset.csv --config configs/experiment_three_case.yaml \
   --run-id "$RUN_ID"
 ```
@@ -82,7 +99,15 @@ logical generation của P0. Scheduler giữ request hash, iteration và resume 
 `CANCELLED`, 400 cấu hình sai, hoặc lỗi compile là failure thật và phải ghi
 riêng trong báo cáo; không tự động đổi thành PASS.
 
+Lệnh `e2e` trả exit code `0` chỉ khi toàn bộ workflow hoàn tất. Exit code `75`
+nghĩa là generation đã được checkpoint nhưng còn chờ quota/resume; chạy lại
+cùng lệnh và cùng `RUN_ID`.
+
 ## 5. Kiểm tra hoàn tất và integrity
+
+Lệnh `e2e` ở trên đã tự động chạy aggregate, seal artifact và integrity check.
+Lệnh dưới đây chỉ cần dùng khi muốn kiểm tra lại một run đã có mà không gọi
+LLM hay chạy lại evaluation:
 
 ```bash
 rtk env PYTHONPATH=src python3 -m src.experiments.cli verify-integrity \
@@ -90,8 +115,9 @@ rtk env PYTHONPATH=src python3 -m src.experiments.cli verify-integrity \
   --run-id "$RUN_ID"
 ```
 
-Chỉ coi run là hoàn tất khi có `metrics.json`, `metrics_long.csv`, audit log,
-manifest và integrity report trong thư mục run. Đọc `metrics.json` để lấy
+Chỉ coi run là hoàn tất khi có `aggregate/metrics.json`,
+`aggregate/metrics_long.csv`, audit log, manifest và integrity report trong
+thư mục run. Đọc `aggregate/metrics.json` để lấy
 `e2e_pass`, pass rate, mismatch/inconclusive, model ID, token usage và cost.
 
 ## 6. Visualization và audit

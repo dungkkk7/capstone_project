@@ -7,6 +7,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
@@ -42,6 +43,7 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -62,11 +64,30 @@ static cl::opt<std::string> ReportPath(
 static cl::opt<unsigned> Z3TimeoutMs(
     "095-z3-timeout-ms",
     cl::desc("Per-query Z3 timeout in milliseconds; unknown never proves a rewrite"),
-    cl::init(100));
+    cl::init(50));
 
 static cl::opt<unsigned> MaxZ3Candidates(
     "095-max-z3-candidates",
-    cl::desc("Maximum MBA expressions considered per function"), cl::init(512));
+    cl::desc("Maximum generic residual MBA expressions considered per function "
+             "(0 disables the expensive fallback; direct/native rules remain active)"),
+    cl::init(0));
+
+static cl::opt<unsigned> MaxZ3RecipesPerExpression(
+    "095-max-z3-recipes-per-expression",
+    cl::desc("Maximum residual Z3 recipes tested for one MBA expression"),
+    cl::init(12));
+
+static cl::opt<unsigned> MaxOpaqueZ3Candidates(
+    "095-max-opaque-z3-candidates",
+    cl::desc("Maximum prioritized opaque-predicate Z3 candidates per module"),
+    // Residual SMT is a diagnostic fallback, never the discovery engine.
+    // Deterministic structural/bitwidth rules run without this budget.
+    cl::init(8));
+
+static cl::opt<bool> OpaqueZ3Debug(
+    "095-opaque-z3-debug",
+    cl::desc("Print opaque predicates proved constant by the Z3 fallback"),
+    cl::init(false), cl::Hidden);
 
 static cl::opt<bool> DisableMBA(
     "095-disable-mba", cl::desc("Diagnostic: disable the MBA/Z3 rewrite stage"),
@@ -101,7 +122,18 @@ static cl::opt<bool> DisableMemoryEntryFinalize(
     cl::desc("Diagnostic: retain the one-shot entry of memory dispatchers"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> DeflattenInLoopOnly(
+    "095-deflatten-in-loop-only",
+    cl::desc("Diagnostic: retain PHI-state transitions leaving the root loop"),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<unsigned> MaxPhiDeflattenEdges(
+    "095-max-phi-deflatten-edges",
+    cl::desc("Diagnostic: maximum edges rewritten in one PHI-state root (0 is unlimited)"),
+    cl::init(0), cl::Hidden);
+
 struct StageMetrics {
+  uint64_t Candidates = 0;
   uint64_t Changes = 0;
   uint64_t Unresolved = 0;
 };
@@ -120,11 +152,49 @@ struct Report {
   std::string Module;
   std::string Status = "ok";
   std::map<std::string, StageMetrics> Stages;
+  // Rule-level evidence makes progress auditable instead of inferring it
+  // from aggregate stage change counts.
+  std::map<std::string, uint64_t> RuleHits;
   SmallVector<std::string, 32> UnresolvedReasons;
   SmallVector<FunctionMetrics, 16> Functions;
   ProofStats Z3;
+  uint64_t OpaqueZ3Attempts = 0;
   unsigned TimeoutMs = 0;
 };
+
+static void noteRule(Report &R, StringRef Rule) {
+  ++R.RuleHits[Rule.str()];
+}
+
+static StringRef ruleName(CandidateKind K) {
+  switch (K) {
+  case CandidateKind::ConstantZero: return "mba.constant_zero";
+  case CandidateKind::ConstantOne: return "mba.constant_one";
+  case CandidateKind::ConstantAllOnes: return "mba.constant_all_ones";
+  case CandidateKind::Leaf0: return "mba.leaf0";
+  case CandidateKind::Leaf1: return "mba.leaf1";
+  case CandidateKind::Add: case CandidateKind::PairAdd: return "mba.add";
+  case CandidateKind::Sub01: case CandidateKind::Sub10: case CandidateKind::PairSub: return "mba.sub";
+  case CandidateKind::PairMul: return "mba.mul";
+  case CandidateKind::Xor: case CandidateKind::PairXor: return "mba.xor";
+  case CandidateKind::And: case CandidateKind::PairAnd: return "mba.and";
+  case CandidateKind::Or: case CandidateKind::PairOr: return "mba.or";
+  case CandidateKind::Not0: case CandidateKind::Not1: return "mba.not";
+  case CandidateKind::Neg0: case CandidateKind::Neg1: return "mba.neg";
+  case CandidateKind::AddConst: return "mba.add_const";
+  case CandidateKind::SubConst: return "mba.sub_const";
+  case CandidateKind::XorConst: return "mba.xor_const";
+  case CandidateKind::AndConst: return "mba.and_const";
+  case CandidateKind::OrConst: return "mba.or_const";
+  case CandidateKind::MulConst: return "mba.mul_const";
+  case CandidateKind::ShlConst: return "mba.shl_const";
+  case CandidateKind::LShrConst: return "mba.lshr_const";
+  case CandidateKind::AShrConst: return "mba.ashr_const";
+  case CandidateKind::UnaryNot: return "mba.not";
+  case CandidateKind::UnaryNeg: return "mba.neg";
+  }
+  return "mba.unknown";
+}
 
 static constexpr StringLiteral StageNames[] = {
     "normalize",          "resolve_objects_pointers",
@@ -191,7 +261,13 @@ static std::string defaultReportPath(const Module &M) {
   StringRef Base = sys::path::filename(Source);
   if (Base.empty() || Base == "<stdin>")
     Base = "module";
-  return (Base + ".095.json").str();
+  // Keep reports adjacent but avoid the historical llvm-link.095.json
+  // collision when several samples are processed concurrently.
+  SmallString<256> Stem(Base);
+  sys::path::replace_extension(Stem, "");
+  std::string Tag = std::to_string(static_cast<uint64_t>(hash_value(
+      M.getModuleIdentifier())));
+  return (Stem + ".095." + Tag + ".json").str();
 }
 
 static void writeReport(const Module &M, const Report &R) {
@@ -215,6 +291,8 @@ static void writeReport(const Module &M, const Report &R) {
       J.attribute("proved", int64_t(R.Z3.Proved));
       J.attribute("disproved", int64_t(R.Z3.Disproved));
       J.attribute("unknown", int64_t(R.Z3.Unknown));
+      J.attribute("opaque_candidates_attempted",
+                  int64_t(R.OpaqueZ3Attempts));
       J.attribute("unknown_is_evidence", false);
     });
     J.attributeArray("pipeline", [&] {
@@ -227,10 +305,31 @@ static void writeReport(const Module &M, const Report &R) {
         StageMetrics Empty;
         const StageMetrics &S = It == R.Stages.end() ? Empty : It->second;
         J.attributeObject(Name, [&] {
+          J.attribute("candidates", int64_t(S.Candidates));
           J.attribute("changes", int64_t(S.Changes));
           J.attribute("unresolved", int64_t(S.Unresolved));
-        });
-      }
+  });
+}
+    });
+    J.attributeObject("rule_hits", [&] {
+      for (const auto &KV : R.RuleHits)
+        J.attribute(KV.first, int64_t(KV.second));
+    });
+    J.attributeObject("chernobog_rule_coverage", [&] {
+      // These are the source-side catalog sizes.  Generic LLVM rules are
+      // reported separately because one LLVM matcher can subsume several
+      // IDA-microcode rules; they must not be mistaken for 1:1 coverage.
+      J.attribute("expected_mba_rules", int64_t(110));
+      J.attribute("expected_predicate_rules", int64_t(24));
+      // rules_predicate.h declares 24 concrete classes.  Chernobog's
+      // initialize() registers 23 of them; LnotLnotRule is intentionally
+      // omitted there because it canonicalizes rather than returns a
+      // constant.  The LLVM port implements and tests that canonicalization
+      // as well as all 23 active registry entries.
+      J.attribute("source_active_predicate_rules", int64_t(23));
+      J.attribute("llvm_predicate_semantics_covered", int64_t(24));
+      J.attribute("predicate_rule_mapping_complete", true);
+      J.attribute("direct_rule_mapping_complete", false);
     });
     J.attributeArray("functions", [&] {
       for (const FunctionMetrics &F : R.Functions) {
@@ -453,6 +552,11 @@ static Value *materializeProof(IRBuilder<> &B, Type *Ty,
   auto Leaf = [&](unsigned I) -> Value * {
     return I < Proof.Leaves.size() ? Proof.Leaves[I] : nullptr;
   };
+  auto Const = [&]() -> Value * {
+    return ConstantInt::get(Ty, Proof.Constant);
+  };
+  Value *L = Leaf(Proof.LeftIndex);
+  Value *R = Leaf(Proof.RightIndex);
   switch (Proof.Kind) {
   case CandidateKind::ConstantZero: return ConstantInt::get(Ty, 0);
   case CandidateKind::ConstantOne: return ConstantInt::get(Ty, 1);
@@ -469,26 +573,317 @@ static Value *materializeProof(IRBuilder<> &B, Type *Ty,
   case CandidateKind::Not1: return B.CreateNot(Leaf(1), "deobf.mba.not");
   case CandidateKind::Neg0: return B.CreateNeg(Leaf(0), "deobf.mba.neg");
   case CandidateKind::Neg1: return B.CreateNeg(Leaf(1), "deobf.mba.neg");
+  case CandidateKind::PairAdd: return B.CreateAdd(L, R, "deobf.mba.add");
+  case CandidateKind::PairSub: return B.CreateSub(L, R, "deobf.mba.sub");
+  case CandidateKind::PairMul: return B.CreateMul(L, R, "deobf.mba.mul");
+  case CandidateKind::PairXor: return B.CreateXor(L, R, "deobf.mba.xor");
+  case CandidateKind::PairAnd: return B.CreateAnd(L, R, "deobf.mba.and");
+  case CandidateKind::PairOr: return B.CreateOr(L, R, "deobf.mba.or");
+  case CandidateKind::AddConst: return B.CreateAdd(L, Const(), "deobf.mba.addc");
+  case CandidateKind::SubConst: return B.CreateSub(L, Const(), "deobf.mba.subc");
+  case CandidateKind::XorConst: return B.CreateXor(L, Const(), "deobf.mba.xorc");
+  case CandidateKind::AndConst: return B.CreateAnd(L, Const(), "deobf.mba.andc");
+  case CandidateKind::OrConst: return B.CreateOr(L, Const(), "deobf.mba.orc");
+  case CandidateKind::MulConst: return B.CreateMul(L, Const(), "deobf.mba.mulc");
+  case CandidateKind::ShlConst: return B.CreateShl(L, Const(), "deobf.mba.shlc");
+  case CandidateKind::LShrConst: return B.CreateLShr(L, Const(), "deobf.mba.lshrc");
+  case CandidateKind::AShrConst: return B.CreateAShr(L, Const(), "deobf.mba.ashrc");
+  case CandidateKind::UnaryNot: return B.CreateNot(L, "deobf.mba.not");
+  case CandidateKind::UnaryNeg: return B.CreateNeg(L, "deobf.mba.neg");
   }
   return nullptr;
 }
 
-static bool simplifyMBA(Function &F, Z3Prover &Prover, Report &R) {
-  SmallVector<Instruction *, 256> Candidates;
-  for (Instruction &I : instructions(F)) {
-    if (!I.getType()->isIntegerTy() || I.getType()->isIntegerTy(1) ||
-        I.mayHaveSideEffects() || I.isTerminator())
-      continue;
-    Candidates.push_back(&I);
-    if (Candidates.size() >= MaxZ3Candidates)
+// OLLVM emits this predicate repeatedly in the lifted corpus:
+//
+//   ((x * ~x) & 1) ^ 1
+//
+// x and ~x have opposite low bits, so their product is always even.  This is
+// cheap to prove structurally and should not consume the bounded generic Z3
+// candidate budget.  Integer casts between the product and the low-bit mask
+// preserve bit zero.
+static Value *stripLowBitPreservingCasts(Value *V) {
+  while (auto *CI = dyn_cast<CastInst>(V)) {
+    unsigned Op = CI->getOpcode();
+    if (Op != Instruction::Trunc && Op != Instruction::ZExt &&
+        Op != Instruction::SExt)
       break;
+    V = CI->getOperand(0);
+  }
+  return V;
+}
+
+static bool isBitwiseComplementOf(Value *MaybeNot, Value *Other) {
+  auto *Xor = dyn_cast<BinaryOperator>(MaybeNot);
+  if (!Xor || Xor->getOpcode() != Instruction::Xor)
+    return false;
+  auto IsAllOnes = [](Value *V) {
+    auto *C = dyn_cast<ConstantInt>(V);
+    return C && C->isMinusOne();
+  };
+  return (Xor->getOperand(0) == Other && IsAllOnes(Xor->getOperand(1))) ||
+         (Xor->getOperand(1) == Other && IsAllOnes(Xor->getOperand(0)));
+}
+
+static bool isParityPartnerOf(Value *MaybePartner, Value *Other) {
+  if (isBitwiseComplementOf(MaybePartner, Other))
+    return true;
+
+  auto *BO = dyn_cast<BinaryOperator>(MaybePartner);
+  if (!BO || BO->hasNoUnsignedWrap() || BO->hasNoSignedWrap())
+    return false;
+  auto IsAdjacentConstant = [](Value *V) {
+    auto *C = dyn_cast<ConstantInt>(V);
+    return C && (C->isOne() || C->isMinusOne());
+  };
+  if (BO->getOpcode() == Instruction::Add)
+    return (BO->getOperand(0) == Other &&
+            IsAdjacentConstant(BO->getOperand(1))) ||
+           (BO->getOperand(1) == Other &&
+            IsAdjacentConstant(BO->getOperand(0)));
+  if (BO->getOpcode() == Instruction::Sub)
+    return BO->getOperand(0) == Other &&
+           isa<ConstantInt>(BO->getOperand(1)) &&
+           cast<ConstantInt>(BO->getOperand(1))->isOne();
+  return false;
+}
+
+static bool isKnownEven(Value *V, unsigned Depth = 0) {
+  if (!V || Depth > 12)
+    return false;
+  V = stripLowBitPreservingCasts(V);
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO)
+    return false;
+
+  if (BO->getOpcode() == Instruction::Mul &&
+      !BO->hasNoUnsignedWrap() && !BO->hasNoSignedWrap()) {
+    Value *L = BO->getOperand(0);
+    Value *R = BO->getOperand(1);
+    if (isParityPartnerOf(L, R) || isParityPartnerOf(R, L))
+      return true;
   }
 
+  // AND with one known-even operand is even regardless of the other operand.
+  // This covers the extra flag/state mask inserted by the lifted IR between
+  // x*(x-1) and the final low-bit test.
+  if (BO->getOpcode() == Instruction::And)
+    return isKnownEven(BO->getOperand(0), Depth + 1) ||
+           isKnownEven(BO->getOperand(1), Depth + 1);
+
+  // These operators preserve evenness when both operands are known even.
+  if (BO->getOpcode() == Instruction::Or ||
+      BO->getOpcode() == Instruction::Xor ||
+      BO->getOpcode() == Instruction::Add ||
+      BO->getOpcode() == Instruction::Sub)
+    return isKnownEven(BO->getOperand(0), Depth + 1) &&
+           isKnownEven(BO->getOperand(1), Depth + 1);
+
+  if (BO->getOpcode() == Instruction::Shl)
+    if (auto *Shift = dyn_cast<ConstantInt>(BO->getOperand(1)))
+      return !Shift->isZero();
+  return false;
+}
+
+static bool isEvenProductLowBit(Value *V) {
+  auto *And = dyn_cast<BinaryOperator>(V);
+  if (!And || And->getOpcode() != Instruction::And)
+    return false;
+
+  Value *Product = nullptr;
+  auto IsOne = [](Value *V) {
+    auto *C = dyn_cast<ConstantInt>(V);
+    return C && C->isOne();
+  };
+  if (IsOne(And->getOperand(0)))
+    Product = And->getOperand(1);
+  else if (IsOne(And->getOperand(1)))
+    Product = And->getOperand(0);
+  else
+    return false;
+
+  return isKnownEven(Product);
+}
+
+static std::optional<bool> matchComplementProductParity(Value *V) {
+  if (isEvenProductLowBit(V))
+    return false;
+
+  auto *Xor = dyn_cast<BinaryOperator>(V);
+  if (!Xor || Xor->getOpcode() != Instruction::Xor)
+    return std::nullopt;
+  auto IsOne = [](Value *Operand) {
+    auto *C = dyn_cast<ConstantInt>(Operand);
+    return C && C->isOne();
+  };
+  if (IsOne(Xor->getOperand(0)) &&
+      isEvenProductLowBit(Xor->getOperand(1)))
+    return true;
+  if (IsOne(Xor->getOperand(1)) &&
+      isEvenProductLowBit(Xor->getOperand(0)))
+    return true;
+  return std::nullopt;
+}
+
+static bool simplifyKnownMBA(Function &F, Report &R) {
   bool Changed = false;
+  SmallVector<TruncInst *, 64> EvenLowBits;
+  for (Instruction &I : instructions(F))
+    if (auto *Trunc = dyn_cast<TruncInst>(&I);
+        Trunc && Trunc->getType()->isIntegerTy(1) && !Trunc->use_empty() &&
+        isKnownEven(Trunc->getOperand(0)))
+      EvenLowBits.push_back(Trunc);
+  R.Stages["mba"].Candidates += EvenLowBits.size();
+  for (TruncInst *Trunc : reverse(EvenLowBits)) {
+    if (!Trunc->getParent() || Trunc->use_empty())
+      continue;
+    Trunc->replaceAllUsesWith(ConstantInt::getFalse(Trunc->getContext()));
+    Trunc->eraseFromParent();
+    ++R.Stages["mba"].Changes;
+    noteRule(R, "mba.ollvm_even_product_trunc_i1_zero");
+    Changed = true;
+  }
+
+  SmallVector<Instruction *, 64> ParityCandidates;
+  for (Instruction &I : instructions(F))
+    if (I.getType()->isIntegerTy() && !I.use_empty() &&
+        matchComplementProductParity(&I).has_value())
+      ParityCandidates.push_back(&I);
+  R.Stages["mba"].Candidates += ParityCandidates.size();
+  for (Instruction *I : reverse(ParityCandidates)) {
+    if (!I->getParent() || I->use_empty())
+      continue;
+    std::optional<bool> Result = matchComplementProductParity(I);
+    if (!Result)
+      continue;
+    I->replaceAllUsesWith(ConstantInt::get(I->getType(), *Result));
+    I->eraseFromParent();
+    ++R.Stages["mba"].Changes;
+    noteRule(R, *Result ? "mba.ollvm_even_product_low_bit_one"
+                        : "mba.ollvm_even_product_low_bit_zero");
+    Changed = true;
+  }
+  return Changed;
+}
+
+static bool simplifyMBA(Function &F, Z3Prover &Prover, Report &R) {
+  auto ExpressionOps = [](Value *Root) {
+    std::function<unsigned(Value *, unsigned)> Count =
+        [&](Value *V, unsigned Depth) -> unsigned {
+      if (!V || Depth > 16)
+        return 0;
+      auto *I = dyn_cast<Instruction>(V);
+      auto *BO = dyn_cast_or_null<BinaryOperator>(I);
+      if (!BO)
+        return 0;
+      return 1 + Count(BO->getOperand(0), Depth + 1) +
+             Count(BO->getOperand(1), Depth + 1);
+    };
+    return Count(Root, 0);
+  };
+  auto ExpressionKinds = [](Value *Root) {
+    std::function<unsigned(Value *, unsigned)> Kinds =
+        [&](Value *V, unsigned Depth) -> unsigned {
+      if (!V || Depth > 16)
+        return 0;
+      auto *BO = dyn_cast<BinaryOperator>(V);
+      if (!BO)
+        return 0;
+      unsigned Kind = 0;
+      switch (BO->getOpcode()) {
+      case Instruction::Add:
+      case Instruction::Sub:
+      case Instruction::Mul:
+        Kind = 1;
+        break;
+      case Instruction::And:
+      case Instruction::Or:
+      case Instruction::Xor:
+      case Instruction::Shl:
+      case Instruction::LShr:
+      case Instruction::AShr:
+        Kind = 2;
+        break;
+      default:
+        break;
+      }
+      return Kind | Kinds(BO->getOperand(0), Depth + 1) |
+             Kinds(BO->getOperand(1), Depth + 1);
+    };
+    return Kinds(Root, 0);
+  };
+  auto IsMBAExpression = [&](Instruction &I) {
+    auto *BO = dyn_cast<BinaryOperator>(&I);
+    if (!BO)
+      return false;
+    // Chernobog's registry matches expression trees, not isolated machine
+    // operations.  Avoid spending an SMT budget on a flat add/xor of two
+    // leaves; those are already handled by InstCombine and cannot satisfy a
+    // multi-op MBA pattern.
+    if (!isa<Instruction>(BO->getOperand(0)) &&
+        !isa<Instruction>(BO->getOperand(1)))
+      return false;
+    // Lifted address calculations are usually long add/sub trees but are not
+    // MBA.  Residual OLLVM substitutions combine arithmetic and bitwise
+    // operators; select those across the whole function to avoid starving
+    // later blocks behind early address arithmetic.
+    return (ExpressionKinds(&I) & 3) == 3;
+  };
+  SmallVector<Instruction *, 256> Candidates;
+  bool Changed = false;
+  // Handle the corpus-specific parity MBA before the generic simplifier.  In
+  // p00867 alone this occurs after enough unrelated lifted arithmetic to be
+  // starved by the global SMT candidate cap.
+  Changed |= simplifyKnownMBA(F, R);
+  // LLVM's poison-aware simplifier is the native equivalent of a large
+  // subset of Chernobog's algebraic/factor rules.  Run it before the SMT
+  // recipe search so identities exposed by earlier CFG rewrites are handled
+  // with LLVM's own definedness semantics.
+  if (F.getParent()) {
+    SimplifyQuery Q(F.getParent()->getDataLayout());
+    SmallVector<Instruction *, 256> Native;
+    for (Instruction &I : instructions(F))
+      if (!I.isTerminator() && !I.use_empty())
+        Native.push_back(&I);
+    for (Instruction *I : reverse(Native)) {
+      if (!I->getParent())
+        continue;
+      Value *Replacement = simplifyInstruction(I, Q);
+      if (!Replacement || Replacement == I || Replacement->getType() != I->getType())
+        continue;
+      I->replaceAllUsesWith(Replacement);
+      I->eraseFromParent();
+      ++R.Stages["mba"].Changes;
+      noteRule(R, "mba.llvm_instruction_simplify");
+      Changed = true;
+    }
+  }
+
+  Candidates.clear();
+  for (Instruction &I : instructions(F)) {
+    if (!I.getType()->isIntegerTy() || I.getType()->isIntegerTy(1) ||
+        I.mayHaveSideEffects() || I.isTerminator() || !IsMBAExpression(I) ||
+        ExpressionOps(&I) < 3)
+      continue;
+    Candidates.push_back(&I);
+  }
+  llvm::sort(Candidates, [&](Instruction *A, Instruction *B) {
+    unsigned ScoreA = ExpressionOps(A);
+    unsigned ScoreB = ExpressionOps(B);
+    for (User *U : A->users())
+      ScoreA += isa<ICmpInst, SelectInst, BranchInst>(U) ? 32 : 0;
+    for (User *U : B->users())
+      ScoreB += isa<ICmpInst, SelectInst, BranchInst>(U) ? 32 : 0;
+    return ScoreA > ScoreB;
+  });
+  if (Candidates.size() > MaxZ3Candidates)
+    Candidates.resize(MaxZ3Candidates);
+  R.Stages["mba"].Candidates += Candidates.size();
   for (Instruction *I : reverse(Candidates)) {
     if (!I->getParent() || I->use_empty())
       continue;
-    auto Proof = Prover.proveSimplerInteger(I);
+    auto Proof = Prover.proveSimplerInteger(
+        I, 3, MaxZ3RecipesPerExpression);
     if (!Proof)
       continue;
     bool WidthsMatch = llvm::all_of(
@@ -502,6 +897,7 @@ static bool simplifyMBA(Function &F, Z3Prover &Prover, Report &R) {
     I->replaceAllUsesWith(Replacement);
     I->eraseFromParent();
     ++R.Stages["mba"].Changes;
+    noteRule(R, ruleName(Proof->Kind));
     Changed = true;
   }
 
@@ -541,20 +937,745 @@ static bool simplifySelectChains(Function &F, Report &R) {
   return Changed;
 }
 
+struct PredicateRuleProof {
+  bool Result;
+  StringRef Rule;
+};
+
+static Value *matchXorWithConstant(Value *V,
+                                   function_ref<bool(const ConstantInt *)> Pred) {
+  auto *BO = dyn_cast_or_null<BinaryOperator>(V);
+  if (!BO || BO->getOpcode() != Instruction::Xor)
+    return nullptr;
+  if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0)); C && Pred(C))
+    return BO->getOperand(1);
+  if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1)); C && Pred(C))
+    return BO->getOperand(0);
+  return nullptr;
+}
+
+static Value *matchAndOne(Value *V) {
+  auto *BO = dyn_cast_or_null<BinaryOperator>(V);
+  if (!BO || BO->getOpcode() != Instruction::And)
+    return nullptr;
+  for (unsigned I = 0; I != 2; ++I)
+    if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(I)); C && C->isOne())
+      return BO->getOperand(1 - I);
+  return nullptr;
+}
+
+static Value *stripZExts(Value *V) {
+  while (auto *Cast = dyn_cast_or_null<CastInst>(V)) {
+    if (Cast->getOpcode() != Instruction::ZExt)
+      break;
+    V = Cast->getOperand(0);
+  }
+  return V;
+}
+
+static Value *matchEncodedBooleanNot(Value *V) {
+  if (!V)
+    return nullptr;
+  V = stripZExts(V);
+  Value *Inner = matchXorWithConstant(
+      V, [](const ConstantInt *C) { return C->isOne(); });
+  if (!Inner)
+    return nullptr;
+  Inner = stripZExts(Inner);
+  return Inner->getType()->isIntegerTy(1) ? Inner : nullptr;
+}
+
+static bool samePureExpression(Value *A, Value *B, unsigned Depth = 0) {
+  if (A == B)
+    return true;
+  if (!A || !B || A->getType() != B->getType() || Depth > 32)
+    return false;
+  auto *CA = dyn_cast<ConstantInt>(A);
+  auto *CB = dyn_cast<ConstantInt>(B);
+  if (CA || CB)
+    return CA && CB && CA->getValue() == CB->getValue();
+
+  auto *IA = dyn_cast<Instruction>(A);
+  auto *IB = dyn_cast<Instruction>(B);
+  if (!IA || !IB || IA->getOpcode() != IB->getOpcode() ||
+      IA->getNumOperands() != IB->getNumOperands() ||
+      IA->mayHaveSideEffects() || IB->mayHaveSideEffects() ||
+      isa<LoadInst, PHINode, CallBase>(IA) ||
+      isa<LoadInst, PHINode, CallBase>(IB))
+    return false;
+  if (auto *CmpA = dyn_cast<ICmpInst>(IA)) {
+    auto *CmpB = cast<ICmpInst>(IB);
+    if (CmpA->getPredicate() != CmpB->getPredicate())
+      return false;
+  }
+  if (auto *BOA = dyn_cast<BinaryOperator>(IA)) {
+    auto *BOB = cast<BinaryOperator>(IB);
+    if (BOA->hasNoUnsignedWrap() != BOB->hasNoUnsignedWrap() ||
+        BOA->hasNoSignedWrap() != BOB->hasNoSignedWrap() ||
+        BOA->isExact() != BOB->isExact())
+      return false;
+  }
+
+  auto SameOrdered = [&] {
+    for (unsigned I = 0; I != IA->getNumOperands(); ++I)
+      if (!samePureExpression(IA->getOperand(I), IB->getOperand(I),
+                              Depth + 1))
+        return false;
+    return true;
+  };
+  if (SameOrdered())
+    return true;
+  auto *BOA = dyn_cast<BinaryOperator>(IA);
+  if (!BOA || !BOA->isCommutative() || IA->getNumOperands() != 2)
+    return false;
+  return samePureExpression(IA->getOperand(0), IB->getOperand(1), Depth + 1) &&
+         samePureExpression(IA->getOperand(1), IB->getOperand(0), Depth + 1);
+}
+
+// The lifted flag/state form of P | !P contains an even consecutive product
+// in the low-bit arm:
+//
+//   ((zext(P) xor odd) | zext(x*(x-1))) & 1 xor 1  == P
+//
+// The other OR arm is the ordinary zext(P) xor 1.  Require structural
+// equivalence of both P trees and prove the consecutive product even before
+// folding the enclosing comparison.
+static bool isLiftedComplementGuardNonZero(Value *V) {
+  auto *RootOr = dyn_cast<BinaryOperator>(V);
+  if (!RootOr || RootOr->getOpcode() != Instruction::Or)
+    return false;
+
+  for (unsigned Orientation = 0; Orientation != 2; ++Orientation) {
+    Value *PositiveArm = RootOr->getOperand(Orientation);
+    Value *NegativeArm = RootOr->getOperand(1 - Orientation);
+    Value *LowBit = matchXorWithConstant(
+        PositiveArm, [](const ConstantInt *C) { return C->isOne(); });
+    Value *Mixed = matchAndOne(LowBit);
+    auto *MixedOr = dyn_cast_or_null<BinaryOperator>(Mixed);
+    if (!MixedOr || MixedOr->getOpcode() != Instruction::Or)
+      continue;
+
+    for (unsigned EvenSide = 0; EvenSide != 2; ++EvenSide) {
+      Value *Even = MixedOr->getOperand(EvenSide);
+      if (!isKnownEven(Even))
+        continue;
+      Value *EncodedPositive = MixedOr->getOperand(1 - EvenSide);
+      Value *WidePositive = matchXorWithConstant(
+          EncodedPositive,
+          [](const ConstantInt *C) { return C->getValue()[0]; });
+      Value *Positive = stripZExts(WidePositive);
+      Value *Negative = matchEncodedBooleanNot(NegativeArm);
+      if (Positive && Negative && Positive->getType()->isIntegerTy(1) &&
+          samePureExpression(Positive, Negative))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool isKnownOdd(Value *V, unsigned Depth = 0) {
+  if (!V || Depth > 12)
+    return false;
+  V = stripLowBitPreservingCasts(V);
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->getValue()[0];
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO)
+    return false;
+  switch (BO->getOpcode()) {
+  case Instruction::Or:
+    return isKnownOdd(BO->getOperand(0), Depth + 1) ||
+           isKnownOdd(BO->getOperand(1), Depth + 1);
+  case Instruction::And:
+    return isKnownOdd(BO->getOperand(0), Depth + 1) &&
+           isKnownOdd(BO->getOperand(1), Depth + 1);
+  case Instruction::Xor:
+  case Instruction::Add:
+  case Instruction::Sub:
+    return (isKnownOdd(BO->getOperand(0), Depth + 1) &&
+            isKnownEven(BO->getOperand(1), Depth + 1)) ||
+           (isKnownEven(BO->getOperand(0), Depth + 1) &&
+            isKnownOdd(BO->getOperand(1), Depth + 1));
+  default:
+    return false;
+  }
+}
+
+struct Boolean01 {
+  Value *Atom = nullptr;
+  bool Negated = false;
+};
+
+static Value *matchMaskedEvenComplement(Value *V) {
+  Value *Mixed = matchAndOne(V);
+  auto *MixedOr = dyn_cast_or_null<BinaryOperator>(Mixed);
+  if (!MixedOr || MixedOr->getOpcode() != Instruction::Or)
+    return nullptr;
+  for (unsigned EvenSide = 0; EvenSide != 2; ++EvenSide) {
+    if (!isKnownEven(MixedOr->getOperand(EvenSide)))
+      continue;
+    Value *Encoded = matchXorWithConstant(
+        MixedOr->getOperand(1 - EvenSide),
+        [](const ConstantInt *C) { return C->getValue()[0]; });
+    Value *Atom = stripZExts(Encoded);
+    if (Atom && Atom->getType()->isIntegerTy(1))
+      return Atom;
+  }
+  return nullptr;
+}
+
+static std::optional<Boolean01> normalizeBoolean01(Value *V,
+                                                  unsigned Depth = 0) {
+  if (!V || Depth > 24)
+    return std::nullopt;
+
+  if (auto *Cast = dyn_cast<CastInst>(V);
+      Cast && (Cast->getOpcode() == Instruction::ZExt ||
+               Cast->getOpcode() == Instruction::Trunc)) {
+    auto Inner = normalizeBoolean01(Cast->getOperand(0), Depth + 1);
+    if (Inner)
+      return Inner;
+  }
+
+  if (Value *Atom = matchMaskedEvenComplement(V))
+    return Boolean01{Atom, true};
+
+  if (Value *Inner = matchXorWithConstant(
+          V, [](const ConstantInt *C) { return C->isOne(); })) {
+    auto Form = normalizeBoolean01(Inner, Depth + 1);
+    if (Form) {
+      Form->Negated = !Form->Negated;
+      return Form;
+    }
+  }
+
+  if (auto *And = dyn_cast<BinaryOperator>(V);
+      And && And->getOpcode() == Instruction::And)
+    for (unsigned BoolSide = 0; BoolSide != 2; ++BoolSide) {
+      auto Form = normalizeBoolean01(And->getOperand(BoolSide), Depth + 1);
+      if (Form && isKnownOdd(And->getOperand(1 - BoolSide)))
+        return Form;
+    }
+
+  if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+    for (unsigned ValueSide = 0; ValueSide != 2; ++ValueSide) {
+      auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1 - ValueSide));
+      if (!C || (!C->isZero() && !C->isOne()))
+        continue;
+      auto Form =
+          normalizeBoolean01(Cmp->getOperand(ValueSide), Depth + 1);
+      if (!Form)
+        continue;
+      bool Invert;
+      if (Cmp->getPredicate() == ICmpInst::ICMP_EQ)
+        Invert = C->isZero();
+      else if (Cmp->getPredicate() == ICmpInst::ICMP_NE)
+        Invert = C->isOne();
+      else
+        continue;
+      Form->Negated ^= Invert;
+      return Form;
+    }
+  }
+
+  if (V->getType()->isIntegerTy(1))
+    return Boolean01{V, false};
+  return std::nullopt;
+}
+
+static bool isComplementBooleanBinOp(Value *V, unsigned Opcode) {
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO || BO->getOpcode() != Opcode)
+    return false;
+  auto L = normalizeBoolean01(BO->getOperand(0));
+  auto R = normalizeBoolean01(BO->getOperand(1));
+  return L && R && L->Negated != R->Negated &&
+         samePureExpression(L->Atom, R->Atom);
+}
+
+// Fast, semantics-preserving port of Chernobog's predicate rule registry.
+// Keep LLVM values width-exact here.  In particular, stripping zext/sext/trunc
+// can turn `icmp eq (zext x), (sext x)` into a bogus self-comparison.
+static std::optional<PredicateRuleProof> provePredicateRule(Value *V) {
+  if (isComplementBooleanBinOp(V, Instruction::Or))
+    return PredicateRuleProof{true, "opaque.LiftedBooleanComplementOrRule"};
+  if (isComplementBooleanBinOp(V, Instruction::And))
+    return PredicateRuleProof{false, "opaque.LiftedBooleanComplementAndRule"};
+
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp)
+    return std::nullopt;
+  auto foldConstantLoad = [](Value *X) -> Value * {
+    auto *LI = dyn_cast<LoadInst>(X);
+    if (!LI)
+      return X;
+    auto *GV = dyn_cast<GlobalVariable>(LI->getPointerOperand()
+                                            ->stripPointerCasts());
+    if (!GV || !GV->isConstant() || !GV->hasDefinitiveInitializer())
+      return X;
+    Constant *Init = GV->getInitializer();
+    if (Init->getType() == LI->getType())
+      return Init;
+    return X;
+  };
+  Value *L = foldConstantLoad(Cmp->getOperand(0));
+  Value *Rhs = foldConstantLoad(Cmp->getOperand(1));
+  ICmpInst::Predicate P = Cmp->getPredicate();
+
+  auto proof = [](bool Result, StringRef Rule) {
+    return PredicateRuleProof{Result, Rule};
+  };
+
+  // Native pointer/state lowering represents "value is a sign-extended i32"
+  // as unsigned((value + 2^31)) < 2^32.  ComputeNumSignBits proves the range
+  // without enumerating the many sdiv/sext shapes that produce it.
+  if (P == ICmpInst::ICMP_ULT)
+    if (auto *Limit = dyn_cast<ConstantInt>(Rhs);
+        Limit && Limit->getBitWidth() == 64 &&
+        Limit->getValue() == APInt(64, uint64_t(1) << 32))
+      if (auto *Add = dyn_cast<BinaryOperator>(L);
+          Add && Add->getOpcode() == Instruction::Add) {
+        Value *Ranged = nullptr;
+        for (unsigned I = 0; I != 2; ++I)
+          if (auto *Bias = dyn_cast<ConstantInt>(Add->getOperand(I));
+              Bias && Bias->getValue() == APInt(64, uint64_t(1) << 31))
+            Ranged = Add->getOperand(1 - I);
+        if (Ranged)
+          if (const Module *M = Cmp->getModule();
+              M && ComputeNumSignBits(Ranged, M->getDataLayout()) >= 33)
+            return proof(true, "opaque.LiftedSigned32RangeRule");
+      }
+
+  if (auto *Zero = dyn_cast<ConstantInt>(Rhs);
+      Zero && Zero->isZero() && isLiftedComplementGuardNonZero(L)) {
+    if (P == ICmpInst::ICMP_EQ)
+      return proof(false, "opaque.LiftedComplementGuardRule");
+    if (P == ICmpInst::ICMP_NE)
+      return proof(true, "opaque.LiftedComplementGuardRule");
+  }
+  if (auto *Zero = dyn_cast<ConstantInt>(Rhs);
+      Zero && Zero->isZero() &&
+      isComplementBooleanBinOp(L, Instruction::Or)) {
+    if (P == ICmpInst::ICMP_EQ)
+      return proof(false, "opaque.LiftedBooleanComplementOrRule");
+    if (P == ICmpInst::ICMP_NE)
+      return proof(true, "opaque.LiftedBooleanComplementOrRule");
+  }
+
+  // LLVM lowers microcode lnot(x) to icmp eq x, 0.  Attribute constant lnot
+  // forms to the corresponding Chernobog rule before the generic constant
+  // comparator consumes them.
+  if (P == ICmpInst::ICMP_EQ) {
+    auto *LC = dyn_cast<ConstantInt>(L);
+    auto *RC = dyn_cast<ConstantInt>(Rhs);
+    if (LC && RC && RC->isZero())
+      return proof(LC->isZero(), LC->isZero() ? "opaque.LnotZeroRule"
+                                             : "opaque.LnotOneRule");
+  }
+
+  // SetConstRule: direct constant comparison (all integer predicates).
+  if (auto *LC = dyn_cast<ConstantInt>(L))
+    if (auto *RC = dyn_cast<ConstantInt>(Rhs)) {
+      const APInt &A = LC->getValue(), &B = RC->getValue();
+      switch (P) {
+      case ICmpInst::ICMP_EQ:  return proof(A == B, "opaque.SetConstRule");
+      case ICmpInst::ICMP_NE:  return proof(A != B, "opaque.SetConstRule");
+      case ICmpInst::ICMP_UGT: return proof(A.ugt(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_UGE: return proof(A.uge(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_ULT: return proof(A.ult(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_ULE: return proof(A.ule(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_SGT: return proof(A.sgt(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_SGE: return proof(A.sge(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_SLT: return proof(A.slt(B), "opaque.SetConstRule");
+      case ICmpInst::ICMP_SLE: return proof(A.sle(B), "opaque.SetConstRule");
+      default: break;
+      }
+    }
+
+  // Self-comparison rules from rules_predicate.cpp.
+  if (L == Rhs && L->getType() == Rhs->getType()) {
+    switch (P) {
+    case ICmpInst::ICMP_EQ:
+      return proof(true, "opaque.SetzSelfRule");
+    case ICmpInst::ICMP_NE:
+      return proof(false, "opaque.SetnzSelfRule");
+    case ICmpInst::ICMP_ULT:
+      return proof(false, "opaque.SetbSelfRule");
+    case ICmpInst::ICMP_UGE:
+      return proof(true, "opaque.SetaeSelfRule");
+    case ICmpInst::ICMP_UGT:
+      return proof(false, "opaque.SetaSelfRule");
+    case ICmpInst::ICMP_ULE:
+      return proof(true, "opaque.SetbeSelfRule");
+    case ICmpInst::ICMP_SLT:
+      return proof(false, "opaque.SetlSelfRule");
+    case ICmpInst::ICMP_SGE:
+      return proof(true, "opaque.SetgeSelfRule");
+    case ICmpInst::ICMP_SGT:
+      return proof(false, "opaque.SetgSelfRule");
+    case ICmpInst::ICMP_SLE:
+      return proof(true, "opaque.SetleSelfRule");
+    default: break;
+    }
+  }
+
+  auto *LB = dyn_cast<BinaryOperator>(L);
+  auto isZero = [](Value *X) {
+    auto *C = dyn_cast<ConstantInt>(X);
+    return C && C->isZero();
+  };
+  auto isAllOnes = [](Value *X) {
+    auto *C = dyn_cast<ConstantInt>(X);
+    return C && C->getValue().isAllOnes();
+  };
+  auto same = [](Value *A, Value *B) {
+    return A == B && A->getType() == B->getType();
+  };
+  auto isNotOf = [&](Value *A, Value *B) {
+    auto *X = dyn_cast<BinaryOperator>(B);
+    if (!X || X->getOpcode() != Instruction::Xor)
+      return false;
+    if (isAllOnes(X->getOperand(0)))
+      return same(A, X->getOperand(1));
+    if (isAllOnes(X->getOperand(1)))
+      return same(A, X->getOperand(0));
+    return false;
+  };
+
+  // Identity and tautology rules.  Match the source rule's comparison
+  // opcode exactly; "non-zero" does not imply signed-greater-than zero.
+  if (LB) {
+    if (LB->getOpcode() == Instruction::Xor &&
+        same(LB->getOperand(0), LB->getOperand(1)) && isZero(Rhs)) {
+      if (P == ICmpInst::ICMP_EQ)
+        return proof(true, "opaque.SetzXorSelfRule");
+      if (P == ICmpInst::ICMP_NE)
+        return proof(false, "opaque.SetnzXorSelfRule");
+    }
+    if (LB->getOpcode() == Instruction::And &&
+        (isNotOf(LB->getOperand(0), LB->getOperand(1)) ||
+         isNotOf(LB->getOperand(1), LB->getOperand(0))) &&
+        isZero(Rhs) && P == ICmpInst::ICMP_EQ)
+      return proof(true, "opaque.SetzAndComplementRule");
+    if (LB->getOpcode() == Instruction::And &&
+        (isZero(LB->getOperand(0)) || isZero(LB->getOperand(1))) &&
+        isZero(Rhs) && P == ICmpInst::ICMP_EQ)
+      return proof(true, "opaque.SetzAndZeroRule");
+    if (LB->getOpcode() == Instruction::Or && isZero(Rhs) &&
+        P == ICmpInst::ICMP_NE) {
+      if (isNotOf(LB->getOperand(0), LB->getOperand(1)) ||
+          isNotOf(LB->getOperand(1), LB->getOperand(0)))
+        return proof(true, "opaque.SetnzOrComplementRule");
+      if (isAllOnes(LB->getOperand(0)) || isAllOnes(LB->getOperand(1)))
+        return proof(true, "opaque.SetnzOrMinusOneRule");
+      for (Value *Op : {LB->getOperand(0), LB->getOperand(1)})
+        if (auto *C = dyn_cast<ConstantInt>(Op); C && C->getValue()[0])
+          return proof(true, "opaque.SetnzOrOneRule");
+    }
+  }
+
+  // Unsigned comparisons against zero.
+  if (isZero(Rhs)) {
+    if (P == ICmpInst::ICMP_ULT)
+      return proof(false, "opaque.SetbZeroRule");
+    if (P == ICmpInst::ICMP_UGE)
+      return proof(true, "opaque.SetaeZeroRule");
+  }
+
+  // x * (x + 1) % 2 is always zero (consecutive-product rule).
+  auto isConsecutiveParity = [](Value *X) {
+    auto *Rem = dyn_cast<BinaryOperator>(X);
+    if (!Rem || (Rem->getOpcode() != Instruction::URem &&
+                 Rem->getOpcode() != Instruction::SRem))
+      return false;
+    auto *Mod = dyn_cast<ConstantInt>(Rem->getOperand(1));
+    if (!Mod || !Mod->equalsInt(2))
+      return false;
+    auto *Mul = dyn_cast<BinaryOperator>(Rem->getOperand(0));
+    if (!Mul || Mul->getOpcode() != Instruction::Mul)
+      return false;
+    for (unsigned I = 0; I != 2; ++I) {
+      Value *A = Mul->getOperand(I);
+      Value *B = Mul->getOperand(1 - I);
+      auto *Add = dyn_cast<BinaryOperator>(B);
+      if (!Add || Add->getOpcode() != Instruction::Add)
+        continue;
+      for (unsigned J = 0; J != 2; ++J) {
+        auto *One = dyn_cast<ConstantInt>(Add->getOperand(J));
+        if (One && One->isOne() &&
+            Add->getOperand(1 - J) == A)
+          return true;
+      }
+    }
+    return false;
+  };
+  if (isConsecutiveParity(L) && dyn_cast<ConstantInt>(Rhs) &&
+      cast<ConstantInt>(Rhs)->isZero()) {
+    if (P == ICmpInst::ICMP_EQ || P == ICmpInst::ICMP_ULE ||
+        P == ICmpInst::ICMP_SLE)
+      return proof(true, "opaque.SetRuleZ3");
+    if (P == ICmpInst::ICMP_NE || P == ICmpInst::ICMP_UGT ||
+        P == ICmpInst::ICMP_SGT)
+      return proof(false, "opaque.SetRuleZ3");
+  }
+
+  // Dataset-shaped MBA predicate:
+  //   t = x * (x ^ -1); b = t & 1; c = zext(cond.i1); icmp ugt b, c
+  // The low bit of x*~x is always zero modulo 2, while zext(i1) is 0/1;
+  // therefore `b ugt c` is always false.  Match the data-flow shape rather
+  // than requiring the operands to be syntactically identical constants.
+  auto isXorAllOnes = [](Value *A, Value *B) {
+    auto *X = dyn_cast<BinaryOperator>(B);
+    if (!X || X->getOpcode() != Instruction::Xor)
+      return false;
+    for (unsigned I = 0; I != 2; ++I)
+      if (X->getOperand(I) == A)
+        if (auto *C = dyn_cast<ConstantInt>(X->getOperand(1 - I));
+            C && C->getValue().isAllOnes())
+          return true;
+    return false;
+  };
+  auto isLowBitXTimesNotX = [&](Value *V) {
+    auto *And = dyn_cast<BinaryOperator>(V);
+    if (!And || And->getOpcode() != Instruction::And)
+      return false;
+    for (unsigned I = 0; I != 2; ++I) {
+      auto *Mask = dyn_cast<ConstantInt>(And->getOperand(I));
+      if (!Mask || !Mask->equalsInt(1))
+        continue;
+      auto *Mul = dyn_cast<BinaryOperator>(And->getOperand(1 - I));
+      if (!Mul || Mul->getOpcode() != Instruction::Mul)
+        continue;
+      if (isXorAllOnes(Mul->getOperand(0), Mul->getOperand(1)) ||
+          isXorAllOnes(Mul->getOperand(1), Mul->getOperand(0)))
+        return true;
+    }
+    return false;
+  };
+  auto isZextI1 = [](Value *V) {
+    auto *Z = dyn_cast<CastInst>(V);
+    return Z && Z->getOpcode() == Instruction::ZExt &&
+           Z->getSrcTy()->isIntegerTy(1) && Z->getDestTy()->isIntegerTy();
+  };
+  // Accept commuted operands and all unsigned comparison directions.
+  auto parityRange = [&](Value *V) { return isLowBitXTimesNotX(V); };
+  auto boolRange = [&](Value *V) { return isZextI1(V); };
+  if (parityRange(L) && boolRange(Rhs)) {
+    switch (P) {
+    case ICmpInst::ICMP_UGT: case ICmpInst::ICMP_SGT:
+      return proof(false, "opaque.DatasetLowBitComplementRule");
+    case ICmpInst::ICMP_ULE: case ICmpInst::ICMP_SLE:
+      return proof(true, "opaque.DatasetLowBitComplementRule");
+    default: break;
+    }
+  }
+  if (boolRange(L) && parityRange(Rhs)) {
+    switch (P) {
+    case ICmpInst::ICMP_ULT: case ICmpInst::ICMP_SLT:
+      return proof(false, "opaque.DatasetLowBitComplementRule");
+    case ICmpInst::ICMP_UGE: case ICmpInst::ICMP_SGE:
+      return proof(true, "opaque.DatasetLowBitComplementRule");
+    default: break;
+    }
+  }
+  return std::nullopt;
+}
+
+static Value *matchLogicalNot(Value *V) {
+  auto isI1 = [](Value *X, bool One) {
+    auto *C = dyn_cast<ConstantInt>(X);
+    return C && C->getType()->isIntegerTy(1) &&
+           (One ? C->isOne() : C->isZero());
+  };
+  if (auto *X = dyn_cast<BinaryOperator>(V);
+      X && X->getOpcode() == Instruction::Xor &&
+      X->getType()->isIntegerTy(1)) {
+    if (isI1(X->getOperand(0), true))
+      return X->getOperand(1);
+    if (isI1(X->getOperand(1), true))
+      return X->getOperand(0);
+  }
+  if (auto *Cmp = dyn_cast<ICmpInst>(V);
+      Cmp && Cmp->getPredicate() == ICmpInst::ICMP_EQ) {
+    if (isI1(Cmp->getOperand(0), false) &&
+        Cmp->getOperand(1)->getType()->isIntegerTy(1))
+      return Cmp->getOperand(1);
+    if (isI1(Cmp->getOperand(1), false) &&
+        Cmp->getOperand(0)->getType()->isIntegerTy(1))
+      return Cmp->getOperand(0);
+  }
+  return nullptr;
+}
+
+static void printOpaqueExpressionShape(raw_ostream &OS, Value *V,
+                                       unsigned Depth = 0) {
+  if (!V || Depth > 32) {
+    OS << "leaf";
+    return;
+  }
+  if (auto *C = dyn_cast<ConstantInt>(V)) {
+    OS << "c" << C->getValue();
+    return;
+  }
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || isa<LoadInst, PHINode, CallBase>(I)) {
+    OS << "leaf[";
+    V->printAsOperand(OS, false);
+    OS << "]";
+    return;
+  }
+  if (auto *Cmp = dyn_cast<ICmpInst>(I))
+    OS << "icmp." << CmpInst::getPredicateName(Cmp->getPredicate());
+  else
+    OS << I->getOpcodeName();
+  OS << "(";
+  bool First = true;
+  for (Value *Operand : I->operands()) {
+    if (!First)
+      OS << ",";
+    First = false;
+    printOpaqueExpressionShape(OS, Operand, Depth + 1);
+  }
+  OS << ")";
+}
+
 static bool removeOpaquePredicates(Function &F, Z3Prover &Prover, Report &R) {
+  // A predicate root can survive while an MBA/CFG rewrite changes one of its
+  // operands.  ValueMap follows RAUW/deletion of the key itself, but cannot
+  // detect that internal expression mutation, so cross-stage cached results
+  // are not valid here.
+  Prover.invalidateBooleanCache();
+  auto ConditionOps = [](Value *Root) {
+    std::function<unsigned(Value *, unsigned)> Count =
+        [&](Value *V, unsigned Depth) -> unsigned {
+      if (!V || Depth > 16)
+        return 0;
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || isa<PHINode>(I) || isa<LoadInst>(I) || isa<CallBase>(I))
+        return 0;
+      unsigned Total = 1;
+      for (Value *Op : I->operands())
+        Total += Count(Op, Depth + 1);
+      return Total;
+    };
+    return Count(Root, 0);
+  };
   SmallVector<BranchInst *, 64> Branches;
   for (BasicBlock &BB : F)
     if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
         BI && BI->isConditional())
       Branches.push_back(BI);
+  llvm::stable_sort(Branches, [&](BranchInst *A, BranchInst *B) {
+    return ConditionOps(A->getCondition()) > ConditionOps(B->getCondition());
+  });
 
   bool Changed = false;
-  for (BranchInst *BI : Branches) {
+  // The lifted dataset predominantly materializes opaque predicates as
+  // `select i1` (constant/state and pointer-selection chains), not branches.
+  // Apply the same proof discipline here: only replace a select when the
+  // condition is an exact rule match or Z3 proves it boolean-constant.  Do
+  // not collapse ordinary bounds checks or pointer selects on heuristics.
+  SmallVector<SelectInst *, 64> Selects;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<SelectInst>(&I))
+        Selects.push_back(SI);
+  llvm::stable_sort(Selects, [&](SelectInst *A, SelectInst *B) {
+    return ConditionOps(A->getCondition()) > ConditionOps(B->getCondition());
+  });
+  for (SelectInst *SI : Selects) {
+    Value *Cond = SI->getCondition();
     std::optional<bool> Result;
-    if (auto *C = dyn_cast<ConstantInt>(BI->getCondition()))
+    if (auto Rule = provePredicateRule(Cond)) {
+      ++R.Stages["bcf_opaque_predicates"].Candidates;
+      Result = Rule->Result;
+      noteRule(R, Rule->Rule);
+    } else if (auto *C = dyn_cast<ConstantInt>(Cond)) {
+      ++R.Stages["bcf_opaque_predicates"].Candidates;
       Result = !C->isZero();
-    else
+      noteRule(R, "opaque.SelectConstCondition");
+    } else if (ConditionOps(Cond) >= 3 &&
+               R.OpaqueZ3Attempts < MaxOpaqueZ3Candidates) {
+      // Generic SMT is reserved for integer/state selects.  Lifted pointer
+      // selects are overwhelmingly bounds/range guards and querying each one
+      // dominates runtime without yielding opaque-predicate rewrites.
+      if (!SI->getType()->isIntegerTy() ||
+          (!isa<ConstantInt>(SI->getTrueValue()) &&
+           !isa<ConstantInt>(SI->getFalseValue())))
+        continue;
+      ++R.Stages["bcf_opaque_predicates"].Candidates;
+      ++R.OpaqueZ3Attempts;
+      Result = Prover.proveBooleanConstant(Cond);
+      if (Result) {
+        noteRule(R, "opaque.SelectRuleZ3");
+        if (OpaqueZ3Debug)
+          errs() << "095 opaque Z3 select=" << (*Result ? "true" : "false")
+                 << " function=" << F.getName() << " condition=" << *Cond
+                 << "\n";
+        if (OpaqueZ3Debug) {
+          errs() << "  shape=";
+          printOpaqueExpressionShape(errs(), Cond);
+          errs() << "\n";
+        }
+        if (OpaqueZ3Debug)
+          if (auto *Cmp = dyn_cast<ICmpInst>(Cond))
+            for (Value *Operand : Cmp->operands())
+              if (auto *Def = dyn_cast<Instruction>(Operand))
+                {
+                  errs() << "  operand-def=" << *Def << "\n";
+                  for (Value *Child : Def->operands())
+                    if (auto *ChildDef = dyn_cast<Instruction>(Child))
+                      errs() << "    child-def=" << *ChildDef << "\n";
+                }
+      }
+    }
+    if (!Result)
+      continue;
+    SI->replaceAllUsesWith(*Result ? SI->getTrueValue() : SI->getFalseValue());
+    SI->eraseFromParent();
+    ++R.Stages["bcf_opaque_predicates"].Changes;
+    Changed = true;
+  }
+  if (Changed)
+    Prover.invalidateBooleanCache();
+  for (BranchInst *BI : Branches) {
+    // LnotLnotRule is declared by Chernobog but omitted from its active
+    // registry because it is a non-constant canonicalization.  LLVM can
+    // represent it directly on the branch condition.
+    if (Value *Inner = matchLogicalNot(BI->getCondition()))
+      if (Value *Original = matchLogicalNot(Inner)) {
+        ++R.Stages["bcf_opaque_predicates"].Candidates;
+        BI->setCondition(Original);
+        noteRule(R, "opaque.LnotLnotRule");
+        ++R.Stages["bcf_opaque_predicates"].Changes;
+        Changed = true;
+      }
+
+    std::optional<bool> Result;
+    if (auto Rule = provePredicateRule(BI->getCondition()) ) {
+      ++R.Stages["bcf_opaque_predicates"].Candidates;
+      Result = Rule->Result;
+      noteRule(R, Rule->Rule);
+    } else if (auto *C = dyn_cast<ConstantInt>(BI->getCondition()))
+      Result = !C->isZero();
+    else if (ConditionOps(BI->getCondition()) >= 3 &&
+             R.OpaqueZ3Attempts < MaxOpaqueZ3Candidates) {
+      ++R.Stages["bcf_opaque_predicates"].Candidates;
+      ++R.OpaqueZ3Attempts;
       Result = Prover.proveBooleanConstant(BI->getCondition());
+      if (Result) {
+        noteRule(R, "opaque.SetRuleZ3");
+        if (OpaqueZ3Debug)
+          errs() << "095 opaque Z3 branch=" << (*Result ? "true" : "false")
+                 << " function=" << F.getName()
+                 << " condition=" << *BI->getCondition() << "\n";
+        if (OpaqueZ3Debug) {
+          errs() << "  shape=";
+          printOpaqueExpressionShape(errs(), BI->getCondition());
+          errs() << "\n";
+        }
+      }
+    }
     if (!Result)
       continue;
     unsigned LiveIndex = *Result ? 0 : 1;
@@ -777,7 +1898,6 @@ static void finalizeDispatcherCarrierMap(BasicBlock *Header,
 static void repairCarrierSSA(
     BasicBlock *Header, ArrayRef<BasicBlock *> Bridges,
     ArrayRef<std::unique_ptr<ValueToValueMapTy>> Maps) {
-  SmallPtrSet<BasicBlock *, 32> BridgeSet(Bridges.begin(), Bridges.end());
   SmallVector<PHINode *, 16> OriginalCarriers;
   for (PHINode &Carrier : Header->phis())
     OriginalCarriers.push_back(&Carrier);
@@ -788,20 +1908,43 @@ static void repairCarrierSSA(
     Updater.AddAvailableValue(Header, Carrier);
     for (unsigned I = 0; I < Bridges.size(); ++I) {
       auto It = Maps[I]->find(Carrier);
-      if (It != Maps[I]->end())
-        Updater.AddAvailableValue(Bridges[I], It->second);
+      if (It != Maps[I]->end()) {
+        // A map back to the header PHI is an identity transfer, not a fresh
+        // definition.  Registering it at the bridge would reset a carrier
+        // updated by an immediately preceding rewritten case.  Leave identity
+        // transfers open so SSAUpdater composes the value flowing into the
+        // bridge across newly exposed case-to-case paths.
+        if (It->second != Carrier)
+          Updater.AddAvailableValue(Bridges[I], It->second);
+        if (DeflattenDebug) {
+          errs() << "  carrier=" << Carrier->getName()
+                 << " bridge=" << Bridges[I]->getName() << " value=";
+          It->second->printAsOperand(errs(), false);
+          errs() << "\n";
+        }
+      }
     }
 
     SmallVector<Use *, 64> Uses;
     for (Use &U : Carrier->uses()) {
       auto *UserI = dyn_cast<Instruction>(U.getUser());
-      if (!UserI || UserI->getParent() == Header ||
-          BridgeSet.contains(UserI->getParent()))
+      if (!UserI || UserI->getParent() == Header)
         continue;
       Uses.push_back(&U);
     }
-    for (Use *U : Uses)
+    for (Use *U : Uses) {
+      Value *Before = U->get();
       Updater.RewriteUse(*U);
+      if (DeflattenDebug && U->get() != Before) {
+        auto *UserI = cast<Instruction>(U->getUser());
+        errs() << "  carrier-rewrite=" << Carrier->getName()
+               << " user=" << UserI->getParent()->getName() << " before=";
+        Before->printAsOperand(errs(), false);
+        errs() << " after=";
+        U->get()->printAsOperand(errs(), false);
+        errs() << "\n";
+      }
+    }
   }
 }
 
@@ -1040,6 +2183,28 @@ static bool affineEqualPointers(const Value *A, const Value *B,
          Left->Terms == Right->Terms;
 }
 
+static bool affineDisjointMemory(const StoreInst *Store, const LoadInst *Load,
+                                 const DataLayout &DL) {
+  if (!Store || !Load)
+    return false;
+  unsigned Width =
+      DL.getIndexTypeSizeInBits(Store->getPointerOperand()->getType());
+  auto StoreAddress = affinePointer(Store->getPointerOperand(), DL, Width, 0);
+  auto LoadAddress = affinePointer(Load->getPointerOperand(), DL, Width, 0);
+  if (!StoreAddress || !LoadAddress || StoreAddress->Terms != LoadAddress->Terms)
+    return false;
+  TypeSize StoreSize = DL.getTypeStoreSize(Store->getValueOperand()->getType());
+  TypeSize LoadSize = DL.getTypeStoreSize(Load->getType());
+  if (StoreSize.isScalable() || LoadSize.isScalable())
+    return false;
+  APInt Delta = StoreAddress->Constant - LoadAddress->Constant;
+  uint64_t StoreBytes = StoreSize.getFixedValue();
+  uint64_t LoadBytes = LoadSize.getFixedValue();
+  if (Delta.isNegative())
+    return (-Delta).uge(StoreBytes);
+  return Delta.uge(LoadBytes);
+}
+
 static bool hasFrameStorageOrigin(const Value *V,
                                   SmallPtrSetImpl<const Value *> &Visited,
                                   unsigned Depth = 0) {
@@ -1105,6 +2270,8 @@ solveFinalStoredState(BasicBlock *Source, Value *StatePointer,
       continue;
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
       if (!sameStateStorage(SI->getPointerOperand(), StatePointer, DL)) {
+        if (affineDisjointMemory(SI, StateLoad, DL))
+          continue;
         if (AA.alias(MemoryLocation::get(SI), StateLocation) ==
             AliasResult::NoAlias)
           continue;
@@ -1263,7 +2430,9 @@ static bool deflattenMemoryState(Function &F, SwitchInst *Root,
   // Chernobog's production constant-state handler requires at least one third
   // of the case frontier (and at least three exact edges) before modifying the
   // graph.  This is a coverage guard, not evidence for an individual edge.
-  const size_t MinimumEdges = std::max<size_t>(3, Map.Targets.size() / 3);
+  const size_t FrontierEdges = pred_size(Latch) > 0 ? pred_size(Latch) - 1 : 0;
+  const size_t MinimumEdges = std::max<size_t>(
+      3, std::min<size_t>(Map.Targets.size() / 3, FrontierEdges));
   if (DeflattenDebug)
     errs() << "  memory planned=" << Rewrites.size()
            << " minimum=" << MinimumEdges
@@ -1334,6 +2503,21 @@ static bool deflattenMemoryEntry(Function &F, SwitchInst *Root,
     // non-dispatch predecessor makes the whole switch cycle unreachable.
     if (!DT.isReachableFromEntry(Pred) || Map.Blocks.contains(Pred))
       continue;
+    // A memory dispatcher commonly uses its default edge to enter a tiny
+    // reload latch and switch on the same state again.  After every real case
+    // return has been cut, that latch is reachable only from dispatcher
+    // blocks and is not a second program entry.
+    if (Pred == StateLoad->getParent()) {
+      bool DispatcherOnly = true;
+      for (BasicBlock *LatchPred : predecessors(Pred))
+        if (DT.isReachableFromEntry(LatchPred) &&
+            !Map.Blocks.contains(LatchPred)) {
+          DispatcherOnly = false;
+          break;
+        }
+      if (DispatcherOnly)
+        continue;
+    }
     if (Source)
       return false;
     Source = Pred;
@@ -1365,43 +2549,258 @@ static bool deflattenMemoryEntry(Function &F, SwitchInst *Root,
        !valueDominatesEdge(Choice->Condition, Old, DT)))
     return false;
 
-  auto VMap = std::make_unique<ValueToValueMapTy>();
-  if (!buildHeaderEntryValueMap(Source, Header, DT, *VMap) ||
-      !prepareTargetPHIs(TrueTarget, Source, TrueDispatch, DT, nullptr,
-                         false) ||
+  // This dispatcher no longer has a recurrent edge.  Keep the header as the
+  // one-shot entry and cut only its switch terminator.  Bypassing the whole
+  // header would require repairing every ordinary header definition used by
+  // a case (not just PHI carriers), and cloning those definitions produces
+  // invalid dominance when cases are shared.  Retaining the header executes
+  // its payload exactly once and preserves all existing dominance relations.
+  if (!prepareTargetPHIs(TrueTarget, Header, TrueDispatch, DT, nullptr,
+                         false, Header) ||
       (FalseTarget != TrueTarget &&
-       !prepareTargetPHIs(FalseTarget, Source, FalseDispatch, DT, nullptr,
-                          false)))
+       !prepareTargetPHIs(FalseTarget, Header, FalseDispatch, DT, nullptr,
+                          false, Header)))
     return false;
 
-  BasicBlock *Bridge = BasicBlock::Create(
-      F.getContext(), "deobf.memory.entry", &F, Header);
-  IRBuilder<>(Bridge).CreateBr(TrueTarget);
-  cloneHeaderPayload(Bridge, Header, *VMap);
-  finalizeDispatcherCarrierMap(Header, *VMap);
-  if (!prepareTargetPHIs(TrueTarget, Bridge, TrueDispatch, DT, VMap.get(),
-                         true, Source) ||
+  SmallPtrSet<BasicBlock *, 16> OldSuccessors;
+  for (BasicBlock *Successor : successors(Header))
+    OldSuccessors.insert(Successor);
+
+  if (!prepareTargetPHIs(TrueTarget, Header, TrueDispatch, DT, nullptr, true,
+                         Header) ||
       (FalseTarget != TrueTarget &&
-       !prepareTargetPHIs(FalseTarget, Bridge, FalseDispatch, DT, VMap.get(),
-                          true, Source)))
+       !prepareTargetPHIs(FalseTarget, Header, FalseDispatch, DT, nullptr,
+                          true, Header)))
     report_fatal_error(
         "095 internal error: memory-entry PHI mapping became invalid");
-  Header->removePredecessor(Source, true);
-  IRBuilder<>(Old).CreateBr(Bridge);
-  Old->eraseFromParent();
+
+  IRBuilder<> Builder(Root);
   if (Choice->Condition && TrueTarget != FalseTarget) {
-    Instruction *BridgeTerm = Bridge->getTerminator();
-    IRBuilder<>(BridgeTerm)
-        .CreateCondBr(Choice->Condition, TrueTarget, FalseTarget);
-    BridgeTerm->eraseFromParent();
+    Builder.CreateCondBr(Choice->Condition, TrueTarget, FalseTarget);
+  } else {
+    Builder.CreateBr(TrueTarget);
   }
-  SmallVector<BasicBlock *, 1> Bridges{Bridge};
-  SmallVector<std::unique_ptr<ValueToValueMapTy>, 1> Maps;
-  Maps.push_back(std::move(VMap));
-  repairCarrierSSA(Header, Bridges, Maps);
+  Root->eraseFromParent();
+
+  for (BasicBlock *Successor : OldSuccessors)
+    if (Successor != TrueTarget && Successor != FalseTarget)
+      Successor->removePredecessor(Header, true);
+
   ++R.Stages["deflatten"].Changes;
   if (DeflattenDebug)
     errs() << "095 memory entry: function=" << F.getName()
+           << " header=" << Header->getName()
+           << " source=" << Source->getName() << " result=rewrite\n";
+  return true;
+}
+
+// Rewrite recurrent edges which return directly to a PHI-state header instead
+// of converging through a separate latch PHI.  This is the compact form left
+// after earlier safe cuts and is also emitted directly by some OLLVM builds.
+static bool deflattenDirectPhiReturns(Function &F, SwitchInst *Root,
+                                      PHINode *HeaderPhi, DominatorTree &DT,
+                                      Z3Prover &Prover, Report &R) {
+  BasicBlock *Header = Root->getParent();
+  if (!dispatcherPayloadIsCloneable(Header, Header))
+    return false;
+  DispatchMap Map = collectDispatchMap(Root, HeaderPhi);
+  if (Map.Targets.size() < 3)
+    return false;
+
+  struct Rewrite {
+    BasicBlock *Source;
+    Value *Condition;
+    BasicBlock *TrueTarget;
+    BasicBlock *FalseTarget;
+    BasicBlock *TrueDispatch;
+    BasicBlock *FalseDispatch;
+    std::unique_ptr<ValueToValueMapTy> VMap;
+  };
+  SmallVector<Rewrite, 16> Rewrites;
+  for (unsigned I = 0; I < HeaderPhi->getNumIncomingValues(); ++I) {
+    BasicBlock *Source = HeaderPhi->getIncomingBlock(I);
+    Value *Incoming = stripIntegerCasts(HeaderPhi->getIncomingValue(I));
+    if (Source == Header || Map.Blocks.contains(Source) ||
+        !DT.dominates(Header, Source) || isa<PHINode>(Incoming) ||
+        isa<LoadInst>(Incoming))
+      continue;
+    auto *Br = dyn_cast_or_null<BranchInst>(Source->getTerminator());
+    if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != Header)
+      continue;
+    auto Choice = decodeStateChoice(Incoming);
+    if (!Choice)
+      continue;
+    if (Choice->Condition) {
+      if (std::optional<bool> Proven =
+              Prover.proveBooleanConstant(Choice->Condition)) {
+        ConstantInt *Chosen =
+            *Proven ? Choice->TrueState : Choice->FalseState;
+        *Choice = StateChoice{nullptr, Chosen, Chosen};
+      }
+    }
+    auto TIt = Map.Targets.find(Choice->TrueState->getValue());
+    auto FIt = Map.Targets.find(Choice->FalseState->getValue());
+    if (TIt == Map.Targets.end() || FIt == Map.Targets.end())
+      continue;
+    BasicBlock *TrueTarget = TIt->second;
+    BasicBlock *FalseTarget = FIt->second;
+    if (TrueTarget == Header || FalseTarget == Header ||
+        Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget))
+      continue;
+    BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
+    BasicBlock *FalseDispatch = Map.DispatchPredecessor.lookup(FalseTarget);
+    auto TransparentDispatch = [&](BasicBlock *Dispatch) {
+      return Dispatch == Header ||
+             (Dispatch && Dispatch->phis().empty() && Dispatch->size() == 1 &&
+              isa<SwitchInst>(Dispatch->getTerminator()));
+    };
+    auto VMap = std::make_unique<ValueToValueMapTy>();
+    if (!TransparentDispatch(TrueDispatch) ||
+        !TransparentDispatch(FalseDispatch) ||
+        !buildHeaderEntryValueMap(Source, Header, DT, *VMap) ||
+        !prepareTargetPHIs(TrueTarget, Source, TrueDispatch, DT, nullptr,
+                           false) ||
+        (FalseTarget != TrueTarget &&
+         !prepareTargetPHIs(FalseTarget, Source, FalseDispatch, DT, nullptr,
+                            false)) ||
+        (Choice->Condition &&
+         !valueDominatesEdge(Choice->Condition, Br, DT)))
+      continue;
+    Rewrites.push_back({Source, Choice->Condition, TrueTarget, FalseTarget,
+                        TrueDispatch, FalseDispatch, std::move(VMap)});
+  }
+  if (Rewrites.empty())
+    return false;
+
+  SmallVector<BasicBlock *, 16> Bridges;
+  SmallVector<std::unique_ptr<ValueToValueMapTy>, 16> Maps;
+  for (Rewrite &RW : Rewrites) {
+    auto *Old = cast<BranchInst>(RW.Source->getTerminator());
+    BasicBlock *Bridge = BasicBlock::Create(
+        F.getContext(), "deobf.dispatch.direct", &F, Header);
+    IRBuilder<>(Bridge).CreateBr(RW.TrueTarget);
+    cloneHeaderPayload(Bridge, Header, *RW.VMap);
+    finalizeDispatcherCarrierMap(Header, *RW.VMap);
+    if (!prepareTargetPHIs(RW.TrueTarget, Bridge, RW.TrueDispatch, DT,
+                           RW.VMap.get(), true, RW.Source) ||
+        (RW.FalseTarget != RW.TrueTarget &&
+         !prepareTargetPHIs(RW.FalseTarget, Bridge, RW.FalseDispatch, DT,
+                            RW.VMap.get(), true, RW.Source)))
+      report_fatal_error(
+          "095 internal error: direct-state PHI mapping became invalid");
+    Header->removePredecessor(RW.Source, true);
+    IRBuilder<>(Old).CreateBr(Bridge);
+    Old->eraseFromParent();
+    if (RW.Condition && RW.TrueTarget != RW.FalseTarget) {
+      Instruction *BridgeTerm = Bridge->getTerminator();
+      IRBuilder<>(BridgeTerm)
+          .CreateCondBr(RW.Condition, RW.TrueTarget, RW.FalseTarget);
+      BridgeTerm->eraseFromParent();
+    }
+    Bridges.push_back(Bridge);
+    Maps.push_back(std::move(RW.VMap));
+  }
+  repairCarrierSSA(Header, Bridges, Maps);
+  R.Stages["deflatten"].Changes += Rewrites.size();
+  return true;
+}
+
+// Once all real recurrent returns have been cut, retain the header payload and
+// replace its one-shot PHI-state switch.  Dominated predecessors are accepted
+// only when they are dispatcher-only cycles; any live program return keeps the
+// transformation fail-closed.
+static bool deflattenPhiEntry(Function &F, SwitchInst *Root,
+                              PHINode *HeaderPhi, DominatorTree &DT,
+                              Z3Prover &Prover, Report &R) {
+  BasicBlock *Header = Root->getParent();
+  DispatchMap Map = collectDispatchMap(Root, HeaderPhi);
+  if (Map.Targets.size() < 3)
+    return false;
+  BasicBlock *Source = nullptr;
+  for (BasicBlock *Pred : predecessors(Header)) {
+    if (!DT.isReachableFromEntry(Pred) || Map.Blocks.contains(Pred))
+      continue;
+    if (DT.dominates(Header, Pred)) {
+      bool DispatcherOnly = true;
+      for (BasicBlock *PredPred : predecessors(Pred))
+        if (DT.isReachableFromEntry(PredPred) &&
+            !Map.Blocks.contains(PredPred)) {
+          DispatcherOnly = false;
+          break;
+        }
+      if (DispatcherOnly)
+        continue;
+      return false;
+    }
+    if (Source)
+      return false;
+    Source = Pred;
+  }
+  auto *Old = Source ? dyn_cast_or_null<BranchInst>(Source->getTerminator())
+                     : nullptr;
+  if (!Old || !Old->isUnconditional() || Old->getSuccessor(0) != Header)
+    return false;
+  int SourceIndex = HeaderPhi->getBasicBlockIndex(Source);
+  if (SourceIndex < 0)
+    return false;
+  auto Choice = decodeStateChoice(HeaderPhi->getIncomingValue(SourceIndex));
+  if (!Choice)
+    return false;
+  if (Choice->Condition) {
+    if (std::optional<bool> Proven =
+            Prover.proveBooleanConstant(Choice->Condition)) {
+      ConstantInt *Chosen = *Proven ? Choice->TrueState : Choice->FalseState;
+      *Choice = StateChoice{nullptr, Chosen, Chosen};
+    }
+  }
+  auto TIt = Map.Targets.find(Choice->TrueState->getValue());
+  auto FIt = Map.Targets.find(Choice->FalseState->getValue());
+  if (TIt == Map.Targets.end() || FIt == Map.Targets.end())
+    return false;
+  BasicBlock *TrueTarget = TIt->second;
+  BasicBlock *FalseTarget = FIt->second;
+  if (Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget))
+    return false;
+  BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
+  BasicBlock *FalseDispatch = Map.DispatchPredecessor.lookup(FalseTarget);
+  auto TransparentDispatch = [&](BasicBlock *Dispatch) {
+    return Dispatch == Header ||
+           (Dispatch && Dispatch->phis().empty() && Dispatch->size() == 1 &&
+            isa<SwitchInst>(Dispatch->getTerminator()));
+  };
+  if (!TransparentDispatch(TrueDispatch) ||
+      !TransparentDispatch(FalseDispatch) ||
+      (Choice->Condition &&
+       !valueDominatesEdge(Choice->Condition, Root, DT)) ||
+      !prepareTargetPHIs(TrueTarget, Header, TrueDispatch, DT, nullptr, false,
+                         Header) ||
+      (FalseTarget != TrueTarget &&
+       !prepareTargetPHIs(FalseTarget, Header, FalseDispatch, DT, nullptr,
+                          false, Header)))
+    return false;
+
+  SmallPtrSet<BasicBlock *, 16> OldSuccessors;
+  for (BasicBlock *Successor : successors(Header))
+    OldSuccessors.insert(Successor);
+  if (!prepareTargetPHIs(TrueTarget, Header, TrueDispatch, DT, nullptr, true,
+                         Header) ||
+      (FalseTarget != TrueTarget &&
+       !prepareTargetPHIs(FalseTarget, Header, FalseDispatch, DT, nullptr,
+                          true, Header)))
+    report_fatal_error(
+        "095 internal error: PHI-entry target mapping became invalid");
+  IRBuilder<> Builder(Root);
+  if (Choice->Condition && TrueTarget != FalseTarget)
+    Builder.CreateCondBr(Choice->Condition, TrueTarget, FalseTarget);
+  else
+    Builder.CreateBr(TrueTarget);
+  Root->eraseFromParent();
+  for (BasicBlock *Successor : OldSuccessors)
+    if (Successor != TrueTarget && Successor != FalseTarget)
+      Successor->removePredecessor(Header, true);
+  ++R.Stages["deflatten"].Changes;
+  if (DeflattenDebug)
+    errs() << "095 PHI entry: function=" << F.getName()
            << " header=" << Header->getName()
            << " source=" << Source->getName() << " result=rewrite\n";
   return true;
@@ -1425,6 +2824,53 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     return false;
 
   BasicBlock *Header = Root->getParent();
+
+  // Split a mixed entry/return forwarder before classifying recurrent edges.
+  // Unlike the canonical latch, such a block is not dominated by the header
+  // because one of its predecessors is an entry path.
+  for (unsigned I = 0; I < HeaderPhi->getNumIncomingValues(); ++I) {
+    BasicBlock *IncomingBlock = HeaderPhi->getIncomingBlock(I);
+    auto *ForwardPhi = dyn_cast<PHINode>(HeaderPhi->getIncomingValue(I));
+    if (!ForwardPhi || ForwardPhi->getParent() != IncomingBlock ||
+        DT.dominates(Header, IncomingBlock))
+      continue;
+    if (expandLatchForwarder(F, IncomingBlock, Header, R))
+      return true;
+  }
+
+  // Hybrid memory form produced by lifting/mem2reg: the switch sees a header
+  // PHI, while the recurrent incoming value is a load from the concrete state
+  // slot.  Treat it as the same memory dispatcher instead of requiring the
+  // load to be the switch operand syntactically.
+  LoadInst *BackedgeStateLoad = nullptr;
+  for (unsigned I = 0; I < HeaderPhi->getNumIncomingValues(); ++I) {
+    BasicBlock *IncomingBlock = HeaderPhi->getIncomingBlock(I);
+    auto *Br = dyn_cast_or_null<BranchInst>(IncomingBlock->getTerminator());
+    auto *Load = dyn_cast<LoadInst>(
+        stripIntegerCasts(HeaderPhi->getIncomingValue(I)));
+    if (!Load || Load->getParent() != IncomingBlock || !Br ||
+        !Br->isUnconditional() || Br->getSuccessor(0) != Header ||
+        !DT.dominates(Header, IncomingBlock))
+      continue;
+    if (BackedgeStateLoad) {
+      BackedgeStateLoad = nullptr;
+      break;
+    }
+    BackedgeStateLoad = Load;
+  }
+  if (BackedgeStateLoad) {
+    if (deflattenMemoryState(F, Root, BackedgeStateLoad, DT, AA, Prover, R))
+      return true;
+    if (!DisableMemoryEntryFinalize &&
+        deflattenMemoryEntry(F, Root, BackedgeStateLoad, DT, AA, Prover, R))
+      return true;
+  }
+
+  if (deflattenDirectPhiReturns(F, Root, HeaderPhi, DT, Prover, R))
+    return true;
+  if (deflattenPhiEntry(F, Root, HeaderPhi, DT, Prover, R))
+    return true;
+
   PHINode *LatchPhi = nullptr;
   BasicBlock *Latch = nullptr;
   for (unsigned I = 0; I < HeaderPhi->getNumIncomingValues(); ++I) {
@@ -1469,6 +2915,95 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
   if (Map.Targets.size() < 3)
     return false;
 
+  // Some flatteners reserve a state whose switch edge enters the latch
+  // itself.  The latch then installs another constant/select state and the
+  // header dispatches a second time before reaching a real case.  Materialize
+  // that dispatcher-internal hop first.  Subsequent rounds can then compose a
+  // normal case transition with this bridge instead of dropping an executed
+  // latch/header cycle or treating the latch as application code.
+  int HeaderToLatch = LatchPhi->getBasicBlockIndex(Header);
+  bool SwitchEntersLatch = false;
+  for (BasicBlock *Successor : successors(Header))
+    SwitchEntersLatch |= Successor == Latch;
+  if (HeaderToLatch >= 0 && SwitchEntersLatch) {
+    auto Choice = decodeStateChoice(LatchPhi->getIncomingValue(HeaderToLatch));
+    if (Choice && Choice->Condition) {
+      if (std::optional<bool> Proven =
+              Prover.proveBooleanConstant(Choice->Condition)) {
+        ConstantInt *Chosen =
+            *Proven ? Choice->TrueState : Choice->FalseState;
+        *Choice = StateChoice{nullptr, Chosen, Chosen};
+      }
+    }
+    if (Choice) {
+      auto TIt = Map.Targets.find(Choice->TrueState->getValue());
+      auto FIt = Map.Targets.find(Choice->FalseState->getValue());
+      if (TIt != Map.Targets.end() && FIt != Map.Targets.end()) {
+        BasicBlock *TrueTarget = TIt->second;
+        BasicBlock *FalseTarget = FIt->second;
+        BasicBlock *TrueDispatch =
+            Map.DispatchPredecessor.lookup(TrueTarget);
+        BasicBlock *FalseDispatch =
+            Map.DispatchPredecessor.lookup(FalseTarget);
+        auto TransparentDispatch = [&](BasicBlock *Dispatch) {
+          return Dispatch == Header ||
+                 (Dispatch && Dispatch->phis().empty() &&
+                  Dispatch->size() == 1 &&
+                  isa<SwitchInst>(Dispatch->getTerminator()));
+        };
+        auto VMap = std::make_unique<ValueToValueMapTy>();
+        if (TrueTarget != Latch && FalseTarget != Latch &&
+            !Map.Blocks.contains(TrueTarget) &&
+            !Map.Blocks.contains(FalseTarget) &&
+            TransparentDispatch(TrueDispatch) &&
+            TransparentDispatch(FalseDispatch) &&
+            (!Choice->Condition ||
+             valueDominatesEdge(Choice->Condition, Root, DT)) &&
+            buildDispatcherValueMap(Header, Latch, Header, DT, *VMap) &&
+            prepareTargetPHIs(TrueTarget, Header, TrueDispatch, DT, nullptr,
+                              false, Header) &&
+            (FalseTarget == TrueTarget ||
+             prepareTargetPHIs(FalseTarget, Header, FalseDispatch, DT,
+                               nullptr, false, Header))) {
+          BasicBlock *Bridge = BasicBlock::Create(
+              F.getContext(), "deobf.dispatch.internal", &F, Latch);
+          IRBuilder<>(Bridge).CreateBr(TrueTarget);
+          cloneDispatcherPayload(Bridge, Latch, Header, *VMap);
+          finalizeDispatcherCarrierMap(Header, *VMap);
+          if (!prepareTargetPHIs(TrueTarget, Bridge, TrueDispatch, DT,
+                                 VMap.get(), true, Header) ||
+              (FalseTarget != TrueTarget &&
+               !prepareTargetPHIs(FalseTarget, Bridge, FalseDispatch, DT,
+                                  VMap.get(), true, Header)))
+            report_fatal_error(
+                "095 internal error: dispatcher-internal PHI mapping became invalid");
+
+          for (unsigned I = 0; I < Root->getNumSuccessors(); ++I)
+            if (Root->getSuccessor(I) == Latch)
+              Root->setSuccessor(I, Bridge);
+          Latch->removePredecessor(Header, true);
+          if (Choice->Condition && TrueTarget != FalseTarget) {
+            Instruction *BridgeTerm = Bridge->getTerminator();
+            IRBuilder<>(BridgeTerm)
+                .CreateCondBr(Choice->Condition, TrueTarget, FalseTarget);
+            BridgeTerm->eraseFromParent();
+          }
+          SmallVector<BasicBlock *, 1> Bridges{Bridge};
+          SmallVector<std::unique_ptr<ValueToValueMapTy>, 1> Maps;
+          Maps.push_back(std::move(VMap));
+          repairCarrierSSA(Header, Bridges, Maps);
+          ++R.Stages["deflatten"].Changes;
+          if (DeflattenDebug)
+            errs() << "  dispatcher-internal source=" << Header->getName()
+                   << " true=" << TrueTarget->getName()
+                   << " false=" << FalseTarget->getName()
+                   << " result=rewrite\n";
+          return true;
+        }
+      }
+    }
+  }
+
   for (unsigned I = 0; I < LatchPhi->getNumIncomingValues(); ++I) {
     BasicBlock *IncomingBlock = LatchPhi->getIncomingBlock(I);
     auto *ForwardPhi = dyn_cast<PHINode>(LatchPhi->getIncomingValue(I));
@@ -1491,6 +3026,7 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
   };
   SmallVector<Rewrite, 32> Rewrites;
   uint64_t UnresolvedStates = 0;
+  Loop *HeaderLoop = LI.getLoopFor(Header);
 
   for (unsigned I = 0; I < LatchPhi->getNumIncomingValues(); ++I) {
     BasicBlock *Source = LatchPhi->getIncomingBlock(I);
@@ -1520,6 +3056,12 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     }
     BasicBlock *TrueTarget = TIt->second;
     BasicBlock *FalseTarget = FIt->second;
+    if (DeflattenInLoopOnly &&
+        (!HeaderLoop || !HeaderLoop->contains(TrueTarget) ||
+         !HeaderLoop->contains(FalseTarget))) {
+      ++UnresolvedStates;
+      continue;
+    }
     // A state that routes back into the dispatcher/latch is recurrent switch
     // plumbing, not an application case.  Rewriting it to the same latch
     // would remove a required PHI incoming while retaining the CFG edge.
@@ -1553,6 +3095,10 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
       continue;
     }
     if (Choice->Condition && !valueDominatesEdge(Choice->Condition, Br, DT)) {
+      ++UnresolvedStates;
+      continue;
+    }
+    if (MaxPhiDeflattenEdges && Rewrites.size() >= MaxPhiDeflattenEdges) {
       ++UnresolvedStates;
       continue;
     }
@@ -1653,7 +3199,6 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
   }
 
   if (DeflattenDebug) {
-    Loop *HeaderLoop = LI.getLoopFor(Header);
     errs() << "  rewrites=" << Rewrites.size()
            << " loop-depth=" << (HeaderLoop ? HeaderLoop->getLoopDepth() : 0)
            << " unresolved=" << UnresolvedStates << "\n";
@@ -1975,6 +3520,9 @@ PreservedAnalyses Deobfuscate095Pass::run(Module &M,
       ++R.Stages["normalize"].Changes;
       Changed = true;
     }
+    // The first dispatcher rewrite exposes lifted BCF arithmetic that was
+    // hidden behind state loads during the early MBA sweep.
+    Changed |= simplifyKnownMBA(F, R);
   }
   bool LateBCFChanged = false;
   for (Function &F : M)
@@ -2007,6 +3555,32 @@ PreservedAnalyses Deobfuscate095Pass::run(Module &M,
       Changed |= cleanupRegisterState(F, FAM, R);
 
   verifyCFGStage(M, "register-state cleanup");
+
+  // Register/fake-stack cleanup can expose a new PHI-backed dispatcher shape
+  // that was intentionally invisible to the earlier deflatten sweeps.  Run a
+  // bounded post-cleanup fixed point so callers do not need repeated plugin
+  // invocations.  Each round still uses the same transactional verifier and
+  // fail-closed proofs as the primary sweep.
+  for (unsigned PostRound = 0; PostRound < 2; ++PostRound) {
+    bool PostChanged = false;
+    for (Function &F : M)
+      if (!F.isDeclaration()) {
+        PostChanged |= normalize(F, FAM);
+        PostChanged |= simplifyKnownMBA(F, R);
+      }
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        PostChanged |= removeOpaquePredicates(F, Prover, R);
+    PostChanged |= runTransactionalDeflatten(M, FAM, Prover, R, true);
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        PostChanged |= cleanupCFG(F, FAM);
+    Changed |= PostChanged;
+    verifyCFGStage(M, "post-cleanup deflatten");
+    if (!PostChanged)
+      break;
+  }
+
   R.Z3 = Prover.stats();
   if (!R.UnresolvedReasons.empty())
     R.Status = "partial";

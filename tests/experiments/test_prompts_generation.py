@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ from experiments.prompts import (  # noqa: E402
     build_one_shot_prompt,
 )
 from experiments.storage import sha256_file  # noqa: E402
+from llm_recovery import llm_recovery as recovery  # noqa: E402
 
 
 EXPECTED_SYSTEM = """You are a highly skilled reverse engineer specializing in binary deobfuscation and C reconstruction.
@@ -46,6 +48,12 @@ class CapturingClient:
     def generate(self, prompt, **kwargs):
         self.calls.append((prompt, kwargs))
         return "int main(void) { return 0; }\n"
+
+
+class JsonRecoveryClient(CapturingClient):
+    def generate(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        return json.dumps({"source": "int main(void) { return 0; }\n"})
 
 
 def config():
@@ -158,3 +166,46 @@ def test_a0_sends_only_raw_lifted_ir_in_one_shot(tmp_path):
         representation
     )
     assert request["forbidden_scan"]["passed"] is True
+
+
+def test_p0_processing_consumes_precomputed_pseudocode_without_ghidra(
+    tmp_path, monkeypatch
+):
+    prepared = tmp_path / "prepared_ghidra.c"
+    prepared.write_text(
+        "// Function: main\nint main(void) { return 0; }\n"
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_decompile_binary_with_ghidra",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("processing must not invoke Ghidra")
+        ),
+    )
+    client = JsonRecoveryClient()
+    output = tmp_path / "generation"
+    result = recovery.run_recovery_loop(
+        ir_text="define i32 @main() { ret i32 0 }",
+        output_recovered_c_path=str(output / "candidate.c"),
+        case_output_dir=str(output),
+        metadata={
+            "precomputed_ghidra_pseudocode_path": str(prepared),
+            "precomputed_ghidra_pseudocode_sha256": hashlib.sha256(
+                prepared.read_bytes()
+            ).hexdigest(),
+        },
+        config=recovery.RecoveryConfig(
+            max_iterations=1,
+            pseudo_backend="ghidra",
+            two_stage_recovery=True,
+            use_file_api=False,
+            require_json=True,
+        ),
+        model_client=client,
+    )
+
+    assert result.success is True
+    assert (output / "ghidra_pseudocode.c").read_bytes() == (
+        prepared.read_bytes()
+    )
+    assert len(client.calls) == 1
