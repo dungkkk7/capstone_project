@@ -3757,6 +3757,39 @@ static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
   if (containsNativeStackInteger(Address, StackSeen))
     return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
                             "native.stack.address.fallback");
+  // A lifted data address can retain its guest base behind a control-flow
+  // PHI, e.g. ``index * stride + phi(guest_base_a, guest_base_b)``.  The
+  // native-integer classifier only sees the non-constant index and may then
+  // preserve the whole expression as an absolute host pointer.  That turns
+  // a valid recovered-object access into a write to an unmapped guest VA.
+  // Treat a recovered guest-range constant anywhere in this arithmetic tree
+  // as stronger provenance than the generic native-integer heuristic.
+  std::function<bool(Value *, unsigned)> HasGuestAnchor =
+      [&](Value *V, unsigned Depth) -> bool {
+    if (!V || Depth > 8)
+      return false;
+    if (auto *CI = dyn_cast<ConstantInt>(V))
+      return FindRecoveredGlobalForGuestAddress(M, CI->getZExtValue())
+          .has_value();
+    if (auto *PN = dyn_cast<PHINode>(V)) {
+      for (Value *Incoming : PN->incoming_values())
+        if (HasGuestAnchor(Incoming, Depth + 1))
+          return true;
+      return false;
+    }
+    if (auto *Sel = dyn_cast<SelectInst>(V))
+      return HasGuestAnchor(Sel->getTrueValue(), Depth + 1) ||
+             HasGuestAnchor(Sel->getFalseValue(), Depth + 1);
+    if (auto *BO = dyn_cast<BinaryOperator>(V))
+      return HasGuestAnchor(BO->getOperand(0), Depth + 1) ||
+             HasGuestAnchor(BO->getOperand(1), Depth + 1);
+    if (auto *Cast = dyn_cast<CastInst>(V))
+      return HasGuestAnchor(Cast->getOperand(0), Depth + 1);
+    if (auto *Freeze = dyn_cast<FreezeInst>(V))
+      return HasGuestAnchor(Freeze->getOperand(0), Depth + 1);
+    return false;
+  };
+  bool HasRecoveredGuestAnchor = HasGuestAnchor(Address, 0);
   // Recovered typed globals can flow through State as integer addresses:
   //   ptrtoint(@global + fixed_offset) + index * stride + field_offset.
   // Even callers that disable the broad native-integer heuristic must retain
@@ -3765,11 +3798,13 @@ static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
   // 0x18.  Guest-base-plus-ABI-index expressions contain no ptrtoint carrier
   // and therefore continue through the guest range mapper below.
   SmallPtrSet<Value *, 32> ExplicitNativeSeen;
-  if (containsExplicitNativePointerInteger(Address, ExplicitNativeSeen))
+  if (!HasRecoveredGuestAnchor &&
+      containsExplicitNativePointerInteger(Address, ExplicitNativeSeen))
     return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
                             "native.explicit.integer.pointer");
   SmallPtrSet<Value *, 32> NativeSeen;
-  if (PreserveNativeInteger && isNativeInteger(Address, NativeSeen))
+  if (!HasRecoveredGuestAnchor && PreserveNativeInteger &&
+      isNativeInteger(Address, NativeSeen))
     return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
                             "native.integer.pointer");
 

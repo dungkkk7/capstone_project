@@ -365,7 +365,16 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         skipped = skipped.strip()
         if skipped:
             pipeline = ",".join(p for p in pipeline.split(",") if p != skipped)
+    # Pass 095 defaults to a report path derived from the LLVM module name.
+    # When opt is launched from the repository root that default leaks
+    # llvm-link.095.<hash>.json files into the root and collides across runs.
+    # Keep the proof report beside the requested brightened output instead.
+    report_path = os.environ.get(
+        "BRIGHTEN_095_REPORT",
+        f"{os.path.splitext(output_path)[0]}.095.json",
+    )
     cmd.extend([
+        f"-095-report={report_path}",
         "-passes", pipeline,
         input_path,
         "-o", output_path

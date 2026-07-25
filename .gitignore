@@ -7,6 +7,7 @@ scratch/
 *.bin
 *.so
 *.bc
+llvm-link.095.*.json
 data/clean_src/test/
 data/obfuscated/test/
 data/test.csv

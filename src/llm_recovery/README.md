@@ -48,7 +48,7 @@ Mode 1 **không fallback về `original_binary` nữa**. Nó chỉ nhận:
 
 Nội bộ pipeline sẽ truyền:
 
-- Nếu brightened IR compile được sang binary tham chiếu: `.../<base>_brightened_ref.bin`
+- Nếu delifted IR compile được sang binary tham chiếu: `.../<base>_delifted_ref.bin`
 - Ngược lại, trong luồng hiện tại sẽ truyền `original_binary` như fallback từ `main.py` (khi metadata được set).
 
 Nếu `recovery_reference_binary` thiếu -> mode 1 dừng, không tự chuyển sang mode 2.

@@ -149,10 +149,11 @@ class P0LegacyAdapter:
             str(brightened_ll), str(representation_dir), "delifted"
         )
         delifted_ll = Path(delifted_ll_text)
-        if delift_status == "applied":
-            primary_ll = delifted_ll
-        else:
-            primary_ll = brightened_ll
+        if delift_status != "applied" or not delifted_ll.is_file():
+            raise RepresentationError(
+                "P0_DELIFT_FAILED",
+                "P0 delift bundle did not produce the final delifted LLVM IR",
+            )
         native_report = read_native_contract_report(str(brightened_bc))
         if native_report:
             atomic_write_json(
@@ -166,11 +167,11 @@ class P0LegacyAdapter:
         # model or sampling policy than A0/B0.
         legacy_config = build_p0_recovery_config(self.config)
 
-        brightened_reference = representation_dir / "brightened_ref.bin"
-        compile_to_binary(str(primary_ll), str(brightened_reference))
+        delifted_reference = representation_dir / "delifted_ref.bin"
+        compile_to_binary(str(delifted_ll), str(delifted_reference))
         recovery_reference = (
-            str(brightened_reference)
-            if brightened_reference.is_file()
+            str(delifted_reference)
+            if delifted_reference.is_file()
             else sample.original_elf_path
         )
 
@@ -200,14 +201,14 @@ class P0LegacyAdapter:
         attachment_paths = [str(p0_pseudocode)]
         attachment_hashes = [sha256_file(p0_pseudocode)]
         if attach_clean_ir:
-            attachment_paths.insert(0, str(primary_ll))
-            attachment_hashes.insert(0, sha256_file(primary_ll))
+            attachment_paths.insert(0, str(delifted_ll))
+            attachment_hashes.insert(0, sha256_file(delifted_ll))
         representation = RepresentationArtifact(
             method=MethodId.P0,
-            primary_path=str(primary_ll),
-            primary_sha256=sha256_file(primary_ll),
-            byte_count=primary_ll.stat().st_size,
-            token_count=max(1, (primary_ll.stat().st_size + 2) // 3),
+            primary_path=str(delifted_ll),
+            primary_sha256=sha256_file(delifted_ll),
+            byte_count=delifted_ll.stat().st_size,
+            token_count=max(1, (delifted_ll.stat().st_size + 2) // 3),
             builder_version=self.VERSION,
             attachment_paths=attachment_paths,
             attachment_sha256=attachment_hashes,
@@ -218,8 +219,8 @@ class P0LegacyAdapter:
                 "brightened_bc_sha256": sha256_file(brightened_bc),
                 "delift_bundle": delift_status,
                 "delift_bundle_log": delift_log,
-                "delifted_ll_path": str(primary_ll),
-                "delifted_ll_sha256": sha256_file(primary_ll),
+                "delifted_ll_path": str(delifted_ll),
+                "delifted_ll_sha256": sha256_file(delifted_ll),
                 "pseudocode_path": str(p0_pseudocode),
                 "pseudocode_sha256": sha256_file(p0_pseudocode),
                 "internal_precheck_path": str(
@@ -281,14 +282,14 @@ class P0LegacyAdapter:
                 "P0_REPRESENTATION_METHOD_MISMATCH",
                 "P0 processing received another method's representation",
             )
-        brightened_ll = Path(representation.primary_path)
+        delifted_ll = Path(representation.primary_path)
         if (
-            not brightened_ll.is_file()
-            or sha256_file(brightened_ll) != representation.primary_sha256
+            not delifted_ll.is_file()
+            or sha256_file(delifted_ll) != representation.primary_sha256
         ):
             raise RepresentationError(
                 "P0_REPRESENTATION_HASH_MISMATCH",
-                "Frozen P0 brightened LLVM IR is missing or changed",
+                "Frozen P0 delifted LLVM IR is missing or changed",
             )
         provenance = representation.provenance or {}
         p0_pseudocode = Path(str(provenance.get("pseudocode_path") or ""))
@@ -401,7 +402,7 @@ class P0LegacyAdapter:
         )
         output_candidate = generation_dir / "p0_recovered.c"
         result: RecoveryResult = run_recovery_loop(
-            ir_text=brightened_ll.read_text(
+            ir_text=delifted_ll.read_text(
                 encoding="utf-8", errors="replace"
             ),
             output_recovered_c_path=str(output_candidate),
@@ -410,11 +411,11 @@ class P0LegacyAdapter:
                 "original_binary": sample.original_elf_path,
                 "recovery_reference_binary": recovery_reference,
                 "recovery_reference_label": (
-                    "brightened.bc compiled"
+                    "delifted.ll compiled"
                     if recovery_reference != sample.original_elf_path
                     else "original"
                 ),
-                "input_ir": str(brightened_ll),
+                "input_ir": str(delifted_ll),
                 "precomputed_ghidra_pseudocode_path": str(
                     prepared_pseudocode
                 ),
@@ -486,7 +487,7 @@ class P0LegacyAdapter:
             "protocol": "legacy_iterative_repair",
             "max_iterations": 5,
             **model_freeze,
-            "representation_sha256": sha256_file(brightened_ll),
+            "representation_sha256": sha256_file(delifted_ll),
             "pseudocode_sha256": sha256_file(prepared_pseudocode),
             "recovery_reference_sha256": sha256_file(recovery_reference),
         }

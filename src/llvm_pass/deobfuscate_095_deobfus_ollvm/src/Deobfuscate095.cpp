@@ -58,7 +58,7 @@ namespace {
 
 static cl::opt<std::string> ReportPath(
     "095-report",
-    cl::desc("Path for the deobfuscate-095 JSON report (default: source.095.json)"),
+    cl::desc("Path for the deobfuscate-095 JSON report (default: system temp directory)"),
     cl::init(""));
 
 static cl::opt<unsigned> Z3TimeoutMs(
@@ -261,12 +261,27 @@ static std::string defaultReportPath(const Module &M) {
   StringRef Base = sys::path::filename(Source);
   if (Base.empty() || Base == "<stdin>")
     Base = "module";
-  // Keep reports adjacent but avoid the historical llvm-link.095.json
-  // collision when several samples are processed concurrently.
   SmallString<256> Stem(Base);
   sys::path::replace_extension(Stem, "");
   std::string Tag = std::to_string(static_cast<uint64_t>(hash_value(
       M.getModuleIdentifier())));
+
+  // A bare module identifier is relative to opt's cwd.  The old fallback
+  // therefore polluted whichever directory launched opt (usually the repo
+  // root) with llvm-link.095.*.  Direct callers do not provide the pipeline's
+  // result directory, so keep the implicit report in a private temp folder;
+  // pipeline callers can still select an explicit -095-report path.
+  SmallString<256> ReportDir;
+  sys::path::system_temp_directory(true, ReportDir);
+  if (!ReportDir.empty()) {
+    sys::path::append(ReportDir, "deobfuscate-095");
+    (void)sys::fs::create_directories(ReportDir);
+    sys::path::append(ReportDir, Stem + ".095." + Tag + ".json");
+    return ReportDir.str().str();
+  }
+
+  // This is only a last-resort fallback for unusual environments where the
+  // system temp directory cannot be queried.
   return (Stem + ".095." + Tag + ".json").str();
 }
 
