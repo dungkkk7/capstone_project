@@ -360,7 +360,11 @@ class P0LegacyAdapter:
                 "Frozen P0 brightened bitcode is missing or changed",
             )
         precheck = run_legacy_fuzz(
-            recovery_reference,
+            # Keep Program 1 as LLVM IR so AFL++ can instrument it with
+            # afl-cc.  The compiled delifted binary remains the execution
+            # reference/oracle target; passing that ELF as Program 1 makes
+            # afl-cc try to compile an already-linked binary.
+            str(delifted_ll),
             sample.original_elf_path,
             iterations=int(self.config["p0"]["fuzz_iterations"]),
             timeout=float(self.config["p0"]["fuzz_timeout_sec"]),
