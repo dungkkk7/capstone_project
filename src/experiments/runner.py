@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import copy
+import fcntl
+import json
 import os
 import platform
 import re
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from pathlib import Path
@@ -14,7 +18,9 @@ from types import SimpleNamespace
 from typing import Any, Dict
 
 from llm_recovery.llm_recovery import (
+    LLMContextOverflowError,
     LLMEmptyResponseError,
+    P0_PROMPT_POLICY_VERSION,
     RecoveryError,
 )
 
@@ -46,7 +52,7 @@ from .generation import (
 )
 from .identity import read_dataset
 from .models import RepresentationArtifact, SampleIdentity, VariantResult
-from .p0_legacy import P0LegacyAdapter, P0PrecheckFailed
+from .p0_legacy import P0LegacyAdapter
 from .quota import QuotaWaitExceeded
 from .representations import (
     A0Builder,
@@ -62,9 +68,9 @@ from .storage import (
 )
 from .storage import sha256_text
 from .prompts import (
+    B0_MINIMAL_SYSTEM_PROMPT,
     B0_PROMPT_POLICY_VERSION,
-    B0_USER_TEMPLATE,
-    ONE_SHOT_SYSTEM_PROMPT,
+    build_one_shot_prompt,
 )
 from llvm_pass.britening_ir import PASS_PIPELINE, PLUGINS
 
@@ -179,6 +185,53 @@ class ExperimentRunner:
         self.b0_builder = B0Builder(config)
         self.p0_adapter = P0LegacyAdapter(config, self.lift_service)
 
+    @contextmanager
+    def command_lock(self, command: str):
+        """Prevent two CLI commands from mutating one run concurrently."""
+
+        lock_dir = self.run_root.parent / ".run_locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{self.run_id}.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            try:
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError as exc:
+                handle.seek(0)
+                holder = handle.read().strip()
+                detail = f" Active holder: {holder}" if holder else ""
+                raise RunIntegrityError(
+                    f"Run '{self.run_id}' is already active; refusing to "
+                    "start a concurrent command that could invalidate its "
+                    f"sealed artifacts.{detail}"
+                ) from exc
+
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "command": command,
+                        "started_at_utc": dt.datetime.now(
+                            dt.timezone.utc
+                        ).isoformat(),
+                    },
+                    sort_keys=True,
+                )
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
     def initialize(self) -> None:
         self.run_root.mkdir(parents=True, exist_ok=True)
         manifest_path = self.run_root / "experiment_manifest.json"
@@ -215,9 +268,9 @@ class ExperimentRunner:
                 method.value for method in self.execution_order
             ],
             "protocols": {
-                "P0": "legacy_iterative_repair_max_5",
+                "P0": "dual_evidence_file_api_iterative_repair_max_5",
                 "A0": "strict_one_shot",
-                "B0": "strict_one_shot",
+                "B0": "common_recovery_core_ghidra_strict_one_shot",
             },
             "phase_contract": {
                 "preparation": (
@@ -678,10 +731,7 @@ class ExperimentRunner:
             if not result_path.is_file():
                 return False
             data = load_json(result_path)
-            if (
-                data.get("final_stage") == Stage.FINALIZED.value
-                and not self._is_retryable_llm_failure(data)
-            ):
+            if data.get("final_stage") == Stage.FINALIZED.value:
                 continue
             try:
                 representation = self._load_prepared_representation(
@@ -695,27 +745,21 @@ class ExperimentRunner:
                 return False
         return True
 
-    def _prepare_input_sample(self, sample: SampleIdentity) -> None:
-        print(
-            f"[experiment] prepare sample={sample.sample_id}",
-            flush=True,
-        )
-        self.audit.log(
-            "sample_preparation_started",
-            sample_id=sample.sample_id,
-            stage=Stage.ENROLLED.value,
-            status="RUNNING",
-            payload={"llm_calls": 0, "fuzz_calls": 0},
-        )
-        started = time.perf_counter()
+    def _prepare_base_input(
+        self, sample: SampleIdentity
+    ) -> list[Dict[str, Any]]:
+        """Prepare the one shared deterministic corpus without method work."""
+
+        if self._prepared_input_available(sample):
+            return self._load_prepared_base_inputs(sample)
         try:
             output_dir = (
                 self._sample_dir(sample) / "common" / "base_corpus"
             )
-            inputs = prepare_base_corpus(sample, output_dir, self.config)
+            prepare_base_corpus(sample, output_dir, self.config)
             # Read back the persisted files so preparation cannot be marked
             # complete when its manifest or payloads are inconsistent.
-            self._load_prepared_base_inputs(sample)
+            return self._load_prepared_base_inputs(sample)
         except Exception as exc:
             self.audit.log(
                 "sample_preparation_failed",
@@ -730,103 +774,104 @@ class ExperimentRunner:
             )
             raise
 
-        representation_summary: Dict[str, Any] = {}
-        for method in self.execution_order:
-            result_path = self._result_path(sample, method)
-            if method is MethodId.P0 and self._p0_backfill_eligible(sample):
-                self._archive_p0_backfill(sample)
-            if (
-                self.config["experiment"].get("resume", True)
-                and result_path.is_file()
-            ):
-                existing = load_json(result_path)
-                if (
-                    existing.get("final_stage") == Stage.FINALIZED.value
-                    and not self._is_retryable_llm_failure(existing)
-                ):
-                    representation_summary[method.value] = {
-                        "status": "terminal",
-                        "failure_code": existing.get("failure_code"),
-                    }
-                    continue
-                try:
-                    frozen = self._load_prepared_representation(
-                        sample, method
-                    )
-                except RepresentationError:
-                    frozen = None
-                if frozen is not None:
-                    representation_summary[method.value] = {
-                        "status": "ready_for_llm",
-                        "representation_sha256": frozen.primary_sha256,
-                    }
-                    continue
+    def _prepare_method_representation(
+        self, sample: SampleIdentity, method: MethodId
+    ) -> Dict[str, Any]:
+        """Prepare exactly one method so sibling methods never form a barrier."""
 
-            result = VariantResult.enrolled(self.run_id, sample, method)
-            variant_dir = self._sample_dir(sample) / method.value
-            method_started = time.perf_counter()
+        result_path = self._result_path(sample, method)
+        if method is MethodId.P0 and self._p0_backfill_eligible(sample):
+            self._archive_p0_backfill(sample)
+        if (
+            self.config["experiment"].get("resume", True)
+            and result_path.is_file()
+        ):
+            existing = load_json(result_path)
+            if existing.get("final_stage") == Stage.FINALIZED.value:
+                return {
+                    "status": "terminal",
+                    "failure_code": existing.get("failure_code"),
+                }
+            try:
+                frozen = self._load_prepared_representation(sample, method)
+            except RepresentationError:
+                frozen = None
+            if frozen is not None:
+                return {
+                    "status": "ready_for_llm",
+                    "representation_sha256": frozen.primary_sha256,
+                    "evidence_sha256": frozen.attachment_sha256,
+                }
+
+        result = VariantResult.enrolled(self.run_id, sample, method)
+        variant_dir = self._sample_dir(sample) / method.value
+        method_started = time.perf_counter()
+        self.audit.log(
+            "variant_preparation_started",
+            sample_id=sample.sample_id,
+            method=method.value,
+            stage=Stage.REPRESENTATION.value,
+            status="RUNNING",
+            payload={"llm_calls": 0, "fuzz_calls": 0},
+        )
+        try:
+            if method is MethodId.P0:
+                representation = self.p0_adapter.prepare(
+                    sample,
+                    self._sample_dir(sample) / "common",
+                    variant_dir,
+                )
+            elif method is MethodId.A0:
+                representation = self.a0_builder.build(
+                    sample,
+                    self._sample_dir(sample) / "common",
+                    variant_dir / "representation",
+                )
+            else:
+                representation = self.b0_builder.build(
+                    sample, variant_dir / "representation"
+                )
+            result.representation = representation.to_dict()
+            result.final_stage = Stage.GENERATION
+            result.provenance["prepared_without_llm"] = True
+            result.timing["preparation_duration_ms"] = int(
+                (time.perf_counter() - method_started) * 1000
+            )
+            self._persist(sample, result)
+            summary = {
+                "status": "ready_for_llm",
+                "representation_sha256": representation.primary_sha256,
+                "evidence_sha256": representation.attachment_sha256,
+            }
             self.audit.log(
-                "variant_preparation_started",
+                "variant_preparation_completed",
                 sample_id=sample.sample_id,
                 method=method.value,
                 stage=Stage.REPRESENTATION.value,
-                status="RUNNING",
-                payload={"llm_calls": 0, "fuzz_calls": 0},
-            )
-            try:
-                if method is MethodId.P0:
-                    representation = self.p0_adapter.prepare(
-                        sample,
-                        self._sample_dir(sample) / "common",
-                        variant_dir,
-                    )
-                elif method is MethodId.A0:
-                    representation = self.a0_builder.build(
-                        sample,
-                        self._sample_dir(sample) / "common",
-                        variant_dir / "representation",
-                    )
-                else:
-                    representation = self.b0_builder.build(
-                        sample, variant_dir / "representation"
-                    )
-                result.representation = representation.to_dict()
-                result.final_stage = Stage.GENERATION
-                result.provenance["prepared_without_llm"] = True
-                result.timing["preparation_duration_ms"] = int(
-                    (time.perf_counter() - method_started) * 1000
-                )
-                self._persist(sample, result)
-                representation_summary[method.value] = {
-                    "status": "ready_for_llm",
+                status="READY_FOR_LLM",
+                payload={
+                    "llm_calls": 0,
+                    "fuzz_calls": 0,
                     "representation_sha256": representation.primary_sha256,
-                    "evidence_sha256": representation.attachment_sha256,
-                }
-                self.audit.log(
-                    "variant_preparation_completed",
-                    sample_id=sample.sample_id,
-                    method=method.value,
-                    stage=Stage.REPRESENTATION.value,
-                    status="READY_FOR_LLM",
-                    payload={
-                        "llm_calls": 0,
-                        "fuzz_calls": 0,
-                        "representation_sha256": (
-                            representation.primary_sha256
-                        ),
-                    },
-                )
-            except Exception as exc:
-                self._finalize_exception(
-                    sample, result, exc, method_started
-                )
-                representation_summary[method.value] = {
-                    "status": "terminal",
-                    "failure_code": result.failure_code,
-                }
-                if self.config["experiment"].get("fail_fast"):
-                    raise
+                },
+            )
+            return summary
+        except Exception as exc:
+            self._finalize_exception(sample, result, exc, method_started)
+            if self.config["experiment"].get("fail_fast"):
+                raise
+            return {
+                "status": "terminal",
+                "failure_code": result.failure_code,
+            }
 
+    def _write_preparation_manifest(
+        self,
+        sample: SampleIdentity,
+        inputs: list[Dict[str, Any]],
+        representation_summary: Dict[str, Any],
+        started: float,
+    ) -> None:
         preparation_manifest = {
             "schema_version": "1.0",
             "sample_id": sample.sample_id,
@@ -858,6 +903,207 @@ class ExperimentRunner:
                 ),
             },
         )
+
+    def _prepare_input_sample(self, sample: SampleIdentity) -> None:
+        """Compatibility preparation command; E2E uses independent flows."""
+
+        print(
+            f"[experiment] prepare sample={sample.sample_id}",
+            flush=True,
+        )
+        self.audit.log(
+            "sample_preparation_started",
+            sample_id=sample.sample_id,
+            stage=Stage.ENROLLED.value,
+            status="RUNNING",
+            payload={"llm_calls": 0, "fuzz_calls": 0},
+        )
+        started = time.perf_counter()
+        inputs = self._prepare_base_input(sample)
+        representation_summary = {
+            method.value: self._prepare_method_representation(sample, method)
+            for method in self.execution_order
+        }
+        self._write_preparation_manifest(
+            sample, inputs, representation_summary, started
+        )
+
+    def _run_generation_flows(self) -> None:
+        """Dispatch independent method batches without waiting between them."""
+        import time as _time
+
+        cases = list(self.samples)
+        batch_size = max(1, int(self.config["experiment"].get("dispatch_batch_size", 10)))
+        interval = max(0.0, float(self.config["experiment"].get("dispatch_interval_seconds", 30)))
+        print(
+            f"[experiment] llm-build: {len(cases)} case(s) × "
+            f"{len(self.execution_order)} flows, batch/flow={batch_size}, "
+            f"interval={interval:.0f}s",
+            flush=True,
+        )
+
+        def run_one(sample: SampleIdentity, method: MethodId) -> None:
+            worker = copy.copy(self)
+            worker.execution_order = [method]
+            worker._generate_sample(sample)
+
+        # Submit all work to an unbounded executor queue. Dispatch cadence is
+        # independent from completion; futures are joined only at the end.
+        executor = ThreadPoolExecutor(
+            max_workers=max(1, len(cases) * len(self.execution_order)),
+            thread_name_prefix="experiment-flow",
+        )
+        try:
+            futures = []
+            for offset in range(0, len(cases), batch_size):
+                batch = cases[offset : offset + batch_size]
+                for method in self.execution_order:
+                    futures.extend(
+                        executor.submit(run_one, sample, method)
+                        for sample in batch
+                    )
+                if offset + batch_size < len(cases) and interval:
+                    _time.sleep(interval)
+            for future in futures:
+                future.result()
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _process_sample_streaming(self, sample: SampleIdentity) -> None:
+        """Generate one sample and fuzz it immediately after its generation."""
+        if not self._sample_generation_ready(sample):
+            self._generate_sample(sample)
+        if self._sample_generation_ready(sample) and not self._sample_complete(sample):
+            self._process_comparison_sample(sample)
+
+    def _run_candidate_flows(self) -> None:
+        """Run independent sample/method pipelines without sibling barriers."""
+        total = len(self.samples) * len(self.methods)
+
+        def run_one(sample: SampleIdentity, method: MethodId) -> None:
+            worker = copy.copy(self)
+            worker.methods = [method]
+            worker.execution_order = [method]
+            worker._generate_sample(sample)
+            if not worker._sample_generation_ready(sample):
+                return
+            worker._process_comparison_sample(sample)
+
+        executor = ThreadPoolExecutor(
+            max_workers=max(1, total), thread_name_prefix="experiment-candidate"
+        )
+        try:
+            futures = [
+                executor.submit(run_one, sample, method)
+                for sample in self.samples
+                for method in self.methods
+            ]
+            for future in futures:
+                future.result()
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _run_streaming_cases(self) -> None:
+        """Run each method end-to-end after only the shared base input is ready."""
+
+        def run_case(sample: SampleIdentity) -> None:
+            started = time.perf_counter()
+            print(
+                f"[experiment] prepare shared input sample={sample.sample_id}",
+                flush=True,
+            )
+            self.audit.log(
+                "sample_preparation_started",
+                sample_id=sample.sample_id,
+                stage=Stage.ENROLLED.value,
+                status="RUNNING",
+                payload={"llm_calls": 0, "fuzz_calls": 0},
+            )
+            inputs = self._prepare_base_input(sample)
+            methods = list(self.methods)
+
+            def run_method(
+                method: MethodId,
+            ) -> tuple[MethodId, Dict[str, Any]]:
+                worker = copy.copy(self)
+                worker.methods = [method]
+                worker.execution_order = [method]
+                summary = worker._prepare_method_representation(
+                    sample, method
+                )
+                if (
+                    summary.get("status") == "ready_for_llm"
+                    and not worker._sample_generation_ready(sample)
+                ):
+                    worker._generate_sample(sample)
+                if (
+                    worker._sample_generation_ready(sample)
+                    and not worker._sample_processing_ready(sample)
+                ):
+                    worker._process_comparison_sample(sample)
+                return method, summary
+
+            representation_summary: Dict[str, Any] = {}
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(methods)),
+                thread_name_prefix=f"experiment-case-{sample.sample_id}",
+            ) as executor:
+                futures = [executor.submit(run_method, method) for method in methods]
+                for future in futures:
+                    method, summary = future.result()
+                    representation_summary[method.value] = summary
+            self._write_preparation_manifest(
+                sample,
+                inputs,
+                representation_summary,
+                started,
+            )
+
+        self._run_samples(
+            "e2e-stream",
+            run_case,
+            lambda sample: self._sample_complete(sample),
+        )
+
+    def _reconcile_processing_manifests(self) -> None:
+        """Merge independently written method checkpoints per sample."""
+        for sample in self.samples:
+            sample_dir = self._sample_dir(sample)
+            raw_results = []
+            complete = True
+            for method in self.methods:
+                path = self._result_path(sample, method)
+                if not path.is_file():
+                    complete = False
+                    break
+                data = load_json(path)
+                if data.get("final_stage") != Stage.FINALIZED.value:
+                    complete = False
+                    break
+                raw_results.append({
+                    "method": method.value,
+                    "result_path": str(path),
+                    "result_sha256": sha256_file(path),
+                    "terminal_status": data.get("terminal_status"),
+                    "failure_code": data.get("failure_code"),
+                    "has_differential_data": bool(data.get("evaluation")),
+                    "union_corpus_sha256": (
+                        (data.get("integrity") or {}).get(
+                            "union_corpus_sha256"
+                        )
+                    ),
+                })
+            if complete:
+                atomic_write_json(
+                    sample_dir / "processing_manifest.json",
+                    {
+                        "schema_version": "1.0",
+                        "sample_id": sample.sample_id,
+                        "phase": "processing",
+                        "raw_results": raw_results,
+                        "ready_for_evaluation": True,
+                    },
+                )
 
     def precompute(self) -> None:
         """Backward-compatible alias for the full preparation phase."""
@@ -909,12 +1155,6 @@ class ExperimentRunner:
             data = load_json(path)
             if data.get("final_stage") != Stage.FINALIZED.value:
                 return False
-            # A provider cancellation may have finalized the variant before
-            # the process can be resumed. Keep that sample eligible for a
-            # later run so a transient LLM failure is not treated as a final
-            # scientific outcome forever.
-            if self._is_retryable_llm_failure(data):
-                return False
         return True
 
     @staticmethod
@@ -944,8 +1184,6 @@ class ExperimentRunner:
                 return False
             data = load_json(path)
             if data.get("final_stage") == Stage.FINALIZED.value:
-                if self._is_retryable_llm_failure(data):
-                    return False
                 continue
             if data.get("terminal_status") == (
                 TerminalStatus.WAITING_FOR_QUOTA.value
@@ -1071,48 +1309,11 @@ class ExperimentRunner:
             payload={"command": "run", "workflow": workflow},
         )
         print(
-            "[experiment] E2E phase 1/3 PREPARATION: corpus + frozen LLM evidence",
+            "[experiment] E2E streaming: preparation → LLM → build → fuzz/compare",
             flush=True,
         )
-        self._run_samples(
-            "preparation",
-            self._prepare_input_sample,
-            lambda sample: self._sample_input_prepared(sample),
-        )
-        print(
-            "[experiment] E2E phase 2/3 PROCESSING: LLM + build + fuzz/compare",
-            flush=True,
-        )
-        self._run_samples(
-            "llm-build",
-            self._generate_sample,
-            lambda sample: self._sample_generation_complete(sample),
-        )
-        pending_generation = [
-            sample.sample_id
-            for sample in self.samples
-            if not self._sample_generation_ready(sample)
-        ]
-        if pending_generation:
-            self.audit.log(
-                "generation_deferred",
-                stage=Stage.GENERATION.value,
-                status="WAITING_FOR_QUOTA",
-                payload={"pending_sample_ids": pending_generation},
-            )
-            print(
-                "[experiment] generation deferred; pending sample(s) saved "
-                "for backfill: "
-                + ", ".join(pending_generation),
-                flush=True,
-            )
-            self._seal_audit("run-deferred-generation")
-            return False
-        self._run_samples(
-            "fuzz-compare",
-            self._process_comparison_sample,
-            lambda sample: self._sample_complete(sample),
-        )
+        self._run_streaming_cases()
+        self._reconcile_processing_manifests()
         pending_processing = [
             sample.sample_id
             for sample in self.samples
@@ -1159,31 +1360,10 @@ class ExperimentRunner:
         self.audit.log(
             "command_started", status="RUNNING", payload={"command": "process"}
         )
-        unprepared = [
-            sample.sample_id
-            for sample in self.samples
-            if not self._sample_preparation_ready(sample)
-        ]
-        if unprepared:
-            raise RunIntegrityError(
-                "Processing requires frozen preparation artifacts for: "
-                + ", ".join(unprepared)
-            )
-        self._run_samples(
-            "llm-build",
-            self._generate_sample,
-            lambda sample: self._sample_generation_complete(sample),
-        )
-        if not all(
-            self._sample_generation_ready(sample) for sample in self.samples
-        ):
-            self._seal_audit("process-deferred-generation")
-            return False
-        self._run_samples(
-            "fuzz-compare",
-            self._process_comparison_sample,
-            lambda sample: self._sample_complete(sample),
-        )
+        # Streaming pipeline: a completed sample enters fuzz/compare
+        # immediately; unfinished samples do not create a global barrier.
+        self._run_streaming_cases()
+        self._reconcile_processing_manifests()
         completed = all(
             self._sample_processing_output_ready(sample)
             for sample in self.samples
@@ -1233,6 +1413,320 @@ class ExperimentRunner:
         )
         return aggregate
 
+    def refuzz(self) -> Dict[str, Any]:
+        """Refuzz frozen A0/B0 candidates without any model generation.
+
+        This is a controlled post-hoc repair for runs whose candidates are
+        valid but whose former final-fuzz implementation was incorrect.
+        Previous comparison/report artifacts are archived inside the run
+        before replacement, and candidate/generation/build evidence remains
+        byte-identical.
+        """
+
+        manifest_path = self.run_root / "experiment_manifest.json"
+        if not manifest_path.is_file():
+            raise RunIntegrityError(
+                f"Refuzz requires an existing run: {self.run_id}"
+            )
+        experiment_manifest = load_json(manifest_path)
+        enrolled_ids = {
+            str(value)
+            for value in experiment_manifest.get("sample_ids") or []
+        }
+        observed_ids = {sample.sample_id for sample in self.samples}
+        if observed_ids != enrolled_ids:
+            raise RunIntegrityError(
+                "Refuzz requires the exact frozen enrolled sample set"
+            )
+        enrolled_methods = {
+            MethodId(str(value))
+            for value in experiment_manifest.get("methods") or []
+        }
+        targets = [
+            MethodId(str(value))
+            for value in self.config.get(
+                "_refuzz_methods", ["A0", "B0"]
+            )
+        ]
+        if not targets or any(
+            method not in {MethodId.A0, MethodId.B0}
+            for method in targets
+        ):
+            raise RunIntegrityError(
+                "Refuzz target must contain A0 and/or B0"
+            )
+        if not set(targets).issubset(enrolled_methods):
+            raise RunIntegrityError(
+                "Refuzz target is not enrolled in the existing run"
+            )
+
+        eligible_jobs: list[tuple[SampleIdentity, MethodId]] = []
+        skipped_jobs: list[Dict[str, Any]] = []
+        for sample in self.samples:
+            identity_path = self._sample_dir(sample) / "identity.json"
+            if not identity_path.is_file():
+                raise RunIntegrityError(
+                    f"Missing frozen identity: {sample.sample_id}"
+                )
+            frozen_identity = load_json(identity_path)
+            if (
+                frozen_identity.get("original_elf_sha256")
+                != sample.original_elf_sha256
+            ):
+                raise RunIntegrityError(
+                    "Refuzz original ELF changed: "
+                    f"{sample.sample_id}"
+                )
+            for method in targets:
+                data = load_json(self._result_path(sample, method))
+                generation = data.get("generation") or {}
+                build = data.get("build") or {}
+                candidate_path = Path(
+                    str(generation.get("candidate_path") or "")
+                )
+                executable_path = Path(
+                    str(build.get("executable_path") or "")
+                )
+                if not candidate_path.is_file():
+                    skipped_jobs.append(
+                        {
+                            "sample_id": sample.sample_id,
+                            "method": method.value,
+                            "reason": "no_frozen_candidate",
+                            "terminal_status": data.get(
+                                "terminal_status"
+                            ),
+                            "failure_code": data.get("failure_code"),
+                        }
+                    )
+                    continue
+                if (
+                    sha256_file(candidate_path)
+                    != generation.get("candidate_sha256")
+                ):
+                    raise RunIntegrityError(
+                        "Frozen candidate changed: "
+                        f"{sample.sample_id}/{method.value}"
+                    )
+                if not build.get("ok"):
+                    skipped_jobs.append(
+                        {
+                            "sample_id": sample.sample_id,
+                            "method": method.value,
+                            "reason": "candidate_build_failed",
+                            "terminal_status": data.get(
+                                "terminal_status"
+                            ),
+                            "failure_code": data.get("failure_code"),
+                        }
+                    )
+                    continue
+                if not executable_path.is_file():
+                    raise RunIntegrityError(
+                        "Frozen executable missing: "
+                        f"{sample.sample_id}/{method.value}"
+                    )
+                if (
+                    sha256_file(executable_path)
+                    != build.get("executable_sha256")
+                ):
+                    raise RunIntegrityError(
+                        "Frozen executable changed: "
+                        f"{sample.sample_id}/{method.value}"
+                    )
+                eligible_jobs.append((sample, method))
+        if not eligible_jobs:
+            raise RunIntegrityError(
+                "No compiled frozen A0/B0 candidate is eligible for refuzz"
+            )
+
+        stamp = dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y%m%dT%H%M%S%fZ"
+        )
+        history_root = self.run_root / "refuzz_history" / stamp
+        history_root.mkdir(parents=True, exist_ok=False)
+        for name in (
+            "aggregate",
+            "evaluation_manifest.json",
+            "integrity_report.json",
+        ):
+            source = self.run_root / name
+            if source.exists():
+                destination = history_root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+        atomic_write_json(
+            history_root / "refuzz_manifest.json",
+            {
+                "schema_version": "1.0",
+                "run_id": self.run_id,
+                "created_at_utc": dt.datetime.now(
+                    dt.timezone.utc
+                ).isoformat(),
+                "methods": [method.value for method in targets],
+                "sample_ids": sorted(observed_ids),
+                "eligible_jobs": [
+                    {
+                        "sample_id": sample.sample_id,
+                        "method": method.value,
+                    }
+                    for sample, method in eligible_jobs
+                ],
+                "skipped_jobs": skipped_jobs,
+                "new_fuzz_config_sha256": self.config[
+                    "_config_sha256"
+                ],
+                "new_source_snapshot": _source_snapshot(
+                    self.project_root
+                ),
+                "llm_calls": 0,
+            },
+        )
+        self.audit.log(
+            "refuzz_started",
+            stage=Stage.FUZZ_DISCOVERY.value,
+            status="RUNNING",
+            payload={
+                "methods": [method.value for method in targets],
+                "sample_count": len(self.samples),
+                "eligible_job_count": len(eligible_jobs),
+                "skipped_job_count": len(skipped_jobs),
+                "history_path": str(history_root),
+                "llm_calls": 0,
+            },
+        )
+
+        frozen_generation: Dict[tuple[str, str], Dict[str, Any]] = {}
+        jobs_by_sample: Dict[str, list[MethodId]] = {}
+        for sample, method in eligible_jobs:
+            jobs_by_sample.setdefault(sample.sample_id, []).append(method)
+        for sample in self.samples:
+            processing_manifest = (
+                self._sample_dir(sample) / "processing_manifest.json"
+            )
+            if processing_manifest.is_file():
+                destination = (
+                    history_root
+                    / "samples"
+                    / sample.sample_id
+                    / "processing_manifest.json"
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(processing_manifest, destination)
+            for method in jobs_by_sample.get(sample.sample_id, []):
+                result_path = self._result_path(sample, method)
+                data = load_json(result_path)
+                target_history = (
+                    history_root
+                    / "samples"
+                    / sample.sample_id
+                    / method.value
+                )
+                target_history.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(result_path, target_history / "result.json")
+                processing_dir = (
+                    self._sample_dir(sample)
+                    / method.value
+                    / "processing"
+                )
+                if processing_dir.exists():
+                    shutil.move(
+                        str(processing_dir),
+                        str(target_history / "processing"),
+                    )
+                result = VariantResult.from_dict(data)
+                frozen_generation[(sample.sample_id, method.value)] = {
+                    "candidate_sha256": (
+                        result.generation or {}
+                    ).get("candidate_sha256"),
+                    "model_call_count": (
+                        result.generation or {}
+                    ).get("model_call_count"),
+                    "api_attempt_count": (
+                        result.generation or {}
+                    ).get("api_attempt_count"),
+                }
+                result.evaluation = None
+                result.e2e_pass = False
+                result.terminal_status = TerminalStatus.CANCELLED
+                result.final_stage = Stage.FUZZ_DISCOVERY
+                result.failure_code = None
+                result.failure_message = None
+                result.integrity.pop("union_corpus_sha256", None)
+                result.integrity.pop("reference_sha256", None)
+                result.timing.pop("evaluation_duration_ms", None)
+                result.timing.pop(
+                    "processing_comparison_duration_ms", None
+                )
+                result.timing.pop("total_duration_ms", None)
+                result.provenance["refuzz"] = {
+                    "timestamp": stamp,
+                    "history_path": str(target_history),
+                    "llm_reused": True,
+                }
+                self._persist(sample, result)
+
+        def run_one(
+            sample: SampleIdentity, method: MethodId
+        ) -> None:
+            worker = copy.copy(self)
+            worker.methods = [method]
+            worker.execution_order = [method]
+            worker._process_comparison_sample(sample)
+            updated = load_json(worker._result_path(sample, method))
+            original = frozen_generation[
+                (sample.sample_id, method.value)
+            ]
+            generation = updated.get("generation") or {}
+            for field, expected in original.items():
+                if generation.get(field) != expected:
+                    raise RunIntegrityError(
+                        "Refuzz mutated frozen LLM evidence: "
+                        f"{sample.sample_id}/{method.value}/{field}"
+                    )
+
+        jobs = eligible_jobs
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(jobs)),
+            thread_name_prefix="experiment-refuzz",
+        ) as executor:
+            futures = [
+                executor.submit(run_one, sample, method)
+                for sample, method in jobs
+            ]
+            for future in as_completed(futures):
+                future.result()
+
+        self._reconcile_processing_manifests()
+        aggregate = self._aggregate_outputs()
+        self.audit.log(
+            "refuzz_completed",
+            stage=Stage.FINALIZED.value,
+            status="COMPLETED",
+            payload={
+                "methods": [method.value for method in targets],
+                "sample_count": len(self.samples),
+                "refuzzed_job_count": len(jobs),
+                "skipped_job_count": len(skipped_jobs),
+                "llm_calls": 0,
+            },
+        )
+        self._seal_audit("refuzz")
+        verify_run_integrity(
+            self.run_root,
+            self.samples,
+            self.methods,
+            attach_clean_ir=bool(
+                self.config["p0"].get("attach_clean_ir", False)
+            ),
+        )
+        print(
+            "[experiment] refuzz complete; reused frozen candidates, "
+            f"llm_calls=0: {self.run_root}",
+            flush=True,
+        )
+        return aggregate
+
     def _aggregate_outputs(self) -> Dict[str, Any]:
         from .reporting import aggregate_run
 
@@ -1247,6 +1741,11 @@ class ExperimentRunner:
                 "report.md",
                 "dashboard.html",
                 "figures_manifest.json",
+                "deobfuscation_metrics.json",
+                "ir_stage_metrics.csv",
+                "ir_transition_metrics.csv",
+                "source_deobfuscation_metrics.csv",
+                "binary_artifact_metrics.csv",
             )
         ]
         atomic_write_json(
@@ -1365,6 +1864,33 @@ class ExperimentRunner:
                     raise
 
     def _generate_sample(self, sample: SampleIdentity) -> None:
+        variant_workers = max(
+            1, int(self.config["experiment"].get("variant_workers", 1))
+        )
+        if variant_workers > 1 and len(self.execution_order) > 1:
+            methods = list(self.execution_order)
+            workers = min(variant_workers, len(methods))
+            print(
+                f"[experiment] sample={sample.sample_id}: "
+                f"variants={len(methods)}, variant_workers={workers}",
+                flush=True,
+            )
+
+            def run_variant(method: MethodId) -> None:
+                # Each task owns one method directory and receives a shallow
+                # runner copy so the parent runner's ordering remains intact.
+                worker = copy.copy(self)
+                worker.execution_order = [method]
+                worker._generate_sample(sample)
+
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix=f"experiment-variants-{sample.sample_id}",
+            ) as executor:
+                futures = [executor.submit(run_variant, method) for method in methods]
+                for future in futures:
+                    future.result()
+            return
         print(
             f"[experiment] process sample={sample.sample_id} stage=llm start",
             flush=True,
@@ -1376,22 +1902,32 @@ class ExperimentRunner:
             status="RUNNING",
         )
         sample_dir = self._sample_dir(sample)
-        if not self._sample_preparation_ready(sample):
+        missing_representations = []
+        for method in self.execution_order:
+            try:
+                self._load_prepared_representation(sample, method)
+            except RepresentationError:
+                result_path = self._result_path(sample, method)
+                terminal = False
+                if result_path.is_file():
+                    existing = load_json(result_path)
+                    terminal = (
+                        existing.get("final_stage")
+                        == Stage.FINALIZED.value
+                    )
+                if not terminal:
+                    missing_representations.append(method.value)
+        if not self._prepared_input_available(sample) or missing_representations:
             raise RunIntegrityError(
-                f"Sample {sample.sample_id} is not prepared; run prepare first"
+                f"Sample {sample.sample_id} is not prepared for method(s): "
+                + ", ".join(missing_representations or ["base-corpus"])
             )
 
         for method in self.execution_order:
             existing_path = self._result_path(sample, method)
             if self.config["experiment"].get("resume", True) and existing_path.is_file():
                 existing = load_json(existing_path)
-                retryable_llm_failure = self._is_retryable_llm_failure(
-                    existing
-                )
-                if (
-                    existing.get("final_stage") == Stage.FINALIZED.value
-                    and not retryable_llm_failure
-                ):
+                if existing.get("final_stage") == Stage.FINALIZED.value:
                     continue
                 if existing.get("generation") and (existing.get("build") or {}).get("ok"):
                     continue
@@ -1443,7 +1979,13 @@ class ExperimentRunner:
                         {
                             "protocol": "legacy_iterative_repair",
                             "max_iterations": 5,
-                            "internal_precheck_passed": True,
+                            "internal_precheck_passed": (
+                                p0.internal_precheck_passed
+                            ),
+                            "internal_precheck_diagnostic_only": True,
+                            "recovery_oracle_path": (
+                                p0.recovery_oracle_path
+                            ),
                         }
                     )
                     print(
@@ -1586,7 +2128,20 @@ class ExperimentRunner:
             status="RUNNING",
         )
         sample_dir = self._sample_dir(sample)
-        common_dir = sample_dir / "common"
+        # Independent method flows must not share union/reference state.
+        # The final report aggregates result.json files after all flows end.
+        comparison_scope = (
+            self.methods[0].value
+            if len(self.methods) == 1
+            else "common"
+        )
+        common_dir = (
+            sample_dir
+            / comparison_scope
+            / "processing"
+            / "comparison_common"
+        )
+        common_dir.mkdir(parents=True, exist_ok=True)
         base_inputs = self._load_prepared_base_inputs(sample)
         print(
             f"[experiment] sample={sample.sample_id} stage=base-corpus "
@@ -1649,8 +2204,23 @@ class ExperimentRunner:
                 "started": time.perf_counter(),
             }
 
-        discoveries = []
+        # Each worker reaches this function with exactly one method. Keep that
+        # flow independent, but include every input exercised by its own AFL++
+        # run in the scored replay corpus. No sibling method is awaited.
+        # P0's internal fuzz inputs remain attached to its recovery history
+        # and metrics, but are not replayed again here. The final comparison
+        # uses one bounded input set for every method: prepared base inputs
+        # plus the final candidate's own main-compatible AFL++ discoveries.
+        method_discoveries = []
+        configured_discovery_methods = {
+            str(value).upper()
+            for value in self.config.get("fuzz", {}).get(
+                "discovery_methods", ["P0"]
+            )
+        }
         for method, state in active.items():
+            if method.value not in configured_discovery_methods:
+                continue
             variant_dir = sample_dir / method.value
             try:
                 print(
@@ -1666,7 +2236,7 @@ class ExperimentRunner:
                     variant_dir / "processing" / "discovery",
                     self.config,
                 )
-                discoveries.append(discovered)
+                method_discoveries.append(discovered)
                 print(
                     f"[experiment] sample={sample.sample_id} method={method.value} "
                     f"stage=fuzz-discovery done discovered={len(discovered)}",
@@ -1681,7 +2251,7 @@ class ExperimentRunner:
                 state["comparison_failed"] = True
 
         union, corpus_hash = build_union_corpus(
-            base_inputs, discoveries, common_dir
+            base_inputs, method_discoveries, common_dir
         )
         self.audit.log(
             "union_corpus_built",
@@ -1691,6 +2261,9 @@ class ExperimentRunner:
             payload={
                 "input_count": len(union),
                 "union_corpus_sha256": corpus_hash,
+                "fuzz_discovery_input_count": sum(
+                    len(items) for items in method_discoveries
+                ),
             },
         )
         print(
@@ -1827,7 +2400,7 @@ class ExperimentRunner:
     ) -> None:
         if result.method is MethodId.P0:
             self._recover_partial_p0_artifacts(sample, result)
-        if isinstance(exc, ContextOverflow):
+        if isinstance(exc, (ContextOverflow, LLMContextOverflowError)):
             status = TerminalStatus.CONTEXT_OVERFLOW
             code = f"{result.method.value}_CONTEXT_OVERFLOW"
         elif isinstance(exc, RepresentationError):
@@ -1839,10 +2412,6 @@ class ExperimentRunner:
                 else TerminalStatus.REPRESENTATION_FAILED
             )
             code = exc.code
-        elif isinstance(exc, P0PrecheckFailed):
-            status = TerminalStatus.REPRESENTATION_FAILED
-            code = "P0_SEMANTIC_PRECHECK_FAILED"
-            result.provenance["p0_internal_precheck"] = exc.report
         elif isinstance(exc, LeakageError):
             status = TerminalStatus.INFRA_ERROR
             code = f"{result.method.value}_FORBIDDEN_ARTIFACT_IN_REQUEST"
@@ -1916,7 +2485,7 @@ class ExperimentRunner:
                 "primary_sha256": sha256_file(brightened_ll),
                 "byte_count": brightened_ll.stat().st_size,
                 "token_count": max(
-                    1, (brightened_ll.stat().st_size + 2) // 3
+                    1, (brightened_ll.stat().st_size + 1) // 2
                 ),
                 "builder_version": self.p0_adapter.VERSION,
                 "attachment_paths": attachment_paths,
@@ -1925,12 +2494,13 @@ class ExperimentRunner:
                 "provenance": {
                     "source_sha256": sample.original_elf_sha256,
                     "protocol": "legacy_iterative_repair",
+                    "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
                     "max_iterations": 5,
                     "partial_recovery": True,
                 },
                 "evidence_byte_count": evidence_bytes,
                 "evidence_token_count": max(
-                    1, (evidence_bytes + 2) // 3
+                    1, (evidence_bytes + 1) // 2
                 ),
             }
         if result.generation is not None:
@@ -2035,6 +2605,7 @@ class ExperimentRunner:
             "response_metadata": {
                 **last_meta,
                 "protocol": "legacy_iterative_repair",
+                "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
                 "partial_recovery": True,
                 "model_freeze": {
                     "model_id": llm["model_id"],
@@ -2084,6 +2655,16 @@ def verify_run_integrity(
             "thinking_level": llm_config.get("thinking_level"),
         }
         if llm_config
+        else None
+    )
+    expected_p0_model_freeze = (
+        {
+            **expected_model_freeze,
+            "thinking_level": (
+                expected_model_freeze.get("thinking_level") or "LOW"
+            ),
+        }
+        if expected_model_freeze is not None
         else None
     )
     audit_required = (
@@ -2292,7 +2873,18 @@ def verify_run_integrity(
                             "location": request.get("location"),
                             **(request.get("decoding") or {}),
                         }
-                        if observed_freeze != expected_model_freeze:
+                        method_expected_freeze = expected_model_freeze
+                        if method is MethodId.B0:
+                            method_expected_freeze = {
+                                **expected_model_freeze,
+                                "thinking_level": (
+                                    expected_model_freeze.get(
+                                        "thinking_level"
+                                    )
+                                    or "LOW"
+                                ),
+                            }
+                        if observed_freeze != method_expected_freeze:
                             errors.append(
                                 "model freeze mismatch: "
                                 f"{sample.sample_id}/{method.value}"
@@ -2311,7 +2903,9 @@ def verify_run_integrity(
                 else:
                     request = load_json(request_path)
                     policy = request.get("prompt_policy") or {}
-                    if request.get("system_prompt") != ONE_SHOT_SYSTEM_PROMPT:
+                    if request.get("system_prompt") != (
+                        B0_MINIMAL_SYSTEM_PROMPT
+                    ):
                         errors.append(
                             f"B0 system prompt drift: {sample.sample_id}"
                         )
@@ -2319,12 +2913,27 @@ def verify_run_integrity(
                         errors.append(
                             f"B0 prompt policy drift: {sample.sample_id}"
                         )
-                    if not request.get("user_prompt", "").startswith(
-                        B0_USER_TEMPLATE.split("{GHIDRA_PSEUDOCODE}", 1)[0]
-                    ):
+                    primary_path = Path(
+                        representation.get("primary_path") or ""
+                    )
+                    if not primary_path.is_file():
                         errors.append(
-                            f"B0 user prompt drift: {sample.sample_id}"
+                            f"B0 representation missing: {sample.sample_id}"
                         )
+                    else:
+                        expected_prompt = build_one_shot_prompt(
+                            MethodId.B0,
+                            primary_path.read_text(
+                                encoding="utf-8",
+                                errors="replace",
+                            ),
+                        )
+                        if request.get("user_prompt") != (
+                            expected_prompt.user_prompt
+                        ):
+                            errors.append(
+                                f"B0 user prompt drift: {sample.sample_id}"
+                            )
                     if not (request.get("forbidden_scan") or {}).get("passed"):
                         errors.append(
                             f"B0 leakage scan failed: {sample.sample_id}"
@@ -2372,8 +2981,8 @@ def verify_run_integrity(
                 observed_model_freeze = (
                     generation.get("response_metadata") or {}
                 ).get("model_freeze")
-                if expected_model_freeze is not None and (
-                    observed_model_freeze != expected_model_freeze
+                if expected_p0_model_freeze is not None and (
+                    observed_model_freeze != expected_p0_model_freeze
                 ):
                     errors.append(
                         f"P0 model freeze mismatch: {sample.sample_id}"
@@ -2425,14 +3034,26 @@ def verify_run_integrity(
                             "provider total token count below components: "
                             f"{sample.sample_id}/{method.value}"
                         )
-        corpus_hashes = {
-            (result.get("integrity") or {}).get("union_corpus_sha256")
-            for result in results
-            if result.get("evaluation")
-        }
-        corpus_hashes.discard(None)
-        if len(corpus_hashes) > 1:
-            errors.append(f"union corpus mismatch: {sample.sample_id}")
+        # Final-candidate AFL++ discovery is method-local so P0/A0/B0 can
+        # complete without waiting for sibling flows. Their corpus hashes may
+        # therefore differ; each result must instead be internally consistent.
+        for result in results:
+            evaluation = result.get("evaluation") or {}
+            if not evaluation:
+                continue
+            corpus_hash = (result.get("integrity") or {}).get(
+                "union_corpus_sha256"
+            )
+            if not corpus_hash:
+                errors.append(
+                    "missing union corpus hash: "
+                    f"{sample.sample_id}/{result.get('method')}"
+                )
+            elif evaluation.get("corpus_manifest_sha256") != corpus_hash:
+                errors.append(
+                    "union corpus hash mismatch: "
+                    f"{sample.sample_id}/{result.get('method')}"
+                )
         reference_hashes = {
             (result.get("integrity") or {}).get("reference_sha256")
             for result in results

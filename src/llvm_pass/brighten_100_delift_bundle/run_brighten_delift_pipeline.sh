@@ -24,10 +24,33 @@ FINAL_BIN="$WORKDIR/${BASE}.bin"
 
 "${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -S -passes=verify "$INPUT" -o "$S1"
 python3 "$SCRIPT_DIR/run_exact_llvm_passes.py" "$S1" "$S2"
-python3 "$SCRIPT_DIR/delift_storage.py" "$S2" "$S3"
-python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S3" "$S4"
+DELIFT_OPT_PIPELINE='default<O3>,verify' python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S2" "$S3"
+python3 "$SCRIPT_DIR/delift_storage.py" "$S3" "$S4"
 python3 "$SCRIPT_DIR/strip_brighten_residuals.py" "$S4" "$S5"
-python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S5" "$FINAL_LL"
+DELIFT_OPT_PIPELINE='default<O3>,verify' \
+  python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S5" "$FINAL_LL"
+python3 "$SCRIPT_DIR/dedup_pointer_selects.py" "$FINAL_LL" "$FINAL_LL.dedup"
+mv "$FINAL_LL.dedup" "$FINAL_LL"
+# Run the deterministic (non-SMT) MBA cleanup once more after resolver
+# centralisation.  The first 095 invocation runs before the mapper exists;
+# this second pass sees the compacted arithmetic and is bounded by zero Z3
+# queries, so it cannot turn the pipeline into an unbounded solver job.
+DEOBF_PLUGIN="${DEOBF_PLUGIN:-$SCRIPT_DIR/../deobfuscate_095_deobfus_ollvm/build/lib095.so}"
+if [[ -f "$DEOBF_PLUGIN" ]]; then
+  OPT_TOOL="${OPT_BIN:-$(command -v opt-21 || command -v opt)}"
+  "$OPT_TOOL" -load-pass-plugin="$DEOBF_PLUGIN" -S \
+    -passes=095 -095-max-z3-candidates=0 -095-max-opaque-z3-candidates=0 \
+    "$FINAL_LL" -o "$FINAL_LL.post095"
+  mv "$FINAL_LL.post095" "$FINAL_LL"
+  # 095 exposes algebraic identities; let the regular optimizer fold the
+  # newly-created constants and dead chains once more.
+  "$OPT_TOOL" -S -passes='default<O3>,verify' "$FINAL_LL" -o "$FINAL_LL.post095-o3"
+  mv "$FINAL_LL.post095-o3" "$FINAL_LL"
+  "$OPT_TOOL" -passes=verify -disable-output "$FINAL_LL"
+fi
+python3 "$SCRIPT_DIR/compact_ir_text.py" "$FINAL_LL" "$FINAL_LL.compact"
+mv "$FINAL_LL.compact" "$FINAL_LL"
+"${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -passes=verify -disable-output "$FINAL_LL"
 CLANG_BIN="${CLANG_BIN:-$(command -v clang-21 || command -v clang || true)}"
 if [[ -z "$CLANG_BIN" ]]; then
   echo "clang-21/clang not found" >&2

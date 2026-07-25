@@ -39,6 +39,15 @@ def test_p0_must_remain_five_iterations():
         validate_config(config)
 
 
+def test_all_final_candidates_use_main_compatible_fuzz_defaults():
+    config = validated_config()
+
+    assert config["fuzz"]["discovery_methods"] == ["P0", "A0", "B0"]
+    assert config["fuzz"]["seconds_per_method"] == 1
+    assert config["fuzz"]["target_accepted_inputs"] == 100
+    assert config["evaluation"]["per_input_timeout_sec"] == 0.5
+
+
 def test_sample_workers_must_be_positive():
     config = validated_config()
     config["experiment"]["sample_workers"] = 0
@@ -160,6 +169,20 @@ def test_pairwise_metrics_use_enrolled_programs(tmp_path):
     assert "audit/events.jsonl" in dashboard
     report = (aggregate_dir / "report.md").read_text()
     assert "NOT A RESEARCH RESULT" in report
+
+
+def test_p0_internal_precheck_never_changes_e2e_denominator():
+    config = validated_config()
+    failed = _result("test", "p00001", "P0", False)
+    failed["failure_code"] = "P0_SEMANTIC_PRECHECK_FAILED"
+    passed = _result("test", "p00002", "P0", True)
+
+    summary = _method_summary([failed, passed], config)["P0"]
+
+    assert summary["enrolled"] == 2
+    assert summary["pass"] == 1
+    assert summary["e2e_rate"] == 0.5
+    assert "excluded_precheck_count" not in summary
 
 
 def test_aggregate_refuses_nonterminal_quota_result(tmp_path):
@@ -298,6 +321,8 @@ def test_p0_model_freeze_ignores_ambient_sampling_environment(monkeypatch):
     assert frozen.max_iterations == 5
     assert frozen.pseudo_backend == "ghidra"
     assert frozen.use_file_api is True
+    assert frozen.attach_clean_ir is True
+    assert frozen.thinking_level == "HIGH"
 
 
 def test_unknown_config_key_is_rejected(tmp_path):

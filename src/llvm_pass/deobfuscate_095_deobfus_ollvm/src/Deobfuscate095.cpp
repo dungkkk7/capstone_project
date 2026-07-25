@@ -1759,6 +1759,32 @@ static DispatchMap collectDispatchMap(SwitchInst *Root, Value *State) {
   return Map;
 }
 
+// Resolve a concrete dispatcher state without losing the switch's default
+// semantics.  collectDispatchMap intentionally records only explicit case
+// values; a missing value is therefore not automatically an error because it
+// may legally select the terminal default arm (possibly through a chain of
+// same-state forwarding switches).  We only follow forwarding switches whose
+// condition is the exact dispatcher state.  This keeps the transformation
+// fail-closed for a default block that contains unrelated control flow.
+static BasicBlock *lookupDispatchTarget(const DispatchMap &Map,
+                                        SwitchInst *Root,
+                                        const APInt &State) {
+  auto It = Map.Targets.find(State);
+  if (It != Map.Targets.end())
+    return It->second;
+
+  BasicBlock *Default = Root->getDefaultDest();
+  SmallPtrSet<BasicBlock *, 8> Seen;
+  while (Default && Seen.insert(Default).second) {
+    auto *Next = dyn_cast<SwitchInst>(Default->getTerminator());
+    if (!Next || stripIntegerCasts(Next->getCondition()) !=
+                     stripIntegerCasts(Root->getCondition()))
+      break;
+    Default = Next->getDefaultDest();
+  }
+  return Default;
+}
+
 static bool valueDominatesEdge(Value *V, Instruction *At, DominatorTree &DT) {
   if (!V || isa<Constant>(V) || isa<Argument>(V) || isa<GlobalValue>(V))
     return V != nullptr;
@@ -1795,6 +1821,18 @@ static bool prepareTargetPHIs(BasicBlock *Target, BasicBlock *NewPred,
     for (auto [PN, Incoming] : Additions)
       PN->addIncoming(Incoming, NewPred);
   return true;
+}
+
+// A switch may contain several case values which all select the same latch.
+// LLVM therefore permits duplicate incoming entries for that predecessor in
+// the latch PHIs.  Once those edges are redirected to a bridge, the old
+// predecessor disappears as a CFG edge; remove every matching PHI entry (the
+// BasicBlock helper historically removes only the first duplicate).
+static void removeAllPredecessorPHIEntries(BasicBlock *Block,
+                                           BasicBlock *Pred) {
+  for (PHINode &PN : Block->phis())
+    while (PN.getBasicBlockIndex(Pred) >= 0)
+      PN.removeIncomingValue(Pred, true);
 }
 
 static bool dispatcherPayloadIsCloneable(BasicBlock *Latch,
@@ -2376,17 +2414,17 @@ static bool deflattenMemoryState(Function &F, SwitchInst *Root,
       ++UnresolvedStates;
       return;
     }
-    auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-    auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-    if (TIt == Map.Targets.end() || FIt == Map.Targets.end()) {
+    BasicBlock *TrueTarget =
+        lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+    BasicBlock *FalseTarget =
+        lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+    if (!TrueTarget || !FalseTarget) {
       if (DeflattenDebug)
         errs() << "  memory source=" << Source->getName()
                << " result=state-target-missing\n";
       ++UnresolvedStates;
       return;
     }
-    BasicBlock *TrueTarget = TIt->second;
-    BasicBlock *FalseTarget = FIt->second;
     if (TrueTarget == Latch || FalseTarget == Latch ||
         Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget)) {
       if (DeflattenDebug)
@@ -2545,12 +2583,12 @@ static bool deflattenMemoryEntry(Function &F, SwitchInst *Root,
       Source, StateLoad->getPointerOperand(), StateLoad, AA, Prover);
   if (!Choice)
     return false;
-  auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-  auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-  if (TIt == Map.Targets.end() || FIt == Map.Targets.end())
+  BasicBlock *TrueTarget =
+      lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+  BasicBlock *FalseTarget =
+      lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+  if (!TrueTarget || !FalseTarget)
     return false;
-  BasicBlock *TrueTarget = TIt->second;
-  BasicBlock *FalseTarget = FIt->second;
   BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
   BasicBlock *FalseDispatch = Map.DispatchPredecessor.lookup(FalseTarget);
   auto TransparentDispatch = [&](BasicBlock *Dispatch) {
@@ -2653,12 +2691,12 @@ static bool deflattenDirectPhiReturns(Function &F, SwitchInst *Root,
         *Choice = StateChoice{nullptr, Chosen, Chosen};
       }
     }
-    auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-    auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-    if (TIt == Map.Targets.end() || FIt == Map.Targets.end())
+    BasicBlock *TrueTarget =
+        lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+    BasicBlock *FalseTarget =
+        lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+    if (!TrueTarget || !FalseTarget)
       continue;
-    BasicBlock *TrueTarget = TIt->second;
-    BasicBlock *FalseTarget = FIt->second;
     if (TrueTarget == Header || FalseTarget == Header ||
         Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget))
       continue;
@@ -2768,12 +2806,12 @@ static bool deflattenPhiEntry(Function &F, SwitchInst *Root,
       *Choice = StateChoice{nullptr, Chosen, Chosen};
     }
   }
-  auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-  auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-  if (TIt == Map.Targets.end() || FIt == Map.Targets.end())
+  BasicBlock *TrueTarget =
+      lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+  BasicBlock *FalseTarget =
+      lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+  if (!TrueTarget || !FalseTarget)
     return false;
-  BasicBlock *TrueTarget = TIt->second;
-  BasicBlock *FalseTarget = FIt->second;
   if (Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget))
     return false;
   BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
@@ -2951,11 +2989,11 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
       }
     }
     if (Choice) {
-      auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-      auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-      if (TIt != Map.Targets.end() && FIt != Map.Targets.end()) {
-        BasicBlock *TrueTarget = TIt->second;
-        BasicBlock *FalseTarget = FIt->second;
+      BasicBlock *TrueTarget =
+          lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+      BasicBlock *FalseTarget =
+          lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+      if (TrueTarget && FalseTarget) {
         BasicBlock *TrueDispatch =
             Map.DispatchPredecessor.lookup(TrueTarget);
         BasicBlock *FalseDispatch =
@@ -2996,7 +3034,7 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
           for (unsigned I = 0; I < Root->getNumSuccessors(); ++I)
             if (Root->getSuccessor(I) == Latch)
               Root->setSuccessor(I, Bridge);
-          Latch->removePredecessor(Header, true);
+          removeAllPredecessorPHIEntries(Latch, Header);
           if (Choice->Condition && TrueTarget != FalseTarget) {
             Instruction *BridgeTerm = Bridge->getTerminator();
             IRBuilder<>(BridgeTerm)
@@ -3063,14 +3101,14 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
         *Choice = StateChoice{nullptr, Chosen, Chosen};
       }
     }
-    auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-    auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-    if (TIt == Map.Targets.end() || FIt == Map.Targets.end()) {
+    BasicBlock *TrueTarget =
+        lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+    BasicBlock *FalseTarget =
+        lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+    if (!TrueTarget || !FalseTarget) {
       ++UnresolvedStates;
       continue;
     }
-    BasicBlock *TrueTarget = TIt->second;
-    BasicBlock *FalseTarget = FIt->second;
     if (DeflattenInLoopOnly &&
         (!HeaderLoop || !HeaderLoop->contains(TrueTarget) ||
          !HeaderLoop->contains(FalseTarget))) {
@@ -3158,15 +3196,15 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
           *Choice = StateChoice{nullptr, Chosen, Chosen};
         }
       }
-      auto TIt = Map.Targets.find(Choice->TrueState->getValue());
-      auto FIt = Map.Targets.find(Choice->FalseState->getValue());
-      if (TIt == Map.Targets.end() || FIt == Map.Targets.end()) {
+      BasicBlock *TrueTarget =
+          lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+      BasicBlock *FalseTarget =
+          lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
+      if (!TrueTarget || !FalseTarget) {
         EntryDebug("state-target-missing");
         ++UnresolvedStates;
         continue;
       }
-      BasicBlock *TrueTarget = TIt->second;
-      BasicBlock *FalseTarget = FIt->second;
       if (TrueTarget == Latch || FalseTarget == Latch ||
           Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget)) {
         EntryDebug("target-is-dispatcher");

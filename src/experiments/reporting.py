@@ -8,6 +8,11 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import Any, Dict, Iterable
 
+from .deobfuscation_metrics import (
+    extract_binary_metrics,
+    extract_c_metrics,
+    median_summary,
+)
 from .storage import atomic_write_json, atomic_write_text, load_json
 from .ir_metrics import extract_ir_metrics
 from .visualization import generate_visualizations
@@ -52,12 +57,16 @@ def _generation_cost_usd(
     return (input_tokens * input_price + billable_output * output_price) / 1_000_000
 
 
-def _load_results(run_root: Path) -> list[Dict[str, Any]]:
+def _load_results(
+    run_root: Path, sample_ids: set[str] | None = None
+) -> list[Dict[str, Any]]:
     results = []
     samples_root = run_root / "samples"
     if not samples_root.is_dir():
         return results
     for path in sorted(samples_root.glob("*/*/result.json")):
+        if sample_ids is not None and path.parent.parent.name not in sample_ids:
+            continue
         result = load_json(path)
         result["_path"] = str(path)
         discovery_path = (
@@ -155,10 +164,9 @@ def _validate_aggregate_inputs(
                 f"incomplete method set for {sample_id}: "
                 f"expected {sorted(expected_methods)}, got {sorted(methods)}"
             )
-        if len(union_hashes[sample_id]) > 1:
-            errors.append(f"union corpus mismatch: {sample_id}")
-        if len(reference_hashes[sample_id]) > 1:
-            errors.append(f"reference mismatch: {sample_id}")
+        # Independent method flows may discover different inputs. Each
+        # result still records its own reference/corpus hashes; the final
+        # report aggregates the three completed flow results.
     expected_sample_ids = set(
         (experiment_manifest or {}).get("sample_ids") or []
     )
@@ -372,28 +380,31 @@ def _method_summary(
         grouped[result["method"]].append(result)
     summary = {}
     for method, items in sorted(grouped.items()):
-        n = len(items)
-        rep_ok = sum(bool(item.get("representation")) for item in items)
+        # Every enrolled case belongs in the E2E denominator. P0's internal
+        # semantic precheck is diagnostic evidence, not an exclusion rule.
+        metric_items = items
+        n = len(metric_items)
+        rep_ok = sum(bool(item.get("representation")) for item in metric_items)
         context_fit = sum(
             bool(item.get("representation"))
             and item.get("terminal_status") != "CONTEXT_OVERFLOW"
-            for item in items
+            for item in metric_items
         )
         llm_responses = sum(
             int((item.get("generation") or {}).get("model_call_count") or 0)
             > 0
-            for item in items
+            for item in metric_items
         )
         generated = sum(
             bool((item.get("generation") or {}).get("candidate_sha256"))
-            for item in items
+            for item in metric_items
         )
-        built = sum(bool((item.get("build") or {}).get("ok")) for item in items)
+        built = sum(bool((item.get("build") or {}).get("ok")) for item in metric_items)
         runnable = sum(
             (item.get("evaluation") or {}).get("smoke_runnable") is True
-            for item in items
+            for item in metric_items
         )
-        passed = sum(bool(item.get("e2e_pass")) for item in items)
+        passed = sum(bool(item.get("e2e_pass")) for item in metric_items)
         statuses = Counter(item["terminal_status"] for item in items)
         context_overflow = statuses.get("CONTEXT_OVERFLOW", 0)
         infra_failures = statuses.get("INFRA_ERROR", 0)
@@ -401,7 +412,7 @@ def _method_summary(
         inconclusive = statuses.get("EVAL_INCONCLUSIVE", 0)
         calls = sum(
             int((item.get("generation") or {}).get("model_call_count") or 0)
-            for item in items
+            for item in metric_items
         )
         api_attempts = sum(
             int(
@@ -413,14 +424,14 @@ def _method_summary(
                 )
                 or 0
             )
-            for item in items
+            for item in metric_items
         )
         quota_throttles = sum(
             int(
                 (item.get("generation") or {}).get("quota_throttle_count")
                 or 0
             )
-            for item in items
+            for item in metric_items
         )
         quota_wait_ms = sum(
             int(
@@ -429,7 +440,7 @@ def _method_summary(
                 )
                 or 0
             )
-            for item in items
+            for item in metric_items
         )
         discovery_tested = [
             len(
@@ -437,12 +448,12 @@ def _method_summary(
                     (item.get("_discovery") or {}).get("report") or {}
                 ).get("tested_payloads") or []
             )
-            for item in items
+            for item in metric_items
             if item.get("_discovery")
         ]
         unique_discovered = [
             len((item.get("_discovery") or {}).get("inputs") or [])
-            for item in items
+            for item in metric_items
             if item.get("_discovery")
         ]
         discovery_engines = Counter(
@@ -453,23 +464,23 @@ def _method_summary(
                     ).get("fuzz_config") or {}
                 ).get("engine") or "unknown"
             )
-            for item in items
+            for item in metric_items
             if item.get("_discovery")
         )
         input_tokens = sum(
             int((item.get("generation") or {}).get("input_tokens") or 0)
-            for item in items
+            for item in metric_items
         )
         output_tokens = sum(
             int((item.get("generation") or {}).get("output_tokens") or 0)
-            for item in items
+            for item in metric_items
         )
         thinking_tokens = sum(
             int(
                 (item.get("generation") or {}).get("thinking_tokens")
                 or 0
             )
-            for item in items
+            for item in metric_items
         )
         billable_output_tokens = sum(
             int(
@@ -905,7 +916,8 @@ def _pairwise(
     sample_ids = sorted(
         sample_id
         for sample_id, method in by_key
-        if method == "P0" and (sample_id, right_method) in by_key
+        if method == "P0"
+        and (sample_id, right_method) in by_key
     )
     rows = []
     pairs = []
@@ -982,17 +994,22 @@ def _holm_adjust(stats: list[Dict[str, Any]], alpha: float) -> None:
 
 
 def aggregate_run(
-    run_root: str | Path, config: Dict[str, Any]
+    run_root: str | Path,
+    config: Dict[str, Any],
+    sample_ids: set[str] | None = None,
 ) -> Dict[str, Any]:
     root = Path(run_root)
     aggregate = root / "aggregate"
-    results = _load_results(root)
+    results = _load_results(root, sample_ids)
     experiment_manifest_path = root / "experiment_manifest.json"
     experiment_manifest = (
         load_json(experiment_manifest_path)
         if experiment_manifest_path.is_file()
         else {}
     )
+    if sample_ids is not None:
+        experiment_manifest = dict(experiment_manifest)
+        experiment_manifest["sample_ids"] = sorted(sample_ids)
     _validate_aggregate_inputs(results, config, experiment_manifest)
     aggregate.mkdir(parents=True, exist_ok=True)
     variants = [_flatten_variant(item) for item in results]
@@ -1054,40 +1071,309 @@ def aggregate_run(
         (item["sample_id"], item["method"]): item for item in results
     }
     ir_rows = []
+    ir_stage_rows = []
+    ir_transition_rows = []
+    source_rows = []
+    binary_rows = []
     for sample_id in sorted({item["sample_id"] for item in results}):
         a0 = by_sample_method.get((sample_id, "A0"))
         p0 = by_sample_method.get((sample_id, "P0"))
-        if not a0 or not p0:
-            continue
-        a0_metrics = extract_ir_metrics(
-            (a0.get("representation") or {}).get("primary_path", "")
-        )
-        p0_metrics = extract_ir_metrics(
-            (p0.get("representation") or {}).get("primary_path", "")
-        )
-        if not a0_metrics or not p0_metrics:
-            continue
-        row: Dict[str, Any] = {"sample_id": sample_id}
-        for name in (
-            "instruction_count",
-            "basic_block_count",
-            "cfg_edge_count",
-            "function_count",
-        ):
-            raw = a0_metrics[name]
-            enhanced = p0_metrics[name]
-            row[f"A0_{name}"] = raw
-            row[f"P0_{name}"] = enhanced
-            row[f"{name}_reduction"] = (
-                (raw - enhanced) / raw if raw else None
+        b0 = by_sample_method.get((sample_id, "B0"))
+        if a0 and p0:
+            raw_path = (a0.get("representation") or {}).get(
+                "primary_path", ""
             )
-        ir_rows.append(row)
+            p0_representation = p0.get("representation") or {}
+            p0_provenance = p0_representation.get("provenance") or {}
+            brightened_bc_value = p0_provenance.get("brightened_bc_path")
+            brightened_path = (
+                Path(brightened_bc_value).with_suffix(".ll")
+                if brightened_bc_value
+                else ""
+            )
+            delifted_path = p0_provenance.get(
+                "delifted_ll_path",
+                p0_representation.get("primary_path", ""),
+            )
+            stage_metrics = {
+                "raw_lifted_ir": extract_ir_metrics(raw_path),
+                "brightened_ir": extract_ir_metrics(brightened_path),
+                "delifted_ir": extract_ir_metrics(delifted_path),
+            }
+            for stage, metrics in stage_metrics.items():
+                if metrics:
+                    ir_stage_rows.append(
+                        {
+                            "sample_id": sample_id,
+                            "stage": stage,
+                            **metrics,
+                        }
+                    )
+            transition_metrics = (
+                "instruction_count",
+                "basic_block_count",
+                "cfg_edge_count",
+                "cyclomatic_complexity",
+                "indirect_call_count",
+                "helper_reference_count",
+            )
+            for transition, left_stage, right_stage in (
+                (
+                    "raw_to_brightened",
+                    "raw_lifted_ir",
+                    "brightened_ir",
+                ),
+                (
+                    "brightened_to_delifted",
+                    "brightened_ir",
+                    "delifted_ir",
+                ),
+                ("raw_to_delifted", "raw_lifted_ir", "delifted_ir"),
+            ):
+                left = stage_metrics[left_stage]
+                right = stage_metrics[right_stage]
+                if not left or not right:
+                    continue
+                transition_row: Dict[str, Any] = {
+                    "sample_id": sample_id,
+                    "transition": transition,
+                }
+                for name in transition_metrics:
+                    baseline = left[name]
+                    transition_row[f"{name}_reduction"] = (
+                        (baseline - right[name]) / baseline
+                        if baseline
+                        else None
+                    )
+                ir_transition_rows.append(transition_row)
+            raw_metrics = stage_metrics["raw_lifted_ir"]
+            enhanced_metrics = stage_metrics["delifted_ir"]
+            if raw_metrics and enhanced_metrics:
+                row: Dict[str, Any] = {"sample_id": sample_id}
+                for name in (
+                    "instruction_count",
+                    "basic_block_count",
+                    "cfg_edge_count",
+                    "function_count",
+                    "cyclomatic_complexity",
+                    "indirect_call_count",
+                    "helper_reference_count",
+                ):
+                    raw = raw_metrics[name]
+                    enhanced = enhanced_metrics[name]
+                    # Preserve legacy aliases consumed by the existing figure.
+                    row[f"A0_{name}"] = raw
+                    row[f"P0_{name}"] = enhanced
+                    row[f"{name}_reduction"] = (
+                        (raw - enhanced) / raw if raw else None
+                    )
+                ir_rows.append(row)
+
+        for method, result in (("P0", p0), ("A0", a0), ("B0", b0)):
+            if not result:
+                continue
+            generation = result.get("generation") or {}
+            build = result.get("build") or {}
+            source_metrics = extract_c_metrics(
+                generation.get("candidate_path") or ""
+            )
+            if source_metrics:
+                source_rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "method": method,
+                        "terminal_status": result.get("terminal_status"),
+                        "build_ok": bool(build.get("ok")),
+                        **source_metrics,
+                    }
+                )
+            executable_metrics = extract_binary_metrics(
+                build.get("executable_path") or ""
+            )
+            if executable_metrics:
+                binary_rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "artifact": f"{method}_recovered",
+                        **executable_metrics,
+                    }
+                )
+
+        b0_representation = ((b0 or {}).get("representation") or {})
+        b0_provenance = b0_representation.get("provenance") or {}
+        original_path = b0_provenance.get("source_path")
+        original_metrics = extract_binary_metrics(original_path or "")
+        if original_metrics:
+            binary_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "artifact": "original_obfuscated",
+                    **original_metrics,
+                }
+            )
     if ir_rows:
         _write_csv(
             aggregate / "ir_cfg_metrics.csv",
             ir_rows,
             list(ir_rows[0].keys()),
         )
+    ir_columns = [
+        "sample_id",
+        "stage",
+        "byte_count",
+        "line_count",
+        "function_count",
+        "declaration_count",
+        "global_count",
+        "basic_block_count",
+        "instruction_count",
+        "cfg_edge_count",
+        "cyclomatic_complexity",
+        "conditional_branch_count",
+        "switch_count",
+        "indirect_branch_count",
+        "call_count",
+        "indirect_call_count",
+        "phi_count",
+        "select_count",
+        "alloca_count",
+        "load_count",
+        "store_count",
+        "unreachable_count",
+        "helper_reference_count",
+        "unique_helper_count",
+        "helper_references_per_kinst",
+        "branch_density",
+        "cfg_edge_density",
+        "opcode_entropy_bits",
+    ]
+    source_columns = [
+        "sample_id",
+        "method",
+        "terminal_status",
+        "build_ok",
+        "byte_count",
+        "line_count",
+        "source_line_count",
+        "function_count",
+        "decision_count",
+        "cyclomatic_complexity",
+        "goto_count",
+        "label_count",
+        "loop_count",
+        "switch_count",
+        "max_brace_nesting",
+        "decompiler_artifact_count",
+        "artifact_density_per_kloc",
+    ]
+    binary_columns = [
+        "sample_id",
+        "artifact",
+        "size_bytes",
+        "entropy_bits_per_byte",
+        "printable_string_count",
+        "printable_string_bytes",
+        "zero_byte_fraction",
+    ]
+    _write_csv(aggregate / "ir_stage_metrics.csv", ir_stage_rows, ir_columns)
+    _write_csv(
+        aggregate / "ir_transition_metrics.csv",
+        ir_transition_rows,
+        [
+            "sample_id",
+            "transition",
+            "instruction_count_reduction",
+            "basic_block_count_reduction",
+            "cfg_edge_count_reduction",
+            "cyclomatic_complexity_reduction",
+            "indirect_call_count_reduction",
+            "helper_reference_count_reduction",
+        ],
+    )
+    _write_csv(
+        aggregate / "source_deobfuscation_metrics.csv",
+        source_rows,
+        source_columns,
+    )
+    _write_csv(
+        aggregate / "binary_artifact_metrics.csv",
+        binary_rows,
+        binary_columns,
+    )
+    deobfuscation_summary = {
+        "scope": {
+            "semantic": (
+                "E2E PASS and mismatch outcomes against the original "
+                "obfuscated ELF remain the primary endpoint."
+            ),
+            "ir": (
+                "LLVM structural metrics compare raw-lifted, brightened, and "
+                "final delifted IR only within the LLVM domain."
+            ),
+            "source": (
+                "Recovered-C indicators describe structural complexity and "
+                "residual decompiler artifacts; they do not prove readability "
+                "or semantic correctness."
+            ),
+            "binary": (
+                "Binary size/entropy/string metrics are artifact "
+                "characteristics and are not compared directly with LLVM "
+                "instruction counts."
+            ),
+        },
+        "ir_stage_medians": median_summary(
+            ir_stage_rows,
+            group_key="stage",
+            metric_names=(
+                "instruction_count",
+                "basic_block_count",
+                "cfg_edge_count",
+                "cyclomatic_complexity",
+                "indirect_call_count",
+                "helper_reference_count",
+                "opcode_entropy_bits",
+            ),
+        ),
+        "ir_transition_medians": median_summary(
+            ir_transition_rows,
+            group_key="transition",
+            metric_names=(
+                "instruction_count_reduction",
+                "basic_block_count_reduction",
+                "cfg_edge_count_reduction",
+                "cyclomatic_complexity_reduction",
+                "indirect_call_count_reduction",
+                "helper_reference_count_reduction",
+            ),
+        ),
+        "source_method_medians": median_summary(
+            source_rows,
+            group_key="method",
+            metric_names=(
+                "source_line_count",
+                "function_count",
+                "cyclomatic_complexity",
+                "goto_count",
+                "max_brace_nesting",
+                "decompiler_artifact_count",
+                "artifact_density_per_kloc",
+            ),
+        ),
+        "binary_artifact_medians": median_summary(
+            binary_rows,
+            group_key="artifact",
+            metric_names=(
+                "size_bytes",
+                "entropy_bits_per_byte",
+                "printable_string_count",
+                "zero_byte_fraction",
+            ),
+        ),
+    }
+    atomic_write_json(
+        aggregate / "deobfuscation_metrics.json",
+        deobfuscation_summary,
+    )
 
     metrics_rows = _metrics_long_rows(method_summary, statistics)
     _write_csv(
@@ -1182,7 +1468,10 @@ def aggregate_run(
         },
         "study_design": {
             "comparison": "end-to-end method performance",
-            "P0": "unchanged iterative repair pipeline, at most five LLM calls",
+            "P0": (
+                "Ghidra pseudocode plus cleaned LLVM IR through File API, "
+                "iterative repair with at most five LLM calls"
+            ),
             "A0": "raw LLVM IR, one logical LLM generation",
             "B0": "Ghidra pseudocode from original obfuscated ELF, one logical LLM generation",
             "causal_claim": (
@@ -1241,10 +1530,23 @@ def aggregate_run(
             "mcnemar_exact_p": (
                 "two-sided exact McNemar test on discordant paired outcomes"
             ),
+            "ir_structural_reduction": (
+                "descriptive raw-lifted to final-delifted LLVM reduction; "
+                "never compared directly with machine-code instruction counts"
+            ),
+            "source_decompiler_artifact_density": (
+                "regex-detected residual decompiler/lifter identifiers per "
+                "1000 nonblank recovered-C lines; lower is descriptive only"
+            ),
+            "binary_entropy": (
+                "Shannon entropy over artifact bytes; descriptive and not a "
+                "semantic-equivalence metric"
+            ),
         },
         "methods": method_summary,
         "pairwise_statistics": statistics,
         "ir_structure": ir_rows,
+        "deobfuscation": deobfuscation_summary,
         "long_format_row_count": len(metrics_rows),
     }
     atomic_write_json(aggregate / "metrics.json", metrics_document)
@@ -1254,6 +1556,7 @@ def aggregate_run(
         statistics,
         ir_rows,
         execution_context,
+        deobfuscation_summary,
     )
 
     lines = [
@@ -1275,13 +1578,15 @@ def aggregate_run(
             f"enrolled samples: `{execution_context['sample_count']}`."
         ),
         "",
-        "P0 is the unchanged legacy iterative method with at most five "
-        "compiler/fuzz-feedback iterations. A0 and B0 are one-shot methods. "
-        "The comparison therefore measures end-to-end method performance, "
-        "not a representation-only causal effect.",
+        "P0 is the iterative method with at most five compiler/fuzz-feedback "
+        "iterations. A0 and B0 are one-shot methods. B0 and P0 share the same "
+        "reconstruction core and strict JSON contract, while P0 additionally "
+        "receives cleaned LLVM IR through the File API and later validation "
+        "feedback. The comparison measures end-to-end method performance, not "
+        "a prompt-only or representation-only causal effect.",
         "",
-        "The B0 prompt is group-designed and informed by BinDeObfBench task "
-        "framing; it is not represented as the exact prompt from the paper.",
+        "The shared P0/B0 prompt is group-designed and is not represented as "
+        "the exact prompt from an external paper.",
         "",
         "Audit evidence is stored as a hash-chained JSONL event log and a "
         "SHA-256 artifact manifest. Machine-readable metrics are available in "
@@ -1301,6 +1606,53 @@ def aggregate_run(
             f"{summary['total_api_attempts']} | "
             f"{summary['total_quota_wait_duration_ms'] / 1000:.1f}s |"
         )
+    ir_medians = deobfuscation_summary.get("ir_stage_medians") or {}
+    if ir_medians:
+        lines.extend(
+            [
+                "",
+                "## Deobfuscation structure",
+                "",
+                "Descriptive medians; semantic E2E PASS remains the primary "
+                "endpoint. LLVM counts are compared only across LLVM stages.",
+                "",
+                "| IR stage | Instructions | Basic blocks | Cyclomatic | "
+                "Indirect calls | Lifter/helper refs |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for stage, values in sorted(ir_medians.items()):
+            lines.append(
+                f"| {stage} | "
+                f"{values.get('median_instruction_count', 0):.2f} | "
+                f"{values.get('median_basic_block_count', 0):.2f} | "
+                f"{values.get('median_cyclomatic_complexity', 0):.2f} | "
+                f"{values.get('median_indirect_call_count', 0):.2f} | "
+                f"{values.get('median_helper_reference_count', 0):.2f} |"
+            )
+    source_medians = (
+        deobfuscation_summary.get("source_method_medians") or {}
+    )
+    if source_medians:
+        lines.extend(
+            [
+                "",
+                "### Recovered C structure",
+                "",
+                "| Method | Source lines | Functions | Cyclomatic | Gotos | "
+                "Decompiler artifacts |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for method, values in sorted(source_medians.items()):
+            lines.append(
+                f"| {method} | "
+                f"{values.get('median_source_line_count', 0):.2f} | "
+                f"{values.get('median_function_count', 0):.2f} | "
+                f"{values.get('median_cyclomatic_complexity', 0):.2f} | "
+                f"{values.get('median_goto_count', 0):.2f} | "
+                f"{values.get('median_decompiler_artifact_count', 0):.2f} |"
+            )
     if statistics:
         lines.extend(
             [

@@ -10,11 +10,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping
 
-from fuzzing_equi_check.fuzzing import SemanticFuzzer, make_bytes_generator
+from fuzzing_equi_check.fuzzing import SemanticFuzzer
 from fuzzing_equi_check.input_contracts import (
     generate_contract_inputs,
     resolve_input_contract,
 )
+from main import _resolve_seed_paths, _run_fuzzer_sync, _select_generator
 
 from .models import BuildResult, SampleIdentity
 from .storage import (
@@ -216,54 +217,45 @@ def discover_inputs(
             {"enabled": False, "method": method, "inputs": []},
         )
         return []
-    seeds = [Path(item["path"]).read_bytes() for item in base_inputs]
     target_inputs = int(config["fuzz"]["target_accepted_inputs"])
-    per_input_timeout = float(config["evaluation"]["per_input_timeout_sec"])
+    # Keep final-candidate fuzzing identical to src/main.py llm-recovery:
+    # case-specific seed paths, source-aware generator, 1-second AFL++ input
+    # generation and a 0.5-second differential-execution timeout.
+    per_input_timeout = 0.5
+    root = Path(config["_project_root"])
+    seed_paths, seed_dir = _resolve_seed_paths(
+        str(root), sample.original_elf_path
+    )
+    generator, generator_reason = _select_generator(
+        str(root), sample.original_elf_path
+    )
     print(
         f"[fuzz] sample={sample.sample_id} method={method} discovery start | "
-        f"base_inputs={len(seeds)} target={target_inputs} "
-        f"timeout={per_input_timeout}s",
+        f"main-compatible C-candidate flow target={target_inputs} "
+        f"timeout={per_input_timeout}s generator={generator_reason}",
         flush=True,
     )
-    root = Path(config["_project_root"])
     contract = resolve_input_contract(
         str(root), sample.original_elf_path, only_custom=True
     )
     fuzzer = SemanticFuzzer(
         str(candidate_source),
         sample.original_elf_path,
-        seed_inputs=seeds,
+        seed_paths=seed_paths,
+        seed_dir=seed_dir,
         input_contract=contract,
     )
-    previous_fuzz_seconds = os.environ.get("BRIGHTEN_AFL_FUZZ_SECONDS")
-    os.environ["BRIGHTEN_AFL_FUZZ_SECONDS"] = str(
-        config["fuzz"]["seconds_per_method"]
+    print(
+        f"[fuzz] sample={sample.sample_id} method={method} "
+        "main-compatible compile+differential start",
+        flush=True,
     )
-    try:
-        print(
-            f"[fuzz] sample={sample.sample_id} method={method} compile start",
-            flush=True,
-        )
-        fuzzer.compile()
-        print(
-            f"[fuzz] sample={sample.sample_id} method={method} compile done; "
-            "differential run start",
-            flush=True,
-        )
-        report = fuzzer.run_differential_test(
-            iterations=target_inputs,
-            generator=make_bytes_generator(),
-            timeout=per_input_timeout,
-            compare_stderr=bool(config["evaluation"]["compare_stderr"]),
-            num_workers=1,
-            seed_inputs=seeds,
-        )
-    finally:
-        if previous_fuzz_seconds is None:
-            os.environ.pop("BRIGHTEN_AFL_FUZZ_SECONDS", None)
-        else:
-            os.environ["BRIGHTEN_AFL_FUZZ_SECONDS"] = previous_fuzz_seconds
-        fuzzer.cleanup()
+    report = _run_fuzzer_sync(
+        fuzzer,
+        iterations=target_inputs,
+        generator=generator,
+        timeout=per_input_timeout,
+    )
 
     print(
         f"[fuzz] sample={sample.sample_id} method={method} discovery done | "
@@ -310,6 +302,11 @@ def discover_inputs(
         {
             "enabled": True,
             "method": method,
+            "pipeline": "main_llm_recovery_c_candidate",
+            "generator_reason": generator_reason,
+            "seed_paths": [str(path) for path in seed_paths],
+            "seed_dir": str(seed_dir) if seed_dir else None,
+            "reference_path": sample.original_elf_path,
             "report": report,
             "inputs": discovered,
         },

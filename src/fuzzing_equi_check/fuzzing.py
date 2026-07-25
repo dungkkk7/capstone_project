@@ -968,23 +968,77 @@ def account_differential_result(report: Dict[str, Any],
         decoded_stdin = repr(stdin_data)
 
     def process_sample(res: Dict[str, Any]) -> Dict[str, Any]:
+        stdout = bytes(res["stdout"])
+        stderr = bytes(res["stderr"])
         sample = {
             "status": res["status"],
             "returncode": res["returncode"],
-            "stdout": res["stdout"].decode("utf-8", errors="replace"),
-            "stderr": res["stderr"].decode("utf-8", errors="replace"),
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "stderr": stderr.decode("utf-8", errors="replace"),
+            "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+            "stderr_base64": base64.b64encode(stderr).decode("ascii"),
+            "stdout_byte_length": len(stdout),
+            "stderr_byte_length": len(stderr),
         }
         if "signal" in res:
             sample["signal"] = res["signal"]
+        if "elapsed" in res:
+            sample["elapsed_ms"] = round(float(res["elapsed"]) * 1000, 3)
         return sample
 
+    def stream_diff(
+        stream: str, left_payload: bytes, right_payload: bytes
+    ) -> Dict[str, Any]:
+        common = 0
+        for left_byte, right_byte in zip(left_payload, right_payload):
+            if left_byte != right_byte:
+                break
+            common += 1
+        left_byte = (
+            f"{left_payload[common]:02x}"
+            if common < len(left_payload)
+            else None
+        )
+        right_byte = (
+            f"{right_payload[common]:02x}"
+            if common < len(right_payload)
+            else None
+        )
+        return {
+            "stream": stream,
+            "first_differing_byte": common,
+            "recovered_byte_hex": left_byte,
+            "reference_byte_hex": right_byte,
+            "recovered_length": len(left_payload),
+            "reference_length": len(right_payload),
+            "recovered_window_hex": left_payload[
+                max(0, common - 16) : common + 32
+            ].hex(),
+            "reference_window_hex": right_payload[
+                max(0, common - 16) : common + 32
+            ].hex(),
+        }
+
+    output_diffs = []
+    if res1["stdout"] != res2["stdout"]:
+        output_diffs.append(
+            stream_diff("stdout", res1["stdout"], res2["stdout"])
+        )
+    if res1["stderr"] != res2["stderr"]:
+        output_diffs.append(
+            stream_diff("stderr", res1["stderr"], res2["stderr"])
+        )
     report["mismatch_examples"].append({
         "index": result["index"],
         "args": result["args"],
         "stdin": decoded_stdin,
+        "stdin_base64": base64.b64encode(stdin_data).decode("ascii"),
+        "stdin_hex": stdin_data.hex(),
+        "stdin_byte_length": len(stdin_data),
         "reason": result["reason"],
         "prog1": process_sample(res1),
         "prog2": process_sample(res2),
+        "output_diffs": output_diffs,
     })
 
 def finalize_equivalence_report(report: Dict[str, Any]) -> None:

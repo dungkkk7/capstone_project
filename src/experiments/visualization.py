@@ -532,8 +532,27 @@ def _dashboard(
     statistics: list[Dict[str, Any]],
     figures: list[Dict[str, Any]],
     execution_context: Dict[str, Any],
+    deobfuscation: Dict[str, Any],
 ) -> Path:
     method_rows = []
+    detail_rows = []
+    detail_metrics = (
+        ("representation_success_unconditional", "Representation success"),
+        ("context_fit_unconditional", "Context fit"),
+        ("llm_response_unconditional", "LLM response"),
+        ("generation_unconditional", "Candidate generation"),
+        ("build_success_unconditional", "Build success"),
+        ("runnable_unconditional", "Runnable"),
+        ("confirmed_non_equivalence_unconditional", "Behavior mismatch"),
+        ("inconclusive_unconditional", "Inconclusive"),
+        ("infra_failure_unconditional", "Infrastructure failure"),
+        ("total_discovery_tested_inputs", "Discovery tested inputs"),
+        ("total_unique_discovered_inputs", "Unique discovered inputs"),
+        ("estimated_total_cost_usd", "Estimated cost (USD)"),
+        ("total_model_calls", "Accepted model calls"),
+        ("total_api_attempts", "API attempts"),
+        ("total_quota_wait_duration_ms", "Quota wait (s)"),
+    )
     for method in _methods(summary):
         item = summary[method]
         ci = item.get("e2e_rate_wilson_ci") or [None, None]
@@ -554,6 +573,24 @@ def _dashboard(
             f"<td>{item.get('total_quota_wait_duration_ms', 0) / 1000:.1f}s</td>"
             "</tr>"
         )
+        cells = []
+        for key, _label in detail_metrics:
+            value = item.get(key)
+            if key.endswith("_unconditional"):
+                text_value = f"{float(value or 0) * 100:.1f}%"
+            elif key == "total_quota_wait_duration_ms":
+                text_value = f"{float(value or 0) / 1000:.1f}"
+            elif key == "estimated_total_cost_usd":
+                text_value = "N/A" if value is None else f"{float(value):.4f}"
+            else:
+                text_value = str(value if value is not None else "N/A")
+            cells.append(f"<td>{_escape(text_value)}</td>")
+        detail_rows.append(
+            f"<tr><th scope=\"row\">{_escape(method)}</th>"
+            + "".join(cells)
+            + "</tr>"
+        )
+    detail_headers = "".join(f"<th>{_escape(label)}</th>" for _, label in detail_metrics)
     figure_sections = "\n".join(
         "<figure>"
         f"<img src=\"figures/{_escape(item['path'])}\" "
@@ -588,6 +625,75 @@ def _dashboard(
         + "</tbody></table></div></section>"
         if pairwise_rows
         else ""
+    )
+    ir_metric_keys = (
+        ("median_instruction_count", "Instructions"),
+        ("median_basic_block_count", "Basic blocks"),
+        ("median_cyclomatic_complexity", "Cyclomatic"),
+        ("median_indirect_call_count", "Indirect calls"),
+        ("median_helper_reference_count", "Lifter/helper refs"),
+    )
+    source_metric_keys = (
+        ("median_source_line_count", "Source lines"),
+        ("median_function_count", "Functions"),
+        ("median_cyclomatic_complexity", "Cyclomatic"),
+        ("median_goto_count", "Gotos"),
+        ("median_decompiler_artifact_count", "Decompiler artifacts"),
+    )
+
+    def metric_table(
+        values: Dict[str, Any],
+        keys: tuple[tuple[str, str], ...],
+        first_header: str,
+    ) -> str:
+        if not values:
+            return "<p>No complete artifacts were available for this metric group.</p>"
+        headers = "".join(f"<th>{_escape(label)}</th>" for _, label in keys)
+        rows = []
+        for group, item in sorted(values.items()):
+            cells = []
+            for key, _label in keys:
+                value = item.get(key)
+                cells.append(
+                    "<td>N/A</td>"
+                    if value is None
+                    else f"<td>{float(value):.2f}</td>"
+                )
+            rows.append(
+                f"<tr><th scope=\"row\">{_escape(group)}</th>"
+                + "".join(cells)
+                + "</tr>"
+            )
+        return (
+            "<div class=\"table-wrap\"><table><thead><tr>"
+            f"<th>{_escape(first_header)}</th>{headers}</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+        )
+
+    deobfuscation_section = (
+        "<section><h2>Deobfuscation structure metrics</h2>"
+        "<p>These descriptive metrics complement—not replace—the semantic "
+        "PASS endpoint. LLVM counts are compared only across LLVM stages.</p>"
+        "<h3>Raw → brightened → delifted LLVM IR (medians)</h3>"
+        + metric_table(
+            deobfuscation.get("ir_stage_medians") or {},
+            ir_metric_keys,
+            "IR stage",
+        )
+        + "<h3>Recovered C by method (medians)</h3>"
+        + metric_table(
+            deobfuscation.get("source_method_medians") or {},
+            source_metric_keys,
+            "Method",
+        )
+        + "<p>Full definitions and binary artifact characteristics: "
+        "<a href=\"deobfuscation_metrics.json\">deobfuscation_metrics.json</a>, "
+        "<a href=\"ir_stage_metrics.csv\">ir_stage_metrics.csv</a>, "
+        "<a href=\"ir_transition_metrics.csv\">ir_transition_metrics.csv</a>, "
+        "<a href=\"source_deobfuscation_metrics.csv\">"
+        "source_deobfuscation_metrics.csv</a>, "
+        "<a href=\"binary_artifact_metrics.csv\">"
+        "binary_artifact_metrics.csv</a>.</p></section>"
     )
     fake_llm = bool(execution_context.get("fake_llm"))
     mode_label = (
@@ -704,10 +810,10 @@ def _dashboard(
   <header>
     <div class="protocol">{run_label}</div>
     <h1>Binary reconstruction experiment results</h1>
-    <p>P0 preserves the current iterative repair pipeline with at most five
-    LLM calls. A0 and B0 each use one logical generation. All end-to-end
-    behavior is judged against the same original obfuscated ELF and union
-    input corpus.</p>
+    <p>P0 uses Ghidra pseudocode plus cleaned LLVM IR and at most five
+    compiler/fuzz-guided LLM calls. A0 and B0 each use one logical generation.
+    All end-to-end behavior is judged against the same original obfuscated ELF
+    and union input corpus.</p>
     <div class="keys">
       <span class="key p0"><i class="swatch"></i>P0</span>
       <span class="key a0"><i class="swatch"></i>A0</span>
@@ -724,7 +830,18 @@ def _dashboard(
       <tbody>{"".join(method_rows)}</tbody>
     </table></div>
   </section>
+  <section>
+    <h2>Full metric summary</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Method</th>{detail_headers}</tr></thead>
+      <tbody>{"".join(detail_rows)}</tbody>
+    </table></div>
+    <p>Excluded development-only precheck failures are reported in
+    <a href="metrics.json">metrics.json</a> under each method's diagnostic
+    fields and are not included in the research denominator.</p>
+  </section>
   {pairwise_section}
+  {deobfuscation_section}
   <section>
     <h2>Figures</h2>
     {figure_sections}
@@ -735,6 +852,7 @@ def _dashboard(
        <a href="metrics_long.csv">metrics_long.csv</a> ·
        <a href="variants.csv">variants.csv</a> ·
        <a href="statistics.json">statistics.json</a> ·
+       <a href="deobfuscation_metrics.json">deobfuscation metrics</a> ·
        <a href="../audit/events.jsonl">audit/events.jsonl</a> ·
        <a href="../audit/artifact_manifest.json">artifact manifest</a></p>
   </section>
@@ -756,6 +874,7 @@ def generate_visualizations(
     statistics: list[Dict[str, Any]],
     ir_rows: list[Dict[str, Any]],
     execution_context: Dict[str, Any],
+    deobfuscation: Dict[str, Any],
 ) -> Dict[str, Any]:
     aggregate = Path(aggregate_dir)
     figures_dir = aggregate / "figures"
@@ -777,6 +896,7 @@ def generate_visualizations(
         statistics,
         figures,
         execution_context,
+        deobfuscation,
     )
     manifest = {
         "schema_version": "1.1",

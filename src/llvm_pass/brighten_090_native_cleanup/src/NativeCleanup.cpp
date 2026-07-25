@@ -22,6 +22,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -3647,12 +3648,11 @@ static Function *getOrCreateRecoveredDataPointerMapper(Module &M) {
     auto *End = EndMD ? dyn_cast<ConstantInt>(EndMD->getValue()) : nullptr;
     if (!Begin || !End)
       continue;
-    bool Duplicate = false;
-    for (const Range &R : Ranges)
-      Duplicate |= R.Begin == Begin->getZExtValue() &&
-                   R.End == End->getZExtValue();
-    if (!Duplicate)
-      Ranges.push_back({&GV, Begin->getZExtValue(), End->getZExtValue()});
+    // Do not coalesce equal intervals here.  Two recovered globals may share
+    // an address range while carrying different initializers/aliases; the
+    // old inline resolver kept both and the stable sort's later entry won.
+    // Preserving every entry keeps that observable precedence intact.
+    Ranges.push_back({&GV, Begin->getZExtValue(), End->getZExtValue(), 1});
   }
   if (Ranges.empty())
     return nullptr;
@@ -3664,24 +3664,53 @@ static Function *getOrCreateRecoveredDataPointerMapper(Module &M) {
       FunctionType::get(PtrTy, {I64}, false), GlobalValue::InternalLinkage,
       "__brighten_native_data_pointer", M);
   Mapper->setDSOLocal(true);
+  // Keep the range walk out-of-line.  Inlining this resolver at every lifted
+  // pointer use recreates the entire select/icmp/GEP backward slice we are
+  // deliberately centralising here.
+  Mapper->addFnAttr(Attribute::NoInline);
+  Mapper->addFnAttr(Attribute::OptimizeNone);
   Argument *Address = Mapper->getArg(0);
   Address->setName("guest_or_native_address");
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Mapper);
   IRBuilder<> EntryBuilder(Entry);
   BasicBlock *Current = Entry;
-  for (size_t I = 0; I < Ranges.size(); ++I) {
+  for (Range &R : Ranges) {
+    StringRef Name = R.GV->getName();
+    if (Name.starts_with("native_data_") ||
+        Name.starts_with("native_residual_") ||
+        Name.starts_with("dyn_bytes_") ||
+        Name.starts_with("g_bytes_"))
+      R.Priority = 0;
+    if (Name.starts_with("g_arr_") || Name.starts_with("g_scalar_"))
+      R.Priority = 2;
+  }
+  // materializeRecoveredDataPointer used a stable priority sort before
+  // building nested selects.  The outermost (highest-priority) select wins
+  // for overlapping guest ranges; walk the same ordering in reverse so the
+  // first-hit helper branch has identical precedence.
+  llvm::stable_sort(Ranges, [](const Range &L, const Range &R) {
+    if (L.Priority != R.Priority)
+      return L.Priority < R.Priority;
+    uint64_t LSize = L.End - L.Begin;
+    uint64_t RSize = R.End - R.Begin;
+    if (LSize != RSize)
+      return LSize > RSize;
+    return L.Begin < R.Begin;
+  });
+  for (auto It = Ranges.rbegin(); It != Ranges.rend(); ++It) {
+    const Range &R = *It;
     BasicBlock *Hit = BasicBlock::Create(Ctx, "data.hit", Mapper);
     BasicBlock *Next = BasicBlock::Create(Ctx, "data.next", Mapper);
     IRBuilder<> B(Current);
-    Value *AtOrAfter = B.CreateICmpUGE(Address, B.getInt64(Ranges[I].Begin));
-    Value *BeforeEnd = B.CreateICmpULT(Address, B.getInt64(Ranges[I].End));
+    Value *AtOrAfter = B.CreateICmpUGE(Address, B.getInt64(R.Begin));
+    Value *BeforeEnd = B.CreateICmpULT(Address, B.getInt64(R.End));
     Value *InRange = B.CreateAnd(AtOrAfter, BeforeEnd);
     B.CreateCondBr(InRange, Hit, Next);
 
     IRBuilder<> HitBuilder(Hit);
-    Value *Offset = HitBuilder.CreateSub(Address, HitBuilder.getInt64(Ranges[I].Begin));
+    Value *Offset = HitBuilder.CreateSub(Address, HitBuilder.getInt64(R.Begin));
     Value *NativePtr = HitBuilder.CreateGEP(
-        HitBuilder.getInt8Ty(), Ranges[I].GV, Offset, "native.data.dynamic.ptr");
+        HitBuilder.getInt8Ty(), R.GV, Offset, "native.data.dynamic.ptr");
     HitBuilder.CreateRet(NativePtr);
     Current = Next;
   }
@@ -3703,6 +3732,122 @@ static GlobalVariable *getOrCreateRecoveredOobScratch(Module &M) {
       ConstantAggregateZero::get(ScratchTy), "native.recovered.oob.scratch");
   Scratch->setAlignment(Align(1));
   return Scratch;
+}
+
+// Recover the native object behind a constant guest-address expression such
+// as `ptrtoint(frame+TOP) + -32`.  These expressions are emitted as LLVM
+// ConstantExprs after stack recovery.  Keeping them behind the generic range
+// mapper makes every frame load/store an opaque call and prevents LLVM's
+// mem2reg/AA passes from seeing that two accesses share one object.  This
+// helper only accepts a pointer base plus a constant offset; dynamic guest
+// arithmetic continues through the resolver below.
+static bool getConstantRecoveredPointer(Module &M, Value *Address,
+                                        GlobalVariable *&GVOut,
+                                        int64_t &OffsetOut) {
+  if (!Address || !Address->getType()->isIntegerTy())
+    return false;
+
+  Value *PointerBase = nullptr;
+  int64_t AddressDelta = 0;
+  SmallPtrSet<Value *, 16> Seen;
+  std::function<bool(Value *, int64_t &)> Collect =
+      [&](Value *V, int64_t &Delta) -> bool {
+    if (!V || !Seen.insert(V).second)
+      return false;
+    auto *CE = dyn_cast<ConstantExpr>(V);
+    if (!CE)
+      return false;
+    unsigned Opcode = CE->getOpcode();
+    if (Opcode == Instruction::PtrToInt) {
+      PointerBase = CE->getOperand(0);
+      return PointerBase != nullptr;
+    }
+    if (Opcode == Instruction::Add || Opcode == Instruction::Sub) {
+      auto *CI = dyn_cast<ConstantInt>(CE->getOperand(1));
+      if (CI && Collect(CE->getOperand(0), Delta)) {
+        int64_t K = CI->getValue().getSExtValue();
+        if (Opcode == Instruction::Sub)
+          K = -K;
+        if ((K > 0 && Delta > std::numeric_limits<int64_t>::max() - K) ||
+            (K < 0 && Delta < std::numeric_limits<int64_t>::min() - K))
+          return false;
+        Delta += K;
+        return true;
+      }
+    }
+    if (CE->isCast())
+      return Collect(CE->getOperand(0), Delta);
+    return false;
+  };
+  if (!Collect(Address, AddressDelta) || !PointerBase)
+    return false;
+
+  int64_t GEPDelta = 0;
+  Value *Base = GetPointerBaseWithConstantOffset(
+      PointerBase, GEPDelta, M.getDataLayout(), true);
+  auto *GV = dyn_cast_or_null<GlobalVariable>(
+      Base ? Base->stripPointerCasts() : nullptr);
+  if (!GV || (GEPDelta > 0 &&
+              AddressDelta > std::numeric_limits<int64_t>::max() - GEPDelta) ||
+      (GEPDelta < 0 &&
+       AddressDelta < std::numeric_limits<int64_t>::min() - GEPDelta))
+    return false;
+
+  StringRef Name = GV->getName();
+  bool Recovered = Name.starts_with("frame_storage_backing.") ||
+                   GV->getMetadata("brighten.guest.range") ||
+                   Name.starts_with("native_data_") ||
+                   Name.starts_with("native_residual_") ||
+                   Name.starts_with("dyn_bytes_") ||
+                   Name.starts_with("g_bytes_") ||
+                   Name.starts_with("g_arr_") || Name.starts_with("g_scalar_");
+  if (!Recovered)
+    return false;
+  GVOut = GV;
+  OffsetOut = GEPDelta + AddressDelta;
+  return true;
+}
+
+// The mapper is deliberately non-inlined for dynamic addresses, but constant
+// frame addresses that survived an earlier cleanup sweep can still arrive as
+// calls to it.  Resolve those calls late as well; otherwise the opaque call
+// blocks alias analysis even though the address is a constant GEP in disguise.
+static unsigned rewriteConstantRecoveredMapperCalls(Module &M, bool &Changed) {
+  Function *Mapper = M.getFunction("__brighten_native_data_pointer");
+  if (!Mapper)
+    return 0;
+  SmallVector<CallBase *, 256> Calls;
+  for (Function &F : M) {
+    if (F.isDeclaration() || &F == Mapper)
+      continue;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (CB->getCalledFunction() == Mapper && CB->arg_size() == 1)
+            Calls.push_back(CB);
+  }
+
+  unsigned Rewritten = 0;
+  for (CallBase *CB : Calls) {
+    if (!CB->getParent() || CB->arg_size() != 1)
+      continue;
+    GlobalVariable *GV = nullptr;
+    int64_t Offset = 0;
+    if (!getConstantRecoveredPointer(M, CB->getArgOperand(0), GV, Offset))
+      continue;
+    IRBuilder<> B(CB);
+    Value *Ptr = B.CreateGEP(B.getInt8Ty(), GV, B.getInt64(Offset),
+                             "native.data.constant.ptr");
+    CB->replaceAllUsesWith(Ptr);
+    CB->eraseFromParent();
+    ++Rewritten;
+    Changed = true;
+  }
+  if (Mapper->use_empty()) {
+    Mapper->eraseFromParent();
+    Changed = true;
+  }
+  return Rewritten;
 }
 
 static Value *createRecoveredOobScratchPointer(Module &M, IRBuilder<> &B,
@@ -3807,6 +3952,18 @@ static Value *materializeRecoveredDataPointer(Module &M, IRBuilder<> &B,
       isNativeInteger(Address, NativeSeen))
     return B.CreateIntToPtr(Address64, PointerType::getUnqual(Ctx),
                             "native.integer.pointer");
+
+  GlobalVariable *ConstantGV = nullptr;
+  int64_t ConstantOffset = 0;
+  if (getConstantRecoveredPointer(M, Address, ConstantGV, ConstantOffset))
+    return B.CreateGEP(B.getInt8Ty(), ConstantGV,
+                       B.getInt64(ConstantOffset), "native.data.constant.ptr");
+
+  // Do not call the module-level mapper here.  The cleanup pass can create
+  // recovered globals/ranges after the first pointer materialization; a
+  // cached helper would then carry a stale range snapshot and mis-map later
+  // addresses (observed as hangs/SIGSEGV in the semantic corpus).  Keep the
+  // range dispatch local until the pass has a stable, immutable range table.
 
   struct Range {
     GlobalVariable *GV;
@@ -7368,6 +7525,15 @@ static bool collectStateGlobalInstructionUsers(
         return false;
       continue;
     }
+    if (auto *Root = dyn_cast<GlobalVariable>(U)) {
+      // llvm.used/compiler.used are linker-liveness roots, not semantic
+      // escapes.  Keeping them in this walk needlessly prevents localization
+      // of the private register snapshot.
+      if (Root->getName() == "llvm.used" ||
+          Root->getName() == "llvm.compiler.used")
+        continue;
+      return false;
+    }
     auto *I = dyn_cast<Instruction>(U);
     if (!I)
       return false;
@@ -7375,8 +7541,23 @@ static bool collectStateGlobalInstructionUsers(
       Owner = I->getFunction();
     else if (Owner != I->getFunction())
       return false;
-    if (isa<CallBase>(I) || isa<PtrToIntInst>(I) || isa<ReturnInst>(I))
+    if (isa<PtrToIntInst>(I) || isa<ReturnInst>(I))
       return false;
+    if (auto *CB = dyn_cast<CallBase>(I)) {
+      // memset/lifetime intrinsics are ordinary non-escaping writes to the
+      // register snapshot.  Treating them as an escape prevents localization
+      // and leaves thousands of byte-store/load instructions in the final IR.
+      // Any real call or callback still blocks localization conservatively.
+      Function *Callee = CB->getCalledFunction();
+      unsigned ID = Callee ? Callee->getIntrinsicID() : 0;
+      if (ID != Intrinsic::memset && ID != Intrinsic::memcpy &&
+          ID != Intrinsic::memmove && ID != Intrinsic::lifetime_start &&
+          ID != Intrinsic::lifetime_end)
+        return false;
+      // The pointer may be re-materialized as a distinct ConstantExpr after
+      // uniquing; the intrinsic classification itself is sufficient here
+      // because no ordinary call can observe the storage address.
+    }
     if (auto *SI = dyn_cast<StoreInst>(I))
       if (SI->getValueOperand() == V)
         return false;
@@ -7424,6 +7605,204 @@ static bool isLocalizableStateStorage(const GlobalVariable &GV) {
   // spelling a one-shot precondition for localization.
   return GV.hasLocalLinkage() &&
          GV.getName().starts_with("native_register_storage");
+}
+
+// A late register snapshot is frequently completely write-only: the lifted
+// entry stores architectural values into it, but no native operation ever
+// reads those slots.  Keeping such a global makes every store/volatile store
+// appear live and blocks CFG/DSE cleanup.  Remove it only after walking every
+// use and proving that all accesses are writes or memset intrinsics; any load,
+// pointer escape, or ordinary call vetoes the rewrite.
+static unsigned eraseWriteOnlyNativeRegisterStorage(Module &M, bool &Changed) {
+  SmallVector<GlobalVariable *, 4> Candidates;
+  for (GlobalVariable &GV : M.globals())
+    if (GV.getName() == "native_register_storage" &&
+        GV.hasLocalLinkage() && !GV.isThreadLocal())
+      Candidates.push_back(&GV);
+
+  unsigned Removed = 0;
+  for (GlobalVariable *GV : Candidates) {
+    SmallVector<User *, 64> Work(GV->user_begin(), GV->user_end());
+    SmallPtrSet<User *, 32> Seen;
+    SmallVector<Instruction *, 64> Dead;
+    bool Safe = true;
+    while (!Work.empty() && Safe) {
+      User *U = Work.pop_back_val();
+      if (!Seen.insert(U).second)
+        continue;
+      if (auto *C = dyn_cast<Constant>(U)) {
+        for (User *CU : C->users())
+          Work.push_back(CU);
+        continue;
+      }
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I) {
+        Safe = false;
+        break;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(I)) {
+        // Volatile/atomic accesses remain observable even when no load of the
+        // private object exists.  They are not write-only dead stores.
+        if (SI->isVolatile() || SI->isAtomic()) {
+          Safe = false;
+          break;
+        }
+        if (getUnderlyingObject(SI->getPointerOperand()) != GV) {
+          Safe = false;
+          break;
+        }
+        Dead.push_back(I);
+        continue;
+      }
+      if (auto *CB = dyn_cast<CallBase>(I)) {
+        Function *Callee = CB->getCalledFunction();
+        unsigned ID = Callee ? Callee->getIntrinsicID() : 0;
+        if (ID == Intrinsic::memset && CB->arg_size() > 0 &&
+            getUnderlyingObject(CB->getArgOperand(0)) == GV) {
+          Dead.push_back(I);
+          continue;
+        }
+      }
+      // Loads, ptrtoint, returns, and ordinary calls are observable uses.
+      Safe = false;
+    }
+    if (!Safe)
+      continue;
+    for (Instruction *I : Dead)
+      I->eraseFromParent();
+    if (GV->use_empty()) {
+      GV->eraseFromParent();
+      ++Removed;
+      Changed = true;
+    }
+  }
+  return Removed;
+}
+
+struct ExactFrameAccess {
+  GlobalVariable *Backing = nullptr;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+};
+
+static bool getExactFrameAccess(Value *Pointer, Type *AccessTy,
+                                const DataLayout &DL,
+                                ExactFrameAccess &Out) {
+  if (!Pointer || !AccessTy || !AccessTy->isSized())
+    return false;
+  TypeSize Size = DL.getTypeStoreSize(AccessTy);
+  if (Size.isScalable())
+    return false;
+  int64_t Offset = 0;
+  Value *Base = GetPointerBaseWithConstantOffset(Pointer, Offset, DL, true);
+  auto *GV = dyn_cast_or_null<GlobalVariable>(Base ? Base->stripPointerCasts()
+                                                    : nullptr);
+  if (!GV || !GV->getName().starts_with("frame_storage_backing."))
+    return false;
+  Out.Backing = GV;
+  Out.Offset = Offset;
+  Out.Size = Size.getFixedValue();
+  return Out.Size != 0;
+}
+
+static bool frameRangesOverlap(const ExactFrameAccess &A,
+                               const ExactFrameAccess &B) {
+  if (A.Backing != B.Backing)
+    return false;
+  if (A.Offset > std::numeric_limits<int64_t>::max() -
+                     static_cast<int64_t>(A.Size) ||
+      B.Offset > std::numeric_limits<int64_t>::max() -
+                     static_cast<int64_t>(B.Size))
+    return true;
+  int64_t AEnd = A.Offset + static_cast<int64_t>(A.Size);
+  int64_t BEnd = B.Offset + static_cast<int64_t>(B.Size);
+  return A.Offset < BEnd && B.Offset < AEnd;
+}
+
+// LLVM's generic DSE cannot always see that two lifted frame stores use the
+// same byte interval: the pointer is commonly a nested ConstantExpr with
+// ptrtoint/add/sub arithmetic.  Remove only an earlier store to the exact
+// same interval in one basic block, with no intervening load, call, volatile,
+// atomic, or unknown memory access.  This is a deliberately local proof; it
+// never assumes that a dynamic frame pointer is disjoint from a constant slot.
+static unsigned eraseRedundantExactFrameStores(Module &M, bool &Changed) {
+  unsigned Removed = 0;
+  const DataLayout &DL = M.getDataLayout();
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      struct PendingStore {
+        StoreInst *Inst = nullptr;
+        ExactFrameAccess Access;
+      };
+      SmallVector<PendingStore, 16> Pending;
+      for (Instruction &I : BB) {
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          if (SI->isVolatile() || SI->isAtomic()) {
+            Pending.clear();
+            continue;
+          }
+          ExactFrameAccess Access;
+          if (!getExactFrameAccess(SI->getPointerOperand(),
+                                   SI->getValueOperand()->getType(), DL,
+                                   Access)) {
+            Pending.clear();
+            continue;
+          }
+
+          for (auto It = Pending.begin(); It != Pending.end();) {
+            if (!frameRangesOverlap(It->Access, Access)) {
+              ++It;
+              continue;
+            }
+            if (It->Access.Offset == Access.Offset &&
+                It->Access.Size == Access.Size && It->Inst->getParent()) {
+              It->Inst->eraseFromParent();
+              ++Removed;
+              Changed = true;
+            }
+            It = Pending.erase(It);
+          }
+          Pending.push_back({SI, Access});
+          continue;
+        }
+
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (LI->isVolatile() || LI->isAtomic()) {
+            Pending.clear();
+            continue;
+          }
+          ExactFrameAccess Access;
+          if (getExactFrameAccess(LI->getPointerOperand(), LI->getType(), DL,
+                                  Access)) {
+            for (auto It = Pending.begin(); It != Pending.end();) {
+              if (frameRangesOverlap(It->Access, Access))
+                It = Pending.erase(It);
+              else
+                ++It;
+            }
+          } else {
+            Value *Underlying =
+                getUnderlyingObject(LI->getPointerOperand());
+            auto *GV = dyn_cast_or_null<GlobalVariable>(Underlying);
+            if (GV && GV->getName().starts_with("frame_storage_backing."))
+              Pending.clear();
+          }
+          continue;
+        }
+
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (!CB->doesNotAccessMemory())
+            Pending.clear();
+          continue;
+        }
+        if (I.mayReadOrWriteMemory())
+          Pending.clear();
+      }
+    }
+  }
+  return Removed;
 }
 
 // Once startup/dispatcher functions have been removed, a private McSema State
@@ -10671,6 +11050,16 @@ bool NativeCleanupPass::cleanupModule(
     if (PromotedDispatchers)
       errs() << "  final stack dispatcher state slots promoted to SSA: "
              << PromotedDispatchers << "\n";
+    unsigned FinalRedundantFrameStores =
+        eraseRedundantExactFrameStores(M, Changed);
+    if (FinalRedundantFrameStores)
+      errs() << "  final redundant exact frame stores erased: "
+             << FinalRedundantFrameStores << "\n";
+    unsigned FinalConstantMapperPointers =
+        rewriteConstantRecoveredMapperCalls(M, Changed);
+    if (FinalConstantMapperPointers)
+      errs() << "  final constant recovered mapper calls lowered: "
+             << FinalConstantMapperPointers << "\n";
     unsigned FinalPointerIntegers =
         rewriteRecoveredPointerIntegerIdentities(M, Changed);
     if (FinalPointerIntegers)
@@ -10702,6 +11091,11 @@ bool NativeCleanupPass::cleanupModule(
     if (FinalVarargPointers)
       errs() << "  final recovered variadic pointer save slots lowered: "
              << FinalVarargPointers << "\n";
+    unsigned LateConstantMapperPointers =
+        rewriteConstantRecoveredMapperCalls(M, Changed);
+    if (LateConstantMapperPointers)
+      errs() << "  final late constant mapper calls lowered: "
+             << LateConstantMapperPointers << "\n";
     unsigned ThreadPointers = lowerX86ThreadPointerInlineAsm(M, Changed);
     if (ThreadPointers)
       errs() << "  final x86 TLS reads lowered to llvm.thread.pointer: "
@@ -11163,6 +11557,11 @@ bool NativeCleanupPass::cleanupModule(
   // fallback below.  If later inlining/DCE turns that internal backing into a
   // single-owner object, the next cleanup sweep can now localize the lowered
   // native_register_storage form as well.
+  unsigned WriteOnlyRegisterSnapshots =
+      eraseWriteOnlyNativeRegisterStorage(M, Changed);
+  if (WriteOnlyRegisterSnapshots)
+    errs() << "  write-only native register snapshots erased: "
+           << WriteOnlyRegisterSnapshots << "\n";
   unsigned LocalizedStateGlobals = localizePrivateStateGlobals(M, Changed);
   if (LocalizedStateGlobals)
     errs() << "  private State globals localized: "
@@ -11205,6 +11604,15 @@ bool NativeCleanupPass::cleanupModule(
   if (PromotedDispatchers)
     errs() << "  stack dispatcher state slots promoted to SSA: "
            << PromotedDispatchers << "\n";
+  unsigned RedundantFrameStores = eraseRedundantExactFrameStores(M, Changed);
+  if (RedundantFrameStores)
+    errs() << "  redundant exact frame stores erased: "
+           << RedundantFrameStores << "\n";
+  unsigned ConstantMapperPointers =
+      rewriteConstantRecoveredMapperCalls(M, Changed);
+  if (ConstantMapperPointers)
+    errs() << "  constant recovered mapper calls lowered: "
+           << ConstantMapperPointers << "\n";
   // Do not broadly initialize scanf destinations before the call.  Native
   // scanf leaves an integer destination unchanged when conversion/EOF fails;
   // the narrow seeding above is limited to recovered integer locals whose
@@ -11231,6 +11639,11 @@ bool NativeCleanupPass::cleanupModule(
            << CollapsedNativeDispatches << "\n";
     cleanupNativeDeadInstructions(M);
   }
+  unsigned LateConstantMapperPointers =
+      rewriteConstantRecoveredMapperCalls(M, Changed);
+  if (LateConstantMapperPointers)
+    errs() << "  late constant mapper calls lowered: "
+           << LateConstantMapperPointers << "\n";
   // No recovery step below this point consumes guest-range provenance; remove
   // it now so the final NativeStrict contract remains metadata-free.
   // Keep guest-range provenance across the intervening O3 pipeline.  A later

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,10 +9,10 @@ from typing import Any, Callable, Dict, Optional
 from fuzzing_equi_check.fuzzing import SemanticFuzzer, compile_to_binary
 from fuzzing_equi_check.input_contracts import resolve_input_contract
 from llm_recovery.llm_recovery import (
+    P0_PROMPT_POLICY_VERSION,
     RecoveryConfig,
     RecoveryResult,
     VertexGemini,
-    confirmed_equivalence_pass,
     export_ghidra_pseudocode,
     run_recovery_loop,
 )
@@ -30,12 +31,6 @@ from .representations import RawLiftService, RepresentationError
 from .storage import atomic_write_json, sha256_file, stable_json_sha256
 
 
-class P0PrecheckFailed(RuntimeError):
-    def __init__(self, report: Dict[str, Any]):
-        super().__init__("P0 legacy semantic precheck did not pass")
-        self.report = report
-
-
 def build_p0_recovery_config(config: Dict[str, Any]) -> RecoveryConfig:
     """Freeze non-algorithmic P0 runtime knobs to the experiment contract."""
 
@@ -45,32 +40,38 @@ def build_p0_recovery_config(config: Dict[str, Any]) -> RecoveryConfig:
         location=str(llm_config["location"]),
         max_iterations=5,
         fuzz_iterations=int(config["p0"]["fuzz_iterations"]),
-        fuzz_timeout=float(config["p0"]["fuzz_timeout_sec"]),
+        fuzz_timeout=0.5,
         max_ir_chars=None,
         temperature=float(llm_config["temperature"]),
         top_p=float(llm_config["top_p"]),
         candidate_count=int(llm_config.get("candidate_count", 1)),
-        thinking_level=llm_config.get("thinking_level"),
+        thinking_level=llm_config.get("thinking_level") or "LOW",
         llm_timeout=float(llm_config["request_timeout_sec"]),
+        # Supply both frozen evidence sources through the readable File API:
+        # focused Ghidra pseudocode and final cleaned LLVM IR.
         use_file_api=True,
         file_api_inline_max_bytes=None,
         request_timeout=float(llm_config["request_timeout_sec"]),
         max_output_tokens=int(llm_config["max_output_tokens"]),
+        context_window_tokens=int(llm_config["context_window_tokens"]),
+        context_safety_margin_tokens=int(
+            llm_config["context_safety_margin_tokens"]
+        ),
         pseudo_backend="ghidra",
         ghidra_binary_path=str(config["paths"]["ghidra_headless"]),
         ghidra_timeout=float(
             config["representation"]["b0"]["ghidra_timeout_sec"]
         ),
         two_stage_recovery=True,
-        attach_clean_ir=bool(config["p0"].get("attach_clean_ir", False)),
-        require_json=True,
+        attach_clean_ir=True,
+        require_json=False,
     )
 
 
 class _FakeLegacyClient:
     def __init__(self, source_path: str):
         source = Path(source_path).read_text(encoding="utf-8")
-        self.response = json.dumps({"source": source})
+        self.response = source
         self.last_response_meta = {
             "finish_reason": "STOP",
             "model_version": "fake",
@@ -86,7 +87,9 @@ class P0LegacyRun:
     representation: RepresentationArtifact
     generation: GenerationResult
     internal_precheck: Dict[str, Any]
+    internal_precheck_passed: bool
     internal_recovery_report: Optional[Dict[str, Any]]
+    recovery_oracle_path: str
     candidate_path: str
 
 
@@ -166,7 +169,6 @@ class P0LegacyAdapter:
         # ambient LLM_RECOVERY_* variables from silently giving P0 a different
         # model or sampling policy than A0/B0.
         legacy_config = build_p0_recovery_config(self.config)
-
         delifted_reference = representation_dir / "delifted_ref.bin"
         compile_to_binary(str(delifted_ll), str(delifted_reference))
         recovery_reference = (
@@ -208,7 +210,7 @@ class P0LegacyAdapter:
             primary_path=str(delifted_ll),
             primary_sha256=sha256_file(delifted_ll),
             byte_count=delifted_ll.stat().st_size,
-            token_count=max(1, (delifted_ll.stat().st_size + 2) // 3),
+            token_count=max(1, (delifted_ll.stat().st_size + 1) // 2),
             builder_version=self.VERSION,
             attachment_paths=attachment_paths,
             attachment_sha256=attachment_hashes,
@@ -232,6 +234,7 @@ class P0LegacyAdapter:
                 ),
                 "native_contract": native_report,
                 "protocol": "legacy_iterative_repair",
+                "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
                 "max_iterations": 5,
                 "representation_contract": (
                     "delifted LLVM IR plus P0 Ghidra pseudocode"
@@ -251,9 +254,9 @@ class P0LegacyAdapter:
                         Path(path).stat().st_size
                         for path in attachment_paths
                     )
-                    + 2
+                    + 1
                 )
-                // 3,
+                // 2,
             ),
         )
         atomic_write_json(
@@ -325,6 +328,10 @@ class P0LegacyAdapter:
             root, sample.original_elf_path, only_custom=True
         )
         legacy_config = build_p0_recovery_config(self.config)
+        internal_input_dir = variant / "processing" / "p0_internal_discovery"
+        internal_input_dir.mkdir(parents=True, exist_ok=True)
+        internal_inputs: list[Dict[str, Any]] = []
+        fuzz_call_index = 0
 
         def run_legacy_fuzz(
             file1: str,
@@ -340,12 +347,29 @@ class P0LegacyAdapter:
                 seed_dir=seed_dir,
                 input_contract=contract,
             )
-            return _run_fuzzer_sync(
+            nonlocal fuzz_call_index
+            report = _run_fuzzer_sync(
                 fuzzer,
                 iterations=iterations,
                 generator=generator,
                 timeout=timeout,
             )
+            fuzz_call_index += 1
+            for payload_index, encoded in enumerate(report.get("tested_payloads") or []):
+                try:
+                    payload = base64.b64decode(str(encoded), validate=True)
+                except (ValueError, TypeError):
+                    continue
+                path = internal_input_dir / f"fuzz_{fuzz_call_index:03d}_{payload_index:05d}.bin"
+                path.write_bytes(payload)
+                internal_inputs.append({
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                    "category": "p0_internal_fuzz",
+                    "origin_method": "P0",
+                })
+            return report
 
         brightened_bc = Path(
             str(provenance.get("brightened_bc_path") or "")
@@ -371,13 +395,33 @@ class P0LegacyAdapter:
         )
         precheck_path = variant / "p0_internal_precheck.json"
         atomic_write_json(precheck_path, precheck)
-        if not confirmed_equivalence_pass(precheck):
-            raise P0PrecheckFailed(precheck)
+        # This baseline diagnoses whether the brightening/delift reference
+        # already agrees with the original ELF.  It is not an experimental
+        # outcome and must never suppress P0 generation: doing so selects only
+        # easy/pass cases before the method is measured.  The final original-
+        # ELF replay remains the sole E2E oracle.
+        precheck_passed = bool(precheck.get("is_fully_equivalent", False))
+        recovery_oracle = (
+            recovery_reference
+            if precheck_passed
+            else sample.original_elf_path
+        )
+        recovery_oracle_label = (
+            "semantic-gated brightened/delifted reference"
+            if precheck_passed
+            else "original ELF fallback after diagnostic precheck"
+        )
+        print(
+            "[experiment] "
+            f"sample={sample.sample_id} method=P0 stage=semantic-precheck "
+            f"passed={precheck_passed} recovery_oracle={recovery_oracle_label}",
+            flush=True,
+        )
 
         def recovery_fuzz(candidate_path: str) -> Dict[str, Any]:
             return run_legacy_fuzz(
                 candidate_path,
-                recovery_reference,
+                recovery_oracle,
                 iterations=legacy_config.fuzz_iterations,
                 timeout=legacy_config.fuzz_timeout,
             )
@@ -413,12 +457,12 @@ class P0LegacyAdapter:
             case_output_dir=str(generation_dir),
             metadata={
                 "original_binary": sample.original_elf_path,
+                # Ghidra evidence remains frozen from the prepared internal
+                # reference.  The fuzzer callback above may use the original
+                # ELF as oracle when that internal reference failed its
+                # diagnostic baseline.
                 "recovery_reference_binary": recovery_reference,
-                "recovery_reference_label": (
-                    "delifted.ll compiled"
-                    if recovery_reference != sample.original_elf_path
-                    else "original"
-                ),
+                "recovery_reference_label": recovery_oracle_label,
                 "input_ir": str(delifted_ll),
                 "precomputed_ghidra_pseudocode_path": str(
                     prepared_pseudocode
@@ -449,6 +493,16 @@ class P0LegacyAdapter:
 
         responses = sorted(generation_dir.glob("recovery_iter*.response.txt"))
         metas = sorted(generation_dir.glob("recovery_iter*.meta.json"))
+        context_records = []
+        for context_path in sorted(
+            generation_dir.glob("recovery_iter*.context.json")
+        ):
+            try:
+                context_records.append(
+                    json.loads(context_path.read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError):
+                continue
         usage_input = usage_output = usage_thinking = usage_total = 0
         for meta_path in metas:
             try:
@@ -489,11 +543,14 @@ class P0LegacyAdapter:
         }
         request_identity = {
             "protocol": "legacy_iterative_repair",
+            "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
             "max_iterations": 5,
             **model_freeze,
             "representation_sha256": sha256_file(delifted_ll),
             "pseudocode_sha256": sha256_file(prepared_pseudocode),
             "recovery_reference_sha256": sha256_file(recovery_reference),
+            "recovery_oracle_sha256": sha256_file(recovery_oracle),
+            "internal_precheck_passed": precheck_passed,
         }
         quota_metrics = (
             quota.metrics()
@@ -533,12 +590,33 @@ class P0LegacyAdapter:
             ],
             response_metadata={
                 "protocol": "legacy_iterative_repair",
+                "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
                 "success": result.success,
                 "max_iterations": legacy_config.max_iterations,
+                "evidence_schedule": [
+                    record.get("evidence_mode")
+                    for record in context_records
+                ],
+                "context_safe_split_active": any(
+                    bool(record.get("context_safe_split_active"))
+                    for record in context_records
+                ),
                 "generator_reason": generator_reason,
                 "model_freeze": model_freeze,
+                "internal_precheck_passed": precheck_passed,
+                "internal_precheck_path": str(precheck_path),
+                "recovery_oracle_path": recovery_oracle,
+                "recovery_oracle_sha256": sha256_file(recovery_oracle),
+                "recovery_oracle_label": recovery_oracle_label,
                 "quota": quota_metrics,
+                "internal_discovery_manifest": str(
+                    internal_input_dir / "manifest.json"
+                ),
             },
+        )
+        atomic_write_json(
+            internal_input_dir / "manifest.json",
+            {"inputs": internal_inputs},
         )
         atomic_write_json(
             generation_dir / "generation_manifest.json",
@@ -548,6 +626,8 @@ class P0LegacyAdapter:
             representation=representation,
             generation=generation,
             internal_precheck=precheck,
+            internal_precheck_passed=precheck_passed,
             internal_recovery_report=result.fuzz_report,
+            recovery_oracle_path=recovery_oracle,
             candidate_path=str(output_candidate),
         )

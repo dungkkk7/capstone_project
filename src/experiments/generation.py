@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict
 
 from llm_recovery.llm_recovery import (
+    LLMContextOverflowError,
     LLMEmptyResponseError,
     RecoveryConfig,
     RecoveryError,
@@ -72,10 +72,12 @@ def estimate_tokens(text: str) -> int:
     """Conservative deterministic estimate used for the pre-request gate.
 
     Provider-reported token counts are persisted after a successful request.
-    Using three UTF-8 bytes per token errs toward rejecting oversized inputs.
+    Lifted IR is punctuation-dense and has repeatedly tokenized below two UTF-8
+    bytes per token.  Two bytes per token catches those requests locally while
+    still leaving the provider-reported count as the authoritative measurement.
     """
 
-    return max(1, (len(text.encode("utf-8")) + 2) // 3)
+    return max(1, (len(text.encode("utf-8")) + 1) // 2)
 
 
 def _scan_request(
@@ -85,16 +87,17 @@ def _scan_request(
     representation: RepresentationArtifact,
 ) -> Dict[str, Any]:
     matches = []
+    # The system prompt is a versioned, hash-checked policy and may name
+    # forbidden concepts while explicitly prohibiting them. Leakage concerns
+    # the case-specific user/evidence payload, not those policy statements.
     common_haystack = "\n".join(
-        [system_prompt, user_prompt, *representation.attachment_paths]
+        [user_prompt, *representation.attachment_paths]
     ).lower()
     for pattern in FORBIDDEN_COMMON:
         if pattern.lower() in common_haystack:
             matches.append(pattern)
 
-    method_haystack = "\n".join(
-        [system_prompt, user_prompt, *representation.attachment_paths]
-    ).lower()
+    method_haystack = common_haystack
     # The A0 representation naturally describes "raw LLVM IR"; the scanner
     # forbids Ghidra/P0 evidence rather than the word LLVM itself.
     for pattern in FORBIDDEN_BY_METHOD.get(method, ()):
@@ -165,6 +168,11 @@ def generate_one_shot(
         )
 
     llm_config = config["llm"]
+    effective_thinking_level = (
+        (llm_config.get("thinking_level") or "LOW")
+        if method is MethodId.B0
+        else llm_config.get("thinking_level")
+    )
     input_tokens_estimated = estimate_tokens(
         prompt.system_prompt + "\n" + prompt.user_prompt
     )
@@ -214,7 +222,7 @@ def generate_one_shot(
             "top_p": float(llm_config["top_p"]),
             "candidate_count": int(llm_config.get("candidate_count", 1)),
             "max_output_tokens": int(llm_config["max_output_tokens"]),
-            "thinking_level": llm_config.get("thinking_level"),
+            "thinking_level": effective_thinking_level,
         },
         "prompt_policy": prompt_policy_manifest(method),
         "forbidden_scan": scan,
@@ -244,7 +252,7 @@ def generate_one_shot(
             "model_spec_verified_date": llm_config.get(
                 "model_spec_verified_date"
             ),
-            "token_count_kind": "conservative_estimate_3_utf8_bytes_per_token",
+            "token_count_kind": "conservative_source_estimate_2_utf8_bytes_per_token",
         },
     )
     print(
@@ -283,7 +291,7 @@ def generate_one_shot(
             candidate_count=int(llm_config.get("candidate_count", 1)),
             max_iterations=1,
             max_output_tokens=int(llm_config["max_output_tokens"]),
-            thinking_level=llm_config.get("thinking_level"),
+            thinking_level=effective_thinking_level,
             request_timeout=float(llm_config["request_timeout_sec"]),
             llm_timeout=float(llm_config["request_timeout_sec"]),
             use_file_api=False,
@@ -354,6 +362,12 @@ def generate_one_shot(
                 response_meta = dict(client.last_response_meta or {})
                 print(f"[LLM] {log_label} empty response: {exc}", flush=True)
                 break
+            except LLMContextOverflowError as exc:
+                print(
+                    f"[LLM] {log_label} context overflow; không retry: {exc}",
+                    flush=True,
+                )
+                raise ContextOverflow(str(exc)) from exc
             except RecoveryError as exc:
                 last_error = exc
                 print(

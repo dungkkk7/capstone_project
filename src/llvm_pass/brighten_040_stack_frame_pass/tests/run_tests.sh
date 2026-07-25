@@ -13,7 +13,8 @@ DISJOINT_OUT="$(mktemp)"
 PARTIAL_OUT="$(mktemp)"
 MIXED_OUT="$(mktemp)"
 CALL_OUT="$(mktemp)"
-trap 'rm -f "$OUT" "$DISJOINT_OUT" "$PARTIAL_OUT" "$MIXED_OUT" "$CALL_OUT"' EXIT
+LARGE_OUT="$(mktemp)"
+trap 'rm -f "$OUT" "$DISJOINT_OUT" "$PARTIAL_OUT" "$MIXED_OUT" "$CALL_OUT" "$LARGE_OUT"' EXIT
 
 "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-stack-frame-pass \
   -verify-each -S "$ROOT/tests/test_promoted_rsp_slot.ll" -o "$OUT"
@@ -56,5 +57,12 @@ grep -q 'store i64 %local, ptr %other.ptr' "$MIXED_OUT"
 grep -q 'call ptr @sub_callee' "$CALL_OUT"
 grep -q 'store i64 1, ptr %before.ptr' "$CALL_OUT"
 grep -q 'store i64 2, ptr %after.ptr' "$CALL_OUT"
+
+"$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-stack-frame-pass \
+  -verify-each -S "$ROOT/tests/test_large_unproven_frame.ll" -o "$LARGE_OUT"
+
+! grep -q 'native_local_frame' "$LARGE_OUT"
+grep -q 'store i64 5, ptr %ptr.5' "$LARGE_OUT"
+grep -q 'load i64, ptr %ptr.5' "$LARGE_OUT"
 
 echo "Stack frame recovery tests: PASS"

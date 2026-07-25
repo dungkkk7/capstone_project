@@ -1047,11 +1047,14 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       }
     }
 
-    // A large recovered region is not a simple compiler-created local frame:
-    // it commonly mixes saved registers, control-flow temporaries and guest
-    // data carriers.  The affine analysis above can still classify every
-    // access as constant while missing those semantic roles.  Preserve such
-    // regions until a stronger object-separation proof exists.
+    // A large recovered region is not yet proven to be a function-local
+    // object merely because every individual access has a constant offset.
+    // In production IR such regions can still carry values consumed by later
+    // ABI/global-recovery stages.  Promoting the 16/30-access frames in
+    // p01296 changed a recovered global index and made sub_4026f0 read beyond
+    // the recovered `id` array.  Keep the pass fail-closed until object
+    // separation is backed by an interprocedural proof; small scalar frames
+    // remain eligible for the rewrite below.
     for (const auto &Pair : BaseAccesses) {
       if (Pair.second.size() > 8) {
         addSkipReason(BaseReasons, Pair.first, SkipUnsafeOverlap);

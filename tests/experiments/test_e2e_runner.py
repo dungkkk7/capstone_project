@@ -2,6 +2,8 @@ import copy
 import hashlib
 import json
 import sys
+import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,10 +61,45 @@ def test_process_subcommand_is_accepted():
     assert args.command == "process"
 
 
+def test_refuzz_defaults_to_a0_b0_only():
+    args = _parser().parse_args(
+        [
+            "refuzz",
+            "dataset.csv",
+            "--run-id",
+            "test-run",
+        ]
+    )
+
+    assert args.command == "refuzz"
+    assert args.mode == "ab"
+
+
+def test_refuzz_cli_dispatches_without_running_e2e(monkeypatch):
+    actions = []
+    fake_runner = SimpleNamespace(
+        refuzz=lambda: actions.append("refuzz"),
+        command_lock=lambda _command: nullcontext(),
+    )
+    monkeypatch.setattr(
+        cli_module, "_runner_from_args", lambda _args: fake_runner
+    )
+
+    exit_code = cli_module.main(
+        ["refuzz", "dataset.csv", "--run-id", "test-run"]
+    )
+
+    assert exit_code == 0
+    assert actions == ["refuzz"]
+
+
 def test_e2e_cli_reports_checkpointed_incomplete_run(
     monkeypatch,
 ):
-    fake_runner = SimpleNamespace(run=lambda: False)
+    fake_runner = SimpleNamespace(
+        run=lambda: False,
+        command_lock=lambda _command: nullcontext(),
+    )
     monkeypatch.setattr(
         cli_module, "_runner_from_args", lambda _args: fake_runner
     )
@@ -79,6 +116,39 @@ def test_e2e_cli_reports_checkpointed_incomplete_run(
     )
 
     assert exit_code == 75
+
+
+def test_command_lock_rejects_concurrent_command_for_same_run(tmp_path):
+    first = object.__new__(ExperimentRunner)
+    first.run_id = "shared-run"
+    first.run_root = tmp_path / "shared-run"
+    second = object.__new__(ExperimentRunner)
+    second.run_id = first.run_id
+    second.run_root = first.run_root
+
+    with first.command_lock("e2e"):
+        try:
+            with second.command_lock("evaluate"):
+                raise AssertionError("concurrent command unexpectedly acquired lock")
+        except runner_module.RunIntegrityError as exc:
+            message = str(exc)
+
+    assert "already active" in message
+    assert '"command": "e2e"' in message
+
+
+def test_command_lock_is_released_after_command(tmp_path):
+    first = object.__new__(ExperimentRunner)
+    first.run_id = "reusable-run"
+    first.run_root = tmp_path / "reusable-run"
+    second = object.__new__(ExperimentRunner)
+    second.run_id = first.run_id
+    second.run_root = first.run_root
+
+    with first.command_lock("e2e"):
+        pass
+    with second.command_lock("evaluate"):
+        pass
 
 
 def test_prepared_base_corpus_is_validated(tmp_path):
@@ -243,6 +313,138 @@ def test_p0_preparation_does_not_start_fuzzing_or_llm(
     assert not (tmp_path / "P0" / "p0_internal_precheck.json").exists()
 
 
+def test_p0_failed_internal_precheck_is_diagnostic_and_uses_original_oracle(
+    tmp_path, monkeypatch
+):
+    original = tmp_path / "original.elf"
+    original.write_bytes(b"original")
+    delifted = tmp_path / "delifted.ll"
+    delifted.write_text("define i32 @main() { ret i32 0 }\n")
+    brightened_bc = tmp_path / "brightened.bc"
+    brightened_bc.write_bytes(b"brightened")
+    internal_reference = tmp_path / "delifted_ref.bin"
+    internal_reference.write_bytes(b"internal-reference")
+    pseudocode = tmp_path / "ghidra_pseudocode.c"
+    pseudocode.write_text(
+        "// Function: main\nint main(void) { return 0; }\n"
+    )
+    fake_response = tmp_path / "fake_response.c"
+    fake_response.write_text("int main(void) { return 0; }\n")
+
+    sample = SimpleNamespace(
+        sample_id="sample-1",
+        original_elf_path=str(original),
+        original_elf_sha256=hashlib.sha256(original.read_bytes()).hexdigest(),
+    )
+    representation = RepresentationArtifact(
+        method=MethodId.P0,
+        primary_path=str(delifted),
+        primary_sha256=hashlib.sha256(delifted.read_bytes()).hexdigest(),
+        byte_count=delifted.stat().st_size,
+        token_count=1,
+        builder_version="test",
+        attachment_paths=[str(pseudocode)],
+        attachment_sha256=[
+            hashlib.sha256(pseudocode.read_bytes()).hexdigest()
+        ],
+        provenance={
+            "pseudocode_path": str(pseudocode),
+            "pseudocode_sha256": hashlib.sha256(
+                pseudocode.read_bytes()
+            ).hexdigest(),
+            "internal_reference": str(internal_reference),
+            "internal_reference_sha256": hashlib.sha256(
+                internal_reference.read_bytes()
+            ).hexdigest(),
+            "brightened_bc_path": str(brightened_bc),
+            "brightened_bc_sha256": hashlib.sha256(
+                brightened_bc.read_bytes()
+            ).hexdigest(),
+        },
+    )
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["_project_root"] = str(PROJECT_ROOT)
+    config["llm"]["fake_response_path"] = str(fake_response)
+
+    fuzzer_targets = []
+
+    class FakeFuzzer:
+        def __init__(self, file1, file2, **_kwargs):
+            self.file1 = file1
+            self.file2 = file2
+            fuzzer_targets.append(file2)
+
+    reports = [
+        {
+            "is_fully_equivalent": False,
+            "confirmed_runs": 1,
+            "mismatches": 1,
+            "confirmed_equivalence_ratio": 0.0,
+            "tested_payloads": [],
+        },
+        {
+            "is_fully_equivalent": True,
+            "confirmed_runs": 1,
+            "mismatches": 0,
+            "confirmed_equivalence_ratio": 100.0,
+            "tested_payloads": [],
+        },
+    ]
+
+    monkeypatch.setattr(p0_module, "SemanticFuzzer", FakeFuzzer)
+    monkeypatch.setattr(
+        p0_module, "_select_generator", lambda *_args: (None, "test")
+    )
+    monkeypatch.setattr(
+        p0_module, "_resolve_seed_paths", lambda *_args: ([], None)
+    )
+    monkeypatch.setattr(
+        p0_module, "resolve_input_contract", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        p0_module,
+        "_run_fuzzer_sync",
+        lambda *_args, **_kwargs: reports.pop(0),
+    )
+
+    def fake_recovery_loop(
+        *,
+        output_recovered_c_path,
+        case_output_dir,
+        fuzzer_callback,
+        **_kwargs,
+    ):
+        candidate = Path(output_recovered_c_path)
+        candidate.write_text("int main(void) { return 0; }\n")
+        Path(case_output_dir, "ghidra_pseudocode.c").write_bytes(
+            pseudocode.read_bytes()
+        )
+        report = fuzzer_callback(str(candidate))
+        return p0_module.RecoveryResult(
+            success=True,
+            source_path=str(candidate),
+            iterations=1,
+            fuzz_report=report,
+        )
+
+    monkeypatch.setattr(
+        p0_module, "run_recovery_loop", fake_recovery_loop
+    )
+    adapter = P0LegacyAdapter(config, SimpleNamespace())
+    result = adapter.process(
+        sample,
+        tmp_path / "P0",
+        representation=representation,
+    )
+
+    assert result.internal_precheck_passed is False
+    assert result.recovery_oracle_path == str(original)
+    assert fuzzer_targets == [str(original), str(original)]
+    assert result.generation.response_metadata[
+        "internal_precheck_passed"
+    ] is False
+
+
 def test_run_executes_prepare_process_compare_then_evaluate_in_one_call(
     tmp_path, monkeypatch
 ):
@@ -299,8 +501,13 @@ def test_run_executes_prepare_process_compare_then_evaluate_in_one_call(
         result_path.write_text(json.dumps(result))
 
     runner.initialize = initialize
-    runner._sample_input_prepared = lambda _sample: prepared["value"]
-    runner._prepare_input_sample = prepare
+    runner._prepare_base_input = lambda current_sample: (
+        prepare(current_sample) or []
+    )
+    runner._prepare_method_representation = (
+        lambda _sample, _method: {"status": "ready_for_llm"}
+    )
+    runner._write_preparation_manifest = lambda *_args: None
     runner._generate_sample = process
     runner._process_comparison_sample = compare
     runner._sample_processing_output_ready = (
@@ -328,6 +535,45 @@ def test_run_executes_prepare_process_compare_then_evaluate_in_one_call(
     ]
 
 
+def test_streaming_preparation_does_not_let_p0_block_a0_or_b0():
+    runner = object.__new__(ExperimentRunner)
+    sample = SimpleNamespace(sample_id="sample-1")
+    runner.samples = [sample]
+    runner.methods = [MethodId.P0, MethodId.A0, MethodId.B0]
+    runner.execution_order = list(runner.methods)
+    runner.config = copy.deepcopy(DEFAULT_CONFIG)
+    runner.audit = RecordingAudit()
+
+    fast_methods_ready = threading.Event()
+    fast_ready_count = 0
+    ready_lock = threading.Lock()
+
+    def prepare_method(_sample, method):
+        nonlocal fast_ready_count
+        if method is MethodId.P0:
+            assert fast_methods_ready.wait(timeout=1.0)
+        else:
+            with ready_lock:
+                fast_ready_count += 1
+                if fast_ready_count == 2:
+                    fast_methods_ready.set()
+        return {"status": "ready_for_llm"}
+
+    runner._prepare_base_input = lambda _sample: []
+    runner._prepare_method_representation = prepare_method
+    runner._sample_generation_ready = lambda _sample: True
+    runner._sample_processing_ready = lambda _sample: True
+    runner._write_preparation_manifest = lambda *_args: None
+    runner._sample_complete = lambda _sample: False
+    runner._run_samples = (
+        lambda _phase, operation, _is_complete: operation(sample)
+    )
+
+    runner._run_streaming_cases()
+
+    assert fast_ready_count == 2
+
+
 def test_generation_ready_rejects_quota_wait(tmp_path):
     runner = object.__new__(ExperimentRunner)
     sample = SimpleNamespace(sample_id="sample-1")
@@ -347,6 +593,29 @@ def test_generation_ready_rejects_quota_wait(tmp_path):
     )
 
     assert runner._sample_generation_ready(sample) is False
+
+
+def test_terminal_llm_failure_is_ready_for_aggregate(tmp_path):
+    runner = object.__new__(ExperimentRunner)
+    sample = SimpleNamespace(sample_id="sample-1")
+    runner.run_root = tmp_path
+    runner.execution_order = [MethodId.A0]
+    runner.config = copy.deepcopy(DEFAULT_CONFIG)
+    runner.config["_p0_backfill"] = False
+    result_path = runner._result_path(sample, MethodId.A0)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "final_stage": Stage.FINALIZED.value,
+                "terminal_status": TerminalStatus.LLM_REQUEST_FAILED.value,
+                "failure_code": "A0_LLM_REQUEST_FAILED",
+            }
+        )
+    )
+
+    assert runner._sample_generation_ready(sample) is True
+    assert runner._sample_processing_ready(sample) is True
 
 
 def test_evaluate_only_aggregates_frozen_processing_results(

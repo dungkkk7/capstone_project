@@ -100,7 +100,7 @@ def test_quota_controller_waits_and_counts_attempts(tmp_path):
         "api_attempt_count": 2,
         "accepted_model_call_count": 1,
         "quota_throttle_count": 1,
-        "quota_wait_duration_ms": 2000,
+        "quota_wait_duration_ms": 30000,
     }
     assert [name for name, _ in events] == [
         "quota_throttled",
@@ -136,7 +136,7 @@ def test_transient_provider_cancellation_retries_same_iteration(tmp_path):
     }
     assert controller.execute(request, context).startswith("{")
     assert calls == 2
-    assert clock.sleeps == [2]
+    assert clock.sleeps == [30.0]
     assert controller.metrics()["api_attempt_count"] == 2
     assert controller.metrics()["accepted_model_call_count"] == 1
     state = json.loads((tmp_path / "quota_state.json").read_text())
@@ -167,8 +167,8 @@ def test_transient_provider_cancellation_is_bounded(tmp_path):
             ),
             context,
         )
-    assert clock.sleeps == [2, 4]
-    assert controller.metrics()["api_attempt_count"] == 3
+    assert clock.sleeps == [30.0] * 120
+    assert controller.metrics()["api_attempt_count"] == 121
     state = json.loads((tmp_path / "quota_state.json").read_text())
     assert state["status"] == "REQUEST_FAILED"
     assert state["transient_retry_exhausted"] is True
@@ -211,12 +211,12 @@ def test_quota_checkpoint_resumes_same_request_after_interruption(tmp_path):
         now_fn=clock.now,
     )
     assert resumed.execute(lambda: "ok", context) == "ok"
-    assert clock.sleeps == [3]
+    assert clock.sleeps == [30.0]
     assert resumed.metrics()["api_attempt_count"] == 2
     assert resumed.metrics()["accepted_model_call_count"] == 1
 
 
-def test_quota_wait_budget_stops_after_configured_limit(tmp_path):
+def test_quota_wait_budget_is_fixed_to_one_hour(tmp_path):
     clock = FakeClock()
     controller = QuotaController(
         quota_config(max_wait=2, default_wait=2),
@@ -225,7 +225,7 @@ def test_quota_wait_budget_stops_after_configured_limit(tmp_path):
         sleep_fn=clock.sleep,
         now_fn=clock.now,
     )
-    with pytest.raises(QuotaWaitExceeded, match="after 2s"):
+    with pytest.raises(QuotaWaitExceeded, match="after 3600s"):
         controller.execute(
             lambda: (_ for _ in ()).throw(
                 LLMRateLimitError("still limited")
@@ -236,8 +236,8 @@ def test_quota_wait_budget_stops_after_configured_limit(tmp_path):
                 "max_iterations": 1,
             },
         )
-    assert controller.metrics()["api_attempt_count"] == 2
-    assert controller.metrics()["quota_wait_duration_ms"] == 2000
+    assert controller.metrics()["api_attempt_count"] == 121
+    assert controller.metrics()["quota_wait_duration_ms"] == 3600000
 
 
 def test_accepted_response_is_replayed_without_second_api_call(tmp_path):
@@ -305,7 +305,9 @@ class OneShotRateLimitedClient:
         self.calls += 1
         if self.calls == 1:
             raise LLMRateLimitError("quota", retry_after_seconds=1)
-        return "int main(void) { return 0; }\n"
+        return json.dumps(
+            {"source": "int main(void) { return 0; }\n"}
+        )
 
 
 def test_one_shot_keeps_one_generation_after_rate_limit(tmp_path):
@@ -346,7 +348,7 @@ def test_one_shot_keeps_one_generation_after_rate_limit(tmp_path):
     assert generated.model_call_count == 1
     assert generated.api_attempt_count == 2
     assert generated.quota_throttle_count == 1
-    assert generated.quota_wait_duration_ms == 1000
+    assert generated.quota_wait_duration_ms == 30000
 
 
 class EmptyOneShotClient:

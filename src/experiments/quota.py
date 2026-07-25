@@ -27,6 +27,9 @@ class QuotaController:
     """Retry the exact rejected request without consuming a model response."""
 
     SCHEMA_VERSION = "1.0"
+    FIXED_RETRY_INTERVAL_SECONDS = 30.0
+    MAX_RETRY_WAIT_SECONDS = 3600.0
+    MAX_TRANSIENT_RETRIES = 120
 
     def __init__(
         self,
@@ -45,28 +48,19 @@ class QuotaController:
     ):
         policy = dict(llm_config.get("rate_limit") or {})
         self.enabled = bool(policy.get("enabled", True))
-        self.max_wait_seconds = float(
-            policy.get("max_wait_seconds", 3600)
-        )
+        # E2E contract: all LLM requests retry on the same fixed cadence for
+        # at most one hour. Provider Retry-After/YAML cannot silently change
+        # this runtime policy.
+        self.max_wait_seconds = self.MAX_RETRY_WAIT_SECONDS
         self.default_retry_after_seconds = float(
             policy.get("default_retry_after_seconds", 3600)
         )
-        self.retry_initial_seconds = float(
-            policy.get(
-                "retry_initial_seconds", self.default_retry_after_seconds
-            )
-        )
-        self.retry_max_delay_seconds = float(
-            policy.get(
-                "retry_max_delay_seconds", self.default_retry_after_seconds
-            )
-        )
+        self.retry_initial_seconds = self.FIXED_RETRY_INTERVAL_SECONDS
+        self.retry_max_delay_seconds = self.FIXED_RETRY_INTERVAL_SECONDS
         self.transient_retry_enabled = bool(
             policy.get("transient_retry_enabled", True)
         )
-        self.transient_max_retries = int(
-            policy.get("transient_max_retries", 3)
-        )
+        self.transient_max_retries = self.MAX_TRANSIENT_RETRIES
         self.transient_initial_delay_seconds = float(
             policy.get("transient_initial_delay_seconds", 2)
         )
@@ -397,15 +391,7 @@ class QuotaController:
                 if not self.enabled:
                     raise
                 self.quota_throttle_count += 1
-                requested_wait = (
-                    float(exc.retry_after_seconds)
-                    if exc.retry_after_seconds is not None
-                    else min(
-                        self.retry_initial_seconds
-                        * (2 ** max(0, self.quota_throttle_count - 1)),
-                        self.retry_max_delay_seconds,
-                    )
-                )
+                requested_wait = self.FIXED_RETRY_INTERVAL_SECONDS
                 remaining_budget = max(
                     0.0,
                     self.max_wait_seconds
@@ -520,10 +506,7 @@ class QuotaController:
                         provider_error=str(exc),
                     )
                     raise
-                delay = min(
-                    self.transient_initial_delay_seconds * (2 ** transient_retries),
-                    self.transient_max_delay_seconds,
-                )
+                delay = self.FIXED_RETRY_INTERVAL_SECONDS
                 transient_retries += 1
                 self.transient_retry_count += 1
                 retry_at = self._now() + dt.timedelta(seconds=delay)

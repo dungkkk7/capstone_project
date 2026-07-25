@@ -1,4 +1,5 @@
 import copy
+import base64
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from experiments.evaluation import (  # noqa: E402
     discover_inputs,
 )
 from experiments.storage import sha256_bytes  # noqa: E402
+import experiments.evaluation as evaluation_module  # noqa: E402
 from fuzzing_equi_check.input_contracts import (  # noqa: E402
     generate_contract_inputs,
     load_contracts,
@@ -151,3 +153,81 @@ def test_discovery_rejects_compiled_binary_instead_of_silent_afl_fallback(
             tmp_path / "discovery",
             config(),
         )
+
+
+def test_discovery_reuses_main_c_candidate_fuzz_flow(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate.c"
+    original = tmp_path / "original.elf"
+    seed = tmp_path / "case.seed"
+    candidate.write_text("int main(void) { return 0; }\n")
+    original.write_bytes(b"\x7fELF")
+    seed.write_bytes(b"7\n")
+    sample = type(
+        "Sample",
+        (),
+        {
+            "sample_id": "p-test",
+            "original_elf_path": str(original),
+        },
+    )()
+    calls = {}
+
+    class FakeFuzzer:
+        def __init__(self, first, second, **kwargs):
+            calls["fuzzer"] = (first, second, kwargs)
+
+    def fake_run(fuzzer, iterations, generator, timeout):
+        calls["run"] = (fuzzer, iterations, generator, timeout)
+        return {
+            "total_runs": 1,
+            "matches": 1,
+            "mismatches": 0,
+            "inconclusive": 0,
+            "tested_payloads": [
+                base64.b64encode(b"main-flow-input\n").decode("ascii")
+            ],
+            "fuzz_config": {
+                "engine": "afl++",
+                "afl_fuzz_seconds": 1.0,
+                "timeout_seconds": 0.5,
+            },
+        }
+
+    generator = object()
+    monkeypatch.setattr(
+        evaluation_module,
+        "_resolve_seed_paths",
+        lambda *_args: ([str(seed)], str(tmp_path)),
+    )
+    monkeypatch.setattr(
+        evaluation_module,
+        "_select_generator",
+        lambda *_args: (generator, "main selected generator"),
+    )
+    monkeypatch.setattr(evaluation_module, "SemanticFuzzer", FakeFuzzer)
+    monkeypatch.setattr(evaluation_module, "_run_fuzzer_sync", fake_run)
+    monkeypatch.setattr(
+        evaluation_module, "resolve_input_contract", lambda *_args, **_kwargs: None
+    )
+
+    discovered = discover_inputs(
+        sample,
+        str(candidate),
+        [],
+        "A0",
+        tmp_path / "discovery",
+        config(),
+    )
+
+    first, second, kwargs = calls["fuzzer"]
+    assert first == str(candidate)
+    assert second == str(original)
+    assert kwargs["seed_paths"] == [str(seed)]
+    assert kwargs["seed_dir"] == str(tmp_path)
+    assert calls["run"][1:] == (100, generator, 0.5)
+    assert len(discovered) == 1
+    payload = evaluation_module.load_json(
+        tmp_path / "discovery" / "fuzz_discovery.json"
+    )
+    assert payload["pipeline"] == "main_llm_recovery_c_candidate"
+    assert payload["reference_path"] == str(original)

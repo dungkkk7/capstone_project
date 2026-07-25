@@ -22,8 +22,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fail_fast": False,
         "require_clean_git": False,
         # Samples are independent, but methods inside one sample remain
-        # ordered. Keep the default conservative for provider quotas.
+        # ordered by default. Raise variant_workers when provider capacity
+        # permits independent variants to run concurrently.
         "sample_workers": 1,
+        "variant_workers": 1,
+        "dispatch_batch_size": 10,
+        "dispatch_interval_seconds": 30,
     },
     "paths": {
         "result_root": "result/experiments",
@@ -54,15 +58,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ),
         "model_spec_verified_date": "2026-07-24",
         "context_safety_margin_tokens": 1024,
-        "transport_retries": 2,
+        "transport_retries": 5,
         "rate_limit": {
             "enabled": True,
-            "max_wait_seconds": 60,
+            # Keep a checkpoint alive for the whole quota window. A rejected
+            # request retries in-place instead of abandoning the task.
+            "max_wait_seconds": 86400,
             "default_retry_after_seconds": 60,
             "retry_initial_seconds": 2,
-            "retry_max_delay_seconds": 60,
+            "retry_max_delay_seconds": 3600,
             "transient_retry_enabled": True,
-            "transient_max_retries": 3,
+            "transient_max_retries": 10,
             "transient_initial_delay_seconds": 2,
             "transient_max_delay_seconds": 30,
         },
@@ -84,7 +90,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fuzz_iterations": 100,
         "fuzz_timeout_sec": 0.5,
         "use_lifting_cache": True,
-        "attach_clean_ir": False,
+        "attach_clean_ir": True,
     },
     "build": {
         "compiler": "/usr/bin/clang-21",
@@ -104,15 +110,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "fuzz": {
         "enabled": True,
-        "seconds_per_method": 60,
-        "target_accepted_inputs": 50,
+        # Every final C candidate follows the same main.py differential-fuzz
+        # path against the original ELF. P0 additionally preserves its five
+        # internal repair/fuzz iterations.
+        "discovery_methods": ["P0", "A0", "B0"],
+        "seconds_per_method": 1,
+        "target_accepted_inputs": 100,
         "max_saved_unique_inputs": 5000,
     },
     "evaluation": {
         "compare_stdout": True,
         "compare_stderr": True,
         "compare_exit_status": True,
-        "per_input_timeout_sec": 2.0,
+        "per_input_timeout_sec": 0.5,
         "min_confirmed_inputs": 50,
         "max_reference_inconclusive_fraction": 0.20,
         "nondeterminism_repeats": 3,
@@ -147,6 +157,9 @@ def config_fingerprint(config: Dict[str, Any]) -> str:
         {key: value for key, value in config.items() if not key.startswith("_")}
     )
     payload.get("experiment", {}).pop("sample_workers", None)
+    payload.get("experiment", {}).pop("variant_workers", None)
+    payload.get("experiment", {}).pop("dispatch_batch_size", None)
+    payload.get("experiment", {}).pop("dispatch_interval_seconds", None)
     return stable_json_sha256(payload)
 
 
@@ -237,6 +250,16 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError("experiment.sample_workers must be an integer") from exc
     if sample_workers < 1:
         raise ConfigError("experiment.sample_workers must be at least 1")
+    try:
+        variant_workers = int(config["experiment"].get("variant_workers", 1))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("experiment.variant_workers must be an integer") from exc
+    if variant_workers < 1:
+        raise ConfigError("experiment.variant_workers must be at least 1")
+    if int(config["experiment"].get("dispatch_batch_size", 10)) < 1:
+        raise ConfigError("experiment.dispatch_batch_size must be at least 1")
+    if float(config["experiment"].get("dispatch_interval_seconds", 30)) < 0:
+        raise ConfigError("experiment.dispatch_interval_seconds may not be negative")
     if int(config["p0"]["max_iterations"]) != 5:
         raise ConfigError("P0 must preserve max_iterations=5")
     if config["representation"]["a0"].get("allow_passes"):
@@ -288,9 +311,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     default_wait = float(
         rate_limit.get("default_retry_after_seconds", 60)
     )
-    if max_wait <= 0 or max_wait > 3600:
+    if max_wait <= 0 or max_wait > 86400:
         raise ConfigError(
-            "llm.rate_limit.max_wait_seconds must be in (0, 3600]"
+            "llm.rate_limit.max_wait_seconds must be in (0, 86400]"
         )
     retry_initial = float(rate_limit.get("retry_initial_seconds", 2))
     retry_max_delay = float(rate_limit.get("retry_max_delay_seconds", 60))

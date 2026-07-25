@@ -267,6 +267,10 @@ class AsymmetricCrashReportTests(unittest.TestCase):
         self.assertEqual(sample["prog1"]["returncode"], -signal.SIGSEGV)
         self.assertEqual(sample["prog1"]["signal"], signal.SIGSEGV)
         self.assertEqual(sample["prog2"]["status"], "success")
+        self.assertEqual(sample["stdin_base64"], "Y3Jhc2gtaW5wdXQK")
+        self.assertEqual(sample["stdin_hex"], self.payload.hex())
+        self.assertEqual(sample["stdin_byte_length"], len(self.payload))
+        self.assertEqual(sample["prog1"]["stderr_byte_length"], 18)
         self.assertIn("asymmetric crash", report["early_stop_reason"])
 
     def test_fallback_fail_fast_accounts_asymmetric_crash_before_cancel(self):

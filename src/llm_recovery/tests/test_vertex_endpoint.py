@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from llm_recovery.llm_recovery import (
+    LLMContextOverflowError,
     LLMRateLimitError,
     RecoveryConfig,
     RecoveryError,
@@ -26,17 +27,17 @@ class VertexEndpointTests(unittest.TestCase):
 
         self.assertEqual(config.model, "gemini-3.5-flash")
         self.assertEqual(config.location, "global")
-        self.assertEqual(config.thinking_level, "HIGH")
+        self.assertEqual(config.thinking_level, "LOW")
         self.assertEqual(
             _vertex_api_base_url(config.location),
             "https://aiplatform.googleapis.com",
         )
 
-    def test_default_generation_config_uses_high_thinking(self):
+    def test_default_generation_config_reserves_budget_for_source(self):
         with patch.dict(os.environ, {}, clear=True):
             generation_config = _vertex_generation_config(RecoveryConfig())
 
-        self.assertEqual(generation_config["thinkingConfig"], {"thinkingLevel": "HIGH"})
+        self.assertEqual(generation_config["thinkingConfig"], {"thinkingLevel": "LOW"})
         self.assertEqual(generation_config["maxOutputTokens"], 65535)
 
     def test_invalid_thinking_level_is_rejected(self):
@@ -136,6 +137,32 @@ class VertexEndpointTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(raised.exception.retry_after_seconds, 3600)
+
+    def test_rest_context_overflow_has_non_retryable_error_type(self):
+        class Response:
+            status_code = 400
+            text = (
+                '{"error":{"code":400,"status":"INVALID_ARGUMENT",'
+                '"message":"The input token count exceeds the maximum '
+                'number of tokens allowed 1048576."}}'
+            )
+            headers = {}
+
+        requests_module = types.SimpleNamespace(
+            post=lambda *args, **kwargs: Response()
+        )
+        client = VertexGemini(
+            RecoveryConfig(project="test-project", use_file_api=False)
+        )
+        with patch.dict(sys.modules, {"requests": requests_module}), patch(
+            "llm_recovery.llm_recovery._load_adc_credentials",
+            return_value={"quota_project_id": "test-project"},
+        ), patch(
+            "llm_recovery.llm_recovery._request_access_token_via_refresh",
+            return_value="token",
+        ):
+            with self.assertRaises(LLMContextOverflowError):
+                client._generate_rest("USER")
 
 
 if __name__ == "__main__":
