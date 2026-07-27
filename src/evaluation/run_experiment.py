@@ -377,6 +377,7 @@ def main():
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Vertex AI model to use")
     parser.add_argument("--no-rotate-regions", action="store_false", dest="rotate_regions", default=True, help="Disable regional endpoints rotation")
     args = parser.parse_args()
+    args.model = args.model.strip()
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
     
