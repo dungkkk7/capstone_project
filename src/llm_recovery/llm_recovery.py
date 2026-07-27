@@ -98,7 +98,10 @@ class RecoveryConfig:
     location: str = field(default_factory=lambda: os.environ.get("VERTEX_LOCATION", "global"))
     max_iterations: int = 5
     fuzz_iterations: int = field(
-        default_factory=lambda: max(1, int(os.environ.get("LLM_RECOVERY_FUZZ_ITERS", "100")))
+        default_factory=lambda: int(os.environ.get(
+            "LLM_RECOVERY_FUZZ_ITERS",
+            str(getattr(_prompts_cfg, "FUZZ_ITERATIONS", 1000))
+        ))
     )
     fuzz_timeout: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_FUZZ_TIMEOUT", "0.1"))
