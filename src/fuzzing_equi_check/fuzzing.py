@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - supports direct CLI execution
 
 DEFAULT_EXECUTION_TIMEOUT = 0.5
 DEFAULT_AFL_FUZZ_SECONDS = 1.0
-DEFAULT_AFL_INITIAL_CORPUS_LIMIT = 10
+DEFAULT_AFL_INITIAL_CORPUS_LIMIT = 1000
 
 # -----------------------------------------------------------------------------
 # Color Definitions for Visual Polish
@@ -1609,7 +1609,7 @@ int main(int argc, char** argv) {
             stats_file = os.path.join(out_dir, "default/fuzzer_stats")
             
             start_time = time.time()
-            max_fuzz_time = float(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "2.0"))
+            max_fuzz_time = float(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "3.0"))
             
             print(
                 f"{Color.BLUE}[*] AFL++ Mutation Hook: Running AFL++ mutation for {max_fuzz_time}s to collect mutated inputs...{Color.END}"
