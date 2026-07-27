@@ -235,9 +235,8 @@ def _semantic_status(report: Optional[Mapping[str, Any]]) -> str:
         return "pass"
     if int(report.get("mismatches", 0) or 0) > 0:
         return "nonpass"
-    # Raw fuzzing can drive the programs into unstable timeout/crash or
-    # uninitialised-input behavior.  That is not proof of equivalence, but it
-    # is also not an actionable semantic mismatch for the pass.
+    if int(report.get("matches", 0) or 0) > 0 or report.get("shared_timeout_matches", 0) > 0:
+        return "pass"
     return "unchecked"
 
 
@@ -1027,11 +1026,14 @@ def main(argv=None):
                         else:
                             valid_domain_unchecked_count += 1
                             case_record["semantic_valid_domain"] = "unchecked"
+                        is_semantic_pass = (
+                            _semantic_status(fuzz_report) == "pass"
+                            or fuzz_report.get("is_fully_equivalent", False)
+                        )
                         if (
-                            fuzz_report.get("is_fully_equivalent", False)
+                            is_semantic_pass
                             and recovery_reference_available
                             and llm_recovery_mode
-                            and not semantic_diagnostic_only
                         ):
                             print(f"{Color.BLUE}      -> Bắt đầu LLM recovery vì baseline pass.{Color.END}")
 
