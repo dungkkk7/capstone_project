@@ -146,6 +146,45 @@ python3 src/main.py data/custom_dataset.csv llm-recovery --mode=<MODE_NAME>
 
 ---
 
+### 🔄 Cơ Chế Feedback & Error Context Trong Vòng Lặp Sửa Lỗi (LLM Repair Loop)
+
+Khi mã C11 do LLM tạo ra ở các bước lặp trước gặp lỗi (biên dịch thất bại hoặc sai ngữ nghĩa khi fuzzing), hệ thống tự động tổng hợp một khối `<VALIDATION_FEEDBACK>` cực kỳ chi tiết gửi lại cho LLM sửa đổi:
+
+#### 1. Các Giới Hạn Dung Lượng Context (Context Limits)
+
+| Thành Phần Context | Dung Lượng Tối Đa (Max Bounds) | Ý Nghĩa / Nội Dung |
+|---|---|---|
+| **`max_feedback_chars`** | **48,000 ký tự** (`48_000`) | Giới hạn dung lượng toàn bộ thông điệp báo lỗi feedback gửi lại cho LLM. |
+| **`max_candidate_chars`** | **160,000 ký tự** (`160_000`) | Giới hạn mã C khôi phục cũ (kèm số dòng) ở lần lặp trước đó. |
+| **Số ví dụ Counterexamples** | **Tối đa 5 ví dụ** (`examples[:5]`) | Chọn tối đa 5 trường hợp sai ngữ nghĩa tiêu biểu nhất từ AFL++ fuzzer. |
+| **Dung lượng Stdin Per Example** | **8,000 chars** (Text) / **12,000 chars** (b64/hex) | Đầu vào Stdin gây lỗi ở 3 định dạng: Raw Text, Base64 và Hexadecimal. |
+
+#### 2. Cấu Trúc Nội Dung Error Feedback Gửi Cho LLM
+
+##### A. Trường hợp Lỗi Biên Dịch (Compiler Error):
+- **Compiler Output**: Toàn bộ thông báo lỗi và cảnh báo từ Clang/GCC (`syntax error`, `missing declaration`, `type mismatch`, `undefined symbol`).
+- **Line-numbered Candidate Source**: Toàn bộ mã C khôi phục cũ được đánh số dòng để LLM dễ dàng định vị dòng bị lỗi.
+
+##### B. Trường hợp Lỗi Sai Ngữ Nghĩa (Fuzzing Semantic Mismatch):
+- **Báo cáo Thống kê**: Số lượt test (`total_runs`), số lượt match (`matches`), số lượt mismatch (`mismatches`), tỷ lệ tương đương (`equivalence_ratio`).
+- **Tối đa 5 Counterexamples chi tiết (`COUNTEREXAMPLE #1..#5`)**:
+  1. **Phân loại lỗi (`class`)**: `crash`, `timeout`, `stdout_mismatch`, `returncode_mismatch`.
+  2. **Lý do lỗi (`reason`)**: Mô tả chi tiết nguyên nhân (ví dụ: `Execution status mismatch: timeout vs success`).
+  3. **Đầu vào Stdin 3 dạng**:
+     - `stdin_text`: Dạng chuỗi UTF-8.
+     - `stdin_base64`: Dạng mã hóa Base64.
+     - `stdin_hex`: Dạng chuỗi Hexadecimal.
+  4. **Đối sánh thực thi (Candidate C vs Reference Original)**:
+     - `candidate`: `status`, `returncode`, `stdout`, `stderr`, `elapsed_ms`.
+     - `reference`: `status`, `returncode`, `stdout`, `stderr`, `elapsed_ms`.
+  5. **Diff từng byte (Byte-level Diff)**:
+     - `stream`: stdout / stderr
+     - `first_differing_byte`: Vị trí offset byte đầu tiên bị sai lệch.
+     - `candidate_byte` vs `reference_byte` (dạng Hex).
+     - `window_hex`: Cửa sổ hex xung quanh vị trí byte lệch để LLM soi chi tiết.
+
+---
+
 ### Phase 5: Differential Fuzzing Verification (AFL++ Mutation Hook)
 
 Bộ xác minh tương đương ngữ nghĩa nằm tại [`src/fuzzing_equi_check/fuzzing.py`](src/fuzzing_equi_check/fuzzing.py):
