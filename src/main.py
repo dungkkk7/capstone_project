@@ -816,10 +816,7 @@ def main(argv=None):
                         else:
                             native_contract_unchecked_count += 1
                             case_record["finalization"] = "verifier_unavailable"
-                        print(
-                            f"{Color.RED}    [✗] Final IR không qua verifier-only "
-                            f"native contract: {final_ir}{Color.END}"
-                        )
+                        # Disabled verifier-only warning print as requested
                         output_class = (
                             final_report.get("output_class")
                             if final_report else None
