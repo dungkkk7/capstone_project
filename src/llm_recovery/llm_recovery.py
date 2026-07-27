@@ -2704,7 +2704,7 @@ def _format_fuzz_feedback(
             + _diagnostic_text(report.get("early_stop_reason"), 1000)
         )
     examples = report.get("mismatch_examples") or []
-    for sample in examples[:5]:
+    for sample in examples[:7]:
         left = sample.get("prog1", {})
         right = sample.get("prog2", {})
         lines.extend(

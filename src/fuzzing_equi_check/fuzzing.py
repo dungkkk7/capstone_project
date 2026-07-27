@@ -989,7 +989,7 @@ def account_differential_result(report: Dict[str, Any],
         return
 
     report["mismatches"] += 1
-    if len(report["mismatch_examples"]) >= 5:
+    if len(report["mismatch_examples"]) >= 7:
         return
     stdin_data = result["stdin"]
     try:
