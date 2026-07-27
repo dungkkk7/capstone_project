@@ -921,7 +921,7 @@ def main(argv=None):
                             )
                             return _run_fuzzer_sync(
                                 fuzzer,
-                                iterations=100,
+                                iterations=1000,
                                 generator=generator,
                                 timeout=DEFAULT_EXECUTION_TIMEOUT,
                             )

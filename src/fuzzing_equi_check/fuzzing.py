@@ -1600,29 +1600,51 @@ int main(int argc, char** argv) {
             fuzz_env["AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"] = "1"
             fuzz_env["AFL_PATH"] = self.afl_path
             
-            print(
-                f"{Color.BLUE}[*] Running AFL++ for {fuzz_time} seconds to generate inputs "
-                f"(per-input timeout vẫn là {timeout}s, chạy mặc định bằng {timeout}s)...{Color.END}"
-            )
-            subprocess.run(cmd_fuzz, env=fuzz_env, capture_output=True)
+            # 4. Run AFL++ with live mutation hook loop until requested iterations (1000) are collected
+            proc_fuzz = subprocess.Popen(cmd_fuzz, env=fuzz_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # 5. Gather generated inputs
             generated_inputs = []
+            seen = set()
             queue_dir = os.path.join(out_dir, "default/queue")
             crashes_dir = os.path.join(out_dir, "default/crashes")
             hangs_dir = os.path.join(out_dir, "default/hangs")
             
-            for d in [queue_dir, crashes_dir, hangs_dir]:
-                if os.path.exists(d):
-                    for filename in os.listdir(d):
-                        filepath = os.path.join(d, filename)
-                        if os.path.isfile(filepath) and not filename.startswith("."):
-                            try:
-                                with open(filepath, "rb") as f:
-                                    generated_inputs.append(f.read())
-                            except Exception:
-                                pass
-                                
+            start_time = time.time()
+            max_fuzz_time = int(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "180"))
+            
+            print(
+                f"{Color.BLUE}[*] AFL++ Mutation Hook: Polling AFL++ queue to generate {iterations} mutated inputs "
+                f"(max timeout {max_fuzz_time}s)...{Color.END}"
+            )
+            
+            while len(generated_inputs) < iterations:
+                for d in [queue_dir, crashes_dir, hangs_dir]:
+                    if os.path.exists(d):
+                        for filename in os.listdir(d):
+                            if filename.startswith("."):
+                                continue
+                            filepath = os.path.join(d, filename)
+                            if os.path.isfile(filepath):
+                                try:
+                                    with open(filepath, "rb") as f:
+                                        content = f.read()
+                                        if content not in seen:
+                                            seen.add(content)
+                                            generated_inputs.append(content)
+                                except Exception:
+                                    pass
+                if len(generated_inputs) >= iterations:
+                    break
+                if time.time() - start_time > max_fuzz_time:
+                    break
+                time.sleep(0.2)
+                
+            proc_fuzz.terminate()
+            try:
+                proc_fuzz.wait(timeout=2)
+            except Exception:
+                proc_fuzz.kill()
+                
             if not generated_inputs:
                 print(f"{Color.YELLOW}[!] AFL++ did not generate inputs. Using seeds.{Color.END}")
                 for filename in os.listdir(seeds_dir):
@@ -1630,26 +1652,19 @@ int main(int argc, char** argv) {
                     if os.path.isfile(filepath):
                         try:
                             with open(filepath, "rb") as f:
-                                generated_inputs.append(f.read())
+                                content = f.read()
+                                if content not in seen:
+                                    seen.add(content)
+                                    generated_inputs.append(content)
                         except Exception:
                             pass
                             
-            # Deduplicate inputs
-            unique_inputs = []
-            seen = set()
-            for inp in generated_inputs:
-                if inp not in seen:
-                    seen.add(inp)
-                    unique_inputs.append(inp)
-            generated_inputs = unique_inputs
             afl_candidate_count = len(generated_inputs)
             afl_accepted_count = 0
-            afl_stage_input_count = 0
+            afl_stage_input_count = len(generated_inputs)
             contract_supplement_count = 0
 
-            # Preserve the old AFL++ coverage-guided pipeline, but discard byte
-            # mutations that no longer look like any valid input seed. Exact
-            # seeds are always tested first.
+            # Preserve AFL++ contract filtering if enabled
             afl_filter_stats = None
             if input_contract is not None:
                 compatible_inputs = []
@@ -1683,82 +1698,9 @@ int main(int argc, char** argv) {
                     f"{len(compatible_inputs)}/{candidate_count} AFL++ candidate(s); "
                     f"rejected {len(rejected_inputs)} malformed mutation(s).{Color.END}"
                 )
-            elif afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
-                compatible_inputs = []
-                rejected_inputs = []
-                for payload in generated_inputs:
-                    reasons = [seed_shape_rejection_reason(payload, seed) for seed in afl_seed_inputs]
-                    if any(reason is None for reason in reasons):
-                        compatible_inputs.append(payload)
-                    else:
-                        rejected_inputs.append((payload, reasons[0] or "unknown"))
-                generated_inputs = _dedupe_bytes(afl_seed_inputs + compatible_inputs)
-                afl_filter_stats = {
-                    "enabled": True,
-                    "candidate_count": len(generated_inputs),
-                    "accepted_count": len(compatible_inputs),
-                    "rejected_count": len(rejected_inputs),
-                    "rejected_examples": [],
-                }
 
-            # Inputs present at this point came from the AFL++ stage (including
-            # the valid initial corpus). Anything appended below is an explicit
-            # contract-guided supplement used to reach -n/--iterations.
-            afl_stage_input_count = len(generated_inputs)
-            
-            # Supplement with random generator inputs if AFL++ generated fewer than requested iterations
-            if len(generated_inputs) < iterations:
-                if input_contract is not None:
-                    supplement, supplement_stats = generate_contract_inputs(
-                        input_contract,
-                        afl_seed_inputs,
-                        iterations,
-                    )
-                    generated_inputs = _dedupe_bytes(generated_inputs + supplement)
-                    if contract_corpus_stats is None:
-                        contract_corpus_stats = supplement_stats
-                elif afl_seed_inputs and seed_mutation_mode in {"structured", "local", "safe"}:
-                    generated_inputs = _dedupe_bytes(
-                        generated_inputs + generate_structured_seed_inputs(afl_seed_inputs, iterations)
-                    )
-                    # This path is mainly for contracts without a seed file.
-                    # Even generator-produced candidates must pass the same
-                    # contract before reaching differential execution.
-                    attempts = 0
-                    while len(generated_inputs) < iterations and attempts < iterations * 20:
-                        attempts += 1
-                        args, stdin_data = generator()
-                        payload = (
-                            "\n".join(args).encode("utf-8")
-                            if uses_argv else stdin_data
-                        )
-                        if not payload:
-                            continue
-                        valid, _ = validate_contract_payload(
-                            input_contract, payload, afl_seed_inputs
-                        )
-                        if valid and payload not in generated_inputs:
-                            generated_inputs.append(payload)
-                else:
-                    needed = iterations - len(generated_inputs)
-                    for _ in range(needed):
-                        args, stdin_data = generator()
-                        if uses_argv:
-                            payload = "\n".join(args).encode('utf-8')
-                        else:
-                            payload = stdin_data
-                        if not payload:
-                            payload = b"0"
-                        if payload not in seen:
-                            seen.add(payload)
-                            generated_inputs.append(payload)
-
-            contract_supplement_count = max(
-                0, len(generated_inputs) - afl_stage_input_count
-            )
-            
             total_inputs = len(generated_inputs)
-            run_inputs = generated_inputs
+            run_inputs = generated_inputs[:iterations]
             
             # Try to read AFL++ fuzzer stats
             afl_stats = {}
@@ -2010,7 +1952,7 @@ def main():
     parser = argparse.ArgumentParser(description="Differential semantic fuzzer comparing compiled IR / C sources.")
     parser.add_argument("-f1", "--file1", required=True, help="First program file path (.c, .ll, .bc, or compiled binary)")
     parser.add_argument("-f2", "--file2", required=True, help="Second program file path (.c, .ll, .bc, or compiled binary)")
-    parser.add_argument("-n", "--iterations", type=int, default=100, help="Number of fuzz iterations (default: 100)")
+    parser.add_argument("-n", "--iterations", type=int, default=1000, help="Number of fuzz iterations (default: 1000)")
     parser.add_argument(
         "-t", "--timeout", type=float, default=DEFAULT_EXECUTION_TIMEOUT,
         help=f"Hard timeout for each binary execution in seconds (default: {DEFAULT_EXECUTION_TIMEOUT})",
