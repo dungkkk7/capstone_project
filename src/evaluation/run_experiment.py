@@ -186,7 +186,7 @@ def run_fuzzing_tracked(candidate_path: str, ref_binary: str, contract: Any, gen
         fuzzer.cleanup()
         tracker.fuzzing_time += (time.time() - t_start)
 
-def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int) -> CaseTracker:
+def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str) -> CaseTracker:
     tracker = CaseTracker(sample_id, flow_id)
     t_start = time.time()
     
@@ -195,7 +195,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
     
     config = RecoveryConfig()
     config.fuzz_iterations = iterations
-    config.model = "gemini-3.5-flash"
+    config.model = model
     
     # Configure flow modes
     if flow_id == "F1":
@@ -303,7 +303,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
             
     return tracker
 
-def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict) -> CaseTracker:
+def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str) -> CaseTracker:
     try:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
         from main import _select_generator, _resolve_seed_paths
@@ -325,7 +325,8 @@ def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str,
             generator=generator,
             seeds=seed_paths,
             case_output_dir=case_output_dir,
-            iterations=iterations
+            iterations=iterations,
+            model=model
         )
         tracker.reduction = reduction_metrics
         print(f"[✓] Completed Flow {flow_id} for {sample_id} in {tracker.total_runtime:.1f}s", flush=True)
@@ -343,6 +344,7 @@ def main():
     parser.add_argument("--pilot", type=int, default=None, help="Number of pilot cases to run")
     parser.add_argument("--fuzz-iterations", type=int, default=1000, help="Number of fuzz iterations")
     parser.add_argument("--max-workers", type=int, default=15, help="Max parallel flows running simultaneously")
+    parser.add_argument("--model", type=str, default="gemini-3.5-flash", help="Vertex AI model to use")
     args = parser.parse_args()
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -357,7 +359,7 @@ def main():
     if args.pilot:
         rows = rows[:args.pilot]
         
-    print(f"[*] Running concurrent evaluation on {len(rows)} cases with max_workers={args.max_workers}...", flush=True)
+    print(f"[*] Running concurrent evaluation on {len(rows)} cases with model={args.model} and max_workers={args.max_workers}...", flush=True)
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"experiment_{timestamp}"
@@ -400,7 +402,7 @@ def main():
         
         # Add to the queue
         for flow in ["F1", "F2", "F3", "F4", "F5"]:
-            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics))
+            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model))
             
     print(f"[*] Total flow tasks generated: {len(tasks_to_run)}. Launching parallel executor pool...", flush=True)
     
