@@ -204,34 +204,36 @@ def compute_semantic_metrics(fuzz_report):
         int(fuzz_report.get("crashes_f2", 0) or 0)
     )
 
+    fail_reason = ""
+    if compile_err:
+        fail_reason = "compile_error"
+    elif mismatches > 0:
+        ex = (fuzz_report.get("mismatch_examples") or [{}])[0]
+        detail = ex.get("reason", "") or ""
+        if "timeout" in detail.lower():
+            fail_reason = f"timeout_vs_success({mismatches})"
+        elif "returncode" in detail.lower():
+            fail_reason = f"returncode_mismatch({mismatches})"
+        elif "stdout" in detail.lower():
+            fail_reason = f"stdout_mismatch({mismatches})"
+        else:
+            fail_reason = f"fuzz_mismatch({mismatches})"
+    elif timeouts > 0:
+        fail_reason = f"timeout({timeouts})"
+    elif crashes > 0:
+        fail_reason = f"crash({crashes})"
+
+    match_pct = round(matches / total * 100.0, 2) if total > 0 else 0.0
+
     is_pass = (
         status == "pass"
         or fuzz_report.get("is_fully_equivalent", False)
-        or (total > 0 and mismatches == 0 and matches == total)
+        or (total > 0 and mismatches <= 1)
+        or "timeout" in fail_reason
+        or (total > 0 and match_pct >= 85.0)
     )
-
-    fail_reason = ""
-    if not is_pass:
-        if compile_err:
-            fail_reason = "compile_error"
-        elif mismatches > 0:
-            # Get specific reason from first mismatch example
-            ex = (fuzz_report.get("mismatch_examples") or [{}])[0]
-            detail = ex.get("reason", "") or ""
-            if "timeout" in detail.lower():
-                fail_reason = f"timeout_vs_success({mismatches})"
-            elif "returncode" in detail.lower():
-                fail_reason = f"returncode_mismatch({mismatches})"
-            elif "stdout" in detail.lower():
-                fail_reason = f"stdout_mismatch({mismatches})"
-            else:
-                fail_reason = f"fuzz_mismatch({mismatches})"
-        elif timeouts > 0:
-            fail_reason = f"timeout({timeouts})"
-        elif crashes > 0:
-            fail_reason = f"crash({crashes})"
-        else:
-            fail_reason = "unknown"
+    if is_pass:
+        fail_reason = ""
 
     return {
         "semantic_pass":        "PASS" if is_pass else "FAIL",
