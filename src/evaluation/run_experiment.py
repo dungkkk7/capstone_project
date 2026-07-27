@@ -41,6 +41,20 @@ from fuzzing_equi_check.input_contracts import (
     validate_contract_payload,
 )
 
+# Supported Vertex AI regions for Gemini models
+VERTEX_GEMINI_REGIONS = [
+    "us-central1",
+    "us-east4",
+    "us-west1",
+    "us-west4",
+    "europe-west1",
+    "europe-west3",
+    "europe-west4",
+    "europe-west9",
+    "asia-northeast1",
+    "asia-southeast1"
+]
+
 # Custom VertexGemini client to intercept metrics
 class ExperimentVertexGemini(VertexGemini):
     def __init__(self, config: RecoveryConfig, tracker: "CaseTracker"):
@@ -186,7 +200,7 @@ def run_fuzzing_tracked(candidate_path: str, ref_binary: str, contract: Any, gen
         fuzzer.cleanup()
         tracker.fuzzing_time += (time.time() - t_start)
 
-def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str) -> CaseTracker:
+def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str, location: str) -> CaseTracker:
     tracker = CaseTracker(sample_id, flow_id)
     t_start = time.time()
     
@@ -196,6 +210,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
     config = RecoveryConfig()
     config.fuzz_iterations = iterations
     config.model = model
+    config.location = location  # Round-robin assigned region to distribute quota load
     
     # Configure flow modes
     if flow_id == "F1":
@@ -289,7 +304,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
             tracker.status = "INCONCLUSIVE"
             
     except Exception as exc:
-        print(f"Error executing flow {flow_id} on {sample_id}: {exc}")
+        print(f"Error executing flow {flow_id} on {sample_id} ({location}): {exc}")
         traceback.print_exc()
         tracker.status = "INCONCLUSIVE"
     finally:
@@ -303,7 +318,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
             
     return tracker
 
-def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str) -> CaseTracker:
+def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str, location: str) -> CaseTracker:
     try:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
         from main import _select_generator, _resolve_seed_paths
@@ -313,7 +328,7 @@ def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str,
         seed_paths, _ = _resolve_seed_paths(project_root, original_binary)
         contract = resolve_input_contract(project_root, original_binary, only_custom=True)
         
-        print(f"[*] Starting concurrent Flow {flow_id} for {sample_id}...", flush=True)
+        print(f"[*] Starting concurrent Flow {flow_id} for {sample_id} using region [{location}]...", flush=True)
         tracker = run_flow_experiment(
             sample_id=sample_id,
             flow_id=flow_id,
@@ -326,7 +341,8 @@ def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str,
             seeds=seed_paths,
             case_output_dir=case_output_dir,
             iterations=iterations,
-            model=model
+            model=model,
+            location=location
         )
         tracker.reduction = reduction_metrics
         print(f"[✓] Completed Flow {flow_id} for {sample_id} in {tracker.total_runtime:.1f}s", flush=True)
@@ -345,6 +361,7 @@ def main():
     parser.add_argument("--fuzz-iterations", type=int, default=1000, help="Number of fuzz iterations")
     parser.add_argument("--max-workers", type=int, default=15, help="Max parallel flows running simultaneously")
     parser.add_argument("--model", type=str, default="gemini-3.5-flash", help="Vertex AI model to use")
+    parser.add_argument("--rotate-regions", action="store_true", help="Rotate regional endpoints to bypass TPM rate limits")
     args = parser.parse_args()
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -360,6 +377,8 @@ def main():
         rows = rows[:args.pilot]
         
     print(f"[*] Running concurrent evaluation on {len(rows)} cases with model={args.model} and max_workers={args.max_workers}...", flush=True)
+    if args.rotate_regions or os.environ.get("VERTEX_ROTATE_REGIONS"):
+        print(f"[✓] Region rotation enabled. Distributing requests across: {', '.join(VERTEX_GEMINI_REGIONS)}")
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"experiment_{timestamp}"
@@ -370,6 +389,7 @@ def main():
     # Pre-lift and pre-brighten all cases to collect paths & reduction metrics sequentially first
     tasks_to_run = []
     
+    task_idx = 0
     for idx, row in enumerate(rows, 1):
         binary = row["obfuscated_binary"]
         sample_id = os.path.basename(os.path.dirname(binary))
@@ -402,7 +422,14 @@ def main():
         
         # Add to the queue
         for flow in ["F1", "F2", "F3", "F4", "F5"]:
-            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model))
+            # Determine location dynamically
+            if args.rotate_regions or os.environ.get("VERTEX_ROTATE_REGIONS"):
+                location = VERTEX_GEMINI_REGIONS[task_idx % len(VERTEX_GEMINI_REGIONS)]
+            else:
+                location = os.environ.get("VERTEX_LOCATION", "global")
+            
+            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model, location))
+            task_idx += 1
             
     print(f"[*] Total flow tasks generated: {len(tasks_to_run)}. Launching parallel executor pool...", flush=True)
     
