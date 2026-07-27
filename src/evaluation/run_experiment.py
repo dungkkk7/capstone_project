@@ -45,11 +45,7 @@ from fuzzing_equi_check.input_contracts import (
 VERTEX_GEMINI_REGIONS = [
     "us-central1",
     "us-east4",
-    "us-west1",
-    "us-west4",
-    "europe-west1",
     "europe-west3",
-    "europe-west4",
     "europe-west9",
     "asia-northeast1",
     "asia-southeast1"
