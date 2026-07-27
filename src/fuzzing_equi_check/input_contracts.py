@@ -2101,7 +2101,8 @@ def _mutate_numeric(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
         low = int(contract.get("constraints", {}).get("min", max(-1000000, value - 1000000)))
         high = int(contract.get("constraints", {}).get("max", min(1000000, value + 1000000)))
         if low <= high:
-            replacements.append(str(random.randint(low, high)).encode())
+            for _ in range(10):
+                replacements.append(str(random.randint(low, high)).encode())
     elif _FLOAT_RE.fullmatch(match.group(0)):
         value = float(match.group(0))
         low = float(contract.get("constraints", {}).get("min", -1000000.0))
@@ -2147,6 +2148,24 @@ def _mutate_payload(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
         row = lines[row_index]
         lines[row_index] = row[:col_index] + replacement + row[col_index + 1 :]
         return ("\n".join(lines) + "\n").encode()
+    if kind == "encoded_line_stream":
+        lines = seed.splitlines(keepends=True)
+        op = random.choice(["mutate_char", "mutate_num", "add_line"])
+        if op == "add_line":
+            new_val = str(random.randint(0, 100000)).encode() + b"\n"
+            idx = random.randint(0, len(lines))
+            lines.insert(idx, new_val)
+            return b"".join(lines)
+        if op == "mutate_char" and lines:
+            line_idx = random.randrange(len(lines))
+            line = lines[line_idx]
+            if line:
+                char_idx = random.randrange(len(line))
+                if line[char_idx:char_idx+1] != b"\n":
+                    new_char = bytes([random.randint(32, 126)])
+                    lines[line_idx] = line[:char_idx] + new_char + line[char_idx+1:]
+                    return b"".join(lines)
+        return _mutate_characters(seed, contract)
     if kind in {
         "layered_grid_block",
         "triangular_string_matrix",
@@ -2154,7 +2173,6 @@ def _mutate_payload(seed: bytes, contract: Dict[str, Any]) -> Optional[bytes]:
         "word_batches",
         "word_pair_cases",
         "named_edge_query_batches",
-        "encoded_line_stream",
     } or any(
         marker in mutation for marker in ("cells_only", "characters_only", "strings_only", "names_and_counts", "alphabet_only", "token_value_only")
     ):
@@ -2653,17 +2671,20 @@ def _generate_contract_inputs_impl(
 
     attempts = 0
     max_attempts = max(100, iterations * 100)
-    while len(accepted) < iterations and seeds and attempts < max_attempts:
+    pool = list(accepted or seeds)
+    while len(accepted) < iterations and pool and attempts < max_attempts:
         attempts += 1
         candidate = _random_valid_payload(contract)
         if candidate is None:
-            seed = random.choice(seeds)
+            seed = random.choice(pool)
             candidate = _mutate_payload(seed, contract)
         if not candidate or candidate in accepted:
             continue
         valid, _ = validate_contract_payload(contract, candidate, seeds)
         if valid:
             accepted.append(candidate)
+            if len(pool) < 2000:
+                pool.append(candidate)
         else:
             rejected += 1
     return accepted[:iterations], {"accepted": len(accepted), "rejected": rejected}
