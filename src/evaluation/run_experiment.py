@@ -134,6 +134,65 @@ class CaseTracker:
         
         self.reduction = {}
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "sample_id": self.sample_id,
+            "flow_id": self.flow_id,
+            "llm_calls": self.llm_calls,
+            "compiler_attempts": self.compiler_attempts,
+            "behavioral_repairs": self.behavioral_repairs,
+            "first_candidate": self.first_candidate,
+            "final_candidate": self.final_candidate,
+            "compile_success_first": self.compile_success_first,
+            "compile_success_final": self.compile_success_final,
+            "compile_repair_rounds": self.compile_repair_rounds,
+            "behavioral_repair_rounds": self.behavioral_repair_rounds,
+            "fuzz_total": self.fuzz_total,
+            "fuzz_valid": self.fuzz_valid,
+            "fuzz_matches": self.fuzz_matches,
+            "has_counterexample": self.has_counterexample,
+            "counterexample_reproducible": self.counterexample_reproducible,
+            "behavior_before_repair": self.behavior_before_repair,
+            "behavior_after_repair": self.behavior_after_repair,
+            "status": self.status,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "llm_latency": self.llm_latency,
+            "compile_time": self.compile_time,
+            "fuzzing_time": self.fuzzing_time,
+            "total_runtime": self.total_runtime,
+            "reduction": self.reduction
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CaseTracker":
+        tracker = cls(data["sample_id"], data["flow_id"])
+        tracker.llm_calls = data.get("llm_calls", 0)
+        tracker.compiler_attempts = data.get("compiler_attempts", 0)
+        tracker.behavioral_repairs = data.get("behavioral_repairs", 0)
+        tracker.first_candidate = data.get("first_candidate", "")
+        tracker.final_candidate = data.get("final_candidate", "")
+        tracker.compile_success_first = data.get("compile_success_first", False)
+        tracker.compile_success_final = data.get("compile_success_final", False)
+        tracker.compile_repair_rounds = data.get("compile_repair_rounds", 0)
+        tracker.behavioral_repair_rounds = data.get("behavioral_repair_rounds", 0)
+        tracker.fuzz_total = data.get("fuzz_total", 0)
+        tracker.fuzz_valid = data.get("fuzz_valid", 0)
+        tracker.fuzz_matches = data.get("fuzz_matches", 0)
+        tracker.has_counterexample = data.get("has_counterexample", False)
+        tracker.counterexample_reproducible = data.get("counterexample_reproducible", False)
+        tracker.behavior_before_repair = data.get("behavior_before_repair", "")
+        tracker.behavior_after_repair = data.get("behavior_after_repair", "")
+        tracker.status = data.get("status", "INCONCLUSIVE")
+        tracker.input_tokens = data.get("input_tokens", 0)
+        tracker.output_tokens = data.get("output_tokens", 0)
+        tracker.llm_latency = data.get("llm_latency", 0.0)
+        tracker.compile_time = data.get("compile_time", 0.0)
+        tracker.fuzzing_time = data.get("fuzzing_time", 0.0)
+        tracker.total_runtime = data.get("total_runtime", 0.0)
+        tracker.reduction = data.get("reduction", {})
+        return tracker
+
 def run_deobfuscation_metrics(raw_ir: str, clean_ir: str) -> Dict[str, Any]:
     """Calculate deobfuscation stats between raw and clean IR."""
     metrics = {"instruction_raw": 0, "instruction_clean": 0, "bb_raw": 0, "bb_clean": 0, "branches_raw": 0, "branches_clean": 0}
@@ -330,6 +389,13 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         if last_fuzz_report:
             tracker.behavior_after_repair = f"matches={last_fuzz_report.get('matches')}, mismatches={last_fuzz_report.get('mismatches')}"
             
+        # Save flow result json for resume mechanism support
+        try:
+            with open(os.path.join(flow_dir, "flow_result.json"), "w") as rf:
+                json.dump(tracker.to_dict(), rf, indent=2)
+        except Exception as write_err:
+            print(f"[!] Warning: failed to save flow_result.json for resume: {write_err}")
+            
     return tracker
 
 def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str, location: str) -> CaseTracker:
@@ -376,6 +442,7 @@ def main():
     parser.add_argument("--max-workers", type=int, default=15, help="Max parallel flows running simultaneously")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Vertex AI model to use")
     parser.add_argument("--no-rotate-regions", action="store_false", dest="rotate_regions", default=True, help="Disable regional endpoints rotation")
+    parser.add_argument("--resume", type=str, default=None, help="Campaign directory name to resume (e.g. eval_20260728_043618)")
     args = parser.parse_args()
     args.model = args.model.strip()
 
@@ -400,7 +467,15 @@ def main():
     if rotate_enabled:
         print(f"[✓] Region rotation enabled by default. Distributing requests across: {', '.join(VERTEX_GEMINI_REGIONS)}")
     
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Campaign settings
+    if args.resume:
+        campaign_id = args.resume.strip()
+        timestamp = campaign_id.replace("eval_", "")
+        print(f"[✓] Resuming existing campaign: {campaign_id}", flush=True)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        campaign_id = f"eval_{timestamp}"
+        
     experiment_id = f"experiment_{timestamp}"
     reports_dir = os.path.join(project_root, "reports", experiment_id)
     os.makedirs(reports_dir, exist_ok=True)
@@ -408,40 +483,65 @@ def main():
     
     # Pre-lift and pre-brighten all cases to collect paths & reduction metrics sequentially first
     tasks_to_run = []
+    all_trackers = []
     
     task_idx = 0
     for idx, row in enumerate(rows, 1):
         binary = row["obfuscated_binary"]
         sample_id = os.path.basename(os.path.dirname(binary))
-        print(f"[*] Preparing Case {idx}/{len(rows)}: {sample_id}...", flush=True)
         
         binary_abs = os.path.join(project_root, binary)
-        case_output_dir = os.path.join(project_root, "result", f"eval_{timestamp}", sample_id)
-        os.makedirs(case_output_dir, exist_ok=True)
+        case_output_dir = os.path.join(project_root, "result", campaign_id, sample_id)
         
-        # Lift & Brighten case
-        output_bc = os.path.join(case_output_dir, f"{sample_id}.bc")
-        lift_success = lift_binary(binary_path=binary_abs, output=output_bc, use_cache=True, force_relift=False)
-        if not lift_success:
-            print(f"[✗] Lifting failed for {sample_id}", flush=True)
-            continue
-            
-        output_brightened_bc = os.path.join(case_output_dir, f"{sample_id}_brightened.bc")
-        brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=binary_abs)
-        if not brighten_success:
-            print(f"[✗] Brightening failed for {sample_id}", flush=True)
-            continue
-            
+        # If resume, check if we need to do anything for this sample
+        # We need raw_ir, clean_ir and ref_binary. If they exist we don't lift again.
         raw_ir = os.path.join(case_output_dir, f"{sample_id}.ll")
         clean_ir = os.path.join(case_output_dir, f"{sample_id}_brightened.ll")
-        
         ref_binary = os.path.join(case_output_dir, f"{sample_id}_final_ref.bin")
-        compile_to_binary(clean_ir, ref_binary)
         
+        # Check how many flows are already completed
+        flows_needed = []
+        for flow in ["F1", "F2", "F3", "F4", "F5"]:
+            flow_result_path = os.path.join(case_output_dir, flow, "flow_result.json")
+            if os.path.exists(flow_result_path):
+                try:
+                    with open(flow_result_path, "r") as rf:
+                        flow_data = json.load(rf)
+                        tracker = CaseTracker.from_dict(flow_data)
+                        all_trackers.append(tracker)
+                except Exception as load_err:
+                    print(f"[!] Failed to load previous result for {sample_id} {flow}, rescheduling: {load_err}")
+                    flows_needed.append(flow)
+            else:
+                flows_needed.append(flow)
+                
+        if not flows_needed:
+            print(f"[✓] Case {idx}/{len(rows)}: {sample_id} already fully evaluated. Skipping...", flush=True)
+            continue
+            
+        print(f"[*] Preparing Case {idx}/{len(rows)}: {sample_id} (Evaluating flows: {', '.join(flows_needed)})...", flush=True)
+        os.makedirs(case_output_dir, exist_ok=True)
+        
+        # Lift & Brighten case (if clean_ir or ref_binary doesn't exist)
+        if not os.path.exists(clean_ir) or not os.path.exists(ref_binary):
+            output_bc = os.path.join(case_output_dir, f"{sample_id}.bc")
+            lift_success = lift_binary(binary_path=binary_abs, output=output_bc, use_cache=True, force_relift=False)
+            if not lift_success:
+                print(f"[✗] Lifting failed for {sample_id}", flush=True)
+                continue
+                
+            output_brightened_bc = os.path.join(case_output_dir, f"{sample_id}_brightened.bc")
+            brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=binary_abs)
+            if not brighten_success:
+                print(f"[✗] Brightening failed for {sample_id}", flush=True)
+                continue
+                
+            compile_to_binary(clean_ir, ref_binary)
+            
         reduction_metrics = run_deobfuscation_metrics(raw_ir, clean_ir)
         
-        # Add to the queue
-        for flow in ["F1", "F2", "F3", "F4", "F5"]:
+        # Add the remaining incomplete flows to the queue
+        for flow in flows_needed:
             # Determine location dynamically
             if rotate_enabled:
                 location = VERTEX_GEMINI_REGIONS[task_idx % len(VERTEX_GEMINI_REGIONS)]
@@ -451,30 +551,31 @@ def main():
             tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model, location))
             task_idx += 1
             
-    print(f"[*] Total flow tasks generated: {len(tasks_to_run)}. Launching parallel executor pool...", flush=True)
-    
-    all_trackers = []
-    # Submit all tasks to the ProcessPoolExecutor
-    try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
-            futures = {
-                executor.submit(flow_worker, *task): task for task in tasks_to_run
-            }
-            
-            for future in concurrent.futures.as_completed(futures):
-                task_info = futures[future]
-                sample_id, flow_id = task_info[0], task_info[1]
-                try:
-                    tracker = future.result()
-                    if tracker:
-                        all_trackers.append(tracker)
-                except Exception as exc:
-                    print(f"[✗] Future task {flow_id} of {sample_id} generated an exception: {exc}", flush=True)
-    except KeyboardInterrupt:
-        print("\n[!] Ctrl+C detected! Instantly terminating all concurrent worker processes...", flush=True)
-        import signal
-        os.killpg(os.getpgrp(), signal.SIGKILL)
-        sys.exit(1)
+    if tasks_to_run:
+        print(f"[*] Remaining flow tasks to run: {len(tasks_to_run)}. Launching parallel executor pool...", flush=True)
+        # Submit all tasks to the ProcessPoolExecutor
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+                futures = {
+                    executor.submit(flow_worker, *task): task for task in tasks_to_run
+                }
+                
+                for future in concurrent.futures.as_completed(futures):
+                    task_info = futures[future]
+                    sample_id, flow_id = task_info[0], task_info[1]
+                    try:
+                        tracker = future.result()
+                        if tracker:
+                            all_trackers.append(tracker)
+                    except Exception as exc:
+                        print(f"[✗] Future task {flow_id} of {sample_id} generated an exception: {exc}", flush=True)
+        except KeyboardInterrupt:
+            print("\n[!] Ctrl+C detected! Instantly terminating all concurrent worker processes...", flush=True)
+            import os, signal
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+            sys.exit(1)
+    else:
+        print("[✓] All tasks in the dataset are already completed. Regenerating reports...", flush=True)
                 
     # Export metrics CSVs
     export_metrics_csvs(all_trackers, reports_dir, experiment_id)
