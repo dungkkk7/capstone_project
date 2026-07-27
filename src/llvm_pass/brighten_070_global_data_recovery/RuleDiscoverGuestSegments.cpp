@@ -5,6 +5,7 @@
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <cctype>
 #include <cstring>
@@ -169,6 +170,106 @@ bool BrightenGlobalDataRecoveryPass::DiscoverGuestSegments(
 
     ++Count;
     Ctx.Segments.push_back(std::move(Seg));
+  }
+
+  // The loader maps PT_LOAD ranges at page granularity.  Do not infer this
+  // from a segment name or alignment: the Python driver serializes the ELF
+  // program headers as !brighten.elf.pt_loads, and CLI/no-ELF inputs simply
+  // have no such metadata.  A separate byte region preserves the logical
+  // object boundary while making the proven zero page tail available to the
+  // same guest-address map as the source load segment.
+  bool HasValidatedPTLoadPartition = false;
+  if (NamedMDNode *Loads = M.getNamedMetadata("brighten.elf.pt_loads")) {
+    SmallVector<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>, 8> Tails;
+    bool Malformed = false;
+    for (MDNode *N : Loads->operands()) {
+      if (!N || N->getNumOperands() != 7) { Malformed = true; break; }
+      uint64_t V[7] = {};
+      for (unsigned I = 0; I != 7; ++I) {
+        auto *CM = dyn_cast<ConstantAsMetadata>(N->getOperand(I));
+        auto *CI = CM ? dyn_cast<ConstantInt>(CM->getValue()) : nullptr;
+        if (!CI || !CI->getType()->isIntegerTy(64)) { Malformed = true; break; }
+        V[I] = CI->getZExtValue();
+      }
+      if (Malformed || !V[2] || V[1] > V[2] || V[0] > UINT64_MAX - V[2] ||
+          V[6] <= V[0] + V[2] || V[6] - (V[0] + V[2]) > UINT32_MAX) {
+        Malformed = true; break;
+      }
+      Tails.emplace_back(V[0], V[0] + V[2], V[6], V[3]);
+    }
+    for (unsigned I = 0; !Malformed && I < Tails.size(); ++I)
+      for (unsigned J = I + 1; J < Tails.size(); ++J)
+        if (std::get<0>(Tails[I]) < std::get<2>(Tails[J]) &&
+            std::get<0>(Tails[J]) < std::get<2>(Tails[I])) Malformed = true;
+    if (!Malformed) for (auto [Begin, LogicalEnd, MappedEnd, Flags] : Tails) {
+      GuestSegment *Source = nullptr;
+      for (const auto &Existing : Ctx.Segments) {
+        if (Existing->BaseResolved && Existing->GuestBase <= LogicalEnd - 1 &&
+            LogicalEnd <= Existing->GuestBase + Existing->Size) {
+          Source = Existing.get(); break;
+        }
+      }
+      // McSema may append synthetic external-slot storage after the ELF
+      // logical end.  It has no guest-range metadata; PT_LOAD is the
+      // authoritative range, so require only that the backing aggregate
+      // covers the proven mapped tail, never that its physical type ends
+      // exactly at memsz.
+      if (!Source || Source->GuestBase != Begin ||
+          Source->GuestBase + Source->Size < MappedEnd ||
+          Source->Executable != ((Flags & 1) != 0) ||
+          Source->Writable != ((Flags & 2) != 0)) {
+        continue;
+      }
+      // The lifted aggregate may physically include synthetic slots after the
+      // ELF memsz.  They are not guest-addressable storage.  Clip the source
+      // interval before BuildGuestAddressMap so [logical_end,mapped_end) has
+      // exactly one owner (the page-tail below), for both loads and stores.
+      Source->Size = LogicalEnd - Source->GuestBase;
+      // This metadata is consumed by the later resolver lowering.  Without
+      // it, that pass derives a range from a data_<addr> alias and the
+      // aggregate's *physical* size, accidentally reintroducing McSema's
+      // synthetic overhang as guest storage.  The PT_LOAD logical interval is
+      // authoritative and is intentionally installed before aliases are
+      // canonicalized.
+      Source->GV->setMetadata("brighten.guest.range", MDNode::get(
+          M.getContext(), {
+              ConstantAsMetadata::get(ConstantInt::get(
+                  Type::getInt64Ty(M.getContext()), Source->GuestBase)),
+              ConstantAsMetadata::get(ConstantInt::get(
+                  Type::getInt64Ty(M.getContext()), LogicalEnd))}));
+      uint64_t TailSize = MappedEnd - LogicalEnd;
+      auto *Ty = ArrayType::get(Type::getInt8Ty(M.getContext()), TailSize);
+      auto *GV = new GlobalVariable(M, Ty, !(Flags & 2),
+          GlobalValue::InternalLinkage, ConstantAggregateZero::get(Ty),
+          "native_elf_mapped_page_tail");
+      GV->setAlignment(Align(1));
+      GV->setMetadata("brighten.guest.range", MDNode::get(M.getContext(), {
+          ConstantAsMetadata::get(ConstantInt::get(Type::getInt64Ty(M.getContext()), LogicalEnd)),
+          ConstantAsMetadata::get(ConstantInt::get(Type::getInt64Ty(M.getContext()), MappedEnd))}));
+      // No direct IR use exists until a later native resolver is materialized;
+      // retain this provenance-backed backing region across intervening DCE.
+      appendToUsed(M, {GV});
+      auto Tail = std::make_unique<GuestSegment>(); Tail->GV = GV;
+      Tail->GuestBase = LogicalEnd; Tail->Size = TailSize; Tail->BaseResolved = true;
+      Tail->ReadOnly = !(Flags & 2); Tail->Writable = Flags & 2; Tail->Executable = Flags & 1;
+      Tail->IsMappedPageTail = true;
+      Tail->Kind = Tail->Writable ? SegmentKind::Bss : SegmentKind::Unknown;
+      Ctx.SegmentByBase[Tail->GuestBase] = Tail.get(); Ctx.Segments.push_back(std::move(Tail)); ++Count;
+    }
+    // A descriptor is useful only if every non-executable PT_LOAD which has
+    // a lifted backing region participated in the same partition.  Do not
+    // enable an authoritative map from a partially accepted descriptor set.
+    HasValidatedPTLoadPartition = !Malformed;
+  }
+
+  if (HasValidatedPTLoadPartition && !Ctx.buildAuthoritativeGuestAddressMap()) {
+    // Overlapping backing ranges have no proven owner.  Leave the existing
+    // lifter representation untouched rather than letting first-match order
+    // choose storage for a load and a different storage for a store.
+    Ctx.HasAuthoritativeGuestAddressMap = false;
+    Ctx.AuthoritativeGuestAddressMap.clear();
+    if (Ctx.Debug)
+      errs() << "[brighten-global-data] refused overlapping PT_LOAD guest map\n";
   }
 
   Ctx.Report.SegmentsDiscovered = Count;

@@ -11,6 +11,7 @@ class BrightenRuntimeHelperPass : public llvm::PassInfoMixin<BrightenRuntimeHelp
 
  private:
   static bool LowerMcSemaAttachThunks(llvm::Module &M);
+  static bool PreserveX86DivideFaults(llvm::Module &M);
   static bool DefineRemillControlFlowRuntime(llvm::Module &M);
   static bool LowerRemillMemoryIntrinsics(llvm::Module &M);
   static bool DefineRemillPureValueIntrinsics(llvm::Module &M);

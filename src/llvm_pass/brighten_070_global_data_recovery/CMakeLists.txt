@@ -25,6 +25,8 @@ add_llvm_pass_plugin(BrightenGlobalDataRecoveryPass
   ResolveObjectConflicts.cpp
   MaterializeRecoveredGlobals.cpp
   RuleRewriteGuestDataReferences.cpp
+  RuleRecoverLateResidualFormatStrings.cpp
+  RuleCanonicalizeGuestPointerResolvers.cpp
   RecoverJumpTableCFG.cpp
   RuleCleanupAndVerify.cpp
   RuleReport.cpp

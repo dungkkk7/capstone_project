@@ -22,6 +22,11 @@ public:
   static bool CloneNativeFunctions(ABIRecoveryContext &Ctx);
   static bool RewriteNativeFunctionBodies(ABIRecoveryContext &Ctx);
   static bool RewriteKnownCallsites(ABIRecoveryContext &Ctx);
+  // Normalize only fully proven direct libc scanf("%d", int *) boundaries
+  // into a typed call-through wrapper.  This is ABI normalization, not a
+  // replacement for scanf and deliberately makes no capture/memory claim.
+  static bool NormalizeScanfI32Boundaries(ABIRecoveryContext &Ctx);
+  static bool LowerCallbackAndSharedStateABI(ABIRecoveryContext &Ctx);
   static bool CreateRemillWrappers(ABIRecoveryContext &Ctx);
   static bool RewriteMainWrapper(ABIRecoveryContext &Ctx);
   static bool CleanupDeadRemillABI(ABIRecoveryContext &Ctx);

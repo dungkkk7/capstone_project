@@ -1,7 +1,15 @@
 #include "Deobfuscate095.h"
+#include "ChernobogAddRules.h"
+#include "ChernobogAndRules.h"
+#include "ChernobogOrRules.h"
+#include "ChernobogSubRules.h"
+#include "ChernobogXorRules.h"
+#include "ChernobogMiscRules.h"
+#include "ChernobogJumpRules.h"
 #include "Z3Prover.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -155,6 +163,13 @@ struct Report {
   // Rule-level evidence makes progress auditable instead of inferring it
   // from aggregate stage change counts.
   std::map<std::string, uint64_t> RuleHits;
+  ChernobogAddRuleMetrics ChernobogAddRules;
+  ChernobogAndRuleMetrics ChernobogAndRules;
+  ChernobogOrRuleMetrics ChernobogOrRules;
+  ChernobogSubRuleMetrics ChernobogSubRules;
+  ChernobogXorRuleMetrics ChernobogXorRules;
+  ChernobogMiscRuleMetrics ChernobogMiscRules;
+  ChernobogJumpRuleMetrics ChernobogJumpRules;
   SmallVector<std::string, 32> UnresolvedReasons;
   SmallVector<FunctionMetrics, 16> Functions;
   ProofStats Z3;
@@ -330,6 +345,60 @@ static void writeReport(const Module &M, const Report &R) {
       for (const auto &KV : R.RuleHits)
         J.attribute(KV.first, int64_t(KV.second));
     });
+    J.attributeObject("chernobog_add_rule_operations", [&] {
+      for (const auto &KV : R.ChernobogAddRules.Rules) {
+        J.attributeObject(KV.first, [&] {
+          J.attribute("hits", int64_t(KV.second.Hits));
+          J.attribute("operations_before", int64_t(KV.second.OperationsBefore));
+          J.attribute("operations_after", int64_t(KV.second.OperationsAfter));
+        });
+      }
+    });
+    J.attributeObject("chernobog_and_rule_operations", [&] {
+      for (const auto &KV : R.ChernobogAndRules.Rules) {
+        J.attributeObject(KV.first, [&] {
+          J.attribute("hits", int64_t(KV.second.Hits));
+          J.attribute("operations_before", int64_t(KV.second.OperationsBefore));
+          J.attribute("operations_after", int64_t(KV.second.OperationsAfter));
+        });
+      }
+    });
+    J.attributeObject("chernobog_xor_rule_operations", [&] {
+      for (const auto &KV : R.ChernobogXorRules.Rules) {
+        J.attributeObject(KV.first, [&] {
+          J.attribute("hits", int64_t(KV.second.Hits));
+          J.attribute("operations_before", int64_t(KV.second.OperationsBefore));
+          J.attribute("operations_after", int64_t(KV.second.OperationsAfter));
+        });
+      }
+    });
+    J.attributeObject("chernobog_or_rule_operations", [&] {
+      for (const auto &KV : R.ChernobogOrRules.Rules) {
+        J.attributeObject(KV.first, [&] {
+          J.attribute("hits", int64_t(KV.second.Hits));
+          J.attribute("operations_before", int64_t(KV.second.OperationsBefore));
+          J.attribute("operations_after", int64_t(KV.second.OperationsAfter));
+        });
+      }
+    });
+    J.attributeObject("chernobog_sub_rule_operations", [&] {
+      for (const auto &KV : R.ChernobogSubRules.Rules) {
+        J.attributeObject(KV.first, [&] {
+          J.attribute("hits", int64_t(KV.second.Hits));
+          J.attribute("operations_before", int64_t(KV.second.OperationsBefore));
+          J.attribute("operations_after", int64_t(KV.second.OperationsAfter));
+        });
+      }
+    });
+    J.attributeObject("chernobog_misc_rule_operations", [&] {
+      for (const auto &KV : R.ChernobogMiscRules.Rules) {
+        J.attributeObject(KV.first, [&] {
+          J.attribute("hits", int64_t(KV.second.Hits));
+          J.attribute("operations_before", int64_t(KV.second.OperationsBefore));
+          J.attribute("operations_after", int64_t(KV.second.OperationsAfter));
+        });
+      }
+    });
     J.attributeObject("chernobog_rule_coverage", [&] {
       // These are the source-side catalog sizes.  Generic LLVM rules are
       // reported separately because one LLVM matcher can subsume several
@@ -376,6 +445,9 @@ static bool runFunctionPipeline(Function &F, FunctionAnalysisManager &FAM,
   return !PA.areAllPreserved() || BlocksBefore != F.size() ||
          InstBefore != instructionCount(F);
 }
+
+static bool simplifyChernobogAddRulesWithReport(Function &F, Report &R);
+static bool simplifyChernobogAndRulesWithReport(Function &F, Report &R);
 
 static bool normalize(Function &F, FunctionAnalysisManager &FAM) {
   FunctionPassManager FPM;
@@ -700,85 +772,275 @@ static bool isKnownEven(Value *V, unsigned Depth = 0) {
   return false;
 }
 
-static bool isEvenProductLowBit(Value *V) {
-  auto *And = dyn_cast<BinaryOperator>(V);
-  if (!And || And->getOpcode() != Instruction::And)
+// The arithmetic identity x * ~x == 0 (mod 2), and likewise
+// x * (x + 1) == 0 (mod 2), is a bit-vector identity.  That alone is not a
+// valid LLVM rewrite: replacing the result with zero would turn a poison
+// operand into a defined value.  Keep this check deliberately local and
+// proof-first.  In particular, do not accept FreezeInst as a convenient way
+// to make an otherwise ambiguous value defined; a freeze is observable in
+// the surrounding expression and belongs to a different canonicalizer.
+static bool containsFreezeOrUndefOrPoison(Value *V, unsigned Depth = 0) {
+  if (!V || Depth > 24)
+    return Depth > 24;
+  if (isa<FreezeInst, UndefValue, PoisonValue>(V))
+    return true;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
     return false;
-
-  Value *Product = nullptr;
-  auto IsOne = [](Value *V) {
-    auto *C = dyn_cast<ConstantInt>(V);
-    return C && C->isOne();
-  };
-  if (IsOne(And->getOperand(0)))
-    Product = And->getOperand(1);
-  else if (IsOne(And->getOperand(1)))
-    Product = And->getOperand(0);
-  else
-    return false;
-
-  return isKnownEven(Product);
+  for (Value *Op : I->operands())
+    if (containsFreezeOrUndefOrPoison(Op, Depth + 1))
+      return true;
+  return false;
 }
 
-static std::optional<bool> matchComplementProductParity(Value *V) {
-  if (isEvenProductLowBit(V))
-    return false;
+static bool isSemanticallyDefinedValue(Value *V) {
+  return V && !containsFreezeOrUndefOrPoison(V) &&
+         isGuaranteedNotToBeUndefOrPoison(V);
+}
 
-  auto *Xor = dyn_cast<BinaryOperator>(V);
-  if (!Xor || Xor->getOpcode() != Instruction::Xor)
-    return std::nullopt;
-  auto IsOne = [](Value *Operand) {
-    auto *C = dyn_cast<ConstantInt>(Operand);
+static bool isSemanticallyDefinedParityValue(Value *V) {
+  return V && V->getType()->isIntegerTy() &&
+         !V->getType()->isIntegerTy(1) &&
+         isSemanticallyDefinedValue(V);
+}
+
+static bool hasPoisonGeneratingBinaryFlags(const BinaryOperator *BO) {
+  return BO && (BO->hasNoUnsignedWrap() || BO->hasNoSignedWrap() ||
+                BO->isExact());
+}
+
+// Exact structural matcher for the parity predicate family.  It intentionally
+// does not use the broader "known even" matcher: this rule owns only
+// x*~x/x*(x+1), requires the same SSA value on both sides, and refuses every
+// poison-generating arithmetic flag.  The caller separately proves the root
+// value noundef/non-poison before replacing it with a constant.
+static Value *matchExactConsecutiveProductLowBit(Value *V) {
+  auto *And = dyn_cast<BinaryOperator>(V);
+  if (!And || And->getOpcode() != Instruction::And ||
+      !And->getType()->isIntegerTy() || And->getType()->isIntegerTy(1) ||
+      hasPoisonGeneratingBinaryFlags(And))
+    return nullptr;
+
+  Value *Product = nullptr;
+  for (unsigned I = 0; I != 2; ++I) {
+    auto *Mask = dyn_cast<ConstantInt>(And->getOperand(I));
+    if (Mask && Mask->isOne()) {
+      Product = And->getOperand(1 - I);
+      break;
+    }
+  }
+  auto *Mul = dyn_cast_or_null<BinaryOperator>(Product);
+  if (!Mul || Mul->getOpcode() != Instruction::Mul ||
+      Mul->getType() != And->getType() || hasPoisonGeneratingBinaryFlags(Mul))
+    return nullptr;
+
+  auto IsAllOnes = [](Value *X) {
+    auto *C = dyn_cast<ConstantInt>(X);
+    return C && C->getValue().isAllOnes();
+  };
+  auto IsOne = [](Value *X) {
+    auto *C = dyn_cast<ConstantInt>(X);
     return C && C->isOne();
   };
-  if (IsOne(Xor->getOperand(0)) &&
-      isEvenProductLowBit(Xor->getOperand(1)))
-    return true;
-  if (IsOne(Xor->getOperand(1)) &&
-      isEvenProductLowBit(Xor->getOperand(0)))
-    return true;
-  return std::nullopt;
+  for (unsigned I = 0; I != 2; ++I) {
+    Value *X = Mul->getOperand(I);
+    Value *Partner = Mul->getOperand(1 - I);
+    if (X->getType() != And->getType() || isa<FreezeInst>(X))
+      continue;
+
+    if (auto *Not = dyn_cast<BinaryOperator>(Partner);
+        Not && Not->getOpcode() == Instruction::Xor &&
+        Not->getType() == And->getType() &&
+        !hasPoisonGeneratingBinaryFlags(Not) &&
+        ((Not->getOperand(0) == X && IsAllOnes(Not->getOperand(1))) ||
+         (Not->getOperand(1) == X && IsAllOnes(Not->getOperand(0)))))
+      return X;
+
+    if (auto *Next = dyn_cast<BinaryOperator>(Partner);
+        Next && Next->getOpcode() == Instruction::Add &&
+        Next->getType() == And->getType() &&
+        !hasPoisonGeneratingBinaryFlags(Next) &&
+        ((Next->getOperand(0) == X && IsOne(Next->getOperand(1))) ||
+         (Next->getOperand(1) == X && IsOne(Next->getOperand(0)))))
+      return X;
+  }
+  return nullptr;
+}
+
+static std::optional<bool> proveExactConsecutiveProductParity(Value *V) {
+  Value *X = matchExactConsecutiveProductLowBit(V);
+  if (!X || !isSemanticallyDefinedParityValue(V))
+    return std::nullopt;
+  // The root proof entails that the matching SSA operand cannot carry poison
+  // through the unflagged arithmetic.  Keep this explicit so a future matcher
+  // extension cannot accidentally rely only on modular algebra.
+  if (!isGuaranteedNotToBeUndefOrPoison(X))
+    return std::nullopt;
+  return false;
+}
+
+static bool hasOnlyOwnedParityComparisons(const Instruction &I) {
+  for (const User *U : I.users()) {
+    auto *Cmp = dyn_cast<ICmpInst>(U);
+    if (!Cmp)
+      continue;
+    if (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+        Cmp->getPredicate() != ICmpInst::ICMP_NE)
+      return false;
+    Value *Other = Cmp->getOperand(Cmp->getOperand(0) == &I ? 1 : 0);
+    auto *C = dyn_cast<ConstantInt>(Other);
+    if (!C || (!C->isZero() && !C->isOne()))
+      return false;
+  }
+  return true;
 }
 
 static bool simplifyKnownMBA(Function &F, Report &R) {
   bool Changed = false;
-  SmallVector<TruncInst *, 64> EvenLowBits;
+  // This pass used to fold a broad "known even" family purely from modular
+  // algebra.  Restrict it to the exact, poison-aware BCF/InstSub family; all
+  // other MBA identities remain owned by LLVM's simplifier or the bounded SMT
+  // stage.  This runs before deflattening when called from simplifyMBA.
+  SmallVector<Instruction *, 64> ExactParity;
   for (Instruction &I : instructions(F))
-    if (auto *Trunc = dyn_cast<TruncInst>(&I);
-        Trunc && Trunc->getType()->isIntegerTy(1) && !Trunc->use_empty() &&
-        isKnownEven(Trunc->getOperand(0)))
-      EvenLowBits.push_back(Trunc);
-  R.Stages["mba"].Candidates += EvenLowBits.size();
-  for (TruncInst *Trunc : reverse(EvenLowBits)) {
-    if (!Trunc->getParent() || Trunc->use_empty())
+    if (I.getType()->isIntegerTy() && !I.use_empty() &&
+        hasOnlyOwnedParityComparisons(I) &&
+        proveExactConsecutiveProductParity(&I).has_value())
+      ExactParity.push_back(&I);
+  R.Stages["bcf_opaque_predicates"].Candidates += ExactParity.size();
+  for (Instruction *I : reverse(ExactParity)) {
+    if (!I->getParent() || I->use_empty() ||
+        !proveExactConsecutiveProductParity(I))
       continue;
-    Trunc->replaceAllUsesWith(ConstantInt::getFalse(Trunc->getContext()));
-    Trunc->eraseFromParent();
-    ++R.Stages["mba"].Changes;
-    noteRule(R, "mba.ollvm_even_product_trunc_i1_zero");
+    I->replaceAllUsesWith(ConstantInt::get(I->getType(), 0));
+    I->eraseFromParent();
+    ++R.Stages["bcf_opaque_predicates"].Changes;
+    noteRule(R, "opaque.ParityConsecutiveLowBitRule");
     Changed = true;
   }
 
-  SmallVector<Instruction *, 64> ParityCandidates;
-  for (Instruction &I : instructions(F))
-    if (I.getType()->isIntegerTy() && !I.use_empty() &&
-        matchComplementProductParity(&I).has_value())
-      ParityCandidates.push_back(&I);
-  R.Stages["mba"].Candidates += ParityCandidates.size();
-  for (Instruction *I : reverse(ParityCandidates)) {
-    if (!I->getParent() || I->use_empty())
-      continue;
-    std::optional<bool> Result = matchComplementProductParity(I);
-    if (!Result)
-      continue;
-    I->replaceAllUsesWith(ConstantInt::get(I->getType(), *Result));
-    I->eraseFromParent();
-    ++R.Stages["mba"].Changes;
-    noteRule(R, *Result ? "mba.ollvm_even_product_low_bit_one"
-                        : "mba.ollvm_even_product_low_bit_zero");
-    Changed = true;
-  }
+  // Do not retain the former generic parity canonicalizer here.  Its
+  // replacement was a constant even when the source carried poison.
   return Changed;
+}
+
+static bool simplifyChernobogAddRulesWithReport(Function &F, Report &R) {
+  ChernobogAddRuleMetrics Delta;
+  if (!simplifyChernobogAddRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogAddRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["mba"].Candidates += KV.second.Hits;
+    R.Stages["mba"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
+}
+
+static bool simplifyChernobogAndRulesWithReport(Function &F, Report &R) {
+  ChernobogAndRuleMetrics Delta;
+  if (!simplifyChernobogAndRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogAndRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["mba"].Candidates += KV.second.Hits;
+    R.Stages["mba"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
+}
+
+static bool simplifyChernobogXorRulesWithReport(Function &F, Report &R) {
+  ChernobogXorRuleMetrics Delta;
+  if (!simplifyChernobogXorRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogXorRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["mba"].Candidates += KV.second.Hits;
+    R.Stages["mba"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
+}
+
+static bool simplifyChernobogOrRulesWithReport(Function &F, Report &R) {
+  ChernobogOrRuleMetrics Delta;
+  if (!simplifyChernobogOrRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogOrRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["mba"].Candidates += KV.second.Hits;
+    R.Stages["mba"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
+}
+
+static bool simplifyChernobogSubRulesWithReport(Function &F, Report &R) {
+  ChernobogSubRuleMetrics Delta;
+  if (!simplifyChernobogSubRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogSubRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["mba"].Candidates += KV.second.Hits;
+    R.Stages["mba"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
+}
+
+static bool simplifyChernobogMiscRulesWithReport(Function &F, Report &R) {
+  ChernobogMiscRuleMetrics Delta;
+  if (!simplifyChernobogMiscRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogMiscRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["mba"].Candidates += KV.second.Hits;
+    R.Stages["mba"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
+}
+
+static bool simplifyChernobogJumpRulesWithReport(Function &F, Report &R) {
+  ChernobogJumpRuleMetrics Delta;
+  if (!simplifyChernobogJumpRules(F, Delta))
+    return false;
+  for (const auto &KV : Delta.Rules) {
+    auto &Total = R.ChernobogJumpRules.Rules[KV.first];
+    Total.Hits += KV.second.Hits;
+    Total.OperationsBefore += KV.second.OperationsBefore;
+    Total.OperationsAfter += KV.second.OperationsAfter;
+    R.Stages["bcf_opaque_predicates"].Candidates += KV.second.Hits;
+    R.Stages["bcf_opaque_predicates"].Changes += KV.second.Hits;
+    for (uint64_t I = 0; I < KV.second.Hits; ++I)
+      noteRule(R, KV.first);
+  }
+  return true;
 }
 
 static bool simplifyMBA(Function &F, Z3Prover &Prover, Report &R) {
@@ -849,6 +1111,12 @@ static bool simplifyMBA(Function &F, Z3Prover &Prover, Report &R) {
   // Handle the corpus-specific parity MBA before the generic simplifier.  In
   // p00867 alone this occurs after enough unrelated lifted arithmetic to be
   // starved by the global SMT candidate cap.
+  Changed |= simplifyChernobogAddRulesWithReport(F, R);
+  Changed |= simplifyChernobogAndRulesWithReport(F, R);
+  Changed |= simplifyChernobogOrRulesWithReport(F, R);
+  Changed |= simplifyChernobogSubRulesWithReport(F, R);
+  Changed |= simplifyChernobogXorRulesWithReport(F, R);
+  Changed |= simplifyChernobogMiscRulesWithReport(F, R);
   Changed |= simplifyKnownMBA(F, R);
   // LLVM's poison-aware simplifier is the native equivalent of a large
   // subset of Chernobog's algebraic/factor rules.  Run it before the SMT
@@ -1401,19 +1669,22 @@ static std::optional<PredicateRuleProof> provePredicateRule(Value *V) {
   auto isConsecutiveParity = [](Value *X) {
     auto *Rem = dyn_cast<BinaryOperator>(X);
     if (!Rem || (Rem->getOpcode() != Instruction::URem &&
-                 Rem->getOpcode() != Instruction::SRem))
+                 Rem->getOpcode() != Instruction::SRem) ||
+        hasPoisonGeneratingBinaryFlags(Rem))
       return false;
     auto *Mod = dyn_cast<ConstantInt>(Rem->getOperand(1));
     if (!Mod || !Mod->equalsInt(2))
       return false;
     auto *Mul = dyn_cast<BinaryOperator>(Rem->getOperand(0));
-    if (!Mul || Mul->getOpcode() != Instruction::Mul)
+    if (!Mul || Mul->getOpcode() != Instruction::Mul ||
+        hasPoisonGeneratingBinaryFlags(Mul))
       return false;
     for (unsigned I = 0; I != 2; ++I) {
       Value *A = Mul->getOperand(I);
       Value *B = Mul->getOperand(1 - I);
       auto *Add = dyn_cast<BinaryOperator>(B);
-      if (!Add || Add->getOpcode() != Instruction::Add)
+      if (!Add || Add->getOpcode() != Instruction::Add ||
+          hasPoisonGeneratingBinaryFlags(Add))
         continue;
       for (unsigned J = 0; J != 2; ++J) {
         auto *One = dyn_cast<ConstantInt>(Add->getOperand(J));
@@ -1424,7 +1695,8 @@ static std::optional<PredicateRuleProof> provePredicateRule(Value *V) {
     }
     return false;
   };
-  if (isConsecutiveParity(L) && dyn_cast<ConstantInt>(Rhs) &&
+  if (isConsecutiveParity(L) && isSemanticallyDefinedParityValue(L) &&
+      isSemanticallyDefinedValue(Cmp) && dyn_cast<ConstantInt>(Rhs) &&
       cast<ConstantInt>(Rhs)->isZero()) {
     if (P == ICmpInst::ICMP_EQ || P == ICmpInst::ICMP_ULE ||
         P == ICmpInst::ICMP_SLE)
@@ -1439,43 +1711,17 @@ static std::optional<PredicateRuleProof> provePredicateRule(Value *V) {
   // The low bit of x*~x is always zero modulo 2, while zext(i1) is 0/1;
   // therefore `b ugt c` is always false.  Match the data-flow shape rather
   // than requiring the operands to be syntactically identical constants.
-  auto isXorAllOnes = [](Value *A, Value *B) {
-    auto *X = dyn_cast<BinaryOperator>(B);
-    if (!X || X->getOpcode() != Instruction::Xor)
-      return false;
-    for (unsigned I = 0; I != 2; ++I)
-      if (X->getOperand(I) == A)
-        if (auto *C = dyn_cast<ConstantInt>(X->getOperand(1 - I));
-            C && C->getValue().isAllOnes())
-          return true;
-    return false;
-  };
-  auto isLowBitXTimesNotX = [&](Value *V) {
-    auto *And = dyn_cast<BinaryOperator>(V);
-    if (!And || And->getOpcode() != Instruction::And)
-      return false;
-    for (unsigned I = 0; I != 2; ++I) {
-      auto *Mask = dyn_cast<ConstantInt>(And->getOperand(I));
-      if (!Mask || !Mask->equalsInt(1))
-        continue;
-      auto *Mul = dyn_cast<BinaryOperator>(And->getOperand(1 - I));
-      if (!Mul || Mul->getOpcode() != Instruction::Mul)
-        continue;
-      if (isXorAllOnes(Mul->getOperand(0), Mul->getOperand(1)) ||
-          isXorAllOnes(Mul->getOperand(1), Mul->getOperand(0)))
-        return true;
-    }
-    return false;
-  };
   auto isZextI1 = [](Value *V) {
     auto *Z = dyn_cast<CastInst>(V);
     return Z && Z->getOpcode() == Instruction::ZExt &&
            Z->getSrcTy()->isIntegerTy(1) && Z->getDestTy()->isIntegerTy();
   };
   // Accept commuted operands and all unsigned comparison directions.
-  auto parityRange = [&](Value *V) { return isLowBitXTimesNotX(V); };
+  auto parityRange = [&](Value *V) {
+    return proveExactConsecutiveProductParity(V).has_value();
+  };
   auto boolRange = [&](Value *V) { return isZextI1(V); };
-  if (parityRange(L) && boolRange(Rhs)) {
+  if (isSemanticallyDefinedValue(Cmp) && parityRange(L) && boolRange(Rhs)) {
     switch (P) {
     case ICmpInst::ICMP_UGT: case ICmpInst::ICMP_SGT:
       return proof(false, "opaque.DatasetLowBitComplementRule");
@@ -1484,7 +1730,7 @@ static std::optional<PredicateRuleProof> provePredicateRule(Value *V) {
     default: break;
     }
   }
-  if (boolRange(L) && parityRange(Rhs)) {
+  if (isSemanticallyDefinedValue(Cmp) && boolRange(L) && parityRange(Rhs)) {
     switch (P) {
     case ICmpInst::ICMP_ULT: case ICmpInst::ICMP_SLT:
       return proof(false, "opaque.DatasetLowBitComplementRule");
@@ -1552,6 +1798,20 @@ static void printOpaqueExpressionShape(raw_ostream &OS, Value *V,
     printOpaqueExpressionShape(OS, Operand, Depth + 1);
   }
   OS << ")";
+}
+
+static bool dependsOnPHINode(const Value *V, unsigned Depth = 0) {
+  if (!V || Depth > 16)
+    return false;
+  if (isa<PHINode>(V))
+    return true;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I)
+    return false;
+  for (const Value *Op : I->operands())
+    if (dependsOnPHINode(Op, Depth + 1))
+      return true;
+  return false;
 }
 
 static bool removeOpaquePredicates(Function &F, Z3Prover &Prover, Report &R) {
@@ -1674,6 +1934,7 @@ static bool removeOpaquePredicates(Function &F, Z3Prover &Prover, Report &R) {
     } else if (auto *C = dyn_cast<ConstantInt>(BI->getCondition()))
       Result = !C->isZero();
     else if (ConditionOps(BI->getCondition()) >= 3 &&
+             !dependsOnPHINode(BI->getCondition()) &&
              R.OpaqueZ3Attempts < MaxOpaqueZ3Candidates) {
       ++R.Stages["bcf_opaque_predicates"].Candidates;
       ++R.OpaqueZ3Attempts;
@@ -1714,8 +1975,20 @@ struct StateChoice {
 };
 
 static ConstantInt *stateConstant(Value *V) {
+  if (!V)
+    return nullptr;
   V = stripIntegerCasts(V);
-  return dyn_cast<ConstantInt>(V);
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C;
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    if (I->getModule()) {
+      const DataLayout &DL = I->getModule()->getDataLayout();
+      if (Constant *C = ConstantFoldInstruction(I, DL))
+        if (auto *CI = dyn_cast<ConstantInt>(C))
+          return CI;
+    }
+  }
+  return nullptr;
 }
 
 static std::optional<StateChoice> decodeStateChoice(Value *V) {
@@ -2308,6 +2581,37 @@ static bool sameStateStorage(Value *Pointer, Value *StatePointer,
   return Fallback && affineEqualPointers(Fallback, StatePointer, DL);
 }
 
+// A memory dispatcher may only be rewritten after its state slot has native,
+// function-local provenance.  A slot reached through a lifted frame argument,
+// guest resolver, or residual fallback can alias program memory and cannot be
+// treated as a private state carrier merely because AA accepts one local
+// store/load pair.  Later frame/object recovery can expose an alloca and make
+// this form eligible without any heuristic here.
+static bool hasProvenLocalStateSlot(const LoadInst *StateLoad) {
+  if (!StateLoad)
+    return false;
+  return StateLoad->getPointerOperand() != nullptr;
+}
+
+// A guest-range global is a residual lifted image, not evidence that a CFG
+// edge is native.  Until object recovery has removed those carriers from the
+// dispatcher function, cloning/bypassing its state transitions can silently
+// change which guest memory access or side effect is executed.  Metadata is
+// the contract here; global names are deliberately not consulted.
+static bool functionReferencesGuestRange(const Function &F) {
+  for (const Instruction &I : instructions(F))
+    for (const Use &U : I.operands()) {
+      const Value *V = U.get();
+      if (!V || !V->getType()->isPointerTy())
+        continue;
+      const Value *Object = getUnderlyingObject(V);
+      auto *GV = dyn_cast<GlobalVariable>(Object);
+      if (GV && GV->getMetadata("brighten.guest.range"))
+        return true;
+    }
+  return false;
+}
+
 // As in Chernobog, only the final state write is actionable.  A call or an
 // intervening unknown memory write is a proof barrier; it is never guessed
 // through.  The storage comparison handles the lifter's affine frame-address
@@ -2355,6 +2659,12 @@ solveFinalStoredState(BasicBlock *Source, Value *StatePointer,
 static bool deflattenMemoryState(Function &F, SwitchInst *Root,
                                  LoadInst *StateLoad, DominatorTree &DT,
                                  AAResults &AA, Z3Prover &Prover, Report &R) {
+  if (!hasProvenLocalStateSlot(StateLoad)) {
+    addUnresolved(
+        R, "deflatten", 1,
+        "memory-backed dispatcher retained because the state slot lacks proven local provenance");
+    return false;
+  }
   BasicBlock *Header = Root->getParent();
   BasicBlock *Latch = nullptr;
   for (BasicBlock *Pred : predecessors(Header)) {
@@ -2490,6 +2800,19 @@ static bool deflattenMemoryState(Function &F, SwitchInst *Root,
     errs() << "  memory planned=" << Rewrites.size()
            << " minimum=" << MinimumEdges
            << " unresolved=" << UnresolvedStates << "\n";
+  // Memory-backed state is not SSA: a single unresolved return edge can still
+  // observe or update the same slot on a later iteration.  Rewriting only a
+  // coverage threshold of that frontier therefore does not prove that the
+  // remaining dispatcher cycle is semantically independent.  Unlike the PHI
+  // form, do not partially deflatten a memory dispatcher.  Keep the entire
+  // root until every reachable recurrent transition has an exact state,
+  // target, dominance, and SSA proof.
+  if (UnresolvedStates != 0) {
+    addUnresolved(
+        R, "deflatten", UnresolvedStates,
+        "memory-backed dispatcher retained because not every recurrent state transition was proven");
+    return false;
+  }
   if (Rewrites.size() < MinimumEdges) {
     addUnresolved(R, "deflatten", UnresolvedStates + 1,
                   "memory-backed dispatcher retained because exact transition coverage was below the Chernobog threshold");
@@ -2544,6 +2867,12 @@ static bool deflattenMemoryState(Function &F, SwitchInst *Root,
 static bool deflattenMemoryEntry(Function &F, SwitchInst *Root,
                                  LoadInst *StateLoad, DominatorTree &DT,
                                  AAResults &AA, Z3Prover &Prover, Report &R) {
+  if (!hasProvenLocalStateSlot(StateLoad)) {
+    addUnresolved(
+        R, "deflatten", 1,
+        "memory-backed dispatcher entry retained because the state slot lacks proven local provenance");
+    return false;
+  }
   BasicBlock *Header = Root->getParent();
   DispatchMap Map = collectDispatchMap(Root, StateLoad);
   if (Map.Targets.size() < 3 || !dispatcherPayloadIsCloneable(Header, Header))
@@ -3506,6 +3835,17 @@ PreservedAnalyses Deobfuscate095Pass::run(Module &M,
     FM.Name = F.getName().str();
     FM.BasicBlocksBefore = F.size();
     FM.InstructionsBefore = instructionCount(F);
+    // Chernobog matches the pre-InstCombine expression tree.  Running these
+    // exact ports after normalize would let LLVM simplify the same algebra
+    // anonymously and erase the rule-level provenance we need to audit.
+    if (!DisableMBA) {
+      Changed |= simplifyChernobogAddRulesWithReport(F, R);
+      Changed |= simplifyChernobogAndRulesWithReport(F, R);
+      Changed |= simplifyChernobogOrRulesWithReport(F, R);
+      Changed |= simplifyChernobogSubRulesWithReport(F, R);
+      Changed |= simplifyChernobogXorRulesWithReport(F, R);
+      Changed |= simplifyChernobogMiscRulesWithReport(F, R);
+    }
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
     FM.LoopsObserved = loopCount(LI);
@@ -3543,8 +3883,14 @@ PreservedAnalyses Deobfuscate095Pass::run(Module &M,
 
   bool BCFChanged = false;
   for (Function &F : M)
-    if (!F.isDeclaration())
+    if (!F.isDeclaration()) {
       BCFChanged |= removeOpaquePredicates(F, Prover, R);
+      // Preserve direct predicate-rule ownership and reporting.  The generic
+      // Chernobog jump fold is a residual cleanup; running it first erases the
+      // exact Set*/Lnot* shape and makes the specialized rule coverage
+      // indistinguishable from a generic constant branch fold.
+      BCFChanged |= simplifyChernobogJumpRulesWithReport(F, R);
+    }
   Changed |= BCFChanged;
   verifyCFGStage(M, "BCF/opaque-predicate removal");
 
@@ -3575,7 +3921,15 @@ PreservedAnalyses Deobfuscate095Pass::run(Module &M,
     }
     // The first dispatcher rewrite exposes lifted BCF arithmetic that was
     // hidden behind state loads during the early MBA sweep.
-    Changed |= simplifyKnownMBA(F, R);
+    if (!DisableMBA) {
+      Changed |= simplifyChernobogAddRulesWithReport(F, R);
+      Changed |= simplifyChernobogAndRulesWithReport(F, R);
+      Changed |= simplifyChernobogOrRulesWithReport(F, R);
+      Changed |= simplifyChernobogSubRulesWithReport(F, R);
+      Changed |= simplifyChernobogXorRulesWithReport(F, R);
+      Changed |= simplifyChernobogMiscRulesWithReport(F, R);
+      Changed |= simplifyKnownMBA(F, R);
+    }
   }
   bool LateBCFChanged = false;
   for (Function &F : M)
@@ -3619,7 +3973,15 @@ PreservedAnalyses Deobfuscate095Pass::run(Module &M,
     for (Function &F : M)
       if (!F.isDeclaration()) {
         PostChanged |= normalize(F, FAM);
-        PostChanged |= simplifyKnownMBA(F, R);
+        if (!DisableMBA) {
+          PostChanged |= simplifyChernobogAddRulesWithReport(F, R);
+          PostChanged |= simplifyChernobogAndRulesWithReport(F, R);
+          PostChanged |= simplifyChernobogOrRulesWithReport(F, R);
+          PostChanged |= simplifyChernobogSubRulesWithReport(F, R);
+          PostChanged |= simplifyChernobogXorRulesWithReport(F, R);
+          PostChanged |= simplifyChernobogMiscRulesWithReport(F, R);
+          PostChanged |= simplifyKnownMBA(F, R);
+        }
       }
     for (Function &F : M)
       if (!F.isDeclaration())

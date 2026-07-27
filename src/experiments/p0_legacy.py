@@ -16,7 +16,11 @@ from llm_recovery.llm_recovery import (
     export_ghidra_pseudocode,
     run_recovery_loop,
 )
-from llvm_pass.britening_ir import brighten_ir, read_native_contract_report
+from llvm_pass.britening_ir import (
+    brighten_ir,
+    read_native_contract_report,
+    verify_native_contract,
+)
 from main import (
     _resolve_seed_paths,
     _run_experimental_delift_bundle,
@@ -148,20 +152,21 @@ class P0LegacyAdapter:
             raise RepresentationError(
                 "P0_BRIGHTENED_LL_MISSING", "P0 did not produce brightened.ll"
             )
-        delifted_ll_text, delift_status, delift_log = _run_experimental_delift_bundle(
-            str(brightened_ll), str(representation_dir), "delifted"
+        final_ll_text, delift_status, delift_log = _run_experimental_delift_bundle(
+            str(brightened_ll), str(representation_dir), "p0"
         )
-        delifted_ll = Path(delifted_ll_text)
-        if delift_status != "applied" or not delifted_ll.is_file():
+        final_ll = Path(final_ll_text) if final_ll_text else None
+        if delift_status != "applied" or final_ll is None or not final_ll.is_file():
             raise RepresentationError(
-                "P0_DELIFT_FAILED",
-                "P0 delift bundle did not produce the final delifted LLVM IR",
+                "P0_FINALIZATION_FAILED",
+                "P0 delift bundle did not produce final LLVM IR",
             )
-        native_report = read_native_contract_report(str(brightened_bc))
-        if native_report:
-            atomic_write_json(
-                representation_dir / "native_contract_report.json", native_report
+        if not verify_native_contract(str(final_ll)):
+            raise RepresentationError(
+                "P0_FINAL_VERIFY_FAILED",
+                "P0 final LLVM IR did not pass the verifier-only native gate",
             )
+        native_report = read_native_contract_report(str(final_ll))
 
         # Freeze provider/decoding knobs from the experiment config for every
         # method.  This preserves P0's current representation, prompt,
@@ -169,13 +174,14 @@ class P0LegacyAdapter:
         # ambient LLM_RECOVERY_* variables from silently giving P0 a different
         # model or sampling policy than A0/B0.
         legacy_config = build_p0_recovery_config(self.config)
-        delifted_reference = representation_dir / "delifted_ref.bin"
-        compile_to_binary(str(delifted_ll), str(delifted_reference))
-        recovery_reference = (
-            str(delifted_reference)
-            if delifted_reference.is_file()
-            else sample.original_elf_path
-        )
+        final_reference = representation_dir / "final_ref.bin"
+        compile_to_binary(str(final_ll), str(final_reference))
+        if not final_reference.is_file():
+            raise RepresentationError(
+                "P0_FINAL_REFERENCE_FAILED",
+                "P0 final LLVM IR did not produce the compiled reference",
+            )
+        recovery_reference = str(final_reference)
 
         p0_pseudocode = representation_dir / "ghidra_pseudocode.c"
         export_ghidra_pseudocode(
@@ -203,14 +209,14 @@ class P0LegacyAdapter:
         attachment_paths = [str(p0_pseudocode)]
         attachment_hashes = [sha256_file(p0_pseudocode)]
         if attach_clean_ir:
-            attachment_paths.insert(0, str(delifted_ll))
-            attachment_hashes.insert(0, sha256_file(delifted_ll))
+            attachment_paths.insert(0, str(final_ll))
+            attachment_hashes.insert(0, sha256_file(final_ll))
         representation = RepresentationArtifact(
             method=MethodId.P0,
-            primary_path=str(delifted_ll),
-            primary_sha256=sha256_file(delifted_ll),
-            byte_count=delifted_ll.stat().st_size,
-            token_count=max(1, (delifted_ll.stat().st_size + 1) // 2),
+            primary_path=str(final_ll),
+            primary_sha256=sha256_file(final_ll),
+            byte_count=final_ll.stat().st_size,
+            token_count=max(1, (final_ll.stat().st_size + 1) // 2),
             builder_version=self.VERSION,
             attachment_paths=attachment_paths,
             attachment_sha256=attachment_hashes,
@@ -221,8 +227,9 @@ class P0LegacyAdapter:
                 "brightened_bc_sha256": sha256_file(brightened_bc),
                 "delift_bundle": delift_status,
                 "delift_bundle_log": delift_log,
-                "delifted_ll_path": str(delifted_ll),
-                "delifted_ll_sha256": sha256_file(delifted_ll),
+                "final_ir_path": str(final_ll),
+                "final_ir_sha256": sha256_file(final_ll),
+                "finalization": "verified",
                 "pseudocode_path": str(p0_pseudocode),
                 "pseudocode_sha256": sha256_file(p0_pseudocode),
                 "internal_precheck_path": str(
@@ -237,9 +244,9 @@ class P0LegacyAdapter:
                 "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
                 "max_iterations": 5,
                 "representation_contract": (
-                    "delifted LLVM IR plus P0 Ghidra pseudocode"
+                    "verified final LLVM IR plus P0 Ghidra pseudocode"
                     if attach_clean_ir
-                    else "P0 Ghidra pseudocode only; delifted LLVM IR retained locally"
+                    else "P0 Ghidra pseudocode only; final LLVM IR retained locally"
                 ),
                 "model_freeze": model_freeze,
                 "prepared_without_llm": True,
@@ -285,14 +292,14 @@ class P0LegacyAdapter:
                 "P0_REPRESENTATION_METHOD_MISMATCH",
                 "P0 processing received another method's representation",
             )
-        delifted_ll = Path(representation.primary_path)
+        final_ll = Path(representation.primary_path)
         if (
-            not delifted_ll.is_file()
-            or sha256_file(delifted_ll) != representation.primary_sha256
+            not final_ll.is_file()
+            or sha256_file(final_ll) != representation.primary_sha256
         ):
             raise RepresentationError(
                 "P0_REPRESENTATION_HASH_MISMATCH",
-                "Frozen P0 delifted LLVM IR is missing or changed",
+                "Frozen P0 final LLVM IR is missing or changed",
             )
         provenance = representation.provenance or {}
         p0_pseudocode = Path(str(provenance.get("pseudocode_path") or ""))
@@ -371,46 +378,22 @@ class P0LegacyAdapter:
                 })
             return report
 
-        brightened_bc = Path(
-            str(provenance.get("brightened_bc_path") or "")
-        )
-        if (
-            not brightened_bc.is_file()
-            or sha256_file(brightened_bc)
-            != provenance.get("brightened_bc_sha256")
-        ):
-            raise RepresentationError(
-                "P0_BRIGHTENED_BC_HASH_MISMATCH",
-                "Frozen P0 brightened bitcode is missing or changed",
-            )
         precheck = run_legacy_fuzz(
-            # Keep Program 1 as LLVM IR so AFL++ can instrument it with
-            # afl-cc.  The compiled delifted binary remains the execution
-            # reference/oracle target; passing that ELF as Program 1 makes
-            # afl-cc try to compile an already-linked binary.
-            str(delifted_ll),
+            str(final_ll),
             sample.original_elf_path,
             iterations=int(self.config["p0"]["fuzz_iterations"]),
             timeout=float(self.config["p0"]["fuzz_timeout_sec"]),
         )
         precheck_path = variant / "p0_internal_precheck.json"
         atomic_write_json(precheck_path, precheck)
-        # This baseline diagnoses whether the brightening/delift reference
-        # already agrees with the original ELF.  It is not an experimental
-        # outcome and must never suppress P0 generation: doing so selects only
-        # easy/pass cases before the method is measured.  The final original-
-        # ELF replay remains the sole E2E oracle.
         precheck_passed = bool(precheck.get("is_fully_equivalent", False))
-        recovery_oracle = (
-            recovery_reference
-            if precheck_passed
-            else sample.original_elf_path
-        )
-        recovery_oracle_label = (
-            "semantic-gated brightened/delifted reference"
-            if precheck_passed
-            else "original ELF fallback after diagnostic precheck"
-        )
+        if not precheck_passed:
+            raise RepresentationError(
+                "P0_FINAL_SEMANTIC_REGRESSION",
+                "P0 final LLVM IR failed semantic precheck",
+            )
+        recovery_oracle = recovery_reference
+        recovery_oracle_label = "semantic-gated final IR reference"
         print(
             "[experiment] "
             f"sample={sample.sample_id} method=P0 stage=semantic-precheck "
@@ -450,7 +433,7 @@ class P0LegacyAdapter:
         )
         output_candidate = generation_dir / "p0_recovered.c"
         result: RecoveryResult = run_recovery_loop(
-            ir_text=delifted_ll.read_text(
+            ir_text=final_ll.read_text(
                 encoding="utf-8", errors="replace"
             ),
             output_recovered_c_path=str(output_candidate),
@@ -463,7 +446,7 @@ class P0LegacyAdapter:
                 # diagnostic baseline.
                 "recovery_reference_binary": recovery_reference,
                 "recovery_reference_label": recovery_oracle_label,
-                "input_ir": str(delifted_ll),
+                "input_ir": str(final_ll),
                 "precomputed_ghidra_pseudocode_path": str(
                     prepared_pseudocode
                 ),
@@ -546,7 +529,7 @@ class P0LegacyAdapter:
             "prompt_policy_version": P0_PROMPT_POLICY_VERSION,
             "max_iterations": 5,
             **model_freeze,
-            "representation_sha256": sha256_file(delifted_ll),
+            "representation_sha256": sha256_file(final_ll),
             "pseudocode_sha256": sha256_file(prepared_pseudocode),
             "recovery_reference_sha256": sha256_file(recovery_reference),
             "recovery_oracle_sha256": sha256_file(recovery_oracle),

@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <cstring>
 
 namespace brighten_global {
@@ -86,6 +87,11 @@ struct GuestSegment {
   bool ReadOnly = false;
   bool Writable = false;
   bool Executable = false;
+  // A page-tail is already the authoritative byte owner for its guest
+  // interval.  It is never a source for an additional recovered writable
+  // object unless a future pass can remove/rewrite every tail use as one
+  // transaction.
+  bool IsMappedPageTail = false;
   bool BaseResolved = false;
   std::string SkipReason;
   std::vector<uint8_t> FlatBytes;
@@ -104,6 +110,17 @@ struct GuestAddressRef {
   std::vector<UseEvidence> EvidenceList;
 };
 
+// This is the only map used to assign a guest address to backing storage when
+// ELF PT_LOAD evidence is available.  It deliberately describes backing
+// regions, not recovered typed views: a recovered scalar/string can rewrite a
+// proven direct use, but it must not become a second owner of a dynamic guest
+// address.
+struct GuestAddressRegion {
+  uint64_t Begin = 0;
+  uint64_t End = 0;
+  GuestSegment *Segment = nullptr;
+};
+
 struct ObjectCandidate {
   uint64_t Begin = 0;
   uint64_t End = 0;
@@ -114,6 +131,10 @@ struct ObjectCandidate {
   SmallVector<std::string, 4> Risks;
   GuestSegment *SourceSegment = nullptr;
   std::string Name;
+  // This candidate was proven from complete direct fixed-width accesses.  Its
+  // materialization and rewrite are all-or-nothing: a residual interval may
+  // not acquire a second storage location while an unresolved carrier remains.
+  bool RequiresTransactionalDirectRewrite = false;
   bool Conflict = false;
   std::string DropReason;
 };
@@ -130,6 +151,7 @@ struct RecoveredObject {
   std::string Name;
   std::string Action;
   std::string SkipReason;
+  bool RequiresTransactionalDirectRewrite = false;
   unsigned UseCount = 0;
 };
 
@@ -177,6 +199,8 @@ struct GlobalDataContext {
 
   SmallVector<std::unique_ptr<GuestSegment>, 16> Segments;
   std::map<uint64_t, GuestSegment *> SegmentByBase;
+  SmallVector<GuestAddressRegion, 16> AuthoritativeGuestAddressMap;
+  bool HasAuthoritativeGuestAddressMap = false;
 
   SmallVector<std::unique_ptr<GuestAddressRef>, 256> AddressRefs;
 
@@ -198,7 +222,37 @@ struct GlobalDataContext {
   explicit GlobalDataContext(Module &Mod)
       : M(Mod), DL(Mod.getDataLayout()) {}
 
+  // PT_LOAD-backed regions must form a partition.  A failed construction is
+  // fail-closed: callers retain the old lifting representation rather than
+  // selecting an arbitrary overlapping global.
+  bool buildAuthoritativeGuestAddressMap() {
+    SmallVector<GuestAddressRegion, 16> Regions;
+    for (const auto &Seg : Segments) {
+      if (!Seg || !Seg->BaseResolved || !Seg->Size ||
+          Seg->GuestBase > UINT64_MAX - Seg->Size)
+        return false;
+      Regions.push_back({Seg->GuestBase, Seg->GuestBase + Seg->Size,
+                         Seg.get()});
+    }
+    std::sort(Regions.begin(), Regions.end(), [](const GuestAddressRegion &L,
+                                                 const GuestAddressRegion &R) {
+      return L.Begin < R.Begin;
+    });
+    for (size_t I = 1; I < Regions.size(); ++I)
+      if (Regions[I - 1].End > Regions[I].Begin)
+        return false;
+    AuthoritativeGuestAddressMap = std::move(Regions);
+    HasAuthoritativeGuestAddressMap = true;
+    return true;
+  }
+
   GuestSegment *findSegmentForAddr(uint64_t Addr) const {
+    if (HasAuthoritativeGuestAddressMap) {
+      for (const GuestAddressRegion &Region : AuthoritativeGuestAddressMap)
+        if (Addr >= Region.Begin && Addr < Region.End)
+          return Region.Segment;
+      return nullptr;
+    }
     for (auto &Seg : Segments) {
       if (!Seg->BaseResolved)
         continue;

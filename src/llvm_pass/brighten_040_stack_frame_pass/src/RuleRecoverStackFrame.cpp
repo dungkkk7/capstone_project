@@ -15,10 +15,12 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <cstdint>
 #include <queue>
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 
 namespace brighten_stack_frame {
 
@@ -119,6 +121,7 @@ enum SkipReason : unsigned {
   SkipFrameTooLarge = 1u << 10,
   SkipMemoryBoundary = 1u << 11,
   SkipReadBeforeWrite = 1u << 12,
+  SkipEntryABISlot = 1u << 13,
 };
 
 struct StackFrameReportEntry {
@@ -182,6 +185,7 @@ static void printSkipReasons(raw_ostream &OS, unsigned Reasons) {
   Emit(SkipFrameTooLarge, "frame_too_large");
   Emit(SkipMemoryBoundary, "memory_boundary");
   Emit(SkipReadBeforeWrite, "read_before_write");
+  Emit(SkipEntryABISlot, "entry_abi_slot");
 
   if (First) OS << "none";
 }
@@ -298,6 +302,50 @@ static bool isRBPRegisterState(Value *V, const DataLayout &DL, Function &F) {
   return resolveStateOffset(V, DL, F) == 2328;
 }
 
+static bool isEntryABISpillAccess(const StackAccess &Acc,
+                                  const DataLayout &DL, Function &F) {
+  // A lifted `push rbp` stores the architectural RBP value in the first word
+  // below entry RSP. That word is coupled to State at the call boundary, not
+  // an independently-owned local object.
+  if (!Acc.IsWrite || Acc.Begin >= 0 || Acc.End <= -8) {
+    return false;
+  }
+  auto *SI = dyn_cast<StoreInst>(Acc.I);
+  auto *LI = SI ? dyn_cast<LoadInst>(SI->getValueOperand()) : nullptr;
+  return LI && isRBPRegisterState(LI->getPointerOperand(), DL, F);
+}
+
+static bool hasSharedRBPStateTraffic(Function &F, const DataLayout &DL) {
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      Value *Ptr = nullptr;
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        Ptr = LI->getPointerOperand();
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        Ptr = SI->getPointerOperand();
+      }
+      // Entry-only reads seed promoted register slots. They do not establish
+      // that the ABI spill remains shared after the prologue.
+      if (&BB == &F.getEntryBlock()) {
+        continue;
+      }
+      Value *Base = Ptr ? Ptr->stripPointerCasts() : nullptr;
+      while (auto *GEP = dyn_cast_or_null<GEPOperator>(Base)) {
+        Base = GEP->getPointerOperand()->stripPointerCasts();
+      }
+      // A promoted State field is a local implementation detail.  Direct
+      // traffic through arg0/global State remains externally observable.
+      if (!Ptr || isa<AllocaInst>(Base)) {
+        continue;
+      }
+      if (resolveStateOffset(Ptr, DL, F) == 2328) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static bool AddNoSignedOverflow(int64_t A, int64_t B, int64_t &Out) {
   if ((B > 0 && A > INT64_MAX - B) ||
       (B < 0 && A < INT64_MIN - B))
@@ -327,16 +375,32 @@ static StackExpr getStackExpr(Value *V, const DenseMap<Value *, StackExpr> &Expr
   return E;
 }
 
-static StackExpr mergeExpr(const StackExpr &A, const StackExpr &B) {
+static bool isStackExpr(const StackExpr &E) {
+  return E.K == StackExpr::Kind::StackConst ||
+         E.K == StackExpr::Kind::StackDynamic;
+}
+
+static bool hasSameStackBase(const StackExpr &A, const StackExpr &B) {
+  return isStackExpr(A) && isStackExpr(B) && A.Base == B.Base;
+}
+
+static StackExpr mergeExpr(const StackExpr &A, const StackExpr &B,
+                           bool *HadNonFiniteMerge = nullptr) {
   if (A.K == StackExpr::Kind::Unreachable) return B;
   if (B.K == StackExpr::Kind::Unreachable) return A;
   if (A.K == StackExpr::Kind::Unknown || B.K == StackExpr::Kind::Unknown) {
+    if (HadNonFiniteMerge && (isStackExpr(A) || isStackExpr(B))) {
+      *HadNonFiniteMerge = true;
+    }
     StackExpr Res;
     Res.K = StackExpr::Kind::Unknown;
     return Res;
   }
   if (A == B) return A;
-  if (A.K == StackExpr::Kind::StackConst && B.K == StackExpr::Kind::StackConst && A.Base == B.Base) {
+  if (hasSameStackBase(A, B)) {
+    if (HadNonFiniteMerge) {
+      *HadNonFiniteMerge = true;
+    }
     StackExpr Res;
     Res.K = StackExpr::Kind::StackDynamic;
     Res.Base = A.Base;
@@ -348,14 +412,15 @@ static StackExpr mergeExpr(const StackExpr &A, const StackExpr &B) {
   return UnknownExpr;
 }
 
-static BlockState mergeBlockStates(const SmallVectorImpl<BlockState> &States) {
+static BlockState mergeBlockStates(const SmallVectorImpl<BlockState> &States,
+                                   bool *HadNonFiniteMerge = nullptr) {
   if (States.empty()) {
     return BlockState();
   }
   BlockState Merged = States[0];
   for (size_t i = 1; i < States.size(); ++i) {
-    Merged.RSP = mergeExpr(Merged.RSP, States[i].RSP);
-    Merged.RBP = mergeExpr(Merged.RBP, States[i].RBP);
+    Merged.RSP = mergeExpr(Merged.RSP, States[i].RSP, HadNonFiniteMerge);
+    Merged.RBP = mergeExpr(Merged.RBP, States[i].RBP, HadNonFiniteMerge);
   }
   return Merged;
 }
@@ -528,9 +593,639 @@ static bool CallMayClobberGuestStackState(CallBase *CB, const DataLayout &DL,
   return false;
 }
 
-static bool IsDirectNativeFrame(ArrayRef<StackAccess *> Accesses,
-                                Function &F) {
+static bool HasProvenFiniteFrameBoundary(
+    Function &F, const DenseMap<BasicBlock *, BlockState> &BlockEntryState,
+    const DenseMap<BasicBlock *, BlockState> &BlockExitState,
+    bool HadNonFiniteRegisterMerge, bool HadUnresolvedStackValueMerge,
+    bool HadUnresolvedStackClobber, bool SawRSPAdjustment,
+    ArrayRef<StackAccess> Accesses) {
+  if (HadNonFiniteRegisterMerge || HadUnresolvedStackValueMerge ||
+      HadUnresolvedStackClobber || !SawRSPAdjustment) {
+    return false;
+  }
+
+  int64_t MinRSP = 0;
+  auto CheckState = [&](const BlockState &State) {
+    if (State.RSP.K == StackExpr::Kind::Unreachable) {
+      return true;
+    }
+    if (State.RSP.K != StackExpr::Kind::StackConst ||
+        State.RSP.Base.V != nullptr ||
+        State.RSP.Base.Kind != StackBaseKind::RSP ||
+        !State.RSP.Base.Stable || State.RSP.Offset < -(1024 * 1024) ||
+        State.RSP.Offset > 8) {
+      return false;
+    }
+    MinRSP = std::min(MinRSP, State.RSP.Offset);
+    return true;
+  };
+
+  for (const auto &Pair : BlockEntryState) {
+    if (!CheckState(Pair.second)) {
+      return false;
+    }
+  }
+  for (const auto &Pair : BlockExitState) {
+    if (!CheckState(Pair.second)) {
+      return false;
+    }
+  }
+
+  for (BasicBlock &BB : F) {
+    if (!isa<ReturnInst>(BB.getTerminator())) {
+      continue;
+    }
+    auto It = BlockExitState.find(&BB);
+    if (It == BlockExitState.end() ||
+        It->second.RSP.K != StackExpr::Kind::StackConst ||
+        It->second.RSP.Base.V != nullptr ||
+        It->second.RSP.Base.Kind != StackBaseKind::RSP ||
+        (It->second.RSP.Offset != 0 && It->second.RSP.Offset != 8)) {
+      return false;
+    }
+  }
+
+  bool HasSemanticCall = false;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB) {
+        continue;
+      }
+      Function *CalledF = CB->getCalledFunction();
+      if (CalledF) {
+        StringRef Name = CalledF->getName();
+        if (CalledF->isIntrinsic() || CalledF->doesNotReturn() ||
+            Name == "__translate_guest_pointer" ||
+            Name == "llvm.sideeffect" || Name.starts_with("llvm.dbg.") ||
+            Name.starts_with("llvm.lifetime.")) {
+          continue;
+        }
+      }
+      HasSemanticCall = true;
+    }
+  }
+
+  for (const StackAccess &Access : Accesses) {
+    if (Access.Addr.K != StackExpr::Kind::StackConst ||
+        Access.Addr.Base.V != nullptr ||
+        Access.Addr.Base.Kind != StackBaseKind::RSP ||
+        Access.End <= Access.Begin || Access.Begin < -(1024 * 1024) ||
+        Access.End > 0) {
+      return false;
+    }
+    if (Access.Begin < MinRSP &&
+        (HasSemanticCall || Access.Begin < MinRSP - 128)) {
+      return false;
+    }
+  }
+  return MinRSP < 0;
+}
+
+struct DispatcherSlot {
+  int64_t Begin = 0;
+  int64_t End = 0;
+  unsigned BitWidth = 0;
+};
+
+struct DispatcherPathState {
+  bool CurrentKnown = false;
+  uint64_t CurrentValue = 0;
+  const LoadInst *LastLoad = nullptr;
+  bool LastLoadKnown = false;
+  uint64_t LastLoadValue = 0;
+  bool Initialized = false;
+  bool UsedDispatcherFact = false;
+};
+
+struct FiniteIntResult {
+  bool Known = false;
+  bool DependsOnDispatcher = false;
+  SmallVector<APInt, 4> Values;
+};
+
+static void addFiniteValue(FiniteIntResult &Result, const APInt &Value) {
+  for (const APInt &Existing : Result.Values) {
+    if (Existing == Value) {
+      return;
+    }
+  }
+  if (Result.Values.size() < 16) {
+    Result.Values.push_back(Value);
+  } else {
+    Result.Known = false;
+  }
+}
+
+static FiniteIntResult evaluateFiniteInt(
+    Value *V, const DispatcherPathState &State, BasicBlock *CurrentBlock,
+    BasicBlock *Predecessor, DenseSet<Value *> &Visiting) {
+  FiniteIntResult Result;
+  if (!V || !V->getType()->isIntegerTy() || !Visiting.insert(V).second) {
+    return Result;
+  }
+
+  auto Finish = [&](FiniteIntResult R) {
+    Visiting.erase(V);
+    return R;
+  };
+
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    Result.Known = true;
+    addFiniteValue(Result, CI->getValue());
+    return Finish(std::move(Result));
+  }
+
+  if (V == State.LastLoad) {
+    Result.Known = State.LastLoadKnown;
+    Result.DependsOnDispatcher = true;
+    if (Result.Known) {
+      addFiniteValue(Result,
+                     APInt(V->getType()->getIntegerBitWidth(),
+                           State.LastLoadValue));
+    }
+    return Finish(std::move(Result));
+  }
+
+  if (auto *FI = dyn_cast<FreezeInst>(V)) {
+    return Finish(evaluateFiniteInt(FI->getOperand(0), State, CurrentBlock,
+                                    Predecessor, Visiting));
+  }
+
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    if (PN->getParent() != CurrentBlock || !Predecessor) {
+      return Finish(std::move(Result));
+    }
+    int Incoming = PN->getBasicBlockIndex(Predecessor);
+    if (Incoming < 0) {
+      return Finish(std::move(Result));
+    }
+    return Finish(evaluateFiniteInt(PN->getIncomingValue(Incoming), State,
+                                    CurrentBlock, Predecessor, Visiting));
+  }
+
+  if (auto *Cast = dyn_cast<CastInst>(V)) {
+    FiniteIntResult Operand = evaluateFiniteInt(
+        Cast->getOperand(0), State, CurrentBlock, Predecessor, Visiting);
+    if (!Operand.Known) {
+      return Finish(std::move(Result));
+    }
+    Result.Known = true;
+    Result.DependsOnDispatcher = Operand.DependsOnDispatcher;
+    unsigned Width = Cast->getType()->getIntegerBitWidth();
+    for (const APInt &Value : Operand.Values) {
+      switch (Cast->getOpcode()) {
+        case Instruction::Trunc:
+          addFiniteValue(Result, Value.trunc(Width));
+          break;
+        case Instruction::ZExt:
+          addFiniteValue(Result, Value.zext(Width));
+          break;
+        case Instruction::SExt:
+          addFiniteValue(Result, Value.sext(Width));
+          break;
+        case Instruction::BitCast:
+          if (Value.getBitWidth() != Width) {
+            Result.Known = false;
+          } else {
+            addFiniteValue(Result, Value);
+          }
+          break;
+        default:
+          Result.Known = false;
+          break;
+      }
+      if (!Result.Known) {
+        break;
+      }
+    }
+    return Finish(std::move(Result));
+  }
+
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (auto *Overflowing = dyn_cast<OverflowingBinaryOperator>(BO)) {
+      if (Overflowing->hasNoSignedWrap() || Overflowing->hasNoUnsignedWrap()) {
+        return Finish(std::move(Result));
+      }
+    }
+    if (auto *Exact = dyn_cast<PossiblyExactOperator>(BO)) {
+      if (Exact->isExact()) {
+        return Finish(std::move(Result));
+      }
+    }
+    FiniteIntResult LHS = evaluateFiniteInt(
+        BO->getOperand(0), State, CurrentBlock, Predecessor, Visiting);
+    FiniteIntResult RHS = evaluateFiniteInt(
+        BO->getOperand(1), State, CurrentBlock, Predecessor, Visiting);
+    if (!LHS.Known || !RHS.Known ||
+        LHS.Values.size() * RHS.Values.size() > 16) {
+      return Finish(std::move(Result));
+    }
+    Result.Known = true;
+    Result.DependsOnDispatcher =
+        LHS.DependsOnDispatcher || RHS.DependsOnDispatcher;
+    for (const APInt &L : LHS.Values) {
+      for (const APInt &R : RHS.Values) {
+        if (L.getBitWidth() != R.getBitWidth()) {
+          Result.Known = false;
+          break;
+        }
+        APInt Value(L.getBitWidth(), 0);
+        switch (BO->getOpcode()) {
+          case Instruction::Add:
+            Value = L + R;
+            break;
+          case Instruction::Sub:
+            Value = L - R;
+            break;
+          case Instruction::Mul:
+            Value = L * R;
+            break;
+          case Instruction::And:
+            Value = L & R;
+            break;
+          case Instruction::Or:
+            Value = L | R;
+            break;
+          case Instruction::Xor:
+            Value = L ^ R;
+            break;
+          case Instruction::Shl:
+          case Instruction::LShr:
+          case Instruction::AShr: {
+            uint64_t Amount = R.getLimitedValue();
+            if (Amount >= L.getBitWidth()) {
+              Result.Known = false;
+              break;
+            }
+            if (BO->getOpcode() == Instruction::Shl) {
+              Value = L.shl(Amount);
+            } else if (BO->getOpcode() == Instruction::LShr) {
+              Value = L.lshr(Amount);
+            } else {
+              Value = L.ashr(Amount);
+            }
+            break;
+          }
+          default:
+            Result.Known = false;
+            break;
+        }
+        if (!Result.Known) {
+          break;
+        }
+        addFiniteValue(Result, Value);
+      }
+      if (!Result.Known) {
+        break;
+      }
+    }
+    return Finish(std::move(Result));
+  }
+
+  if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+    FiniteIntResult LHS = evaluateFiniteInt(
+        Cmp->getOperand(0), State, CurrentBlock, Predecessor, Visiting);
+    FiniteIntResult RHS = evaluateFiniteInt(
+        Cmp->getOperand(1), State, CurrentBlock, Predecessor, Visiting);
+    if (!LHS.Known || !RHS.Known ||
+        LHS.Values.size() * RHS.Values.size() > 16) {
+      return Finish(std::move(Result));
+    }
+    Result.Known = true;
+    Result.DependsOnDispatcher =
+        LHS.DependsOnDispatcher || RHS.DependsOnDispatcher;
+    for (const APInt &L : LHS.Values) {
+      for (const APInt &R : RHS.Values) {
+        if (L.getBitWidth() != R.getBitWidth()) {
+          Result.Known = false;
+          break;
+        }
+        bool Value = false;
+        switch (Cmp->getPredicate()) {
+          case CmpInst::ICMP_EQ: Value = L.eq(R); break;
+          case CmpInst::ICMP_NE: Value = L.ne(R); break;
+          case CmpInst::ICMP_UGT: Value = L.ugt(R); break;
+          case CmpInst::ICMP_UGE: Value = L.uge(R); break;
+          case CmpInst::ICMP_ULT: Value = L.ult(R); break;
+          case CmpInst::ICMP_ULE: Value = L.ule(R); break;
+          case CmpInst::ICMP_SGT: Value = L.sgt(R); break;
+          case CmpInst::ICMP_SGE: Value = L.sge(R); break;
+          case CmpInst::ICMP_SLT: Value = L.slt(R); break;
+          case CmpInst::ICMP_SLE: Value = L.sle(R); break;
+          default:
+            Result.Known = false;
+            break;
+        }
+        if (!Result.Known) {
+          break;
+        }
+        addFiniteValue(Result, APInt(1, Value));
+      }
+      if (!Result.Known) {
+        break;
+      }
+    }
+    return Finish(std::move(Result));
+  }
+
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    FiniteIntResult Cond = evaluateFiniteInt(
+        Sel->getCondition(), State, CurrentBlock, Predecessor, Visiting);
+    if (Cond.Known && Cond.Values.empty()) {
+      Cond.Known = false;
+    }
+    bool TakeTrue = !Cond.Known;
+    bool TakeFalse = !Cond.Known;
+    if (Cond.Known) {
+      for (const APInt &Value : Cond.Values) {
+        TakeTrue |= !Value.isZero();
+        TakeFalse |= Value.isZero();
+      }
+    }
+    Result.Known = true;
+    Result.DependsOnDispatcher = Cond.DependsOnDispatcher;
+    auto MergeArm = [&](Value *Arm) {
+      FiniteIntResult ArmResult = evaluateFiniteInt(
+          Arm, State, CurrentBlock, Predecessor, Visiting);
+      if (!ArmResult.Known) {
+        Result.Known = false;
+        return;
+      }
+      Result.DependsOnDispatcher |= ArmResult.DependsOnDispatcher;
+      for (const APInt &Value : ArmResult.Values) {
+        addFiniteValue(Result, Value);
+      }
+    };
+    if (TakeTrue) {
+      MergeArm(Sel->getTrueValue());
+    }
+    if (Result.Known && TakeFalse) {
+      MergeArm(Sel->getFalseValue());
+    }
+    return Finish(std::move(Result));
+  }
+
+  return Finish(std::move(Result));
+}
+
+static bool rangesOverlap(int64_t AStart, int64_t AEnd, int64_t BStart,
+                          int64_t BEnd) {
+  return AStart < BEnd && BStart < AEnd;
+}
+
+static const StackAccess *findStackAccess(ArrayRef<StackAccess *> Accesses,
+                                          Instruction *I) {
+  for (const StackAccess *Access : Accesses) {
+    if (Access->I == I) {
+      return Access;
+    }
+  }
+  return nullptr;
+}
+
+static bool isExactStackSlot(const DispatcherSlot &Slot,
+                             const StackAccess *Access) {
+  return Access && Access->Addr.K == StackExpr::Kind::StackConst &&
+         Access->Begin == Slot.Begin && Access->End == Slot.End;
+}
+
+static bool isCandidateLoad(const DispatcherSlot &Slot,
+                            ArrayRef<StackAccess *> Accesses, LoadInst *LI) {
+  if (!LI->getType()->isIntegerTy(Slot.BitWidth) || LI->isVolatile() ||
+      LI->isAtomic()) {
+    return false;
+  }
+  return isExactStackSlot(Slot, findStackAccess(Accesses, LI));
+}
+
+static bool isCandidateStore(const DispatcherSlot &Slot,
+                             ArrayRef<StackAccess *> Accesses, StoreInst *SI) {
+  if (!SI->getValueOperand()->getType()->isIntegerTy(Slot.BitWidth) ||
+      SI->isVolatile() || SI->isAtomic()) {
+    return false;
+  }
+  return isExactStackSlot(Slot, findStackAccess(Accesses, SI));
+}
+
+static bool instructionMayWriteSlot(const DispatcherSlot &Slot,
+                                    ArrayRef<StackAccess *> Accesses,
+                                    Instruction *I) {
+  for (const StackAccess *Access : Accesses) {
+    if (Access->I == I && Access->IsWrite &&
+        rangesOverlap(Access->Begin, Access->End, Slot.Begin, Slot.End)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static SmallVector<DispatcherSlot, 8>
+collectDispatcherSlots(ArrayRef<StackAccess *> Accesses) {
+  SmallVector<DispatcherSlot, 8> Slots;
+  std::set<std::pair<int64_t, int64_t>> SeenRanges;
+  for (const StackAccess *Access : Accesses) {
+    auto *LI = dyn_cast<LoadInst>(Access->I);
+    auto *SI = dyn_cast<StoreInst>(Access->I);
+    Type *ValueTy = LI ? LI->getType()
+                       : (SI ? SI->getValueOperand()->getType() : nullptr);
+    auto *IntTy = dyn_cast_or_null<IntegerType>(ValueTy);
+    if (!IntTy || IntTy->getBitWidth() > 64 || Access->End <= Access->Begin ||
+        static_cast<uint64_t>(Access->End - Access->Begin) * 8 !=
+            IntTy->getBitWidth() ||
+        !SeenRanges.insert({Access->Begin, Access->End}).second) {
+      continue;
+    }
+    DispatcherSlot Slot;
+    Slot.Begin = Access->Begin;
+    Slot.End = Access->End;
+    Slot.BitWidth = IntTy->getBitWidth();
+    Slots.push_back(Slot);
+  }
+  return Slots;
+}
+
+static bool hasProvenDispatcherInitialization(
+    const StackAccess *Read, ArrayRef<StackAccess *> Accesses, Function &F,
+    const DispatcherSlot &Slot) {
+  using StateKey =
+      std::tuple<uintptr_t, uintptr_t, bool, uint64_t, uintptr_t, bool,
+                 uint64_t, bool, bool>;
+  struct WorkItem {
+    BasicBlock *BB = nullptr;
+    BasicBlock *Predecessor = nullptr;
+    DispatcherPathState State;
+  };
+
+  std::queue<WorkItem> Worklist;
+  std::set<StateKey> Seen;
+  auto Enqueue = [&](BasicBlock *BB, BasicBlock *Predecessor,
+                     const DispatcherPathState &State) {
+    StateKey Key{reinterpret_cast<uintptr_t>(BB),
+                 reinterpret_cast<uintptr_t>(Predecessor), State.CurrentKnown,
+                 State.CurrentValue,
+                 reinterpret_cast<uintptr_t>(State.LastLoad),
+                 State.LastLoadKnown, State.LastLoadValue, State.Initialized,
+                 State.UsedDispatcherFact};
+    if (Seen.insert(Key).second) {
+      Worklist.push({BB, Predecessor, State});
+    }
+  };
+
+  DispatcherPathState InitialState;
+  Enqueue(&F.getEntryBlock(), nullptr, InitialState);
+  bool SawReadWithDispatcherFact = false;
+  uint64_t WorkItems = 0;
+  const uint64_t MaxWorkItems =
+      std::max<uint64_t>(4096, static_cast<uint64_t>(F.size()) * 2048);
+
+  while (!Worklist.empty()) {
+    if (++WorkItems > MaxWorkItems) {
+      return false;
+    }
+    WorkItem Item = Worklist.front();
+    Worklist.pop();
+    SmallVector<DispatcherPathState, 4> States{Item.State};
+
+    for (Instruction &I : *Item.BB) {
+      SmallVector<DispatcherPathState, 4> NextStates;
+      for (DispatcherPathState State : States) {
+        if (&I == Read->I) {
+          if (!State.Initialized) {
+            return false;
+          }
+          SawReadWithDispatcherFact |= State.UsedDispatcherFact;
+        }
+
+        for (const StackAccess *Write : Accesses) {
+          if (Write->I == &I && Write->IsWrite && Write->I != Read->I &&
+              Write->Begin <= Read->Begin && Write->End >= Read->End) {
+            State.Initialized = true;
+          }
+        }
+
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (isCandidateLoad(Slot, Accesses, LI)) {
+            State.LastLoad = LI;
+            State.LastLoadKnown = State.CurrentKnown;
+            State.LastLoadValue = State.CurrentValue;
+          }
+        }
+
+        auto *SI = dyn_cast<StoreInst>(&I);
+        if (SI && isCandidateStore(Slot, Accesses, SI)) {
+          DenseSet<Value *> Visiting;
+          FiniteIntResult Stored = evaluateFiniteInt(
+              SI->getValueOperand(), State, Item.BB, Item.Predecessor,
+              Visiting);
+          State.LastLoad = nullptr;
+          State.LastLoadKnown = false;
+          if (!Stored.Known || Stored.Values.empty()) {
+            State.CurrentKnown = false;
+            NextStates.push_back(State);
+          } else {
+            for (const APInt &Value : Stored.Values) {
+              DispatcherPathState Fork = State;
+              Fork.CurrentKnown = true;
+              Fork.CurrentValue = Value.getZExtValue();
+              NextStates.push_back(Fork);
+            }
+          }
+        } else {
+          if (instructionMayWriteSlot(Slot, Accesses, &I)) {
+            State.CurrentKnown = false;
+            State.LastLoad = nullptr;
+            State.LastLoadKnown = false;
+          }
+          NextStates.push_back(State);
+        }
+      }
+      States = std::move(NextStates);
+      if (States.size() > 64) {
+        return false;
+      }
+    }
+
+    Instruction *Terminator = Item.BB->getTerminator();
+    for (DispatcherPathState State : States) {
+      if (auto *BI = dyn_cast<BranchInst>(Terminator)) {
+        if (BI->isUnconditional()) {
+          Enqueue(BI->getSuccessor(0), Item.BB, State);
+          continue;
+        }
+        DenseSet<Value *> Visiting;
+        FiniteIntResult Cond = evaluateFiniteInt(
+            BI->getCondition(), State, Item.BB, Item.Predecessor, Visiting);
+        if (Cond.Known && Cond.Values.empty()) {
+          Cond.Known = false;
+        }
+        bool TakeTrue = !Cond.Known;
+        bool TakeFalse = !Cond.Known;
+        if (Cond.Known) {
+          for (const APInt &Value : Cond.Values) {
+            TakeTrue |= !Value.isZero();
+            TakeFalse |= Value.isZero();
+          }
+        }
+        bool PrunedByDispatcher =
+            Cond.Known && Cond.DependsOnDispatcher && TakeTrue != TakeFalse;
+        State.UsedDispatcherFact |= PrunedByDispatcher;
+        if (TakeTrue) {
+          Enqueue(BI->getSuccessor(0), Item.BB, State);
+        }
+        if (TakeFalse) {
+          Enqueue(BI->getSuccessor(1), Item.BB, State);
+        }
+      } else if (auto *SI = dyn_cast<SwitchInst>(Terminator)) {
+        DenseSet<Value *> Visiting;
+        FiniteIntResult Cond = evaluateFiniteInt(
+            SI->getCondition(), State, Item.BB, Item.Predecessor, Visiting);
+        if (Cond.Known && Cond.Values.empty()) {
+          Cond.Known = false;
+        }
+        if (!Cond.Known) {
+          for (BasicBlock *Successor : successors(Item.BB)) {
+            Enqueue(Successor, Item.BB, State);
+          }
+          continue;
+        }
+        SmallVector<BasicBlock *, 4> Feasible;
+        for (const APInt &Value : Cond.Values) {
+          BasicBlock *Successor = SI->getDefaultDest();
+          for (auto Case : SI->cases()) {
+            if (Case.getCaseValue()->getValue() == Value) {
+              Successor = Case.getCaseSuccessor();
+              break;
+            }
+          }
+          if (std::find(Feasible.begin(), Feasible.end(), Successor) ==
+              Feasible.end()) {
+            Feasible.push_back(Successor);
+          }
+        }
+        State.UsedDispatcherFact |=
+            Cond.DependsOnDispatcher && Feasible.size() < SI->getNumSuccessors();
+        for (BasicBlock *Successor : Feasible) {
+          Enqueue(Successor, Item.BB, State);
+        }
+      } else {
+        for (BasicBlock *Successor : successors(Item.BB)) {
+          Enqueue(Successor, Item.BB, State);
+        }
+      }
+    }
+  }
+
+  return SawReadWithDispatcherFact;
+}
+
+static bool IsDirectNativeFrame(ArrayRef<StackAccess *> Accesses, Function &F,
+                                bool HasFiniteCyclicBoundary) {
   DominatorTree DT(F);
+  SmallVector<DispatcherSlot, 8> DispatcherSlots;
+  if (HasFiniteCyclicBoundary) {
+    DispatcherSlots = collectDispatcherSlots(Accesses);
+  }
   for (const StackAccess *Read : Accesses) {
     if (!Read->IsRead) {
       continue;
@@ -547,7 +1242,18 @@ static bool IsDirectNativeFrame(ArrayRef<StackAccess *> Accesses,
       }
     }
     if (!Initialized) {
-      return false;
+      // Memory-carried dispatch can hide initialization from LLVM dominance.
+      // Waive dominance only when a finite dispatcher-state exploration proves
+      // every feasible execution of this read follows a covering write.
+      for (const DispatcherSlot &Slot : DispatcherSlots) {
+        if (hasProvenDispatcherInitialization(Read, Accesses, F, Slot)) {
+          Initialized = true;
+          break;
+        }
+      }
+      if (!Initialized) {
+        return false;
+      }
     }
   }
   return true;
@@ -570,30 +1276,6 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
     if (F.isDeclaration()) continue;
     if (!brighten_state_ssa::IsLiftedFunction(F)) continue;
     VisitedFunctions++;
-
-    // Dispatcher functions carrying undef/poison operands do not have a
-    // trustworthy stack data-flow graph.  Rewriting their frame accesses can
-    // turn an already-opaque lifted path into a concrete SIGSEGV; preserve the
-    // original function and let later passes report the unresolved contract.
-    bool HasUnresolvedValue = false;
-    for (BasicBlock &CheckBB : F) {
-      for (Instruction &I : CheckBB) {
-        for (Value *Op : I.operands()) {
-          if (isa<UndefValue>(Op) || isa<PoisonValue>(Op)) {
-            HasUnresolvedValue = true;
-            break;
-          }
-        }
-        if (HasUnresolvedValue)
-          break;
-      }
-      if (HasUnresolvedValue)
-        break;
-    }
-    if (HasUnresolvedValue) {
-      ++UnsafeCount;
-      continue;
-    }
 
     DenseMap<Value *, StackExpr> ExprMap;
     DenseMap<BasicBlock *, BlockState> BlockEntryState;
@@ -627,6 +1309,10 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
     const uint64_t MaxWorkItems =
         std::max<uint64_t>(1024, static_cast<uint64_t>(F.size()) * 128);
     bool AnalysisAborted = false;
+    bool HadNonFiniteRegisterMerge = false;
+    bool HadUnresolvedStackValueMerge = false;
+    bool HadUnresolvedStackClobber = false;
+    bool SawRSPAdjustment = false;
 
     while (!Worklist.empty()) {
       if (++WorkItems > MaxWorkItems) {
@@ -651,7 +1337,8 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       if (BB == Entry) {
         CurrentState = BlockEntryState[BB];
       } else {
-        CurrentState = mergeBlockStates(PredStates);
+        CurrentState =
+            mergeBlockStates(PredStates, &HadNonFiniteRegisterMerge);
       }
       BlockEntryState[BB] = CurrentState;
 
@@ -688,6 +1375,12 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
         } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
           if (isRSPRegisterState(SI->getPointerOperand(), DL, F)) {
             CurrentState.RSP = getStackExpr(SI->getValueOperand(), ExprMap);
+            if (CurrentState.RSP.K == StackExpr::Kind::StackConst &&
+                CurrentState.RSP.Base.V == nullptr &&
+                CurrentState.RSP.Base.Kind == StackBaseKind::RSP &&
+                CurrentState.RSP.Offset != 0) {
+              SawRSPAdjustment = true;
+            }
           } else if (isRBPRegisterState(SI->getPointerOperand(), DL, F)) {
             CurrentState.RBP = getStackExpr(SI->getValueOperand(), ExprMap);
           }
@@ -775,27 +1468,37 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
             // the mixed-base safety check will preserve the physical frame.
             CurrentState.RSP.K = StackExpr::Kind::Unknown;
             CurrentState.RBP.K = StackExpr::Kind::Unknown;
+            HadUnresolvedStackClobber = true;
           }
         } else if (auto *PHI = dyn_cast<PHINode>(&I)) {
           if (PHI->getNumIncomingValues() > 0) {
             auto EFirst = getStackExpr(PHI->getIncomingValue(0), ExprMap);
             bool AllSame = true;
-            bool SameBase = true;
+            bool AllStack = isStackExpr(EFirst);
+            bool SameBase = AllStack;
             for (unsigned idx = 1; idx < PHI->getNumIncomingValues(); ++idx) {
               auto ECur = getStackExpr(PHI->getIncomingValue(idx), ExprMap);
               if (!(ECur == EFirst)) {
                 AllSame = false;
               }
-              if (ECur.Base.V != EFirst.Base.V || ECur.Base.Kind != EFirst.Base.Kind || ECur.Base.Epoch != EFirst.Base.Epoch) {
-                SameBase = false;
-              }
+              AllStack &= isStackExpr(ECur);
+              SameBase &= hasSameStackBase(EFirst, ECur);
             }
             if (AllSame) {
               Expr = EFirst;
-            } else if (SameBase && EFirst.K != StackExpr::Kind::Unknown && EFirst.K != StackExpr::Kind::Unreachable) {
+            } else if (AllStack && SameBase) {
               Expr.K = StackExpr::Kind::StackDynamic;
               Expr.Base = EFirst.Base;
               Expr.Offset = EFirst.Offset;
+              Expr.DynamicOffset = PHI;
+              HadUnresolvedStackValueMerge = true;
+            } else {
+              bool HasStackIncoming = false;
+              for (Value *Incoming : PHI->incoming_values()) {
+                HasStackIncoming |=
+                    isStackExpr(getStackExpr(Incoming, ExprMap));
+              }
+              HadUnresolvedStackValueMerge |= HasStackIncoming;
             }
           }
         } else if (auto *Sel = dyn_cast<SelectInst>(&I)) {
@@ -803,10 +1506,14 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
           auto EFalse = getStackExpr(Sel->getFalseValue(), ExprMap);
           if (ETrue == EFalse) {
             Expr = ETrue;
-          } else if (ETrue.Base.V == EFalse.Base.V && ETrue.Base.Kind == EFalse.Base.Kind && ETrue.Base.Epoch == EFalse.Base.Epoch && ETrue.K != StackExpr::Kind::Unknown && ETrue.K != StackExpr::Kind::Unreachable) {
+          } else if (hasSameStackBase(ETrue, EFalse)) {
             Expr.K = StackExpr::Kind::StackDynamic;
             Expr.Base = ETrue.Base;
             Expr.Offset = ETrue.Offset;
+            Expr.DynamicOffset = Sel;
+            HadUnresolvedStackValueMerge = true;
+          } else if (isStackExpr(ETrue) || isStackExpr(EFalse)) {
+            HadUnresolvedStackValueMerge = true;
           }
         }
 
@@ -978,6 +1685,7 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       BaseKey Key{Acc.Addr.Base.V, Acc.Addr.Base.Kind, Acc.Addr.Base.Epoch};
       BaseAccesses[Key].push_back(Acc);
     }
+    const bool HasSharedRBPStateTraffic = hasSharedRBPStateTraffic(F, DL);
 
     // Do not reject a frame merely because the function also accesses some
     // other memory object.  A callee-local stack object's lifetime prevents
@@ -1035,6 +1743,27 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       } else if (Key.V != nullptr) {
         addSkipReason(BaseReasons, Key, SkipNonEntryRSP);
       }
+
+      // A lifted `push rbp` stores the architectural frame register in the
+      // first entry-RSP word. It remains State-visible across the ABI boundary
+      // and cannot be split into a local alloca with neighboring locals.
+      if (HasSharedRBPStateTraffic && Key.Kind == StackBaseKind::RSP &&
+          Key.V == nullptr) {
+        for (const StackAccess &Acc : Pair.second) {
+          if (isEntryABISpillAccess(Acc, DL, F)) {
+            addSkipReason(BaseReasons, Key, SkipEntryABISlot);
+            break;
+          }
+        }
+      }
+    }
+
+    // A stack-derived PHI with an unresolved/non-stack incoming value, or a
+    // register merge with no single affine result, is not a finite frame.
+    if (HadNonFiniteRegisterMerge || HadUnresolvedStackValueMerge) {
+      for (const auto &Pair : BaseAccesses) {
+        addSkipReason(BaseReasons, Pair.first, SkipDynamicAddress);
+      }
     }
 
     // Different unresolved base identities may still denote the same
@@ -1047,16 +1776,15 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       }
     }
 
-    // A large recovered region is not yet proven to be a function-local
-    // object merely because every individual access has a constant offset.
-    // In production IR such regions can still carry values consumed by later
-    // ABI/global-recovery stages.  Promoting the 16/30-access frames in
-    // p01296 changed a recovered global index and made sub_4026f0 read beyond
-    // the recovered `id` array.  Keep the pass fail-closed until object
-    // separation is backed by an interprocedural proof; small scalar frames
-    // remain eligible for the rewrite below.
+    // Large frames require a complete finite RSP boundary.  This admits stable
+    // cyclic dispatchers while preserving moving p01296-style stack allocation
+    // and no-finite-PHI frames.
     for (const auto &Pair : BaseAccesses) {
-      if (Pair.second.size() > 8) {
+      if (Pair.second.size() > 8 &&
+          !HasProvenFiniteFrameBoundary(
+              F, BlockEntryState, BlockExitState, HadNonFiniteRegisterMerge,
+              HadUnresolvedStackValueMerge, HadUnresolvedStackClobber,
+              SawRSPAdjustment, Pair.second)) {
         addSkipReason(BaseReasons, Pair.first, SkipUnsafeOverlap);
       }
     }
@@ -1072,6 +1800,10 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
     for (auto &Pair : BaseAccesses) {
       const BaseKey &Key = Pair.first;
       auto &Accesses = Pair.second;
+      bool HasFiniteCyclicBoundary = HasProvenFiniteFrameBoundary(
+          F, BlockEntryState, BlockExitState, HadNonFiniteRegisterMerge,
+          HadUnresolvedStackValueMerge, HadUnresolvedStackClobber,
+          SawRSPAdjustment, Accesses);
 
       StackFrameReportEntry Report;
       Report.FunctionName = F.getName().str();
@@ -1213,7 +1945,8 @@ bool BrightenStackFramePass::RecoverStackFrame(Module &M) {
       // frame, so splitting out only the locally-written components is not
       // semantics-preserving.  Recover the base only when every read in the
       // complete eligible set is initialized locally.
-      if (!IsDirectNativeFrame(SafeAccesses, F)) {
+      if (!IsDirectNativeFrame(SafeAccesses, F,
+                               HasFiniteCyclicBoundary)) {
         UnsafeCount += SafeAccesses.size();
         Report.UnsafeAccesses += SafeAccesses.size();
         Report.Reasons |= SkipReadBeforeWrite;

@@ -1,11 +1,5 @@
 ; A residual image or dynamic byte backing can be rooted only by llvm.used.
-; Final cleanup must remove those dead roots while preserving a backing with
-; a real instruction use.
-;
-; CHECK-NOT: @native_residual_dead
-; CHECK-NOT: @dyn_bytes_dead
-; CHECK: @native_data_live__byte_backing = internal global [4 x i8]
-; CHECK: load i8, ptr @native_data_live__byte_backing
+; The final verifier must preserve and reject these recovery artifacts.
 
 @native_residual_dead = internal constant [4 x i8] c"dead"
 @dyn_bytes_dead = internal global [4 x i8] zeroinitializer

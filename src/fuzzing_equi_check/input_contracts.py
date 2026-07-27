@@ -19,6 +19,160 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 _TOKEN_RE = re.compile(rb"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+)|[A-Za-z_][A-Za-z0-9_]*")
 _INT_RE = re.compile(rb"[+-]?\d+")
 _FLOAT_RE = re.compile(rb"[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?)")
+_C_WHITESPACE = b" \t\n\v\f\r"
+
+
+def _scanf_source(payload: bytes, requirement: Dict[str, Any]) -> Tuple[Optional[bytes], str]:
+    """Return the byte stream consumed by one source-derived scanf contract.
+
+    ``scanf`` consumes stdin, while the common ``fgets(...); sscanf(...)``
+    pattern consumes one complete input line.  The latter must name its line
+    explicitly: guessing a buffer/data-flow relation would make a validity
+    claim we cannot prove.
+    """
+    source = str(requirement.get("source", "stdin"))
+    if source == "stdin":
+        return payload, ""
+    if source == "line":
+        line_index = requirement.get("line_index")
+        if not isinstance(line_index, int) or line_index < 0:
+            return None, "scanf_requirement_source"
+        lines = payload.splitlines()
+        if line_index >= len(lines):
+            return None, "scanf_requirement_eof"
+        return lines[line_index], ""
+    return None, "scanf_requirement_source"
+
+
+def _consume_scanf_integer(data: bytes, offset: int, conversion: str, width: Optional[int]) -> Optional[int]:
+    end = len(data) if width is None else min(len(data), offset + width)
+    token = data[offset:end]
+    sign = 0
+    if sign < len(token) and token[sign:sign + 1] in (b"+", b"-"):
+        sign += 1
+    digits = token[sign:]
+    if conversion in "du":
+        match = re.match(rb"[0-9]+", digits)
+    elif conversion == "o":
+        match = re.match(rb"[0-7]+", digits)
+    elif conversion in "xX":
+        match = re.match(rb"(?:0[xX])?[0-9a-fA-F]+", digits)
+    elif conversion == "i":
+        match = re.match(rb"(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)", digits)
+    else:
+        return None
+    if match is None:
+        return None
+    return offset + sign + match.end()
+
+
+def _consume_scanf_conversion(
+    data: bytes, offset: int, conversion: str, width: Optional[int]
+) -> Optional[int]:
+    if conversion in "diuoxX":
+        return _consume_scanf_integer(data, offset, conversion, width)
+    end = len(data) if width is None else min(len(data), offset + width)
+    if conversion == "s":
+        cursor = offset
+        while cursor < end and data[cursor] not in _C_WHITESPACE:
+            cursor += 1
+        return cursor if cursor != offset else None
+    if conversion == "c":
+        count = 1 if width is None else width
+        return offset + count if count > 0 and offset + count <= len(data) else None
+    # Deliberately fail closed: scansets, floating conversion, %n, positional
+    # arguments and locale-sensitive forms need a real C parser/oracle.
+    return None
+
+
+def _validate_scanf_requirement(payload: bytes, requirement: Dict[str, Any]) -> Tuple[bool, str]:
+    data, reason = _scanf_source(payload, requirement)
+    if data is None:
+        return False, reason
+    fmt = requirement.get("format")
+    if not isinstance(fmt, str) or not fmt:
+        return False, "scanf_requirement_format"
+    try:
+        format_bytes = fmt.encode("ascii")
+    except UnicodeEncodeError:
+        return False, "scanf_format_unsupported"
+
+    cursor = 0
+    index = 0
+    assigned = 0
+    required = requirement.get("required_conversions")
+    while index < len(format_bytes):
+        char = format_bytes[index:index + 1]
+        if char in _C_WHITESPACE:
+            while index < len(format_bytes) and format_bytes[index:index + 1] in _C_WHITESPACE:
+                index += 1
+            while cursor < len(data) and data[cursor] in _C_WHITESPACE:
+                cursor += 1
+            continue
+        if char != b"%":
+            if cursor >= len(data) or data[cursor:cursor + 1] != char:
+                return False, "scanf_literal_mismatch"
+            cursor += 1
+            index += 1
+            continue
+        index += 1
+        if index >= len(format_bytes):
+            return False, "scanf_format_unsupported"
+        if format_bytes[index:index + 1] == b"%":
+            if cursor >= len(data) or data[cursor:cursor + 1] != b"%":
+                return False, "scanf_literal_mismatch"
+            cursor += 1
+            index += 1
+            continue
+        suppressed = format_bytes[index:index + 1] == b"*"
+        if suppressed:
+            index += 1
+        width_start = index
+        while index < len(format_bytes) and format_bytes[index:index + 1].isdigit():
+            index += 1
+        width = int(format_bytes[width_start:index]) if index != width_start else None
+        if width == 0:
+            return False, "scanf_format_unsupported"
+        if format_bytes[index:index + 2] in (b"hh", b"ll"):
+            index += 2
+        elif index < len(format_bytes) and format_bytes[index:index + 1] in b"hljztL":
+            index += 1
+        if index >= len(format_bytes):
+            return False, "scanf_format_unsupported"
+        conversion = chr(format_bytes[index])
+        index += 1
+        if conversion != "c":
+            while cursor < len(data) and data[cursor] in _C_WHITESPACE:
+                cursor += 1
+        next_cursor = _consume_scanf_conversion(data, cursor, conversion, width)
+        if next_cursor is None:
+            if conversion not in "diuoxXsc":
+                return False, "scanf_format_unsupported"
+            return False, "scanf_conversion_incomplete"
+        cursor = next_cursor
+        if not suppressed:
+            assigned += 1
+
+    if required is None:
+        required = assigned
+    if not isinstance(required, int) or required < 0 or assigned < required:
+        return False, "scanf_requirement_format"
+    return True, ""
+
+
+def _validate_scanf_completeness(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    requirements = contract.get("scanf_required_conversions", [])
+    if requirements is None:
+        return True, ""
+    if not isinstance(requirements, list):
+        return False, "scanf_requirement_format"
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            return False, "scanf_requirement_format"
+        valid, reason = _validate_scanf_requirement(payload, requirement)
+        if not valid:
+            return False, reason
+    return True, ""
 
 
 def _is_prime(value: int) -> bool:
@@ -1472,6 +1626,9 @@ def validate_contract_payload(
         return False, "empty_payload"
     if b"\x00" in payload:
         return False, "embedded_nul"
+    valid, reason = _validate_scanf_completeness(payload, contract)
+    if not valid:
+        return False, reason
     kind = contract.get("kind", "")
     constraints = contract.get("constraints", {})
     case_validator = _CASE_VALIDATORS.get(str(contract.get("case_id", "")))

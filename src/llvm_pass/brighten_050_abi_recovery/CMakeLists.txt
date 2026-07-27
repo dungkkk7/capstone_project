@@ -29,6 +29,8 @@ add_llvm_pass_plugin(BrightenABIRecoveryPass
   RuleCloneNativeFunctions.cpp
   RuleRewriteNativeFunctionBodies.cpp
   RuleRewriteKnownCallsites.cpp
+  RuleNormalizeScanfI32Boundaries.cpp
+  RuleLowerCallbackAndSharedStateABI.cpp
   RuleCreateRemillWrappers.cpp
   RuleRewriteMainWrapper.cpp
   RuleCleanupDeadRemillABI.cpp

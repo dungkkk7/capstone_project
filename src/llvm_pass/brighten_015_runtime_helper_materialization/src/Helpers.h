@@ -23,5 +23,10 @@ llvm::Value *FindLikelyMemoryArg(llvm::Function &F);
 llvm::Constant *ZeroValue(llvm::Type *Ty);
 llvm::Value *CastAddressToI64(llvm::IRBuilder<> &B, llvm::Value *Addr);
 llvm::Function *GetOrCreateTranslateGuestPointer(llvm::Module &M);
+// Convert a host pointer returned by a direct external call back to the
+// lifted guest integer address only when its exact host object is a known,
+// non-TLS guest image global. Unknown/dynamic pointers deliberately retain
+// their host integer representation.
+llvm::Function *GetOrCreateGuestAddressFromPointer(llvm::Module &M);
 
 }  // namespace brighten_runtime

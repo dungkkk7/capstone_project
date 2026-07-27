@@ -42,5 +42,12 @@ fi
 
 "${root_dir}/tests/test_opaque_predicates.sh"
 "${root_dir}/tests/test_opaque_select.sh"
+"${root_dir}/tests/test_opaque_semantic_proof.sh"
+"${root_dir}/tests/test_opaque_parity_semantic_proof.sh"
+python3 "${root_dir}/tests/test_p00788_semantic_lifecycle.py"
+python3 "${root_dir}/tests/test_p03430_semantic_lifecycle.py"
+"${root_dir}/tests/test_chernobog_add_ollvm_rules.sh"
+"${root_dir}/tests/test_chernobog_and_ollvm_rules.sh"
+"${root_dir}/tests/test_chernobog_xor_ollvm_rules.sh"
 
 echo "095 regression and differential test passed"

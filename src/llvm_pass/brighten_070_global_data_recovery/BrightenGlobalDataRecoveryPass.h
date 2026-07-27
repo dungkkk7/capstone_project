@@ -29,6 +29,29 @@ public:
   static bool PrintGlobalDataRecoveryReport(GlobalDataContext &Ctx);
 };
 
+// This is intentionally a separate late phase.  It owns the representation
+// of proven guest-address resolvers after object recovery has finished; it
+// does not discover objects or change their ranges.
+class BrightenGuestPointerResolverCanonicalizePass
+    : public llvm::PassInfoMixin<BrightenGuestPointerResolverCanonicalizePass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
+};
+
+bool CanonicalizeGuestPointerResolvers(llvm::Module &M);
+
+// Runs only after the late ABI/external-call bridge has exposed a direct
+// libc format operand. It does not recover arbitrary residual objects.
+bool RecoverLateResidualFormatStrings(llvm::Module &M);
+
+class BrightenLateResidualFormatStringRecoveryPass
+    : public llvm::PassInfoMixin<BrightenLateResidualFormatStringRecoveryPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
+};
+
 } // namespace brighten_global
 
 #endif

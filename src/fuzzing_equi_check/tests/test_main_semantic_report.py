@@ -7,7 +7,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from main import _semantic_status, _write_semantic_report  # noqa: E402
+from main import (  # noqa: E402
+    _allows_non_native_semantic_diagnostic,
+    _semantic_status,
+    _write_semantic_report,
+)
 
 
 class SemanticReportPersistenceTests(unittest.TestCase):
@@ -69,6 +73,30 @@ class SemanticReportPersistenceTests(unittest.TestCase):
             }),
             "unchecked",
         )
+
+    def test_only_compat_runnable_nonpass_gets_diagnostic_execution(self):
+        self.assertTrue(
+            _allows_non_native_semantic_diagnostic({
+                "status": "non_compliant",
+                "is_fully_native": False,
+                "output_class": "compat_runnable",
+            })
+        )
+        self.assertFalse(
+            _allows_non_native_semantic_diagnostic({
+                "status": "non_compliant",
+                "is_fully_native": False,
+                "output_class": "structural_only",
+            })
+        )
+        self.assertFalse(
+            _allows_non_native_semantic_diagnostic({
+                "status": "compliant",
+                "is_fully_native": True,
+                "output_class": "fully_native",
+            })
+        )
+        self.assertFalse(_allows_non_native_semantic_diagnostic(None))
 
 
 if __name__ == "__main__":

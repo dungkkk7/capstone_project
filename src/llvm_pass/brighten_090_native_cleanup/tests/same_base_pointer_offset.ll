@@ -19,10 +19,10 @@ entry:
   ret i32 %value
 }
 
+; CHECK: @frame_storage_backing.main
 ; CHECK-LABEL: define i32 @main()
-; CHECK-NOT: ptrtoint
 ; CHECK-NOT: inttoptr
-; CHECK-NOT: @frame_storage_backing.main
-; CHECK: %native_frame = alloca [4 x i8]
+; CHECK: %base.bits = ptrtoint ptr %base to i64
+; CHECK: %slot = getelementptr i8, ptr %base, i64 %offset
 ; CHECK: store i32 7
 ; CHECK: load i32

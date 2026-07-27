@@ -609,18 +609,22 @@ static void AddAddressRef(Value *V, Instruction *Inst, const GlobalDataContext &
       return;
   }
 
-  GlobalVariable *GV = FindReferencedGlobal(V);
-  GuestSegment *Seg = nullptr;
-  if (GV) {
-    for (auto &S : Ctx.Segments) {
-      if (S->GV == GV) {
-        Seg = S.get();
-        break;
+  // When PT_LOAD evidence constructed an authoritative partition, address
+  // ownership is determined solely by that partition.  In particular a
+  // McSema alias may still physically name the pre-clipped aggregate at the
+  // first page-tail byte; trusting that carrier would send a store to the
+  // aggregate while a dynamic load selects the zero-tail global.
+  GuestSegment *Seg = Ctx.findSegmentForAddr(*Addr);
+  if (!Seg && !Ctx.HasAuthoritativeGuestAddressMap) {
+    GlobalVariable *GV = FindReferencedGlobal(V);
+    if (GV) {
+      for (auto &S : Ctx.Segments) {
+        if (S->GV == GV) {
+          Seg = S.get();
+          break;
+        }
       }
     }
-  }
-  if (!Seg) {
-    Seg = Ctx.findSegmentForAddr(*Addr);
   }
 
   auto Ref = std::make_unique<GuestAddressRef>();

@@ -21,6 +21,7 @@ public:
   static bool LowerMaterializedVAListCalls(ExternCallContext &Ctx);
   static bool LowerLiftedExternalABICalls(ExternCallContext &Ctx);
   static bool RewriteExternalCallsites(ExternCallContext &Ctx);
+  static bool AnnotateDirectScanfDestinationNoCapture(ExternCallContext &Ctx);
   static bool RewriteExternalReturns(ExternCallContext &Ctx);
   static bool CleanupExternalCallArtifacts(ExternCallContext &Ctx);
   static bool VerifyExternalCallRecovery(ExternCallContext &Ctx);

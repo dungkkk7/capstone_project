@@ -9,6 +9,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <cstring>
+#include <limits>
 #include <optional>
 
 namespace brighten_global {
@@ -384,6 +385,21 @@ static bool HasGuestCodeLabel(Module &M, uint64_t Addr) {
 
 static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataContext &Ctx);
 
+static bool CandidateHasObservedWrite(const ObjectCandidate *Cand,
+                                      const GlobalDataContext &Ctx) {
+  if (!Cand || !Cand->SourceSegment)
+    return false;
+  for (const auto &Ref : Ctx.AddressRefs) {
+    if (!Ref || Ref->Segment != Cand->SourceSegment || !Ref->UserInst ||
+        Ref->GuestAddr < Cand->Begin || Ref->GuestAddr >= Cand->End)
+      continue;
+    if (auto *SI = dyn_cast<StoreInst>(Ref->UserInst))
+      if (SI->getPointerOperand() == Ref->OriginalValue)
+        return true;
+  }
+  return false;
+}
+
 static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataContext &Ctx) {
   if (!Cand)
     return nullptr;
@@ -395,7 +411,29 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
   GuestSegment *Seg = Cand->SourceSegment;
   if (!Seg)
     return nullptr;
+  // String extraction is intentionally not a generic mixed-blob split.  The
+  // generator supplies the proof; repeat the section/mutability part at the
+  // materialization boundary so a future candidate producer cannot bypass it.
+  if (Cand->Kind == ObjectKind::StringLiteral &&
+      (!Seg->BaseResolved || !Seg->ReadOnly || Seg->Writable ||
+       Seg->Executable || CandidateHasObservedWrite(Cand, Ctx)))
+    return nullptr;
   uint64_t Off = GetCandidateSourceOffset(Cand, Ctx);
+  const uint64_t CandidateSize = Cand->End - Cand->Begin;
+  if (CandidateSize > std::numeric_limits<uint64_t>::max() - Off)
+    return nullptr;
+
+  // Do not reinterpret relocation-bearing storage as bytes or integer
+  // fields.  The flat image holds zero placeholders at those offsets; using
+  // it for a RawBytes/Scalar/Array candidate would silently replace a dynamic
+  // loader relocation or function pointer with zero.  PointerTable is the
+  // sole owner allowed here because its materializer explicitly preserves
+  // relocation constants as ptr fields.
+  auto Reloc = Seg->Relocations.lower_bound(Off);
+  if (Reloc != Seg->Relocations.end() &&
+      Reloc->first < Off + CandidateSize &&
+      Cand->Kind != ObjectKind::PointerTable)
+    return nullptr;
   Constant *Init = nullptr;
 
   // Some lifted ELF images fold a large zero-initialized BSS tail into a
@@ -404,7 +442,7 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
   // or relocations.  Treat only that proven zero range as zero-initialized;
   // do not let unrelated segment relocations become bytes of the object.
   bool RangeIsZero = true;
-  for (uint64_t I = 0; I < Cand->End - Cand->Begin; ++I) {
+  for (uint64_t I = 0; I < CandidateSize; ++I) {
     if (Off + I >= Seg->FlatBytes.size() || Seg->FlatBytes[Off + I] != 0) {
       RangeIsZero = false;
       break;
@@ -412,7 +450,7 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
   }
   if (RangeIsZero) {
     for (const auto &Rel : Seg->Relocations) {
-      if (Rel.first >= Off && Rel.first < Off + (Cand->End - Cand->Begin)) {
+      if (Rel.first >= Off && Rel.first < Off + CandidateSize) {
         RangeIsZero = false;
         break;
       }
@@ -571,7 +609,8 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
     return nullptr;
 
   std::string Name = Cand->Name;
-  bool IsReadOnly = Seg->ReadOnly;
+  const bool HasObservedWrite = CandidateHasObservedWrite(Cand, Ctx);
+  bool IsReadOnly = Seg->ReadOnly && !HasObservedWrite;
   GlobalValue::LinkageTypes Linkage = GlobalValue::InternalLinkage;
 
   if (Cand->Kind == ObjectKind::StringLiteral) {
@@ -588,7 +627,13 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
 
   auto *GV = new GlobalVariable(Ctx.M, Init->getType(), IsReadOnly,
                                 Linkage, Init, Name);
-  GV->setAlignment(Align(Ctx.DL.getABITypeAlign(Init->getType())));
+  // The recovered field begins inside a live source object.  Its alignment is
+  // constrained by that source placement, not by the ABI preference for the
+  // newly-created type (e.g. i32 at residual+2 is not align 4).  The scalar
+  // preflight has already rejected overlapping typed intervals, but retain
+  // the physical alignment proof for every materialized candidate.
+  const Align SourceAlign = Seg->GV->getAlign().valueOrOne();
+  GV->setAlignment(commonAlignment(SourceAlign, Off));
 
   // Keep the original ELF range as non-semantic provenance for the final
   // native cleanup pass.  It is needed when an ABI/state rewrite recreates a
@@ -624,8 +669,11 @@ static GlobalVariable *MaterializeCandidate(ObjectCandidate *Cand, GlobalDataCon
   Obj->GV = GV;
   Obj->SourceSegment = Seg;
   Obj->ReadOnly = IsReadOnly;
+  Obj->HasWrites = HasObservedWrite;
   Obj->Name = Name;
   Obj->Action = "recovered-" + Name;
+  Obj->RequiresTransactionalDirectRewrite =
+      Cand->RequiresTransactionalDirectRewrite;
 
   if (Cand->Kind == ObjectKind::StringLiteral)
     ++Ctx.Report.StringsRecovered;

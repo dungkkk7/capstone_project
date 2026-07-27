@@ -1,9 +1,9 @@
 ; RUN: opt -load-pass-plugin=%builddir/BrightenGlobalDataRecoveryPass.so \
 ; RUN:   -passes=brighten-global-data-recovery-pass -S < %s | FileCheck %s
 
-; A ptrtoint(data_<base>) subtracted from a pointer return and scaled into a
-; GEP index is a native pointer difference.  An unrelated arithmetic use of
-; the same base remains guest identity.
+; A ptrtoint(data_<base>) subtracted from a pointer return observes pointer
+; identity.  070 has no whole-use-graph proof that every related pointer is
+; rewritten to one native object, so it must preserve this source segment.
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
@@ -15,10 +15,10 @@ target triple = "x86_64-unknown-linux-gnu"
 declare ptr @strchr(ptr, i32)
 
 ; CHECK: @seg_405048__rodata = constant [7 x i8] c"AIDUNY\00"
-; CHECK: @.str.0 = private unnamed_addr constant [7 x i8] c"AIDUNY\00"
+; CHECK-NOT: @.str.0 =
 ; CHECK-LABEL: define i32 @pointer_difference
-; CHECK: %pointer = call ptr @strchr(ptr @.str.0, i32 %character)
-; CHECK: %difference = sub i64 %pointer.bits, ptrtoint (ptr @.str.0 to i64)
+; CHECK: %pointer = call ptr @strchr(ptr @data_405048, i32 %character)
+; CHECK: %difference = sub i64 %pointer.bits, ptrtoint (ptr @data_405048 to i64)
 ; CHECK: %slot = getelementptr i8, ptr @g_arr_0, i64 %scaled
 define i32 @pointer_difference(i32 %character) {
 entry:

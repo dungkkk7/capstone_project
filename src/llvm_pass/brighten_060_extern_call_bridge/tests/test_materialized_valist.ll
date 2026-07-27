@@ -8,11 +8,70 @@
 @.fmt = private constant [4 x i8] c"%ld\00"
 @.scan8 = private constant [25 x i8] c"%lf%lf%lf%lf%lf%lf%lf%lf\00"
 @.scan6 = private constant [19 x i8] c"%lf%lf%lf%lf%lf%lf\00"
+@.scan_string = private constant [3 x i8] c"%s\00"
 @.unrelated = private constant [3 x i8] c"%d\00"
 @frame_storage_backing.test = internal global [256 x i8] zeroinitializer
+@guest_scan_destinations = internal global [48 x i8] zeroinitializer,
+  !brighten.guest.range !0
 
 declare i32 @vprintf(ptr, ptr)
 declare i32 @vscanf(ptr, ptr)
+
+; vscanf register-save slots can contain literal guest addresses.  They must
+; be rebased through the unique guest object before becoming scanf arguments;
+; emitting raw inttoptr would crash libc on a native host.
+define i32 @materialized_vscanf_guest_constants() {
+entry:
+  %save = alloca [176 x i8], align 16
+  %va = alloca [24 x i8], align 8
+  %overflow.slots = alloca [8 x i8], align 8
+  %s1 = getelementptr i8, ptr %save, i64 8
+  %s2 = getelementptr i8, ptr %save, i64 16
+  %s3 = getelementptr i8, ptr %save, i64 24
+  %s4 = getelementptr i8, ptr %save, i64 32
+  %s5 = getelementptr i8, ptr %save, i64 40
+  store i64 24576, ptr %s1, align 8
+  store i64 24584, ptr %s2, align 8
+  store i64 24592, ptr %s3, align 8
+  store i64 24600, ptr %s4, align 8
+  store i64 24608, ptr %s5, align 8
+  store i64 24616, ptr %overflow.slots, align 8
+  store i32 8, ptr %va, align 8
+  %overflow = getelementptr i8, ptr %va, i64 8
+  store ptr %overflow.slots, ptr %overflow, align 8
+  %save.field = getelementptr i8, ptr %va, i64 16
+  store ptr %save, ptr %save.field, align 8
+  %ret = call i32 @vscanf(ptr @.scan6, ptr %va)
+  ret i32 %ret
+}
+
+; CHECK-LABEL: define i32 @materialized_vscanf_guest_constants
+; CHECK: call i32 (ptr, ...) @scanf(ptr @.scan6, ptr {{.*guest_scan_destinations}}
+; CHECK-NOT: inttoptr (i64 24576 to ptr)
+; CHECK-NOT: call i32 @vscanf
+
+; A guest string destination has input-dependent extent.  It is still safe to
+; lower when the first writable byte maps to exactly one recovered guest
+; object: the native call preserves any original overrun behaviour rather than
+; dereferencing the guest integer directly.
+define i32 @materialized_vscanf_guest_string_offset() {
+entry:
+  %save = alloca [176 x i8], align 16
+  %va = alloca [24 x i8], align 8
+  %slot = getelementptr i8, ptr %save, i64 8
+  store i64 24583, ptr %slot, align 8
+  store i32 8, ptr %va, align 8
+  %overflow = getelementptr i8, ptr %va, i64 8
+  store ptr null, ptr %overflow, align 8
+  %save.field = getelementptr i8, ptr %va, i64 16
+  store ptr %save, ptr %save.field, align 8
+  %ret = call i32 @vscanf(ptr @.scan_string, ptr %va)
+  ret i32 %ret
+}
+
+; CHECK-LABEL: define i32 @materialized_vscanf_guest_string_offset
+; CHECK: call i32 (ptr, ...) @scanf(ptr @.scan_string, ptr {{.*guest_scan_destinations}}
+; CHECK-NOT: call i32 @vscanf
 
 define i32 @materialized_printf(i64 %x) {
 entry:
@@ -72,7 +131,7 @@ entry:
 ; CHECK: %native.overflow.frame.ptr = getelementptr i8, ptr %anchor, i64 -24
 ; CHECK: getelementptr i8, ptr %anchor, i64 -16
 ; CHECK: getelementptr i8, ptr %anchor, i64 -8
-; CHECK: call i32 (ptr, ...) @scanf(ptr %native.data.pointer.select.test, ptr %a, ptr %b, ptr %c, ptr %d, ptr %e, ptr %native.overflow.frame.ptr{{[0-9]*}}, ptr %native.overflow.frame.ptr{{[0-9]*}}, ptr %native.overflow.frame.ptr{{[0-9]*}})
+; CHECK: call i32 (ptr, ...) @scanf(ptr %native.data.pointer.select.test, ptr captures(none) %a, ptr captures(none) %b, ptr captures(none) %c, ptr captures(none) %d, ptr captures(none) %e, ptr captures(none) %native.overflow.frame.ptr{{[0-9]*}}, ptr captures(none) %native.overflow.frame.ptr{{[0-9]*}}, ptr captures(none) %native.overflow.frame.ptr{{[0-9]*}})
 ; CHECK-NOT: call i32 @vscanf
 
 ; A concrete recovered backing initializes RSP/RBP with ptrtoint(frame_top).
@@ -120,6 +179,26 @@ entry:
 
 ; CHECK-LABEL: define internal i32 @materialized_scanf_absolute
 ; CHECK: %native.overflow.absolute.ptr = inttoptr i64 %absolute to ptr
-; CHECK: call i32 (ptr, ...) @scanf(ptr @.scan6, ptr %a, ptr %b, ptr %c, ptr %d, ptr %e, ptr %native.overflow.absolute.ptr)
+; CHECK: call i32 (ptr, ...) @scanf(ptr @.scan6, ptr captures(none) %a, ptr captures(none) %b, ptr captures(none) %c, ptr captures(none) %d, ptr captures(none) %e, ptr captures(none) %native.overflow.absolute.ptr)
 ; CHECK-NOT: native.overflow.frame.ptr
 ; CHECK-NOT: call i32 @vscanf
+
+!0 = !{i64 24576, i64 24624}
+
+define i32 @materialized_vscanf_unknown_constant() {
+entry:
+  %save = alloca [176 x i8], align 16
+  %va = alloca [24 x i8], align 8
+  %slot = getelementptr i8, ptr %save, i64 8
+  store i64 3735928559, ptr %slot, align 8
+  store i32 8, ptr %va, align 8
+  %overflow = getelementptr i8, ptr %va, i64 8
+  store ptr null, ptr %overflow, align 8
+  %save.field = getelementptr i8, ptr %va, i64 16
+  store ptr %save, ptr %save.field, align 8
+  %ret = call i32 @vscanf(ptr @.scan6, ptr %va)
+  ret i32 %ret
+}
+
+; CHECK-LABEL: define i32 @materialized_vscanf_unknown_constant
+; CHECK: call i32 @vscanf(ptr @.scan6, ptr %va)

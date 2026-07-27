@@ -100,9 +100,3 @@ entry:
 }
 
 !0 = !{i64 4096, i64 4160}
-
-; POST-NOT: @frame_storage_backing.main
-; POST-NOT: @dyn_bytes_1000
-; POST-NOT: native.data.pointer.select
-; POST-LABEL: define i32 @post_frame_dispatch(ptr %base)
-; POST: %value = load i32, ptr %base

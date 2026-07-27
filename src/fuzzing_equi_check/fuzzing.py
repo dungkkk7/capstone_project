@@ -862,6 +862,36 @@ def is_stable_observation(
             return False
     return True
 
+
+def confirm_one_sided_timeout(
+    bin1: str,
+    bin2: str,
+    args: List[str],
+    stdin_data: bytes,
+    timeout: float,
+    res1: Dict[str, Any],
+    res2: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Recheck a one-sided deadline sequentially with an isolated budget.
+
+    Dataset workers execute many binary pairs concurrently.  A fast original
+    can therefore miss a short wall-clock deadline solely because the host is
+    saturated.  Only the ambiguous one-timeout/one-nontimeout case is retried;
+    crashes and ordinary output mismatches are untouched.  Both sides are
+    rerun so the final verdict still compares observations made under the same
+    budget.  A confirmed timeout remains a semantic mismatch.
+    """
+    one_timed_out = (res1.get("status") == "timeout") ^ (
+        res2.get("status") == "timeout"
+    )
+    if not one_timed_out:
+        return res1, res2
+    confirmation_timeout = max(float(timeout) * 4.0, 2.0)
+    return (
+        run_binary(bin1, args, stdin_data, confirmation_timeout),
+        run_binary(bin2, args, stdin_data, confirmation_timeout),
+    )
+
 def is_inconclusive_pair(res1: Dict[str, Any], res2: Dict[str, Any]) -> bool:
     """Return true only for raw failure-mode pairs with no stable verdict.
 
@@ -1267,6 +1297,9 @@ class SemanticFuzzer:
                 future2 = pair_executor.submit(run_binary, self.bin2, args, stdin_data, timeout)
                 res1 = future1.result()
                 res2 = future2.result()
+            res1, res2 = confirm_one_sided_timeout(
+                self.bin1, self.bin2, args, stdin_data, timeout, res1, res2
+            )
             
             # Resolve case ID
             case_id = None
@@ -1506,8 +1539,19 @@ int main(int argc, char** argv) {
             os.makedirs(seeds_dir, exist_ok=True)
 
             afl_seed_inputs = _dedupe_bytes(seed_inputs or self.seed_inputs or [])
+            invalid_domain_inputs = []
             contract_corpus_stats = None
             if input_contract is not None and afl_seed_inputs:
+                valid_seed_inputs = []
+                for payload in afl_seed_inputs:
+                    valid, reason = validate_contract_payload(
+                        input_contract, payload, afl_seed_inputs
+                    )
+                    if valid:
+                        valid_seed_inputs.append(payload)
+                    else:
+                        invalid_domain_inputs.append((payload, reason))
+                afl_seed_inputs = valid_seed_inputs
                 # AFL++ remains the coverage-guided mutator.  Expand the
                 # initial corpus with valid contract mutations first so AFL
                 # starts from more than one recorded example.
@@ -1742,7 +1786,17 @@ int main(int argc, char** argv) {
                 "equivalence_ratio": 0.0,
                 "is_fully_equivalent": False,
                 "mismatch_examples": [],
-                "tested_payloads": _encode_payloads_for_report(run_inputs[:min(len(run_inputs), 500)])
+                "tested_payloads": _encode_payloads_for_report(run_inputs[:min(len(run_inputs), 500)]),
+                # Invalid-domain payloads are diagnostic evidence only. They
+                # never contribute a semantic PASS/FAIL verdict because a
+                # partial scanf conversion can expose undefined local state.
+                "invalid_domain_inputs": [
+                    {
+                        "payload_base64": base64.b64encode(payload).decode("ascii"),
+                        "reason": reason,
+                    }
+                    for payload, reason in invalid_domain_inputs[:20]
+                ],
             }
             report["fuzz_config"] = {
                 "engine": "afl++",
@@ -1822,6 +1876,9 @@ int main(int argc, char** argv) {
                     future2 = pair_executor.submit(run_binary, self.bin2, args, stdin_data, timeout)
                     res1 = future1.result()
                     res2 = future2.result()
+                res1, res2 = confirm_one_sided_timeout(
+                    self.bin1, self.bin2, args, stdin_data, timeout, res1, res2
+                )
                 
                 # Resolve case ID
                 case_id = None

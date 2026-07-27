@@ -1,7 +1,7 @@
 ; A guest-range dispatch can be created before callback/native-pointer
-; provenance is exposed by inlining.  The final cleanup must recover the
+; provenance is exposed by inlining.  The recovery cleanup must recover the
 ; ordinary native base+index access instead of retaining one select per ELF
-; object.
+; object; the final pass only verifies the resulting IR.
 
 @dyn_bytes_405068 = internal global [64 x i8] zeroinitializer,
   !brighten.guest.range !0

@@ -89,19 +89,41 @@ bool RunTypeReconstruction(Module &M, TypeMode Mode, bool OnlyStruct, bool OnlyA
   return Changed;
 }
 
-PreservedAnalyses BrightenTypeReconstructionPass::run(Module &M, ModuleAnalysisManager &) {
-  bool Changed = RunTypeReconstruction(M, TypeModeOpt, false, false);
+PreservedAnalyses BrightenTypeReconstructionPass::run(Module &M,
+                                                      ModuleAnalysisManager &AM) {
+  bool Changed = RecoverNativePointerIntegerRoundTrips(M, AM);
+  Changed |= RunTypeReconstruction(M, TypeModeOpt, false, false);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
-PreservedAnalyses BrightenStructRecoverPass::run(Module &M, ModuleAnalysisManager &) {
-  bool Changed = RunTypeReconstruction(M, TypeModeOpt, true, false);
+PreservedAnalyses BrightenStructRecoverPass::run(Module &M,
+                                                 ModuleAnalysisManager &AM) {
+  bool Changed = RecoverNativePointerIntegerRoundTrips(M, AM);
+  Changed |= RunTypeReconstruction(M, TypeModeOpt, true, false);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
-PreservedAnalyses BrightenArrayRecoverPass::run(Module &M, ModuleAnalysisManager &) {
-  bool Changed = RunTypeReconstruction(M, TypeModeOpt, false, true);
+PreservedAnalyses BrightenArrayRecoverPass::run(Module &M,
+                                                ModuleAnalysisManager &AM) {
+  bool Changed = RecoverNativePointerIntegerRoundTrips(M, AM);
+  Changed |= RunTypeReconstruction(M, TypeModeOpt, false, true);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+PreservedAnalyses
+BrightenAddressCanonicalizePass::run(Module &M,
+                                     ModuleAnalysisManager &AM) {
+  return CanonicalizeAddresses(M, AM)
+             ? PreservedAnalyses::none()
+             : PreservedAnalyses::all();
+}
+
+PreservedAnalyses
+BrightenHeapProvenResolverCollapsePass::run(Module &M,
+                                             ModuleAnalysisManager &AM) {
+  return CollapseHeapProvenPointerResolvers(M, AM)
+             ? PreservedAnalyses::none()
+             : PreservedAnalyses::all();
 }
 
 } // namespace brighten_type
@@ -123,6 +145,16 @@ llvmGetPassPluginInfo() {
                   }
                   if (Name == "brighten-array-recover") {
                     MPM.addPass(brighten_type::BrightenArrayRecoverPass());
+                    return true;
+                  }
+                  if (Name == "brighten-address-canonicalize") {
+                    MPM.addPass(
+                        brighten_type::BrightenAddressCanonicalizePass());
+                    return true;
+                  }
+                  if (Name == "brighten-heap-proven-resolver-collapse") {
+                    MPM.addPass(
+                        brighten_type::BrightenHeapProvenResolverCollapsePass());
                     return true;
                   }
                   return false;

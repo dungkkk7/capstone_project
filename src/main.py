@@ -18,6 +18,7 @@ from llvm_pass.britening_ir import (
     brighten_ir,
     native_contract_report_path,
     read_native_contract_report,
+    verify_native_contract,
 )
 from llm_recovery.llm_recovery import (
     RecoveryConfig,
@@ -48,9 +49,8 @@ def _run_experimental_delift_bundle(input_ll, case_output_dir, base_name):
     """Run the opt-in post-brightening bundle before semantic/recovery stages.
 
     The repository bundle is intentionally experimental and may reject IR
-    shapes it does not recognize.  Keep the batch moving by returning the
-    original candidate on failure, while preserving a per-case log so an
-    applied/skipped result is never ambiguous.
+    shapes it does not recognize.  A failed bundle returns no candidate:
+    brightened IR is an intermediate and must never acquire final authority.
     """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     bundle_dir = os.path.join(
@@ -58,9 +58,9 @@ def _run_experimental_delift_bundle(input_ll, case_output_dir, base_name):
     )
     runner = os.path.join(bundle_dir, "run_brighten_delift_pipeline.sh")
     log_path = os.path.join(case_output_dir, f"{base_name}_delift_bundle.log")
-    output_prefix = os.path.join(case_output_dir, f"{base_name}_delifted")
+    output_prefix = os.path.join(case_output_dir, f"{base_name}_final")
     if not os.path.isfile(runner):
-        return input_ll, "missing_runner", log_path
+        return None, "missing_runner", log_path
     try:
         result = subprocess.run(
             ["bash", runner, input_ll, output_prefix],
@@ -74,17 +74,17 @@ def _run_experimental_delift_bundle(input_ll, case_output_dir, base_name):
         output_ll = f"{output_prefix}.ll"
         if result.returncode == 0 and os.path.isfile(output_ll):
             return output_ll, "applied", log_path
-        return input_ll, f"failed_rc_{result.returncode}", log_path
+        return None, f"failed_rc_{result.returncode}", log_path
     except subprocess.TimeoutExpired as exc:
         with open(log_path, "w", encoding="utf-8") as handle:
             handle.write(exc.stdout or "")
             handle.write(exc.stderr or "")
             handle.write("\nexperimental delift bundle timed out\n")
-        return input_ll, "timeout", log_path
+        return None, "timeout", log_path
     except Exception as exc:
         with open(log_path, "w", encoding="utf-8") as handle:
             handle.write(f"experimental delift bundle error: {exc}\n")
-        return input_ll, "error", log_path
+        return None, "error", log_path
 
 
 def _resolve_seed_paths(project_root, binary_path):
@@ -214,6 +214,17 @@ def _native_contract_status(report: Optional[Mapping[str, Any]]) -> str:
     if not report or report.get("status") == "unavailable":
         return "unchecked"
     return "pass" if report.get("is_fully_native") is True else "nonpass"
+
+
+def _allows_non_native_semantic_diagnostic(
+    report: Optional[Mapping[str, Any]],
+) -> bool:
+    """Allow behavior evidence only when finalization produced a runnable artifact."""
+    return bool(
+        _native_contract_status(report) == "nonpass"
+        and report
+        and report.get("output_class") == "compat_runnable"
+    )
 
 
 def _semantic_status(report: Optional[Mapping[str, Any]]) -> str:
@@ -770,73 +781,93 @@ def main(argv=None):
                 brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=path)
                 if brighten_success:
                     output_brightened_ll = f"{os.path.splitext(output_brightened_bc)[0]}.ll"
-                    native_report = read_native_contract_report(output_brightened_bc)
-                    native_status = _native_contract_status(native_report)
                     case_record["brightening"] = "pass"
-                    case_record["output_class"] = (
-                        native_report.get("output_class") if native_report else None
-                    )
+                    case_record["finalization"] = "pending"
+                    case_record["final_ir"] = None
                     print(f"{Color.GREEN}[✓] Làm đẹp mã IR thành công cho: {path}{Color.END}")
-                    if native_status == "pass":
-                        native_contract_pass_count += 1
-                        print(f"{Color.GREEN}{Color.BOLD}    [✓] FILE ĐẠT FULLY-NATIVE CONTRACT:{Color.END}")
-                    elif native_status == "nonpass":
-                        native_contract_nonpass_count += 1
-                        violations = native_report.get("metrics", {}).get(
-                            "native_contract_violations", "unknown"
-                        )
-                        print(
-                            f"{Color.YELLOW}{Color.BOLD}    [!] FILE IR ĐÃ BRIGHTEN "
-                            f"NHƯNG CHƯA ĐẠT FULLY-NATIVE CONTRACT "
-                            f"(violations={violations}):{Color.END}"
-                        )
-                    else:
-                        native_contract_unchecked_count += 1
-                        print(
-                            f"{Color.YELLOW}{Color.BOLD}    [!] FILE IR ĐÃ BRIGHTEN "
-                            f"NHƯNG NATIVE CONTRACT CHƯA ĐƯỢC KIỂM TRA:{Color.END}"
-                        )
                     print(f"{Color.BOLD}        {output_brightened_ll}{Color.END}")
-                    print(
-                        f"{Color.BLUE}        Native contract report: "
-                        f"{native_contract_report_path(output_brightened_bc)}{Color.END}"
-                    )
-                    semantic_candidate_path = output_brightened_bc
-                    recovery_input_ll = output_brightened_ll
-                    delift_candidate_path = None
-                    if os.path.isfile(
-                        os.path.join(
-                            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "src",
-                            "llvm_pass",
-                            "brighten_100_delift_bundle",
-                            "run_brighten_delift_pipeline.sh",
-                        )
-                    ):
-                        (
-                            delift_candidate,
-                            delift_status,
-                            delift_log,
-                        ) = _run_experimental_delift_bundle(
+                    brightened_count += 1
+
+                    final_ir, delift_status, delift_log = (
+                        _run_experimental_delift_bundle(
                             output_brightened_ll, case_output_dir, base_name
                         )
-                        case_record["delift_bundle"] = delift_status
-                        case_record["delift_bundle_log"] = delift_log
-                        if delift_status == "applied":
-                            delift_candidate_path = delift_candidate
-                            semantic_candidate_path = delift_candidate
-                            recovery_input_ll = delift_candidate
-                            print(
-                                f"{Color.GREEN}    [✓] Experimental delift "
-                                f"bundle applied: {delift_candidate}{Color.END}"
-                            )
+                    )
+                    case_record["delift_bundle"] = delift_status
+                    case_record["delift_bundle_log"] = delift_log
+                    if delift_status != "applied" or not final_ir:
+                        case_record["finalization"] = "bundle_failed"
+                        native_contract_unchecked_count += 1
+                        semantic_unchecked_count += 1
+                        case_record["semantic"] = "unchecked"
+                        print(
+                            f"{Color.RED}    [✗] Finalization dừng kín: delift "
+                            f"bundle {delift_status}. Log: {delift_log}{Color.END}"
+                        )
+                        continue
+
+                    case_record["final_ir"] = os.path.abspath(final_ir)
+                    semantic_diagnostic_only = False
+                    if not verify_native_contract(final_ir):
+                        final_report = read_native_contract_report(final_ir)
+                        native_status = _native_contract_status(final_report)
+                        if native_status == "nonpass":
+                            native_contract_nonpass_count += 1
+                            case_record["finalization"] = "native_contract_nonpass"
                         else:
-                            print(
-                                f"{Color.YELLOW}    [!] Experimental delift "
-                                f"bundle {delift_status}; dùng brightened IR "
-                                f"gốc. Log: {delift_log}{Color.END}"
-                            )
-                    brightened_count += 1
+                            native_contract_unchecked_count += 1
+                            case_record["finalization"] = "verifier_unavailable"
+                        print(
+                            f"{Color.RED}    [✗] Final IR không qua verifier-only "
+                            f"native contract: {final_ir}{Color.END}"
+                        )
+                        output_class = (
+                            final_report.get("output_class")
+                            if final_report else None
+                        )
+                        case_record["output_class"] = output_class
+                        if not _allows_non_native_semantic_diagnostic(
+                            final_report
+                        ):
+                            semantic_unchecked_count += 1
+                            case_record["semantic"] = "unchecked"
+                            continue
+                        # Structural non-compliance must remain a hard failure,
+                        # but a linked compatibility artifact is still useful
+                        # differential evidence while recovery work continues.
+                        # Keep this evidence explicitly diagnostic: it cannot
+                        # authorize Ghidra/LLM recovery or count as fully native.
+                        semantic_diagnostic_only = True
+                        case_record["semantic_scope"] = (
+                            "diagnostic_non_native"
+                        )
+                        print(
+                            f"{Color.YELLOW}    [!] Chạy differential diagnostic "
+                            f"trên compat_runnable; native contract vẫn FAIL."
+                            f"{Color.END}"
+                        )
+                    else:
+                        native_report = read_native_contract_report(final_ir)
+                        native_contract_pass_count += 1
+                        case_record["finalization"] = "verified"
+                        case_record["output_class"] = native_report.get(
+                            "output_class"
+                        ) if native_report else None
+                        case_record["semantic_scope"] = "native_gate"
+
+                    native_report = read_native_contract_report(final_ir)
+                    case_record["output_class"] = native_report.get(
+                        "output_class"
+                    ) if native_report else None
+                    semantic_candidate_path = final_ir
+                    recovery_input_ll = final_ir
+                    print(
+                        f"{Color.GREEN}    [✓] Final IR verified: {final_ir}{Color.END}"
+                    )
+                    print(
+                        f"{Color.BLUE}        Native contract report: "
+                        f"{native_contract_report_path(final_ir)}{Color.END}"
+                    )
                     case_record["semantic"] = "unchecked"
                     
                     # --- BƯỚC THÊM: KIỂM TRA SEMANTIC EQUIVALENCE (FUZZING CHECK) ---
@@ -859,23 +890,34 @@ def main(argv=None):
                                 f"{input_contract['case_id']} ({input_contract['kind']}){Color.END}"
                             )
 
-                        # Ưu tiên dùng bản binary được biên dịch từ brightened IR
-                        # (đang là file1 của baseline semantic check) cho khâu Ghidra + recovery.
-                        recovery_reference_binary = path
-                        recovery_ref_label = "original"
-                        if os.path.isfile(semantic_candidate_path):
-                            recovery_reference_candidate = os.path.join(case_output_dir, f"{base_name}_brightened_ref.bin")
-                            try:
-                                compile_to_binary(
-                                    semantic_candidate_path,
-                                    recovery_reference_candidate,
-                                )
-                                if os.path.isfile(recovery_reference_candidate):
-                                    recovery_reference_binary = recovery_reference_candidate
-                                    recovery_ref_label = "post-brightening candidate compiled"
-                                    print(f"{Color.BLUE}    [*] Dùng binary tham chiếu để recover: {recovery_reference_candidate}{Color.END}")
-                            except Exception:
-                                print(f"{Color.YELLOW}    [!] Không thể biên dịch brightened IR làm reference, fallback về {path}{Color.END}")
+                        recovery_reference_binary = os.path.join(
+                            case_output_dir, f"{base_name}_final_ref.bin"
+                        )
+                        recovery_ref_label = (
+                            "non-native diagnostic final IR compiled"
+                            if semantic_diagnostic_only
+                            else "verified final IR compiled"
+                        )
+                        try:
+                            compile_to_binary(
+                                semantic_candidate_path,
+                                recovery_reference_binary,
+                            )
+                        except Exception:
+                            pass
+                        recovery_reference_available = os.path.isfile(
+                            recovery_reference_binary
+                        )
+                        if recovery_reference_available:
+                            print(
+                                f"{Color.BLUE}    [*] Dùng final binary tham chiếu "
+                                f"để recover: {recovery_reference_binary}{Color.END}"
+                            )
+                        else:
+                            print(
+                                f"{Color.YELLOW}    [!] Không thể biên dịch final IR; "
+                                f"Ghidra/LLM recovery sẽ bị chặn.{Color.END}"
+                            )
 
                         def run_fuzz(candidate_binary_path):
                             fuzzer = SemanticFuzzer(
@@ -893,71 +935,26 @@ def main(argv=None):
                             )
 
                         fuzz_report = run_fuzz(semantic_candidate_path)
-                        if delift_candidate_path is not None:
-                            delift_semantic_report_path = os.path.join(
-                                case_output_dir,
-                                f"{base_name}_delift_semantic_report.json",
+                        final_semantic_report_path = os.path.join(
+                            case_output_dir,
+                            f"{base_name}_final_semantic_report.json",
+                        )
+                        _write_semantic_report(
+                            final_semantic_report_path, fuzz_report
+                        )
+                        case_record["final_semantic_report"] = (
+                            final_semantic_report_path
+                        )
+                        if (
+                            not fuzz_report.get("is_fully_equivalent", False)
+                            and not semantic_diagnostic_only
+                        ):
+                            case_record["finalization"] = "semantic_regression"
+                            print(
+                                f"{Color.YELLOW}    [!] Final IR semantic non-pass; "
+                                f"không cấp quyền cho brightened intermediate."
+                                f"{Color.END}"
                             )
-                            _write_semantic_report(
-                                delift_semantic_report_path, fuzz_report
-                            )
-                            case_record["delift_semantic_report"] = (
-                                delift_semantic_report_path
-                            )
-                            if fuzz_report.get("is_fully_equivalent", False):
-                                case_record["delift_semantic"] = "pass"
-                            else:
-                                brightened_fuzz_report = run_fuzz(
-                                    output_brightened_bc
-                                )
-                                brightened_semantic_report_path = os.path.join(
-                                    case_output_dir,
-                                    f"{base_name}_brightened_semantic_report.json",
-                                )
-                                _write_semantic_report(
-                                    brightened_semantic_report_path,
-                                    brightened_fuzz_report,
-                                )
-                                case_record["brightened_semantic_report"] = (
-                                    brightened_semantic_report_path
-                                )
-                                semantic_candidate_path = output_brightened_bc
-                                recovery_input_ll = output_brightened_ll
-                                fuzz_report = brightened_fuzz_report
-                                if brightened_fuzz_report.get(
-                                    "is_fully_equivalent", False
-                                ):
-                                    case_record["delift_semantic"] = (
-                                        "rejected_regression"
-                                    )
-                                    print(
-                                        f"{Color.YELLOW}    [!] Delift tạo semantic "
-                                        f"regression; fallback về brightened IR."
-                                        f"{Color.END}"
-                                    )
-                                else:
-                                    case_record["delift_semantic"] = (
-                                        "inherited_brightening_nonpass"
-                                    )
-                                    print(
-                                        f"{Color.YELLOW}    [!] Delift non-pass, "
-                                        f"nhưng brightened baseline cũng non-pass; "
-                                        f"lỗi đã tồn tại trước delift.{Color.END}"
-                                    )
-                                try:
-                                    compile_to_binary(
-                                        semantic_candidate_path,
-                                        recovery_reference_candidate,
-                                    )
-                                    recovery_reference_binary = (
-                                        recovery_reference_candidate
-                                    )
-                                    recovery_ref_label = (
-                                        "semantic-gated brightened candidate"
-                                    )
-                                except Exception:
-                                    recovery_reference_binary = path
-                                    recovery_ref_label = "original"
                         # Keep the exact per-case evidence used by the batch
                         # summary.  Console-only reports made failed corpus
                         # runs impossible to audit after temporary fuzz
@@ -1034,13 +1031,16 @@ def main(argv=None):
                         else:
                             valid_domain_unchecked_count += 1
                             case_record["semantic_valid_domain"] = "unchecked"
-                        if fuzz_report.get("is_fully_equivalent", False) and llm_recovery_mode:
+                        if (
+                            fuzz_report.get("is_fully_equivalent", False)
+                            and recovery_reference_available
+                            and llm_recovery_mode
+                            and not semantic_diagnostic_only
+                        ):
                             print(f"{Color.BLUE}      -> Bắt đầu LLM recovery vì baseline pass.{Color.END}")
 
                             def run_recovery_fuzz(candidate_path):
                                 recovery_compare_target = recovery_reference_binary
-                                if not os.path.isfile(recovery_compare_target):
-                                    recovery_compare_target = path
                                 print(
                                     f"{Color.BLUE}      [*] Khởi tạo semantic compare recovery với target: "
                                     f"{os.path.basename(recovery_compare_target)} ({recovery_ref_label}){Color.END}"

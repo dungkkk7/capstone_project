@@ -465,6 +465,14 @@
         "newline_required": true,
         "max_line_length": 1000
       },
+      "scanf_required_conversions": [
+        {
+          "source": "line",
+          "line_index": 0,
+          "format": "%d%d",
+          "required_conversions": 2
+        }
+      ],
       "mutation": "alphabet_only"
     },
     {

@@ -22,9 +22,6 @@ entry:
 
 ; CHECK-NOT: @__mcsema_reg_state
 ; CHECK-NOT: %struct.State = type
-; CHECK: @__native_state_context = internal unnamed_addr global ptr null
-; CHECK: %native.register.state = alloca [16 x i8]
-; CHECK: store ptr %native.register.state, ptr @__native_state_context
+; CHECK: @native_register_storage = internal global [16 x i8] zeroinitializer
 ; CHECK-LABEL: define internal void @helper()
-; CHECK: %native.register.state.context = load ptr, ptr @__native_state_context
-; CHECK: store i64 9, ptr %native.register.state.context
+; CHECK: store i64 9, ptr @native_register_storage

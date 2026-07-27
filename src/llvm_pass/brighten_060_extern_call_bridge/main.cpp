@@ -32,6 +32,7 @@ PreservedAnalyses BrightenExternCallBridgePass::run(Module &M,
   Changed |= LowerMaterializedVAListCalls(Ctx);
   Changed |= LowerLiftedExternalABICalls(Ctx);
   Changed |= RewriteExternalCallsites(Ctx);
+  Changed |= AnnotateDirectScanfDestinationNoCapture(Ctx);
   Changed |= RewriteExternalReturns(Ctx);
   Changed |= CleanupExternalCallArtifacts(Ctx);
   VerifyExternalCallRecovery(Ctx);

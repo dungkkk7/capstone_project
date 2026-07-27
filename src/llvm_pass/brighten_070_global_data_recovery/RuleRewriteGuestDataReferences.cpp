@@ -1,5 +1,6 @@
 #include "BrightenGlobalDataRecoveryPass.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalAlias.h"
@@ -102,6 +103,89 @@ static Constant *CreateConstantGEPToObject(RecoveredObject *Obj,
       GEP = ConstantExpr::getPtrToInt(GEP, ExpectedTy);
   }
   return GEP;
+}
+
+static bool HasDynamicGEPIndex(const GEPOperator *GEP) {
+  if (!GEP)
+    return false;
+  for (unsigned I = 1; I < GEP->getNumOperands(); ++I)
+    if (!isa<ConstantInt>(GEP->getOperand(I)))
+      return true;
+  return false;
+}
+
+static bool IsVolatileOrAtomicMemoryAccess(const Instruction *I) {
+  if (const auto *LI = dyn_cast_or_null<LoadInst>(I))
+    return LI->isVolatile() || LI->isAtomic();
+  if (const auto *SI = dyn_cast_or_null<StoreInst>(I))
+    return SI->isVolatile() || SI->isAtomic();
+  return isa_and_nonnull<AtomicRMWInst>(I) ||
+         isa_and_nonnull<AtomicCmpXchgInst>(I);
+}
+
+static bool IsAddressIdentitySensitive(GuestAddressRef *Ref);
+
+// Recheck the all-use proof immediately before mutation.  Candidate discovery
+// runs before conflict resolution/materialization and must be conservative,
+// but this fence keeps a future collector from turning a direct scalar split
+// into duplicate storage when it records an additional carrier.
+static bool HasTransactionalDirectScalarRewriteProof(
+    GlobalDataContext &Ctx, const RecoveredObject *Obj) {
+  if (!Obj || !Obj->RequiresTransactionalDirectRewrite || !Obj->SourceSegment ||
+      !Obj->Ty || !Obj->Ty->isSized())
+    return false;
+  const uint64_t Width = Ctx.DL.getTypeStoreSize(Obj->Ty).getFixedValue();
+  if (Width == 0 || Obj->Begin > UINT64_MAX - Width ||
+      Obj->End != Obj->Begin + Width)
+    return false;
+  bool SawDirectAccess = false;
+  for (const auto &Ref : Ctx.AddressRefs) {
+    if (!Ref || Ref->Segment != Obj->SourceSegment || !Ref->UserInst)
+      continue;
+    Instruction *Use = Ref->UserInst;
+    if (auto *GEP = dyn_cast<GEPOperator>(Use)) {
+      bool Dynamic = false;
+      for (unsigned I = 1; I < GEP->getNumOperands(); ++I)
+        Dynamic |= !isa<ConstantInt>(GEP->getOperand(I));
+      if (Dynamic && Ref->GuestAddr <= Obj->Begin)
+        return false;
+    }
+    Type *AccessTy = nullptr;
+    uint64_t AccessWidth = 0;
+    bool Direct = false;
+    if (auto *LI = dyn_cast<LoadInst>(Use)) {
+      Direct = LI->getPointerOperand() == Ref->OriginalValue;
+      if (LI->isVolatile() || LI->isAtomic())
+        return false;
+      AccessTy = LI->getType();
+    } else if (auto *SI = dyn_cast<StoreInst>(Use)) {
+      Direct = SI->getPointerOperand() == Ref->OriginalValue;
+      if (SI->isVolatile() || SI->isAtomic())
+        return false;
+      AccessTy = SI->getValueOperand()->getType();
+    } else if (isa<AtomicRMWInst>(Use) || isa<AtomicCmpXchgInst>(Use)) {
+      return false;
+    }
+    if (AccessTy && AccessTy->isSized())
+      AccessWidth = Ctx.DL.getTypeStoreSize(AccessTy).getFixedValue();
+    if (!AccessTy) {
+      if (Ref->GuestAddr >= Obj->Begin && Ref->GuestAddr < Obj->End &&
+          IsAddressIdentitySensitive(Ref.get()))
+        return false;
+      continue;
+    }
+    const bool Overlaps = Ref->GuestAddr < Obj->End &&
+        (AccessWidth == 0 ? Ref->GuestAddr >= Obj->Begin
+                          : (Ref->GuestAddr > UINT64_MAX - AccessWidth ||
+                             Ref->GuestAddr + AccessWidth > Obj->Begin));
+    if (!Overlaps)
+      continue;
+    if (!Direct || AccessTy != Obj->Ty || AccessWidth != Width ||
+        IsAddressIdentitySensitive(Ref.get()))
+      return false;
+    SawDirectAccess = true;
+  }
+  return SawDirectAccess;
 }
 
 // A guest data address is often used as an opaque-predicate constant before
@@ -497,6 +581,15 @@ static bool RewriteDynamicDataIntToPtrs(GlobalDataContext &Ctx,
         *GuestBase < Obj->Begin || *GuestBase >= Obj->End)
       continue;
 
+    // A PT_LOAD page tail is a zero-filled mapping, not range proof for an
+    // arbitrary dynamic guest integer.  In particular, the lifted physical
+    // aggregate can still carry values outside the tail through this inttoptr
+    // path.  Re-basing that carrier to the tail makes those values alias zero
+    // storage.  Leave it on the original lifted backing until a bounded range
+    // proof can rewrite every alias in the interval transactionally.
+    if (Obj->SourceSegment && Obj->SourceSegment->IsMappedPageTail)
+      continue;
+
     IRBuilder<> Builder(ITP);
     Value *Address64 = Address;
     Type *I64 = Type::getInt64Ty(Ctx.M.getContext());
@@ -532,6 +625,17 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
   // reference; a fallback alias-to-string shortcut is intentionally not used.
   bool AliasChanged = false;
 
+  // Freeze every transactional proof before mutating any use.  Otherwise the
+  // first rewritten store changes its pointer operand and makes a later load
+  // appear to be an unresolved carrier of the old residual address.
+  DenseMap<const RecoveredObject *, bool> TransactionalProof;
+  for (const auto &[Begin, Obj] : Ctx.RecoveredObjects) {
+    (void)Begin;
+    if (Obj && Obj->RequiresTransactionalDirectRewrite)
+      TransactionalProof[Obj.get()] =
+          HasTransactionalDirectScalarRewriteProof(Ctx, Obj.get());
+  }
+
   // 1. Constant Address Refs (including new raw byte locations)
   for (auto &Ref : Ctx.AddressRefs) {
     if (Ref->Rewritten)
@@ -559,6 +663,29 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
       continue;
     }
 
+    if (Obj->RequiresTransactionalDirectRewrite && !TransactionalProof.lookup(Obj)) {
+      Ref->SkipReason = "direct-scalar-transaction-preflight-failed";
+      ++Ctx.Report.PreservedRefs;
+      continue;
+    }
+
+    // A constant base can feed both a direct string/scalar reference and an
+    // unbounded dynamic GEP.  Replacing the shared base with the small
+    // recovered object makes the latter an out-of-bounds LLVM pointer even
+    // though the original merged image legitimately covered it.  Dynamic
+    // indexing is only rewritten for Array/RawBytes objects, whose own
+    // recovery rules established an indexed backing range.  A scalar/string
+    // prefix needs full-source coverage before it can replace a dynamic base.
+    if (auto *GEP = dyn_cast<GEPOperator>(Ref->UserInst);
+        HasDynamicGEPIndex(GEP) &&
+        Obj->Kind != ObjectKind::Array && Obj->Kind != ObjectKind::RawBytes &&
+        (Obj->Begin != Ref->Segment->GuestBase ||
+         Obj->End != Ref->Segment->GuestBase + Ref->Segment->Size)) {
+      Ref->SkipReason = "dynamic-range-not-covered-by-object";
+      ++Ctx.Report.PreservedRefs;
+      continue;
+    }
+
     // Classify each use independently.  A libc use elsewhere in the same
     // recovered object does not make a numeric comparison of this guest
     // address safe to replace with an ASLR-dependent host pointer.  The libc
@@ -572,6 +699,16 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
 
     Instruction *UserInst = Ref->UserInst;
     if (!UserInst) {
+      ++Ctx.Report.PreservedRefs;
+      continue;
+    }
+
+    // Do not change the address operand of volatile/atomic memory accesses.
+    // The readonly-string rule refuses such candidates, but preserving this
+    // boundary here prevents a later producer from weakening that contract.
+    if (Obj->Kind == ObjectKind::StringLiteral &&
+        IsVolatileOrAtomicMemoryAccess(UserInst)) {
+      Ref->SkipReason = "volatile-or-atomic-string-access";
       ++Ctx.Report.PreservedRefs;
       continue;
     }
@@ -699,6 +836,25 @@ bool BrightenGlobalDataRecoveryPass::RewriteGuestDataReferences(
               Ctx.findObjectAt(Seg->GuestBase + ConstantOffset);
           if (!DynamicObj || !DynamicObj->GV ||
               Seg->GuestBase + ConstantOffset < DynamicObj->Begin)
+            continue;
+
+          // Do not use a page-tail object as the target of an unbounded GEP.
+          // Its mapped interval is exact but the dynamic index is not; this is
+          // an all-or-nothing writable ownership boundary.
+          if (DynamicObj->SourceSegment &&
+              DynamicObj->SourceSegment->IsMappedPageTail)
+            continue;
+
+          // This GEP has an unconstrained dynamic index.  A recovered prefix
+          // is not a proof that every possible index remains inside it; keep
+          // the original merged residual unless the object is exactly the
+          // complete source range.  Array/RawBytes are the exception: their
+          // recovery rule, rather than this generic rewrite, owns the indexed
+          // backing-range proof.
+          if ((DynamicObj->Kind != ObjectKind::Array &&
+               DynamicObj->Kind != ObjectKind::RawBytes) &&
+              (DynamicObj->Begin != Seg->GuestBase ||
+               DynamicObj->End != Seg->GuestBase + Seg->Size))
             continue;
 
           Value *NativeBase = DynamicObj->GV;

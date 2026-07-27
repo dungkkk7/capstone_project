@@ -11,6 +11,7 @@ PreservedAnalyses BrightenRuntimeHelperPass::run(Module &M, ModuleAnalysisManage
   bool Changed = false;
 
   Changed |= LowerMcSemaAttachThunks(M);
+  Changed |= PreserveX86DivideFaults(M);
   Changed |= ImplementExternCallBridge(M);
   Changed |= CanonicalizeGuestAddressConstants(M);
   Changed |= RepairExternalFunctionPointerDereferences(M);

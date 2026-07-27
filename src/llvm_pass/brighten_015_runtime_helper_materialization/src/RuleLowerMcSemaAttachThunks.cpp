@@ -22,6 +22,17 @@ using namespace llvm;
 
 namespace {
 
+// A lowered McSema entry thunk invokes a lifted guest function directly.  At
+// that boundary there is no longer an architectural caller that supplied an
+// initial guest RSP, yet the guest prologue still owns real stack accesses.
+// Keep this object local to the native entry invocation; it is not a recovered
+// program frame and must not escape as a replacement for arbitrary guest
+// memory.  The size is deliberately modest: it covers the ABI entry frame and
+// ordinary nested call frames while retaining a normal host-stack failure mode
+// for pathological unbounded guest recursion rather than silently remapping
+// unknown addresses.
+static constexpr uint64_t kEntryGuestStackBytes = 64 * 1024;
+
 static std::optional<uint64_t> ParsePCFromInlineAsm(const Function &F) {
   for (const BasicBlock &BB : F) {
     for (const Instruction &I : BB) {
@@ -65,6 +76,134 @@ static Function *FindWrapperOrSub(Module &M, uint64_t PC, StringRef Name) {
   return nullptr;
 }
 
+struct EntryOwnerCandidate {
+  Function *EntryThunk;
+  Function *Owner;
+  CallBase *OwnerCall;
+};
+
+static bool InitializerContainsOnlyOwnerPointerProvenance(
+    const Constant *C, const Function &Owner, bool &SawOwner) {
+  if (C == &Owner) {
+    SawOwner = true;
+    return true;
+  }
+  if (isa<GlobalValue>(C))
+    return false;
+  if (const auto *CE = dyn_cast<ConstantExpr>(C)) {
+    const unsigned Opcode = CE->getOpcode();
+    if (Opcode != Instruction::BitCast && Opcode != Instruction::AddrSpaceCast)
+      return false;
+  }
+  for (const Use &U : C->operands()) {
+    const auto *Operand = dyn_cast<Constant>(U.get());
+    if (!Operand || !InitializerContainsOnlyOwnerPointerProvenance(
+                        Operand, Owner, SawOwner))
+      return false;
+  }
+  return true;
+}
+
+static bool IsInLLVMRetentionList(const Module &M, const GlobalVariable &GV) {
+  for (StringRef Name : {"llvm.used", "llvm.compiler.used"}) {
+    const GlobalVariable *List = M.getGlobalVariable(Name, true);
+    if (!List || !List->hasInitializer())
+      continue;
+    for (const Use &U : List->getInitializer()->operands()) {
+      const auto *Item = dyn_cast<Constant>(U.get());
+      if (Item && Item->stripPointerCasts() == &GV)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool IsIgnorableDeadOwnerProvenanceGlobal(const Use &OwnerUse,
+                                                 const Function &Owner,
+                                                 const Module &M) {
+  // A constant aggregate/cast can sit between @owner and its initializer
+  // global.  It must be a single-use constant chain; otherwise this is an
+  // address-taken use, not dead provenance.
+  const User *User = OwnerUse.getUser();
+  while (const auto *C = dyn_cast<Constant>(User)) {
+    if (const auto *GV = dyn_cast<GlobalVariable>(C)) {
+      if (!GV->hasLocalLinkage() || !GV->isConstant() || !GV->use_empty() ||
+          GV->hasComdat() || GV->hasSection() ||
+          IsInLLVMRetentionList(M, *GV) || !GV->hasInitializer())
+        return false;
+      for (const GlobalAlias &Alias : M.aliases())
+        if (Alias.getAliasee() &&
+            Alias.getAliasee()->stripPointerCasts() == GV)
+          return false;
+      bool SawOwner = false;
+      return InitializerContainsOnlyOwnerPointerProvenance(
+                 GV->getInitializer(), Owner, SawOwner) &&
+             SawOwner;
+    }
+    if (!C->hasOneUse())
+      return false;
+    User = *C->user_begin();
+  }
+  return false;
+}
+
+// Schema: !brighten.entry_single_invocation = !{!"v1",
+//                                              !"attach_direct_unique"}
+// This is deliberately function metadata, not an LLVM function attribute.
+// It communicates only the proven executable-entry ownership fact to pass 040;
+// it grants no optimizer assumptions about calls, aliasing, or recursion.
+static bool MarkProvenEntrySingleInvocation(Module &M,
+                                            const EntryOwnerCandidate &C) {
+  Function &Entry = *C.EntryThunk;
+  Function &Owner = *C.Owner;
+  if (Owner.isDeclaration() || !Owner.hasLocalLinkage() ||
+      Entry.getMetadata("brighten.entry_single_invocation"))
+    return false;
+
+  // Entry may be externally visible through the native ABI, which is not an
+  // in-module call-graph fact.  Any in-module use, however, makes this entry
+  // callable as a callback/recursive/address-taken value and invalidates the
+  // single-invocation capability.
+  if (!Entry.use_empty())
+    return false;
+  for (GlobalAlias &Alias : M.aliases()) {
+    if (Alias.getAliasee() &&
+        Alias.getAliasee()->stripPointerCasts() == &Entry)
+      return false;
+  }
+
+  // A local direct owner must have exactly the call just emitted by the
+  // executable-entry thunk.  Every other use includes globals, aliases,
+  // callback operands, indirect calls, recursive calls, and another in-module
+  // caller, all of which make one-invocation ownership unprovable.
+  unsigned DirectEntryCalls = 0;
+  for (const Use &U : Owner.uses()) {
+    auto *CB = dyn_cast<CallBase>(U.getUser());
+    if (CB && CB == C.OwnerCall && CB->getFunction() == &Entry &&
+        CB->getCalledOperand()->stripPointerCasts() == &Owner) {
+      ++DirectEntryCalls;
+      continue;
+    }
+    if (!IsIgnorableDeadOwnerProvenanceGlobal(U, Owner, M))
+      return false;
+  }
+  if (DirectEntryCalls != 1)
+    return false;
+
+  for (GlobalAlias &Alias : M.aliases()) {
+    if (Alias.getAliasee() &&
+        Alias.getAliasee()->stripPointerCasts() == &Owner)
+      return false;
+  }
+
+  LLVMContext &Ctx = M.getContext();
+  Entry.setMetadata(
+      "brighten.entry_single_invocation",
+      MDNode::get(Ctx, {MDString::get(Ctx, "v1"),
+                        MDString::get(Ctx, "attach_direct_unique")}));
+  return true;
+}
+
 }  // namespace
 
 bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
@@ -82,6 +221,7 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
 
   // 1. Lower main/start/.init_proc attach thunks
   std::vector<Function *> ThunkFunctions;
+  SmallVector<EntryOwnerCandidate, 1> EntryOwnerCandidates;
   for (Function &F : M) {
     if (F.isDeclaration()) {
       continue;
@@ -182,6 +322,35 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     if (Name == "main") {
       // setup args in State
       if (RegState) {
+        // The original attach thunk enters with a live architectural stack.
+        // Once we replace it with a host-ABI main, RSP would otherwise stay
+        // zero and the first valid guest stack store dereferences -8.  Model
+        // only that entry-stack boundary with a function-local object.  The
+        // sentinel is the initial guest return address; it is distinct from
+        // any recovered local frame and cannot provide provenance for other
+        // guest addresses.
+        ArrayType *EntryStackTy = ArrayType::get(I8, kEntryGuestStackBytes);
+        AllocaInst *EntryStack = B.CreateAlloca(EntryStackTy, nullptr,
+                                                 "entry_guest_stack");
+        EntryStack->setAlignment(Align(16));
+        // This is a transitional entry-boundary repair, never recovered
+        // program storage.  Later native cleanup must either compact it into
+        // a proven native entry frame or leave this marker for the final
+        // native-contract reporter to reject.
+        EntryStack->setMetadata(
+            "brighten.entry_guest_stack.transitional",
+            MDNode::get(Ctx, {MDString::get(
+                                 Ctx, "seeded-guest-rsp-entry-boundary")}));
+        Value *StackTop = B.CreateConstGEP2_64(
+            EntryStackTy, EntryStack, 0, kEntryGuestStackBytes,
+            "entry_guest_stack_top");
+        Value *ReturnSlot = B.CreateInBoundsGEP(
+            I8, StackTop, B.getInt64(-8), "entry_guest_return_slot");
+        B.CreateAlignedStore(ConstantInt::get(I64, 0), ReturnSlot, Align(8));
+        Value *RSPPtr = B.CreateConstGEP1_64(I8, RegState, 2312);
+        B.CreateAlignedStore(B.CreatePtrToInt(ReturnSlot, I64), RSPPtr,
+                             Align(8));
+
         // EDI (argc) - arg 0
         if (F->arg_size() > 0) {
           Value *Argc = F->getArg(0);
@@ -204,16 +373,19 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
 
       // Call target
       // Target có thể có signature (ptr, i64, ptr)->ptr hoặc signature của main
+      CallInst *OwnerCall = nullptr;
       if (HasMemoryThreadingSignature(*Target)) {
-        B.CreateCall(Target->getFunctionType(), Target,
-                     {RegState ? B.CreateBitCast(RegState, Target->getFunctionType()->getParamType(0))
-                               : ConstantPointerNull::get(PointerType::get(Ctx, 0)),
-                      B.getInt64(*PC),
-                      ConstantPointerNull::get(PointerType::get(Ctx, 0))});
+        OwnerCall = B.CreateCall(
+            Target->getFunctionType(), Target,
+            {RegState ? B.CreateBitCast(RegState, Target->getFunctionType()->getParamType(0))
+                      : ConstantPointerNull::get(PointerType::get(Ctx, 0)),
+             B.getInt64(*PC),
+             ConstantPointerNull::get(PointerType::get(Ctx, 0))});
       } else {
         // Call direct
-        B.CreateCall(Target);
+        OwnerCall = B.CreateCall(Target);
       }
+      EntryOwnerCandidates.push_back({F, Target, OwnerCall});
 
       // Read return value (RAX)
       if (RegState && !F->getReturnType()->isVoidTy()) {
@@ -245,6 +417,15 @@ bool BrightenRuntimeHelperPass::LowerMcSemaAttachThunks(Module &M) {
     Changed = true;
     errs() << "[brighten-mcsema-lower] Lowered thunk: " << Name
            << " -> target: " << Target->getName() << "\n";
+  }
+
+  for (const EntryOwnerCandidate &Candidate : EntryOwnerCandidates) {
+    if (MarkProvenEntrySingleInvocation(M, Candidate)) {
+      Changed = true;
+      errs() << "[brighten-mcsema-lower] Marked executable entry "
+             << Candidate.EntryThunk->getName()
+             << " with single-invocation capability\n";
+    }
   }
 
   // 2. Define noop cho __mcsema_early_init nếu thiếu body

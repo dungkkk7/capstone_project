@@ -1,4 +1,5 @@
 #include "BrightenABIRecoveryPass.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -100,6 +101,22 @@ bool BrightenABIRecoveryPass::CleanupDeadRemillABI(ABIRecoveryContext &Ctx) {
       S->RemillFn = nullptr;
       Changed = true;
     }
+  }
+
+  SmallVector<GlobalVariable *, 4> DeadState;
+  for (GlobalVariable &GV : Ctx.M.globals()) {
+    if (!GV.getName().contains("__mcsema_reg_state") ||
+        !GV.hasLocalLinkage())
+      continue;
+    GV.removeDeadConstantUsers();
+    if (GV.use_empty())
+      DeadState.push_back(&GV);
+  }
+  for (GlobalVariable *GV : DeadState) {
+    errs() << "[brighten-abi] cleanup: erase dead shared State "
+           << GV->getName() << "\n";
+    GV->eraseFromParent();
+    Changed = true;
   }
   return Changed;
 }

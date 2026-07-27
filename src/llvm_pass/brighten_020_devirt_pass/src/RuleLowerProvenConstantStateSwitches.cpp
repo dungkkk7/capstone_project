@@ -9,7 +9,6 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Utils/SSAUpdater.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 namespace brighten_devirt {
@@ -224,11 +223,11 @@ bool BrightenDevirtPass::LowerProvenConstantStateSwitches(Module &M) {
 //   header(carried PHIs) -> switch hub -> case region -> latch(PHIs) -> header
 //
 // Unlike the early constant-state rule, this form carries application values.
-// Each threaded edge therefore clones the latch/header side effects and uses
-// SSAUpdater to synthesize merge PHIs in the destination region.  Non-constant
-// transitions continue through the original latch and switch, preserving the
-// dynamic fallback.  Every structural and type check is completed before the
-// first CFG mutation.
+// Each threaded edge therefore clones the latch/header side effects and
+// materializes edge-specific carried PHIs in the destination case.
+// Non-constant transitions continue through the original latch and switch,
+// preserving the dynamic fallback.  Every structural and type check is
+// completed before the first CFG mutation.
 bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
   struct CandidateRewrite {
     BasicBlock *Pred = nullptr;
@@ -239,6 +238,7 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
     bool ConditionValue = false;
     bool FromLatch = true;
     SmallVector<Value *, 16> Outgoing;
+    SmallVector<Value *, 16> LatchOutgoing;
   };
 
   bool Changed = false;
@@ -298,6 +298,8 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
     if (!Selector)
       continue;
     BasicBlock *Header = Selector->getParent();
+    Function *F = Header->getParent();
+    DominatorTree DT(*F);
     bool SelfHub = Header == Hub;
     auto *HeaderBr = dyn_cast<BranchInst>(Header->getTerminator());
     if (!SelfHub &&
@@ -339,14 +341,41 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
     }
     if (!Valid || HeaderPhis.empty())
       continue;
-    // Self-hub dispatchers that carry application values need parallel-copy
-    // reconstruction across every split select arm.  The pure one-PHI form
-    // is fully proven here; multi-PHI self-hubs stay on the conservative
-    // fallback handled by later work.
-    if (SelfHub && HeaderPhis.size() != 1)
+
+    SmallVector<PHINode *, 16> AllLatchPhis;
+    for (PHINode &LP : Latch->phis())
+      AllLatchPhis.push_back(&LP);
+
+    auto PayloadIsCloneable = [](BasicBlock *BB) {
+      for (Instruction &I : *BB) {
+        if (isa<PHINode>(I) || I.isTerminator())
+          continue;
+        if (I.isEHPad())
+          return false;
+        if (auto *CB = dyn_cast<CallBase>(&I); CB && CB->cannotDuplicate())
+          return false;
+      }
+      return true;
+    };
+    if (!PayloadIsCloneable(Latch) ||
+        (!SelfHub && !PayloadIsCloneable(Header)) ||
+        !PayloadIsCloneable(Hub))
       continue;
 
     SmallVector<CandidateRewrite, 32> Rewrites;
+    // A new region.thread edge bypasses Header and Hub on later iterations.
+    // A value carried from Header can dominate the old latch->header edge yet
+    // fail to dominate this new edge.  Until we model dominance in the
+    // rewritten CFG, accept only edge-local instruction values (or values
+    // without an instruction definition).
+    auto IsSafeThreadInput = [&](Value *V, BasicBlock *Pred) {
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I)
+        return true;
+      if (I->getParent() == Header || I->getParent() != Pred)
+        return false;
+      return DT.dominates(I, Pred->getTerminator());
+    };
     auto AddArm = [&](BasicBlock *Pred, ConstantInt *State,
                       Value *BranchCondition, bool ConditionValue,
                       bool FromLatch) {
@@ -375,6 +404,18 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
         R.BranchCondition = BranchCondition;
         R.ConditionValue = ConditionValue;
         R.FromLatch = FromLatch;
+        if (FromLatch) {
+          for (PHINode *LP : AllLatchPhis) {
+            Value *Outgoing = LP->getIncomingValueForBlock(Pred);
+            if (!Outgoing || !IsSafeThreadInput(Outgoing, Pred)) {
+              // An unsafe carried value would need a post-rewrite SSA proof.
+              // Reject the entire candidate before any CFG mutation.
+              Valid = false;
+              return false;
+            }
+            R.LatchOutgoing.push_back(Outgoing);
+          }
+        }
         for (unsigned I = 0; I < HeaderPhis.size(); ++I) {
           Value *Outgoing = nullptr;
           if (HeaderPhis[I] == Selector)
@@ -383,11 +424,14 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
             Outgoing = LatchPhis[I]->getIncomingValueForBlock(Pred);
           else
             Outgoing = HeaderPhis[I]->getIncomingValueForBlock(Pred);
-          if (!Outgoing)
+          if (!Outgoing || !IsSafeThreadInput(Outgoing, Pred)) {
+            Valid = false;
             return false;
+          }
           // Cross-carried register swaps require simultaneous parallel-copy
-          // lowering.  Refuse them transactionally; self-carried and newly
-          // computed values are handled by SSAUpdater below.
+          // lowering. Refuse them transactionally. Header/self-carried values
+          // are rejected above because their old dominance does not survive
+          // the newly-created direct edge.
           if (auto *Other = dyn_cast_or_null<PHINode>(Outgoing))
             if (Other->getParent() == Header && Other != HeaderPhis[I]) {
               Valid = false;
@@ -413,6 +457,9 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
       } else if (auto *Select = dyn_cast<SelectInst>(NextState);
                  SelfHub && HeaderPhis.size() == 1 &&
                  Select && Select->getParent() == Pred) {
+        // Splitting a select transition with additional carried values needs
+        // a proof that every value is identical on both arms.  Keep that form
+        // on the fallback path until the parallel-copy proof is explicit.
         auto *TrueState = dyn_cast<ConstantInt>(Select->getTrueValue());
         auto *FalseState = dyn_cast<ConstantInt>(Select->getFalseValue());
         if (TrueState && FalseState) {
@@ -466,9 +513,10 @@ bool BrightenDevirtPass::LowerRegionSSAStateSwitches(Module &M) {
       R.Thread = BasicBlock::Create(M.getContext(), "region.thread", Hub->getParent(),
                                     R.Dest);
       ValueToValueMapTy VMap;
+      if (R.FromLatch)
+        for (unsigned I = 0; I < AllLatchPhis.size(); ++I)
+          VMap[AllLatchPhis[I]] = R.LatchOutgoing[I];
       for (unsigned I = 0; I < HeaderPhis.size(); ++I) {
-        if (R.FromLatch)
-          VMap[LatchPhis[I]] = R.Outgoing[I];
         VMap[HeaderPhis[I]] = R.Outgoing[I];
       }
 

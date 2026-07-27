@@ -1,7 +1,9 @@
 # Final native cleanup and contract verifier
 
-`brighten-native-cleanup-pass` is the final module-wide gate for the native IR
-contract in `BRIGHTENING_METHODOLOGY.md`.
+`brighten-native-cleanup-pass` performs the compatibility recovery/cleanup
+rewrites. `brighten-native-cleanup-final-pass` is the final module-wide gate
+for the native IR contract in `BRIGHTENING_METHODOLOGY.md`; it reports and
+optionally rejects the current IR without modifying it.
 
 The pass removes only proven-dead lifter functions/globals and lifter metadata.
 It always prints a whole-module report. Add `-brighten-native-strict` to make
@@ -20,7 +22,7 @@ flattened dispatchers, lifted ABI, or undefined values.
 
 ```bash
 opt-21 -load-pass-plugin=build/BrightenNativeCleanupPass.so \
-  -passes=brighten-native-cleanup-pass -brighten-native-strict \
+  -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
   -disable-output input.ll
 ```
 

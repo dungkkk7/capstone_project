@@ -21,6 +21,13 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_llvm_pass_plugin(Deobfuscate095
   src/Plugin.cpp
+  src/ChernobogAddRules.cpp
+  src/ChernobogAndRules.cpp
+  src/ChernobogOrRules.cpp
+  src/ChernobogSubRules.cpp
+  src/ChernobogXorRules.cpp
+  src/ChernobogMiscRules.cpp
+  src/ChernobogJumpRules.cpp
   src/Deobfuscate095.cpp
   src/Z3Prover.cpp
 )

@@ -4,6 +4,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -21,6 +22,95 @@ using namespace llvm;
 static bool IsPrintableOrControl(uint8_t C) {
   return C == 0 || C == '\n' || C == '\r' || C == '\t' || C == '\\' ||
          (C >= 0x20 && C <= 0x7E);
+}
+
+// A relocation is semantic pointer provenance, not merely an integer with the
+// current process' address bits.  Scalar/array recovery must never consume a
+// range containing one: doing so materializes ptrtoint(pointer) as i64 and
+// loses the relocation, function-pointer and ASLR semantics.  Such a range is
+// owned only by the dedicated pointer-table rule when it can emit pointer
+// fields; otherwise it remains in the source residual image.
+static bool RangeContainsRelocation(const GuestSegment *Seg, uint64_t Begin,
+                                    uint64_t End) {
+  if (!Seg || Begin >= End)
+    return false;
+  auto It = Seg->Relocations.lower_bound(Begin);
+  return It != Seg->Relocations.end() && It->first < End;
+}
+
+static uint64_t SourceOffsetForGuestAddress(GlobalDataContext &Ctx,
+                                            GuestSegment *Seg,
+                                            uint64_t GuestAddr);
+
+// A string extracted from a mixed image is a new object with a distinct host
+// identity.  Keep this proof deliberately narrower than generic data
+// recovery: only a non-executable readonly source interval with fully known
+// direct uses may be split.  Dynamic carriers are rejected later by the
+// segment-wide alias preflight; this local check additionally rejects a
+// constant access that would cross the proposed NUL boundary or observes
+// volatile/atomic memory semantics.
+static bool IsProvenReadonlyStringInterval(GlobalDataContext &Ctx,
+                                           GuestSegment *Seg,
+                                           uint64_t Begin, uint64_t End) {
+  if (!Seg || !Seg->BaseResolved || !Seg->ReadOnly || Seg->Writable ||
+      Seg->Executable || Begin >= End || Begin < Seg->GuestBase ||
+      End > Seg->GuestBase + Seg->Size)
+    return false;
+
+  const uint64_t SourceBegin = SourceOffsetForGuestAddress(Ctx, Seg, Begin);
+  if (SourceBegin > UINT64_MAX - (End - Begin) ||
+      RangeContainsRelocation(Seg, SourceBegin, SourceBegin + End - Begin))
+    return false;
+
+  for (const auto &Ref : Ctx.AddressRefs) {
+    if (!Ref || Ref->Segment != Seg || Ref->GuestAddr < Begin ||
+        Ref->GuestAddr >= End || !Ref->UserInst)
+      continue;
+
+    Instruction *Use = Ref->UserInst;
+    if (auto *GEP = dyn_cast<GEPOperator>(Use)) {
+      for (unsigned I = 1; I < GEP->getNumOperands(); ++I)
+        if (!isa<ConstantInt>(GEP->getOperand(I)))
+          return false;
+      continue;
+    }
+
+    uint64_t AccessWidth = 0;
+    bool Reject = false;
+    if (auto *LI = dyn_cast<LoadInst>(Use)) {
+      if (LI->getPointerOperand() != Ref->OriginalValue)
+        continue;
+      Reject = LI->isVolatile() || LI->isAtomic();
+      AccessWidth = Ctx.DL.getTypeStoreSize(LI->getType()).getFixedValue();
+    } else if (auto *SI = dyn_cast<StoreInst>(Use)) {
+      if (SI->getPointerOperand() != Ref->OriginalValue)
+        continue;
+      // A readonly string candidate may never acquire a writable alias.
+      Reject = true;
+      AccessWidth =
+          Ctx.DL.getTypeStoreSize(SI->getValueOperand()->getType()).getFixedValue();
+    } else if (auto *RMW = dyn_cast<AtomicRMWInst>(Use)) {
+      if (RMW->getPointerOperand() != Ref->OriginalValue)
+        continue;
+      Reject = true;
+      AccessWidth = Ctx.DL.getTypeStoreSize(RMW->getValOperand()->getType())
+                        .getFixedValue();
+    } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(Use)) {
+      if (CX->getPointerOperand() != Ref->OriginalValue)
+        continue;
+      Reject = true;
+      AccessWidth = Ctx.DL.getTypeStoreSize(CX->getCompareOperand()->getType())
+                        .getFixedValue();
+    }
+
+    if (Reject)
+      return false;
+    if (AccessWidth != 0 &&
+        (Ref->GuestAddr > UINT64_MAX - AccessWidth ||
+         Ref->GuestAddr + AccessWidth > End))
+      return false;
+  }
+  return true;
 }
 
 static Function *FindFnByGuestAddr(Module &M, uint64_t Addr) {
@@ -42,7 +132,8 @@ static Function *FindFnByGuestAddr(Module &M, uint64_t Addr) {
 }
 
 static void GenerateStringCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) {
-  if (Seg->FlatBytes.empty())
+  if (Seg->FlatBytes.empty() || !Seg->BaseResolved || !Seg->ReadOnly ||
+      Seg->Writable || Seg->Executable)
     return;
 
 
@@ -88,68 +179,22 @@ static void GenerateStringCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) 
     if (!NullTerm || Len < 2 || !AllPrintable)
       continue;
 
-    // A memcpy source/destination is a byte region, not a C string.  When
-    // the region begins at a string-looking alias, keep adjacent
-    // NUL-separated literals in one object; otherwise materialization turns
-    // e.g. a 40-byte command table into only the first 6-byte string.
-    bool HasBufferUse = false;
+    // Do this before candidate widening.  A NUL interval is the only object
+    // boundary proved by this rule; packed buffers belong to RawBytes rules.
+    if (!IsProvenReadonlyStringInterval(Ctx, Seg, Addr, Addr + Len))
+      continue;
+
+    // A write-buffer use is not proof that this NUL interval has a standalone
+    // string identity.  This narrow rule owns exact readonly strings only;
+    // packed/raw byte regions remain with their existing owner.
+    bool HasWriteBufferUse = false;
     for (auto &Ref : Ctx.AddressRefs) {
       if (Ref->GuestAddr < Addr || Ref->GuestAddr >= Addr + Len)
         continue;
-      HasBufferUse |= Ref->ConsumerKind == DataConsumerKind::LibcWriteBufferArg;
+      HasWriteBufferUse |= Ref->ConsumerKind == DataConsumerKind::LibcWriteBufferArg;
     }
-    // Several adjacent ELF aliases are a strong indication of a packed
-    // lookup/command table rather than independent C strings.
-    unsigned AdjacentAliases = 0;
-    for (GlobalAlias &GA : Ctx.M.aliases()) {
-      StringRef N = GA.getName();
-      if (!N.starts_with("data_"))
-        continue;
-      uint64_t A = 0;
-      if (!N.drop_front(5).getAsInteger(16, A) && A >= Addr &&
-          A < Addr + 64)
-        ++AdjacentAliases;
-    }
-    HasBufferUse |= AdjacentAliases >= 4;
-    uint64_t NextAlias = Seg->GuestBase + Seg->Size;
-    bool HasNextAlias = false;
-    for (GlobalAlias &GA : Ctx.M.aliases()) {
-      StringRef N = GA.getName();
-      if (!N.starts_with("data_"))
-        continue;
-      uint64_t A = 0;
-      if (!N.drop_front(5).getAsInteger(16, A) && A > Addr && A < NextAlias) {
-        NextAlias = A;
-        HasNextAlias = true;
-      }
-    }
-    // The segment end is only a storage boundary, not evidence that adjacent
-    // NUL-terminated literals form one byte object.  Extend to a boundary
-    // only when an actual ELF alias proves it (or a buffer consumer above
-    // proves the wider access).  Otherwise independent rodata strings would
-    // be merged and lose their own native identities.
-    if (HasNextAlias && NextAlias > Addr + Len && NextAlias - Addr <= 64)
-      HasBufferUse = true;
-    if (HasBufferUse) {
-      uint64_t Cursor = Off + Len;
-      while (Cursor < Seg->FlatBytes.size()) {
-        uint64_t Next = Cursor;
-        while (Next < Seg->FlatBytes.size() && Seg->FlatBytes[Next] != 0) {
-          if (!IsPrintableOrControl(Seg->FlatBytes[Next]))
-            break;
-          ++Next;
-        }
-        if (Next == Cursor || Next >= Seg->FlatBytes.size() ||
-            Seg->FlatBytes[Next] != 0)
-          break;
-        ++Next;
-        Len = Next - Off;
-        Cursor = Next;
-      }
-      if (HasNextAlias && NextAlias > Addr + Len &&
-          NextAlias <= Seg->GuestBase + Seg->Size)
-        Len = NextAlias - Addr;
-    }
+    if (HasWriteBufferUse)
+      continue;
 
     unsigned Confidence = 0;
     SmallVector<UseEvidence, 8> EvList;
@@ -200,17 +245,74 @@ static void GenerateStringCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) 
     auto Cand = std::make_unique<ObjectCandidate>();
     Cand->Begin = Addr;
     Cand->End = Addr + Len;
-    Cand->Kind = HasBufferUse ? ObjectKind::RawBytes : ObjectKind::StringLiteral;
+    Cand->Kind = ObjectKind::StringLiteral;
     Cand->Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), Len);
     Cand->Confidence = Confidence;
-    if (HasBufferUse)
-      Cand->Confidence += 120;
     Cand->EvidenceList = std::move(EvList);
     Cand->SourceSegment = Seg;
     Cand->Name = "str_cand_" + Twine::utohexstr(Addr).str();
     Ctx.Candidates.push_back(std::move(Cand));
   }
 
+}
+
+// A rejected readonly string interval must remain one source object.  Without
+// this post-generation fence, a scalar/array rule could materialize the same
+// bytes after the string rule correctly refused a crossing, volatile, atomic,
+// relocation, or dynamic access.  This is not generic blob splitting: it is
+// a fail-closed ownership rule for exact NUL intervals with string evidence.
+static void RefuseCandidatesOverlappingUnprovenStringIntervals(
+    GlobalDataContext &Ctx) {
+  struct Range {
+    GuestSegment *Seg;
+    uint64_t Begin;
+    uint64_t End;
+  };
+  SmallVector<Range, 16> Protected;
+
+  for (const auto &SegPtr : Ctx.Segments) {
+    GuestSegment *Seg = SegPtr.get();
+    if (!Seg || !Seg->BaseResolved || !Seg->ReadOnly || Seg->Writable ||
+        Seg->Executable)
+      continue;
+    for (const auto &Ref : Ctx.AddressRefs) {
+      if (!Ref || Ref->Segment != Seg || Ref->GuestAddr < Seg->GuestBase ||
+          Ref->GuestAddr >= Seg->GuestBase + Seg->Size)
+        continue;
+      bool StringEvidence = false;
+      for (const UseEvidence &Ev : Ref->EvidenceList)
+        StringEvidence |= Ev.Kind == EvidenceKind::LibcStringArg ||
+                          Ev.Kind == EvidenceKind::FormatStringArg;
+      if (!StringEvidence)
+        continue;
+
+      uint64_t Off = Ref->GuestAddr - Seg->GuestBase;
+      uint64_t Cursor = Off;
+      bool Printable = true;
+      while (Cursor < Seg->FlatBytes.size() && Seg->FlatBytes[Cursor] != 0) {
+        Printable &= IsPrintableOrControl(Seg->FlatBytes[Cursor]);
+        ++Cursor;
+      }
+      if (!Printable || Cursor >= Seg->FlatBytes.size() ||
+          Seg->FlatBytes[Cursor] != 0 || Cursor == Off)
+        continue;
+      uint64_t End = Seg->GuestBase + Cursor + 1;
+      if (!IsProvenReadonlyStringInterval(Ctx, Seg, Ref->GuestAddr, End))
+        Protected.push_back({Seg, Ref->GuestAddr, End});
+    }
+  }
+
+  if (Protected.empty())
+    return;
+  llvm::erase_if(Ctx.Candidates, [&](const std::unique_ptr<ObjectCandidate> &Cand) {
+    if (!Cand || !Cand->SourceSegment)
+      return false;
+    for (const Range &R : Protected)
+      if (Cand->SourceSegment == R.Seg && Cand->Begin < R.End &&
+          R.Begin < Cand->End)
+        return true;
+    return false;
+  });
 }
 
 static void GenerateArrayCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) {
@@ -314,6 +416,14 @@ static void GenerateArrayCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) {
       uint64_t ArrayBegin = UniqueAddrs[ClusterStart];
       uint64_t ArrayEnd = ArrayBegin + (uint64_t)NumElems * ElemSize;
 
+      const uint64_t SegmentOffset =
+          SourceOffsetForGuestAddress(Ctx, Seg, ArrayBegin);
+      if (RangeContainsRelocation(Seg, SegmentOffset,
+                                  SegmentOffset + ArrayEnd - ArrayBegin)) {
+        ClusterStart = ClusterEnd;
+        continue;
+      }
+
       auto Cand = std::make_unique<ObjectCandidate>();
       Cand->Begin = ArrayBegin;
       Cand->End = ArrayEnd;
@@ -401,6 +511,31 @@ static std::optional<uint64_t> NamedGuestAddress(Value *V) {
   if (Hex.empty() || Hex.getAsInteger(16, Address))
     return std::nullopt;
   return Address;
+}
+
+// Synthetic lifted aggregates are often padded/split differently from their
+// guest virtual ranges.  A data_<guest-address> alias is the authoritative
+// map to initializer storage, and is therefore also the coordinate system for
+// relocation overlap checks.  Falling back to guest-base subtraction is safe
+// only when the lifter did not emit that stronger mapping.
+static uint64_t SourceOffsetForGuestAddress(GlobalDataContext &Ctx,
+                                            GuestSegment *Seg,
+                                            uint64_t GuestAddr) {
+  if (!Seg || !Seg->GV)
+    return 0;
+  for (GlobalAlias &GA : Ctx.M.aliases()) {
+    auto Addr = NamedGuestAddress(&GA);
+    if (!Addr || *Addr != GuestAddr)
+      continue;
+    auto *GEP = dyn_cast<GEPOperator>(GA.getAliasee());
+    if (!GEP || GEP->getPointerOperand()->stripPointerCasts() != Seg->GV)
+      continue;
+    APInt Offset(Ctx.DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+    if (GEP->accumulateConstantOffset(Ctx.DL, Offset) &&
+        Offset.getActiveBits() <= 64)
+      return Offset.getZExtValue();
+  }
+  return GuestAddr - Seg->GuestBase;
 }
 
 static std::optional<uint64_t>
@@ -745,6 +880,88 @@ CollectDynamicIndexBases(GlobalDataContext &Ctx, GuestSegment *Seg) {
   return Bases;
 }
 
+// A fixed writable field can be split out of a live residual only if every
+// carrier that may denote the interval is a direct, same-typed load/store.
+// In particular, a second dynamic carrier would leave two host objects for
+// one guest address after the direct users are rewritten.  Do this proof at
+// candidate generation, before conflict resolution/materialization, so an
+// unsafe candidate never becomes visible to later passes.
+static bool HasCompleteDirectScalarProof(GlobalDataContext &Ctx,
+                                         GuestSegment *Seg, uint64_t Begin,
+                                         Type *Ty) {
+  if (!Seg || !Seg->BaseResolved || Seg->Executable ||
+      (!Seg->Writable && Seg->Kind != SegmentKind::Bss) || !Ty ||
+      !Ty->isSized())
+    return false;
+  const uint64_t Width = Ctx.DL.getTypeStoreSize(Ty).getFixedValue();
+  if (Width == 0 || Begin > UINT64_MAX - Width)
+    return false;
+  const uint64_t End = Begin + Width;
+  if (Begin < Seg->GuestBase || End > Seg->GuestBase + Seg->Size)
+    return false;
+
+  bool SawDirectAccess = false;
+  for (const auto &Ref : Ctx.AddressRefs) {
+    if (!Ref || Ref->Segment != Seg || !Ref->UserInst)
+      continue;
+    Instruction *Use = Ref->UserInst;
+    if (auto *GEP = dyn_cast<GEPOperator>(Use)) {
+      bool Dynamic = false;
+      for (unsigned I = 1; I < GEP->getNumOperands(); ++I)
+        Dynamic |= !isa<ConstantInt>(GEP->getOperand(I));
+      // An unbounded index rooted before (or at) this interval can reach it.
+      if (Dynamic && Ref->GuestAddr <= Begin)
+        return false;
+    }
+
+    Type *AccessTy = nullptr;
+    uint64_t AccessWidth = 0;
+    bool Direct = false;
+    bool UnsafeMemory = false;
+    if (auto *LI = dyn_cast<LoadInst>(Use)) {
+      Direct = LI->getPointerOperand() == Ref->OriginalValue;
+      UnsafeMemory = LI->isVolatile() || LI->isAtomic();
+      AccessTy = LI->getType();
+    } else if (auto *SI = dyn_cast<StoreInst>(Use)) {
+      Direct = SI->getPointerOperand() == Ref->OriginalValue;
+      UnsafeMemory = SI->isVolatile() || SI->isAtomic();
+      AccessTy = SI->getValueOperand()->getType();
+    } else if (isa<AtomicRMWInst>(Use) || isa<AtomicCmpXchgInst>(Use)) {
+      return false;
+    }
+    if (AccessTy && AccessTy->isSized())
+      AccessWidth = Ctx.DL.getTypeStoreSize(AccessTy).getFixedValue();
+
+    // A constant GEP is only the carrier that feeds the direct memory use;
+    // it is not itself an incompatible interval access.  Its identity uses
+    // are represented separately by the address-map consumer classification.
+    if (!AccessTy) {
+      if (Ref->GuestAddr >= Begin && Ref->GuestAddr < End &&
+          (Ref->ConsumerKind == DataConsumerKind::ComparisonOnly ||
+           Ref->ConsumerKind == DataConsumerKind::IntegerAddressConsumer ||
+           Ref->ConsumerKind == DataConsumerKind::ArithmeticOnly))
+        return false;
+      continue;
+    }
+
+    const bool StartsBeforeEnd = Ref->GuestAddr < End;
+    const bool EndsAfterBegin =
+        AccessWidth == 0 ? Ref->GuestAddr >= Begin
+                         : (Ref->GuestAddr > UINT64_MAX - AccessWidth ||
+                            Ref->GuestAddr + AccessWidth > Begin);
+    if (!StartsBeforeEnd || !EndsAfterBegin)
+      continue;
+
+    if (UnsafeMemory || !Direct || AccessTy != Ty || AccessWidth != Width ||
+        Ref->ConsumerKind == DataConsumerKind::ComparisonOnly ||
+        Ref->ConsumerKind == DataConsumerKind::IntegerAddressConsumer ||
+        Ref->ConsumerKind == DataConsumerKind::ArithmeticOnly)
+      return false;
+    SawDirectAccess = true;
+  }
+  return SawDirectAccess;
+}
+
 static void GenerateScalarCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) {
   std::map<uint64_t, SmallVector<std::pair<Type*, bool>, 4>> AccessMap;
   const std::map<uint64_t, DynamicIndexBase> DynamicIndexBases =
@@ -797,6 +1014,28 @@ static void GenerateScalarCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) 
     }
 
     if (!Consistent)
+      continue;
+
+    const uint64_t SegmentOffset =
+        SourceOffsetForGuestAddress(Ctx, Seg, Addr);
+    if (RangeContainsRelocation(Seg, SegmentOffset, SegmentOffset + Width))
+      continue;
+
+    // This is the narrow residual-objectization path: fixed writable direct
+    // scalar access after pointer canonicalization.  Existing generic scalar
+    // recovery remains available for its older evidence modes, but this
+    // candidate has a stronger all-use proof and therefore owns its interval
+    // transactionally in the rewrite stage.
+    const bool TransactionalDirect =
+        HasCompleteDirectScalarProof(Ctx, Seg, Addr, Ty);
+
+    // Writable residual storage is the alias-sensitive case.  Do not fall
+    // back to the historical single-reference scalar candidate when the
+    // complete-interval proof fails: an overlapping width, volatile access,
+    // dynamic carrier, relocation, or address observation must retain one
+    // residual storage object rather than leave a partially rewritten split.
+    if ((Seg->Writable || Seg->Kind == SegmentKind::Bss) &&
+        !TransactionalDirect)
       continue;
 
     // A scalar observation at a dynamically indexed base only describes one
@@ -853,12 +1092,13 @@ static void GenerateScalarCandidates(GlobalDataContext &Ctx, GuestSegment *Seg) 
     Cand->Ty = Ty;
     Cand->SourceSegment = Seg;
     Cand->Name = "scalar_cand_" + Twine::utohexstr(Addr).str();
+    Cand->RequiresTransactionalDirectRewrite = TransactionalDirect;
 
     UseEvidence Ev;
     Ev.Kind = EvidenceKind::LoadStoreWidth;
-    Ev.Confidence = 50;
+    Ev.Confidence = TransactionalDirect ? 70 : 50;
     Cand->EvidenceList.push_back(Ev);
-    Cand->Confidence = 50;
+    Cand->Confidence = Ev.Confidence;
 
     if (HasWrite) {
       UseEvidence WEv;
@@ -1517,6 +1757,8 @@ bool BrightenGlobalDataRecoveryPass::GenerateObjectCandidates(
       GenerateLoadedPointerCarrierReferenceCandidates(Ctx, Seg.get());
     }
   }
+
+  RefuseCandidatesOverlappingUnprovenStringIntervals(Ctx);
 
   if (Ctx.Debug && !Ctx.Candidates.empty())
     errs() << "[brighten-global-data] generated " << Ctx.Candidates.size()

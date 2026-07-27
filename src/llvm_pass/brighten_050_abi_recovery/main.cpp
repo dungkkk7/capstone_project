@@ -23,6 +23,8 @@ PreservedAnalyses BrightenABIRecoveryPass::run(Module &M,
   // wrapper pass below is only a compatibility boundary for genuinely
   // unresolved dynamic users; it must not hide direct calls from ABI recovery.
   Changed |= RewriteKnownCallsites(Ctx);
+  Changed |= NormalizeScanfI32Boundaries(Ctx);
+  Changed |= LowerCallbackAndSharedStateABI(Ctx);
   Changed |= CreateRemillWrappers(Ctx);
   Changed |= RewriteMainWrapper(Ctx);
   Changed |= CleanupDeadRemillABI(Ctx);

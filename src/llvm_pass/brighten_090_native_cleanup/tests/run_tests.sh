@@ -9,6 +9,116 @@ PLUGIN="$ROOT/build/BrightenNativeCleanupPass.so"
 [[ -x "$OPT" ]]
 [[ -f "$PLUGIN" ]]
 
+ENTRY_STACK_CONTRACT_OUT="$(mktemp)"
+ENTRY_STACK_TWO_CALLS_OUT="$(mktemp)"
+ENTRY_STACK_RECURSIVE_OUT="$(mktemp)"
+ENTRY_STACK_TAKEN_OUT="$(mktemp)"
+STATE_SSA_BOUNDARY_OUT="$(mktemp)"
+STATE_SSA_BOUNDARY_O3_OUT="$(mktemp)"
+STATE_SSA_BOUNDARY_DEFAULT_OUT="$(mktemp)"
+trap 'rm -f "$ENTRY_STACK_CONTRACT_OUT" "$ENTRY_STACK_TWO_CALLS_OUT" "$ENTRY_STACK_RECURSIVE_OUT" "$ENTRY_STACK_TAKEN_OUT" "$STATE_SSA_BOUNDARY_OUT" "$STATE_SSA_BOUNDARY_O3_OUT" "$STATE_SSA_BOUNDARY_DEFAULT_OUT"' EXIT
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$ROOT/tests/state_ssa_guest_boundary.ll" -o "$STATE_SSA_BOUNDARY_DEFAULT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  --check-prefix=STATE-DEFAULT "$ROOT/tests/state_ssa_guest_boundary.ll" \
+  < "$STATE_SSA_BOUNDARY_DEFAULT_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa \
+  -brighten-090-propagate-guest-boundary -S \
+  "$ROOT/tests/state_ssa_guest_boundary.ll" -o "$STATE_SSA_BOUNDARY_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  --check-prefix=STATE-PIN "$ROOT/tests/state_ssa_guest_boundary.ll" \
+  < "$STATE_SSA_BOUNDARY_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  --check-prefix=STATE-PLAIN "$ROOT/tests/state_ssa_guest_boundary.ll" \
+  < "$STATE_SSA_BOUNDARY_OUT"
+"$OPT" -passes='default<O3>,verify' -S "$STATE_SSA_BOUNDARY_OUT" \
+  -o "$STATE_SSA_BOUNDARY_O3_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  --check-prefix=O3 "$ROOT/tests/state_ssa_guest_boundary.ll" \
+  < "$STATE_SSA_BOUNDARY_O3_OUT"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$ROOT/tests/entrypoint_stack_contract_positive.ll" -o "$ENTRY_STACK_CONTRACT_OUT"
+grep -Eq '@frame_storage_backing\.main = internal global \[16777216 x i8\].*!brighten\.entry\.stack\.contract' "$ENTRY_STACK_CONTRACT_OUT"
+grep -q '!brighten.entry.stack.producer' "$ENTRY_STACK_CONTRACT_OUT"
+grep -q '!brighten.entry.stack.owner' "$ENTRY_STACK_CONTRACT_OUT"
+grep -q '!brighten.entry.stack.inline.origin' "$ENTRY_STACK_CONTRACT_OUT"
+
+for ENTRY_STACK_NEGATIVE in two_calls recursive address_taken; do
+  case "$ENTRY_STACK_NEGATIVE" in
+    two_calls) ENTRY_STACK_OUT="$ENTRY_STACK_TWO_CALLS_OUT" ;;
+    recursive) ENTRY_STACK_OUT="$ENTRY_STACK_RECURSIVE_OUT" ;;
+    address_taken) ENTRY_STACK_OUT="$ENTRY_STACK_TAKEN_OUT" ;;
+  esac
+  "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes='brighten-native-cleanup-pass,verify' -S \
+    "$ROOT/tests/entrypoint_stack_contract_${ENTRY_STACK_NEGATIVE}_refused.ll" \
+    -o "$ENTRY_STACK_OUT"
+  if grep -q 'brighten.entry.stack.contract' "$ENTRY_STACK_OUT"; then
+    echo "FAIL: entry stack contract accepted $ENTRY_STACK_NEGATIVE boundary" >&2
+    exit 1
+  fi
+done
+
+NATIVE_STACK_SAFE_OUT="$(mktemp)"
+NATIVE_STACK_READ_REFUSE_OUT="$(mktemp)"
+NATIVE_STACK_PARTIAL_REFUSE_OUT="$(mktemp)"
+NATIVE_STACK_CALL_REFUSE_OUT="$(mktemp)"
+NATIVE_STACK_SAFE_TWICE_OUT="$(mktemp)"
+NATIVE_STACK_UNSUPPORTED_OUT="$(mktemp)"
+NATIVE_STACK_UNSUPPORTED_BASELINE="$(mktemp)"
+NATIVE_STACK_NONZERO_ROOT_OUT="$(mktemp)"
+trap 'rm -f "$NATIVE_STACK_SAFE_OUT" "$NATIVE_STACK_READ_REFUSE_OUT" "$NATIVE_STACK_PARTIAL_REFUSE_OUT" "$NATIVE_STACK_CALL_REFUSE_OUT" "$NATIVE_STACK_SAFE_TWICE_OUT" "$NATIVE_STACK_UNSUPPORTED_OUT" "$NATIVE_STACK_UNSUPPORTED_BASELINE" "$NATIVE_STACK_NONZERO_ROOT_OUT"' EXIT
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$ROOT/tests/native_main_stack_fully_initialized.ll" -o "$NATIVE_STACK_SAFE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/native_main_stack_fully_initialized.ll" < "$NATIVE_STACK_SAFE_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$NATIVE_STACK_SAFE_OUT" -o "$NATIVE_STACK_SAFE_TWICE_OUT"
+cmp <(sed '1{/^; ModuleID = /d;}' "$NATIVE_STACK_SAFE_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$NATIVE_STACK_SAFE_TWICE_OUT")
+
+for NATIVE_STACK_REFUSAL in read_before_write partial_write unknown_call; do
+  case "$NATIVE_STACK_REFUSAL" in
+    read_before_write) NATIVE_STACK_OUT="$NATIVE_STACK_READ_REFUSE_OUT" ;;
+    partial_write) NATIVE_STACK_OUT="$NATIVE_STACK_PARTIAL_REFUSE_OUT" ;;
+    unknown_call) NATIVE_STACK_OUT="$NATIVE_STACK_CALL_REFUSE_OUT" ;;
+  esac
+  "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+    "$ROOT/tests/native_main_stack_${NATIVE_STACK_REFUSAL}_refused.ll" \
+    -o "$NATIVE_STACK_OUT"
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/native_main_stack_${NATIVE_STACK_REFUSAL}_refused.ll" < "$NATIVE_STACK_OUT"
+done
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$ROOT/tests/native_main_stack_unsupported_user_rollback.ll" \
+  -o "$NATIVE_STACK_UNSUPPORTED_BASELINE"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$ROOT/tests/native_main_stack_unsupported_user_rollback.ll" \
+  -o "$NATIVE_STACK_UNSUPPORTED_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/native_main_stack_unsupported_user_rollback.ll" < "$NATIVE_STACK_UNSUPPORTED_OUT"
+cmp <(sed '1{/^; ModuleID = /d;}' "$NATIVE_STACK_UNSUPPORTED_BASELINE") \
+    <(sed '1{/^; ModuleID = /d;}' "$NATIVE_STACK_UNSUPPORTED_OUT")
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -brighten-native-state-ssa -S \
+  "$ROOT/tests/native_main_stack_nonzero_root_gep_refused.ll" \
+  -o "$NATIVE_STACK_NONZERO_ROOT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/native_main_stack_nonzero_root_gep_refused.ll" < "$NATIVE_STACK_NONZERO_ROOT_OUT"
+
 MEMSET_SIZE_OUT="$(mktemp)"
 trap 'rm -f "$MEMSET_SIZE_OUT"' EXIT
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -129,6 +239,26 @@ if grep -Eq '\binttoptr\b|native\.data\.pointer\.select|native\.address\.fallbac
 fi
 rm -f "$GLOBAL_PTR_ROUNDTRIP_OUT"
 
+REVERSE_GUEST_POINTER_OUT="$(mktemp)"
+trap 'rm -f "$REVERSE_GUEST_POINTER_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/reverse_guest_pointer_identity.ll" \
+  -o "$REVERSE_GUEST_POINTER_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/reverse_guest_pointer_identity.ll" \
+  < "$REVERSE_GUEST_POINTER_OUT"
+rm -f "$REVERSE_GUEST_POINTER_OUT"
+
+RESIDUAL_RELOCATION_OUT="$(mktemp)"
+trap 'rm -f "$RESIDUAL_RELOCATION_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/residual_relocation_load.ll" -o "$RESIDUAL_RELOCATION_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/residual_relocation_load.ll" < "$RESIDUAL_RELOCATION_OUT"
+rm -f "$RESIDUAL_RELOCATION_OUT"
+
 VARARG_EXTERNAL_PTR_OUT="$(mktemp)"
 trap 'rm -f "$VARARG_EXTERNAL_PTR_OUT"' EXIT
 "$OPT" -load-pass-plugin="$PLUGIN" \
@@ -146,7 +276,7 @@ rm -f "$VARARG_EXTERNAL_PTR_OUT"
 NATIVE_DISPATCH_OUT="$(mktemp)"
 trap 'rm -f "$NATIVE_DISPATCH_OUT"' EXIT
 "$OPT" -load-pass-plugin="$PLUGIN" \
-  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  -passes='brighten-native-cleanup-pass,verify' -S \
   "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
   -o "$NATIVE_DISPATCH_OUT"
 "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
@@ -179,12 +309,133 @@ rm -f "$LOWERED_STATE_OUT"
 "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass \
   -brighten-native-strict -disable-output "$ROOT/tests/clean_native.ll"
 
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -disable-output \
+  "$ROOT/tests/final_contract_native_malloc.ll"
+
+TRANSITIONAL_ENTRY_STACK_REPORT="$(mktemp)"
+trap 'rm -f "$TRANSITIONAL_ENTRY_STACK_REPORT"' EXIT
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes='brighten-native-cleanup-final-pass,verify' \
+    -brighten-native-strict -disable-output \
+    "$ROOT/tests/final_contract_transitional_entry_stack.ll" \
+    > /dev/null 2>"$TRANSITIONAL_ENTRY_STACK_REPORT"; then
+  echo "FAIL: strict verifier accepted transitional entry guest stack" >&2
+  exit 1
+fi
+grep -Fq 'transitional entry guest stack: main' \
+  "$TRANSITIONAL_ENTRY_STACK_REPORT"
+rm -f "$TRANSITIONAL_ENTRY_STACK_REPORT"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -disable-output \
+  "$ROOT/tests/final_contract_structural_pointer_native.ll"
+
+STRUCTURAL_POINTER_CONTROL="$(mktemp)"
+STRUCTURAL_POINTER_FINAL="$(mktemp)"
+STRUCTURAL_POINTER_REPORT="$(mktemp)"
+trap 'rm -f "$STRUCTURAL_POINTER_CONTROL" "$STRUCTURAL_POINTER_FINAL" "$STRUCTURAL_POINTER_REPORT"' EXIT
+"$OPT" -passes=verify -S \
+  "$ROOT/tests/final_contract_structural_pointer_residuals.ll" \
+  -o "$STRUCTURAL_POINTER_CONTROL"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/final_contract_structural_pointer_residuals.ll" \
+  -o "$STRUCTURAL_POINTER_FINAL" 2>"$STRUCTURAL_POINTER_REPORT"
+cmp "$STRUCTURAL_POINTER_CONTROL" "$STRUCTURAL_POINTER_FINAL"
+grep -Fq \
+  'native contract finding: semantic_risk/memory_model: range-dispatched pointer memory access: f' \
+  "$STRUCTURAL_POINTER_REPORT"
+grep -Fq \
+  'native contract finding: semantic_risk/memory_model: range-dispatched pointer memory access: g' \
+  "$STRUCTURAL_POINTER_REPORT"
+grep -Fq \
+  'native contract finding: semantic_risk/pointer_model: integerized guarded pointer reconstruction: h' \
+  "$STRUCTURAL_POINTER_REPORT"
+grep -Fq \
+  'native contract finding: semantic_risk/pointer_model: integerized guarded pointer reconstruction: i' \
+  "$STRUCTURAL_POINTER_REPORT"
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output \
+    "$ROOT/tests/final_contract_structural_pointer_residuals.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted structural pointer residuals" >&2
+  exit 1
+fi
+rm -f "$STRUCTURAL_POINTER_CONTROL" "$STRUCTURAL_POINTER_FINAL" \
+  "$STRUCTURAL_POINTER_REPORT"
+
+FINAL_CONTROL_OUT="$(mktemp)"
+FINAL_VERIFY_OUT="$(mktemp)"
+FINAL_REPORT="$(mktemp)"
+trap 'rm -f "$FINAL_CONTROL_OUT" "$FINAL_VERIFY_OUT" "$FINAL_REPORT"' EXIT
+"$OPT" -passes=verify -S "$ROOT/tests/final_contract_residuals.ll" \
+  -o "$FINAL_CONTROL_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/final_contract_residuals.ll" -o "$FINAL_VERIFY_OUT" \
+  2>"$FINAL_REPORT"
+cmp "$FINAL_CONTROL_OUT" "$FINAL_VERIFY_OUT"
+for FINDING in \
+  'generated raw pointer fallback' \
+  'surviving mapper/select fallback chain' \
+  'synthetic raw byte frame/storage' \
+  'residual image/map global' \
+  'segment pointer mapper' \
+  'guest CFG / flattened dispatcher model'; do
+  grep -Fq "native contract finding: $FINDING" "$FINAL_REPORT"
+done
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/final_contract_residuals.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted generated recovery artifacts" >&2
+  exit 1
+fi
+rm -f "$FINAL_CONTROL_OUT" "$FINAL_VERIFY_OUT" "$FINAL_REPORT"
+
+OVERLAPPING_FALLBACK_CONTROL="$(mktemp)"
+OVERLAPPING_FALLBACK_FINAL="$(mktemp)"
+OVERLAPPING_FALLBACK_REPORT="$(mktemp)"
+trap 'rm -f "$OVERLAPPING_FALLBACK_CONTROL" "$OVERLAPPING_FALLBACK_FINAL" "$OVERLAPPING_FALLBACK_REPORT"' EXIT
+"$OPT" -passes=verify -S \
+  "$ROOT/tests/final_contract_overlapping_pointer_fallback.ll" \
+  -o "$OVERLAPPING_FALLBACK_CONTROL"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/final_contract_overlapping_pointer_fallback.ll" \
+  -o "$OVERLAPPING_FALLBACK_FINAL" 2>"$OVERLAPPING_FALLBACK_REPORT"
+cmp "$OVERLAPPING_FALLBACK_CONTROL" "$OVERLAPPING_FALLBACK_FINAL"
+grep -Fq 'native contract finding: generated raw pointer fallback: ambiguous_overlap_store' \
+  "$OVERLAPPING_FALLBACK_REPORT"
+grep -Fq 'native contract finding: surviving mapper/select fallback chain: ambiguous_overlap_store' \
+  "$OVERLAPPING_FALLBACK_REPORT"
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/final_contract_overlapping_pointer_fallback.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted overlapping pointer fallback" >&2
+  exit 1
+fi
+rm -f "$OVERLAPPING_FALLBACK_CONTROL" "$OVERLAPPING_FALLBACK_FINAL" \
+  "$OVERLAPPING_FALLBACK_REPORT"
+
 DEAD_INLINE_ASM_OUT="$(mktemp)"
 "$OPT" -load-pass-plugin="$PLUGIN" -passes='brighten-native-cleanup-final-pass,verify' \
-  -brighten-native-strict -S "$ROOT/tests/final_dead_inline_asm.ll" \
+  -S "$ROOT/tests/final_dead_inline_asm.ll" \
   -o "$DEAD_INLINE_ASM_OUT"
-if grep -Eq '\\basm\\b' "$DEAD_INLINE_ASM_OUT"; then
-  echo "FAIL: final cleanup left an unused inline asm call" >&2
+if ! grep -Fq ' asm ' "$DEAD_INLINE_ASM_OUT"; then
+  echo "FAIL: final verifier mutated an unused inline asm call" >&2
+  exit 1
+fi
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/final_dead_inline_asm.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted residual inline asm" >&2
   exit 1
 fi
 rm -f "$DEAD_INLINE_ASM_OUT"
@@ -250,23 +501,46 @@ if "$OPT" -load-pass-plugin="$PLUGIN" -passes=brighten-native-cleanup-final-pass
   exit 1
 fi
 
+CONSTANT_DISPATCH_CONTROL="$(mktemp)"
+CONSTANT_DISPATCH_FINAL="$(mktemp)"
+"$OPT" -passes=verify -S "$ROOT/tests/constant_expr_dispatcher_slot.ll" \
+  -o "$CONSTANT_DISPATCH_CONTROL"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-final-pass,verify' -S \
-  "$ROOT/tests/constant_expr_dispatcher_slot.ll" -o - |
-  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
-    "$ROOT/tests/constant_expr_dispatcher_slot.ll"
+  "$ROOT/tests/constant_expr_dispatcher_slot.ll" \
+  -o "$CONSTANT_DISPATCH_FINAL" 2>/dev/null
+cmp "$CONSTANT_DISPATCH_CONTROL" "$CONSTANT_DISPATCH_FINAL"
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/constant_expr_dispatcher_slot.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: final verifier promoted residual dispatcher storage" >&2
+  exit 1
+fi
+rm -f "$CONSTANT_DISPATCH_CONTROL" "$CONSTANT_DISPATCH_FINAL"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-final-pass,verify' \
   -brighten-native-strict -disable-output \
   "$ROOT/tests/native_inst_label.ll"
 
+THREAD_POINTER_CONTROL="$(mktemp)"
+THREAD_POINTER_FINAL="$(mktemp)"
+"$OPT" -passes=verify -S "$ROOT/tests/thread_pointer_inline_asm.ll" \
+  -o "$THREAD_POINTER_CONTROL"
 "$OPT" -load-pass-plugin="$PLUGIN" \
-  -passes='brighten-native-cleanup-final-pass,verify' \
-  -brighten-native-strict -S \
-  "$ROOT/tests/thread_pointer_inline_asm.ll" -o - |
-  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
-    "$ROOT/tests/thread_pointer_inline_asm.ll"
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/thread_pointer_inline_asm.ll" -o "$THREAD_POINTER_FINAL" \
+  2>/dev/null
+cmp "$THREAD_POINTER_CONTROL" "$THREAD_POINTER_FINAL"
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/thread_pointer_inline_asm.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted residual TLS inline asm" >&2
+  exit 1
+fi
+rm -f "$THREAD_POINTER_CONTROL" "$THREAD_POINTER_FINAL"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
@@ -282,11 +556,23 @@ fi
   "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
     "$ROOT/tests/unused_lifted_segment_in_llvm_used.ll"
 
+RESIDUAL_ARTIFACT_CONTROL="$(mktemp)"
+RESIDUAL_ARTIFACT_FINAL="$(mktemp)"
+"$OPT" -passes=verify -S "$ROOT/tests/residual_artifacts_cleanup.ll" \
+  -o "$RESIDUAL_ARTIFACT_CONTROL"
 "$OPT" -load-pass-plugin="$PLUGIN" \
-  -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
-  -S "$ROOT/tests/residual_artifacts_cleanup.ll" -o - |
-  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
-    "$ROOT/tests/residual_artifacts_cleanup.ll"
+  -passes='brighten-native-cleanup-final-pass,verify' -S \
+  "$ROOT/tests/residual_artifacts_cleanup.ll" \
+  -o "$RESIDUAL_ARTIFACT_FINAL" 2>/dev/null
+cmp "$RESIDUAL_ARTIFACT_CONTROL" "$RESIDUAL_ARTIFACT_FINAL"
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/residual_artifacts_cleanup.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted residual image globals" >&2
+  exit 1
+fi
+rm -f "$RESIDUAL_ARTIFACT_CONTROL" "$RESIDUAL_ARTIFACT_FINAL"
 
 echo "Native cleanup tests: PASS"
 
@@ -447,7 +733,7 @@ fi
   -brighten-native-state-ssa -S \
   "$ROOT/tests/relative_stack_global_frame_top.ll" \
   -o "$RELATIVE_STACK_FRAME_TOP_OUT"
-grep -Eq 'getelementptr \(i8, ptr getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\), i64 (-32|%native\.stack\.absolute\.delta)' \
+grep -Eq 'getelementptr (\(i8, ptr |i8, ptr )getelementptr \(i8, ptr @frame_storage_backing\.main, i64 16711680\), i64 (-32|%native\.stack\.absolute\.delta)' \
   "$RELATIVE_STACK_FRAME_TOP_OUT"
 if grep -Eq 'getelementptr i8, ptr @frame_storage_backing\.main, i64 %native\.stack\.absolute\.delta|getelementptr i8, ptr @frame_storage_backing\.main, i64 -32' \
     "$RELATIVE_STACK_FRAME_TOP_OUT"; then
@@ -586,6 +872,9 @@ FRAME_COMPACT_OUT="$(mktemp)"
 FRAME_REFUSE_OUT="$(mktemp)"
 AFFINE_FRAME_OUT="$(mktemp)"
 AFFINE_FRAME_REFUSE_OUT="$(mktemp)"
+AFFINE_DISPATCHER_REFUSE_OUT="$(mktemp)"
+AFFINE_DISPATCHER_REFUSE_TWICE="$(mktemp)"
+AFFINE_PROOF_REFUSE_OUT="$(mktemp)"
 FRAME_POS_BIN="$(mktemp)"
 FRAME_NEG_BIN="$(mktemp)"
 AFFINE_FRAME_BIN="$(mktemp)"
@@ -626,12 +915,21 @@ grep -Eq 'native_frame = alloca \[[0-9]+ x i8\]' "$AFFINE_FRAME_OUT"
 grep -Eq 'call void @llvm\.memset' "$AFFINE_FRAME_OUT"
 
 POST_FRAME_OUT="$(mktemp)"
+POST_FRAME_CONTROL="$(mktemp)"
+"$OPT" -passes=verify -S \
+  "$ROOT/tests/proven_affine_frame_compaction.ll" -o "$POST_FRAME_CONTROL"
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-final-pass,verify' -S \
-  "$ROOT/tests/proven_affine_frame_compaction.ll" -o "$POST_FRAME_OUT"
-"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
-  --check-prefix=POST "$ROOT/tests/proven_affine_frame_compaction.ll" \
-  < "$POST_FRAME_OUT"
+  "$ROOT/tests/proven_affine_frame_compaction.ll" -o "$POST_FRAME_OUT" \
+  2>/dev/null
+cmp "$POST_FRAME_CONTROL" "$POST_FRAME_OUT"
+if "$OPT" -load-pass-plugin="$PLUGIN" \
+    -passes=brighten-native-cleanup-final-pass -brighten-native-strict \
+    -disable-output "$ROOT/tests/proven_affine_frame_compaction.ll" \
+    >/dev/null 2>&1; then
+  echo "FAIL: strict verifier accepted unresolved affine frame artifacts" >&2
+  exit 1
+fi
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' \
@@ -642,6 +940,52 @@ grep -Eq '@frame_storage_backing\.main.*zeroinitializer' \
   "$AFFINE_FRAME_REFUSE_OUT"
 if grep -Eq 'native_frame = alloca' "$AFFINE_FRAME_REFUSE_OUT"; then
   echo "FAIL: cyclic affine stack was unsafely compacted" >&2
+  exit 1
+fi
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/affine_frame_helper_dispatcher_refused.ll" \
+  -o "$AFFINE_DISPATCHER_REFUSE_OUT"
+grep -Eq '@frame_storage_backing\.main.*zeroinitializer' \
+  "$AFFINE_DISPATCHER_REFUSE_OUT"
+grep -Eq 'define internal i32 @worker' "$AFFINE_DISPATCHER_REFUSE_OUT"
+if [[ "$(grep -Ec '^dispatch:' "$AFFINE_DISPATCHER_REFUSE_OUT")" -ne 1 ]]; then
+  echo "FAIL: dispatcher-refused affine helper duplicated CFG blocks" >&2
+  exit 1
+fi
+if [[ "$(grep -Ec 'call i32 @worker\(\)' "$AFFINE_DISPATCHER_REFUSE_OUT")" -ne 2 ]]; then
+  echo "FAIL: dispatcher-refused affine helper call graph changed" >&2
+  exit 1
+fi
+if grep -Eq 'native_frame = alloca' "$AFFINE_DISPATCHER_REFUSE_OUT"; then
+  echo "FAIL: dispatcher-refused affine helper was compacted" >&2
+  exit 1
+fi
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S "$AFFINE_DISPATCHER_REFUSE_OUT" \
+  -o "$AFFINE_DISPATCHER_REFUSE_TWICE"
+# opt derives ModuleID from its input filename.  Ignore that volatile banner
+# while asserting the pass is idempotent.
+cmp <(sed '1{/^; ModuleID = /d;}' "$AFFINE_DISPATCHER_REFUSE_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$AFFINE_DISPATCHER_REFUSE_TWICE")
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' \
+  -brighten-native-state-ssa -S \
+  "$ROOT/tests/affine_frame_helper_proof_refused.ll" \
+  -o "$AFFINE_PROOF_REFUSE_OUT"
+grep -Eq '@frame_storage_backing\.main.*zeroinitializer' \
+  "$AFFINE_PROOF_REFUSE_OUT"
+grep -Eq 'define internal i32 @worker' "$AFFINE_PROOF_REFUSE_OUT"
+if [[ "$(grep -Ec 'call i32 @worker\(\)' "$AFFINE_PROOF_REFUSE_OUT")" -ne 2 ]]; then
+  echo "FAIL: affine-proof refusal changed helper call graph" >&2
+  exit 1
+fi
+if grep -Eq 'native_frame = alloca' "$AFFINE_PROOF_REFUSE_OUT"; then
+  echo "FAIL: affine-proof refusal compacted fake frame" >&2
   exit 1
 fi
 
@@ -663,7 +1007,10 @@ if [[ "$FRAME_POS_STATUS" -ne 7 || "$FRAME_NEG_STATUS" -ne 0 ||
   exit 1
 fi
 rm -f "$FRAME_COMPACT_OUT" "$FRAME_REFUSE_OUT" \
-  "$AFFINE_FRAME_OUT" "$AFFINE_FRAME_REFUSE_OUT" "$POST_FRAME_OUT" \
+  "$AFFINE_FRAME_OUT" "$AFFINE_FRAME_REFUSE_OUT" \
+  "$AFFINE_DISPATCHER_REFUSE_OUT" "$AFFINE_DISPATCHER_REFUSE_TWICE" \
+  "$AFFINE_PROOF_REFUSE_OUT" "$POST_FRAME_OUT" \
+  "$POST_FRAME_CONTROL" \
   "$FRAME_POS_BIN" "$FRAME_NEG_BIN" "$AFFINE_FRAME_BIN"
 
 POINTER_DIFFERENCE_OUT="$(mktemp)"

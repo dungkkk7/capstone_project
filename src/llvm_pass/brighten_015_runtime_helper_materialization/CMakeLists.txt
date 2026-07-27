@@ -20,6 +20,7 @@ add_llvm_pass_plugin(BrightenRuntimeHelperPass
   src/main.cpp
   src/Helpers.cpp
   src/RuleLowerMcSemaAttachThunks.cpp
+  src/RulePreserveX86DivideFaults.cpp
   src/RuleImplementExternCallBridge.cpp
   src/RuleCanonicalizeGuestAddressConstants.cpp
   src/RuleDefineRemillControlFlowRuntime.cpp

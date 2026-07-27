@@ -1,11 +1,37 @@
 #include "BrightenABIRecoveryPass.h"
 
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace brighten_abi {
 
 using namespace llvm;
+
+static constexpr StringLiteral GuestBoundaryAttr =
+    "brighten.preserve.guest.boundary";
+static constexpr StringLiteral GuestBoundaryVersion = "v1";
+static cl::opt<bool> EnableGuestBoundaryPreservation(
+    "brighten-050-preserve-guest-boundary", cl::init(false),
+    cl::desc("Experimental: preserve proven guest function inline boundaries"));
+
+static bool hasGuestBoundaryMarker(const Function &F) {
+  Attribute A = F.getFnAttribute(GuestBoundaryAttr);
+  return A.isStringAttribute() && A.getValueAsString() == GuestBoundaryVersion;
+}
+
+static void preserveProvenGuestBoundary(const Function &Old, Function &New) {
+  if (!EnableGuestBoundaryPreservation)
+    return;
+  // A function cannot be both a deliberate inline boundary and alwaysinline.
+  // Refuse the preservation rather than resolving that contradictory source
+  // contract by changing either attribute.
+  if (Old.hasFnAttribute(Attribute::AlwaysInline) ||
+      (!Old.hasFnAttribute(Attribute::NoInline) && !hasGuestBoundaryMarker(Old)))
+    return;
+  New.addFnAttr(Attribute::NoInline);
+  New.addFnAttr(GuestBoundaryAttr, GuestBoundaryVersion);
+}
 
 static Function *CreateNativeShell(Module &M, FunctionABISummary &S) {
   SmallVector<Type *, 12> Params;
@@ -29,6 +55,7 @@ static Function *CreateNativeShell(Module &M, FunctionABISummary &S) {
                        (S.OriginalName + ".native"), M);
   Native->setCallingConv(Old.getCallingConv());
   Native->setDSOLocal(true);
+  preserveProvenGuestBoundary(Old, *Native);
   return Native;
 }
 

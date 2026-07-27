@@ -47,10 +47,10 @@ entry:
 ; A real native global carrier must survive even though the dynamic guest
 ; rewrite disables the broad ABI-argument heuristic.
 ; CHECK-LABEL: define i64 @read_native_recovered_field(
-; CHECK-NOT: native.address.fallback
-; CHECK-NOT: native.data.pointer.select
-; CHECK: %[[NATIVE:[A-Za-z0-9._]+]] = inttoptr i64 %field to ptr
-; CHECK: load i64, ptr %[[NATIVE]]
+; CHECK: %[[FALLBACK:[A-Za-z0-9._]+]] = inttoptr i64 %field to ptr
+; CHECK: %[[MAPPED:[A-Za-z0-9._]+]] = getelementptr i8, ptr @g_arr_2
+; CHECK: %[[SELECTED:[A-Za-z0-9._]+]] = select i1 {{.*}}, ptr %[[MAPPED]], ptr %[[FALLBACK]]
+; CHECK: load i64, ptr %[[SELECTED]]
 
 ; A nested native GEP represents guest_begin + recovered-object offset +
 ; dynamic index.  Byte-field rematerialization must retain both constants.

@@ -40,6 +40,66 @@ class InputContractManifestTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIsNotNone(reason)
 
+    def test_scanf_conversion_completeness_accepts_c_integer_forms(self):
+        contract = {
+            "kind": "encoded_line_stream",
+            "constraints": {"newline_required": True},
+            "scanf_required_conversions": [
+                {"source": "line", "line_index": 0, "format": "%d%d"},
+                {"source": "line", "line_index": 1, "format": "%i %x %o %s"},
+                {"source": "line", "line_index": 2, "format": "%% %*2d %3s"},
+            ],
+        }
+        payload = b"-8 +5\n0x10 ff 077 word\n% 12 abc\n"
+        valid, reason = validate_contract_payload(contract, payload)
+        self.assertTrue(valid, reason)
+
+    def test_scanf_conversion_completeness_rejects_partial_eof_width_and_unsupported(self):
+        base = {
+            "kind": "encoded_line_stream",
+            "scanf_required_conversions": [
+                {"source": "line", "line_index": 0, "format": "%d%d"},
+            ],
+        }
+        for payload in (b"8@5\n", b"8\n", b"8 +\n"):
+            valid, reason = validate_contract_payload(base, payload)
+            self.assertFalse(valid)
+            self.assertEqual(reason, "scanf_conversion_incomplete")
+
+        width = {
+            "kind": "encoded_line_stream",
+            "scanf_required_conversions": [
+                {"source": "stdin", "format": "%2d%2d"},
+            ],
+        }
+        self.assertTrue(validate_contract_payload(width, b"1234\n")[0])
+        self.assertFalse(validate_contract_payload(width, b"12x4\n")[0])
+
+        unsupported = {
+            "kind": "encoded_line_stream",
+            "scanf_required_conversions": [
+                {"source": "stdin", "format": "%f"},
+            ],
+        }
+        valid, reason = validate_contract_payload(unsupported, b"1.0\n")
+        self.assertFalse(valid)
+        self.assertEqual(reason, "scanf_format_unsupported")
+
+    def test_p01571_rejects_partial_sscanf_header_and_keeps_valid_corpus(self):
+        contract = load_contracts(str(self.project_root), prefer_custom=True)[
+            ("p01571", "s327549193")
+        ]
+        invalid = b"8@5\nqwerty asdf zxcv\nqwert\nasf\ntyui\nzxcvb\nghjk\n"
+        valid, reason = validate_contract_payload(contract, invalid)
+        self.assertFalse(valid)
+        self.assertEqual(reason, "scanf_conversion_incomplete")
+
+        seed = (self.project_root / "data" / "seeds" / "p01571" / "p01571_seed.txt").read_bytes()
+        corpus, stats = generate_contract_inputs(contract, [seed], 20, rng_seed=1571)
+        self.assertEqual(len(corpus), 20)
+        self.assertGreater(stats["accepted"], 0)
+        self.assertTrue(all(validate_contract_payload(contract, payload, [seed])[0] for payload in corpus))
+
     def test_custom_contracts_reject_old_crash_and_timeout_inputs(self):
         contracts = load_contracts(str(self.project_root), prefer_custom=True)
         p02950_timeout = b"719 0\n" + b" ".join([b"0"] * 718) + b"\n"

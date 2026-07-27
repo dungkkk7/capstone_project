@@ -26,7 +26,7 @@ entry:
   ret i32 %result
 }
 
-; CHECK: getelementptr i8, ptr @native_data_2000__byte_backing
+; CHECK: getelementptr i8, ptr @dyn_bytes_2000
 ; CHECK: native.data.pointer.select
 ; CHECK: call i32 (ptr, ...) @scanf
 

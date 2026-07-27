@@ -15,7 +15,7 @@ entry:
 
 ; CHECK-LABEL: define i64 @main(i64 %input)
 ; CHECK-NOT: @__mcsema_reg_state
-; CHECK: %native.register.state = alloca %struct.State
-; CHECK: store %struct.State zeroinitializer, ptr %native.register.state
+; CHECK: %[[STATE:[A-Za-z0-9._]+]] = alloca %struct.State
+; CHECK: store %struct.State zeroinitializer, ptr %[[STATE]]
 ; CHECK: store i64 %input
 ; CHECK: load i64

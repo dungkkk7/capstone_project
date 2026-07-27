@@ -12,6 +12,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
@@ -32,6 +33,28 @@ using namespace llvm;
 namespace brighten_native_cleanup {
 namespace {
 
+static constexpr StringLiteral GuestBoundaryAttr =
+    "brighten.preserve.guest.boundary";
+static constexpr StringLiteral GuestBoundaryVersion = "v1";
+static cl::opt<bool> EnableGuestBoundaryPropagation(
+    "brighten-090-propagate-guest-boundary", cl::init(false),
+    cl::desc("Experimental: propagate proven guest inline boundaries through State-SSA"));
+
+static bool hasGuestBoundaryMarker(const Function &F) {
+  Attribute A = F.getFnAttribute(GuestBoundaryAttr);
+  return A.isStringAttribute() && A.getValueAsString() == GuestBoundaryVersion;
+}
+
+static void preserveProvenGuestBoundary(const Function &Old, Function &New) {
+  if (!EnableGuestBoundaryPropagation)
+    return;
+  if (Old.hasFnAttribute(Attribute::AlwaysInline) ||
+      (!Old.hasFnAttribute(Attribute::NoInline) && !hasGuestBoundaryMarker(Old)))
+    return;
+  New.addFnAttr(Attribute::NoInline);
+  New.addFnAttr(GuestBoundaryAttr, GuestBoundaryVersion);
+}
+
 struct Slot {
   uint64_t Offset = 0;
   Type *Ty = nullptr;
@@ -42,6 +65,135 @@ enum class HiddenTokenKind {
   Memory,
   PC,
 };
+
+// This check runs at the allocation site, before State-SSA cleanup and legal
+// inlining can erase the wrapper-to-native edge.  It is deliberately stricter
+// than recognising a function name or return-candidate metadata.
+static bool isSingleNativeProcessEntry(Function &Entry, CallBase *&NativeCall) {
+  NativeCall = nullptr;
+  if (Entry.isDeclaration() || Entry.hasLocalLinkage() || Entry.isVarArg() ||
+      !Entry.getReturnType()->isIntegerTy(32) ||
+      (Entry.arg_size() != 2 && Entry.arg_size() != 3) ||
+      !Entry.getArg(0)->getType()->isIntegerTy(32) ||
+      !Entry.getArg(1)->getType()->isPointerTy() ||
+      (Entry.arg_size() == 3 && !Entry.getArg(2)->getType()->isPointerTy()) ||
+      Entry.hasAddressTaken())
+    return false;
+
+  for (BasicBlock &BB : Entry)
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      Function *Callee = CB->getCalledFunction();
+      if (Callee == &Entry)
+        return false;
+      if (!Callee || !Callee->getName().ends_with(".native"))
+        continue;
+      if (NativeCall)
+        return false;
+      NativeCall = CB;
+    }
+  if (!NativeCall)
+    return false;
+  for (User *U : Entry.users()) {
+    auto *CB = dyn_cast<CallBase>(U);
+    if (!CB || CB->getCalledFunction() != &Entry)
+      return false;
+  }
+  Function *Callee = NativeCall->getCalledFunction();
+  return Callee && !Callee->isDeclaration() && !Callee->hasAddressTaken() &&
+         Callee->hasOneUse() && *Callee->user_begin() == NativeCall;
+}
+
+// This is a producer certificate, not an optimization hint.  It is emitted
+// only in the same transaction that replaces a proven per-invocation alloca.
+// The module record is stable across renaming; the owner record follows the
+// Function object across normalization.  040 additionally proves every live
+// use is now closed in one resulting function before replacing the global.
+static void emitSyntheticEntryFrameContract(Module &M, GlobalVariable &Storage,
+                                            Function &Entry,
+                                            CallBase &NativeCall) {
+  LLVMContext &Ctx = M.getContext();
+  constexpr uint64_t NativeStackBytes = 16 * 1024 * 1024;
+  constexpr uint64_t NativeStackTop = NativeStackBytes - 64 * 1024;
+  Storage.setMetadata(
+      "brighten.entry.stack.contract",
+      MDNode::get(Ctx, {ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 1)),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt64Ty(Ctx),
+                                             NativeStackBytes)),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt64Ty(Ctx),
+                                             NativeStackTop)),
+                        ConstantAsMetadata::get(
+                            ConstantInt::getTrue(Ctx))}));
+  Entry.setMetadata(
+      "brighten.entry.stack.owner",
+      MDNode::get(Ctx, {ValueAsMetadata::get(&Storage),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 1))}));
+  M.getOrInsertNamedMetadata("brighten.entry.stack.producer")
+      ->addOperand(MDNode::get(
+          Ctx, {ValueAsMetadata::get(&Storage),
+                ConstantAsMetadata::get(
+                    ConstantInt::get(Type::getInt32Ty(Ctx), 1))}));
+  Function *Callee = NativeCall.getCalledFunction();
+  if (!Callee || Callee->isDeclaration() || Callee->empty())
+    return;
+  IRBuilder<> B(&*Callee->getEntryBlock().getFirstInsertionPt());
+  Function *SideEffect = Intrinsic::getDeclaration(&M, Intrinsic::sideeffect);
+  CallInst *Origin = B.CreateCall(SideEffect);
+  Origin->setMetadata(
+      "brighten.entry.stack.inline.origin",
+      MDNode::get(Ctx, {ValueAsMetadata::get(&Storage),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 1))}));
+}
+
+// Unlike the earlier producer certificate, this is checked after State-SSA.
+// The executable entry itself may be externally addressable by the host ABI;
+// that does not create an in-module re-entry path.  Every *in-module* use is
+// still required to be absent or the one direct recovered-body call.
+static bool isOneShotNativeStackEntry(Function &Entry) {
+  if (Entry.isDeclaration() || Entry.hasLocalLinkage() || Entry.isVarArg() ||
+      !Entry.getReturnType()->isIntegerTy(32) ||
+      (Entry.arg_size() != 2 && Entry.arg_size() != 3) ||
+      !Entry.getArg(0)->getType()->isIntegerTy(32) ||
+      !Entry.getArg(1)->getType()->isPointerTy() ||
+      (Entry.arg_size() == 3 && !Entry.getArg(2)->getType()->isPointerTy()))
+    return false;
+
+  CallBase *BodyCall = nullptr;
+  for (BasicBlock &BB : Entry) {
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      Function *Callee = CB->getCalledFunction();
+      if (Callee == &Entry)
+        return false;
+      if (!Callee || Callee->isIntrinsic())
+        continue;
+      if (BodyCall)
+        return false;
+      BodyCall = CB;
+    }
+  }
+  if (!BodyCall)
+    return false;
+  Function *Body = BodyCall->getCalledFunction();
+  if (!Body || Body->isDeclaration() || Body->hasAddressTaken() ||
+      !Body->hasOneUse() || *Body->user_begin() != BodyCall)
+    return false;
+  for (User *U : Entry.users()) {
+    auto *CB = dyn_cast<CallBase>(U);
+    if (!CB || CB->getCalledFunction() != &Entry)
+      return false;
+  }
+  return true;
+}
 
 struct Plan {
   Function *Old = nullptr;
@@ -850,6 +1002,7 @@ static bool ClonePlan(Plan &P, Module &M) {
                            P.Old->getName() + ".state_ssa", M);
   P.New->setCallingConv(P.Old->getCallingConv());
   P.New->setDSOLocal(true);
+  preserveProvenGuestBoundary(*P.Old, *P.New);
   NameNewArgs(P);
 
   // A temporary module-local proxy lets CloneFunctionBodyInto remap the old
@@ -1747,6 +1900,244 @@ static bool lowerNativeMainStateBufferImpl(Module &M) {
   return Changed;
 }
 
+struct StackByteRange {
+  uint64_t Offset = 0;
+  uint64_t Size = 0;
+  const Instruction *Access = nullptr;
+};
+
+// Resolve only exact, constant-preserving aliases of the candidate alloca.
+// The lowering below changes an activation-local object into a zero-filled
+// global, so any address arithmetic we cannot account for is a refusal, not a
+// reason to guess that the global happens to be equivalent.
+static std::optional<int64_t>
+constantOffsetFromNativeStack(Value *V, const AllocaInst &OldStack,
+                              const DataLayout &DL,
+                              SmallPtrSetImpl<Value *> &Seen) {
+  if (!V || !Seen.insert(V).second)
+    return std::nullopt;
+  if (V == &OldStack)
+    return 0;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    auto Base = constantOffsetFromNativeStack(GEP->getPointerOperand(),
+                                              OldStack, DL, Seen);
+    APInt Delta(64, 0, true);
+    if (!Base || !GEP->accumulateConstantOffset(DL, Delta) ||
+        !Delta.isSignedIntN(64))
+      return std::nullopt;
+    int64_t D = Delta.getSExtValue();
+    if ((D > 0 && *Base > INT64_MAX - D) ||
+        (D < 0 && *Base < INT64_MIN - D))
+      return std::nullopt;
+    return *Base + D;
+  }
+  if (auto *BC = dyn_cast<BitCastOperator>(V))
+    return constantOffsetFromNativeStack(BC->getOperand(0), OldStack, DL,
+                                         Seen);
+  if (auto *ASC = dyn_cast<AddrSpaceCastOperator>(V))
+    return constantOffsetFromNativeStack(ASC->getOperand(0), OldStack, DL,
+                                         Seen);
+  if (auto *ITP = dyn_cast<IntToPtrInst>(V)) {
+    auto *PTI = dyn_cast<PtrToIntOperator>(ITP->getOperand(0));
+    if (!PTI)
+      return std::nullopt;
+    return constantOffsetFromNativeStack(PTI->getPointerOperand(), OldStack,
+                                         DL, Seen);
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V)) {
+    auto L = constantOffsetFromNativeStack(SI->getTrueValue(), OldStack, DL,
+                                           Seen);
+    auto R = constantOffsetFromNativeStack(SI->getFalseValue(), OldStack, DL,
+                                           Seen);
+    return L && R && *L == *R ? L : std::nullopt;
+  }
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    std::optional<int64_t> Result;
+    for (Value *Incoming : PN->incoming_values()) {
+      SmallPtrSet<Value *, 16> IncomingSeen;
+      auto Offset = constantOffsetFromNativeStack(Incoming, OldStack, DL,
+                                                  IncomingSeen);
+      if (!Offset || (Result && *Result != *Offset))
+        return std::nullopt;
+      Result = Offset;
+    }
+    return Result;
+  }
+  return std::nullopt;
+}
+
+static std::optional<StackByteRange>
+nativeStackAccessRange(Value *Pointer, Type *AccessTy,
+                       const AllocaInst &OldStack, const DataLayout &DL,
+                       const Instruction *Access, uint64_t StackBytes) {
+  SmallPtrSet<Value *, 16> Seen;
+  auto Offset = constantOffsetFromNativeStack(Pointer, OldStack, DL, Seen);
+  TypeSize Size = DL.getTypeStoreSize(AccessTy);
+  if (!Offset || Size.isScalable() || *Offset < 0)
+    return std::nullopt;
+  uint64_t Begin = static_cast<uint64_t>(*Offset);
+  uint64_t Bytes = Size.getFixedValue();
+  if (Bytes == 0 || Begin > StackBytes || Bytes > StackBytes - Begin)
+    return std::nullopt;
+  return StackByteRange{Begin, Bytes, Access};
+}
+
+static bool containsRange(const StackByteRange &Outer,
+                          const StackByteRange &Inner) {
+  return Outer.Offset <= Inner.Offset &&
+         Inner.Size <= Outer.Size - (Inner.Offset - Outer.Offset);
+}
+
+// A zeroinitialized global is not interchangeable with an uninitialized
+// activation record.  We deliberately accept only the strongest practical
+// certificate: a nonvolatile full-object memset which dominates every stack
+// memory access in a proven one-shot process entry.  The scan is fail-closed
+// for escapes, unknown calls and non-constant alias paths; it is not a broad
+// MemorySSA approximation of partial initialization.
+static bool proveNativeStackDefinitelyInitialized(const AllocaInst &OldStack,
+                                                  Function &Owner,
+                                                  const DataLayout &DL) {
+  auto *ArrayTy = dyn_cast<ArrayType>(OldStack.getAllocatedType());
+  if (!ArrayTy || !ArrayTy->getElementType()->isIntegerTy(8))
+    return false;
+  uint64_t StackBytes = ArrayTy->getNumElements();
+  if (StackBytes < 1024 * 1024)
+    return false;
+  if (!isOneShotNativeStackEntry(Owner))
+    return false;
+
+  // The commit path replaces each direct alloca GEP with the recovered stack
+  // base.  Therefore a direct user must be precisely the canonical [0, 0]
+  // base GEP.  A non-zero root GEP would otherwise silently lose its byte
+  // displacement, and any other direct user used to leave a newly-created
+  // global behind before the old code returned false.
+  for (const User *U : OldStack.users()) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(U);
+    if (!GEP)
+      return false;
+    SmallPtrSet<Value *, 16> Seen;
+    auto Offset = constantOffsetFromNativeStack(
+        const_cast<GetElementPtrInst *>(GEP), OldStack, DL, Seen);
+    if (!Offset || *Offset != 0)
+      return false;
+  }
+
+  const Instruction *FullReset = nullptr;
+  SmallVector<const Instruction *, 32> StackMemoryAccesses;
+  for (BasicBlock &BB : Owner) {
+    for (Instruction &I : BB) {
+      if (auto *PTI = dyn_cast<PtrToIntInst>(&I)) {
+        SmallPtrSet<Value *, 16> Seen;
+        if (!constantOffsetFromNativeStack(PTI->getPointerOperand(), OldStack,
+                                           DL, Seen))
+          continue;
+        for (User *U : PTI->users())
+          if (!isa<IntToPtrInst>(U))
+            return false;
+        continue;
+      }
+
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        SmallPtrSet<Value *, 16> Seen;
+        if (!constantOffsetFromNativeStack(LI->getPointerOperand(), OldStack,
+                                           DL, Seen))
+          continue;
+        if (LI->isVolatile() || LI->isAtomic())
+          return false;
+        auto Range = nativeStackAccessRange(LI->getPointerOperand(),
+                                            LI->getType(), OldStack, DL, LI,
+                                            StackBytes);
+        if (!Range)
+          return false;
+        StackMemoryAccesses.push_back(LI);
+        continue;
+      }
+
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        SmallPtrSet<Value *, 16> DestSeen;
+        bool DestIsStack = constantOffsetFromNativeStack(
+            SI->getPointerOperand(), OldStack, DL, DestSeen).has_value();
+        SmallPtrSet<Value *, 16> ValueSeen;
+        bool ValueIsStack = SI->getValueOperand()->getType()->isPointerTy() &&
+                            constantOffsetFromNativeStack(
+                                SI->getValueOperand(), OldStack, DL,
+                                ValueSeen).has_value();
+        if (ValueIsStack)
+          return false;
+        if (!DestIsStack)
+          continue;
+        if (SI->isVolatile() || SI->isAtomic())
+          return false;
+        auto Range = nativeStackAccessRange(SI->getPointerOperand(),
+                                            SI->getValueOperand()->getType(),
+                                            OldStack, DL, SI, StackBytes);
+        if (!Range)
+          return false;
+        StackMemoryAccesses.push_back(SI);
+        continue;
+      }
+
+      if (auto *MS = dyn_cast<MemSetInst>(&I)) {
+        SmallPtrSet<Value *, 16> Seen;
+        if (!constantOffsetFromNativeStack(MS->getDest(), OldStack, DL, Seen))
+          continue;
+        auto *Length = dyn_cast<ConstantInt>(MS->getLength());
+        if (MS->isVolatile() || !Length || Length->getValue().isNegative() ||
+            !Length->getValue().isIntN(64))
+          return false;
+        uint64_t Bytes = Length->getZExtValue();
+        auto Range = nativeStackAccessRange(MS->getDest(),
+                                            Type::getInt8Ty(Owner.getContext()),
+                                            OldStack, DL, MS, StackBytes);
+        if (!Range || Bytes == 0 || Range->Offset > StackBytes ||
+            Bytes > StackBytes - Range->Offset)
+          return false;
+        Range->Size = Bytes;
+        if (Range->Offset == 0 && Bytes == StackBytes) {
+          if (FullReset)
+            return false;
+          FullReset = MS;
+        } else {
+          StackMemoryAccesses.push_back(MS);
+        }
+        continue;
+      }
+
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        for (Value *Arg : CB->args()) {
+          if (!Arg->getType()->isPointerTy())
+            continue;
+          SmallPtrSet<Value *, 16> Seen;
+          if (constantOffsetFromNativeStack(Arg, OldStack, DL, Seen))
+            return false;
+        }
+        continue;
+      }
+
+      if (isa<GetElementPtrInst, BitCastInst, AddrSpaceCastInst, IntToPtrInst,
+              SelectInst, PHINode>(&I))
+        continue;
+
+      for (Value *Op : I.operands()) {
+        if (!Op->getType()->isPointerTy())
+          continue;
+        SmallPtrSet<Value *, 16> Seen;
+        if (constantOffsetFromNativeStack(Op, OldStack, DL, Seen))
+          return false;
+      }
+    }
+  }
+
+  if (!FullReset)
+    return false;
+  DominatorTree DT(Owner);
+  for (const Instruction *Access : StackMemoryAccesses)
+    if (!DT.dominates(FullReset, Access))
+      return false;
+  return true;
+}
+
 static bool lowerNativeMainStackBufferImpl(Module &M) {
   bool Changed = false;
   for (StringRef FunctionName : {StringRef("main"),
@@ -1762,7 +2153,9 @@ static bool lowerNativeMainStackBufferImpl(Module &M) {
         continue;
       auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType());
       if (AT && AT->getElementType()->isIntegerTy(8) &&
-          AT->getNumElements() >= 1024 * 1024) {
+          AT->getNumElements() >= 1024 * 1024 &&
+          proveNativeStackDefinitelyInitialized(*AI, *Main,
+                                                M.getDataLayout())) {
         OldStack = AI;
         break;
       }
@@ -1787,6 +2180,20 @@ static bool lowerNativeMainStackBufferImpl(Module &M) {
           M, StorageTy, false, GlobalValue::InternalLinkage,
           ConstantAggregateZero::get(StorageTy), StorageName);
       Storage->setAlignment(Align(16));
+      // This is provenance only, not a local-frame capability.  NativeCleanup
+      // validates the eventual C-entry/one-call boundary before it may emit
+      // the versioned per-invocation contract consumed by 040.  A preexisting
+      // global never receives this creation record.
+      Storage->setMetadata(
+          "brighten.stack.synthetic.created",
+          MDNode::get(M.getContext(),
+                      {ValueAsMetadata::get(Main),
+                       ConstantAsMetadata::get(
+                           ConstantInt::get(Type::getInt32Ty(M.getContext()),
+                                            1))}));
+      CallBase *NativeCall = nullptr;
+      if (isSingleNativeProcessEntry(*Main, NativeCall))
+        emitSyntheticEntryFrameContract(M, *Storage, *Main, *NativeCall);
     }
     SmallVector<Value *, 2> StorageIndices = {B.getInt32(0), B.getInt32(0)};
     Value *NewStack = GetElementPtrInst::CreateInBounds(

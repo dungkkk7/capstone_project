@@ -14,7 +14,7 @@ declare i32 @scanf(ptr, ...)
 
 ; --- Test scanf("%d %s", &x, buf) with native stack objects ---
 ; CHECK-LABEL: define ptr @sub_6000
-; CHECK: call i32 (ptr, ...) @scanf(ptr @.str.ds, ptr %x, ptr %buf)
+; CHECK: call i32 (ptr, ...) @scanf(ptr @.str.ds, ptr captures(none) %x, ptr captures(none) %buf)
 ; CHECK-NOT: @__remill_function_call
 define ptr @sub_6000(ptr %state, i64 %pc, ptr %mem) {
 entry:

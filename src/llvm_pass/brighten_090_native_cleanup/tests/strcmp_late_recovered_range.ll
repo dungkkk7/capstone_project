@@ -33,13 +33,13 @@ entry:
   ret i32 %result
 }
 
-; CHECK: @native_data_2000__data__byte_backing = global [64 x i8] zeroinitializer
+; CHECK: @native_residual_2000__data = global [64 x i8] zeroinitializer
 ; CHECK-SAME: !brighten.guest.range
 ; CHECK-LABEL: define i32 @compare_guest_strings
-; CHECK: getelementptr i8, ptr @native_data_2000__data__byte_backing
+; CHECK: getelementptr i8, ptr @native_residual_2000__data
 ; CHECK: call i32 @strcmp(ptr %native.data.pointer.select
 ; CHECK-NOT: call i32 @strcmp(ptr %native.address.fallback
 ; CHECK-LABEL: define i32 @puts_selected_guest_string
-; CHECK: getelementptr i8, ptr @native_data_2000__data__byte_backing
+; CHECK: getelementptr i8, ptr @native_residual_2000__data
 ; CHECK: call i32 @puts(ptr %native.data.pointer.select
 ; CHECK-NOT: call i32 @puts(ptr %native.integer.pointer

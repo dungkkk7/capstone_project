@@ -63,6 +63,8 @@ import subprocess
 import shutil
 import re
 import json
+import struct
+import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -84,10 +86,11 @@ PLUGINS = [
     "deobfuscate_095_deobfus_ollvm/build/lib095.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,095,brighten-extern-call-bridge,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-native-cleanup-final-pass,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-guest-pointer-resolver-canonicalize,095,brighten-devirt-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-type-reconstruct,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-late-residual-format-string-recovery,brighten-guest-pointer-resolver-canonicalize,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,brighten-address-canonicalize,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-address-canonicalize,brighten-post-state-frame-pass,brighten-heap-proven-resolver-collapse,dce,globaldce,brighten-native-cleanup-final-pass,verify"
 )
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
+    PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-post-state-frame-pass", "")
 if os.environ.get("BRIGHTEN_DISABLE_ABI_RECOVERY", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-abi-recovery-pass", "")
 if os.environ.get("BRIGHTEN_DISABLE_EXTERN_BRIDGE", "").lower() in {"1", "true", "yes"}:
@@ -101,6 +104,18 @@ class Color:
     GRAY = '\033[90m'
     BOLD = '\033[1m'
     END = '\033[0m'
+
+
+def late_address_canonicalize_index(pipeline_parts):
+    """Return the final 080 canonicalization boundary in a pass pipeline.
+
+    The post-State 040 consumer needs the canonical form produced after the
+    tail optimizer, not an earlier address pass which may still see unstable
+    ConstantExpr anchors or non-fixed frame offsets.
+    """
+    return len(pipeline_parts) - 1 - pipeline_parts[::-1].index(
+        "brighten-address-canonicalize"
+    )
 
 
 NATIVE_CONTRACT_REPORT_SUFFIX = "_native_contract_report.json"
@@ -185,6 +200,57 @@ def read_native_contract_report(output_path):
             return json.load(handle)
     except (OSError, ValueError):
         return None
+
+
+def verify_native_contract(input_path):
+    """Run the non-mutating final native-contract gate on one final IR file."""
+    if not os.path.isfile(input_path):
+        return False
+
+    opt_bin = shutil.which("opt-21") or shutil.which("opt")
+    plugin_path = os.path.abspath(
+        os.path.join(
+            SCRIPT_DIR,
+            "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so",
+        )
+    )
+    if not opt_bin or not os.path.isfile(plugin_path):
+        write_native_contract_report(input_path, None, strict_enforced=True)
+        return False
+
+    try:
+        os.unlink(native_contract_report_path(input_path))
+    except FileNotFoundError:
+        pass
+
+    cmd = [
+        opt_bin,
+        "-load-pass-plugin",
+        plugin_path,
+        "-brighten-native-strict",
+        "-passes",
+        "brighten-native-cleanup-final-pass,verify",
+        "-disable-output",
+        input_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=float(os.environ.get("BRIGHTEN_FINAL_VERIFY_TIMEOUT", "60")),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        write_native_contract_report(input_path, None, strict_enforced=True)
+        return False
+
+    report = parse_native_contract_reports(result.stderr)
+    write_native_contract_report(input_path, report, strict_enforced=True)
+    return bool(
+        result.returncode == 0
+        and report
+        and report.get("is_fully_native", False)
+    )
 
 def clean_unused_types_and_globals(content):
     # 1. Skip function stripping (keep all defined functions to avoid undefined reference errors)
@@ -272,6 +338,92 @@ def clean_ir_file(ll_path, binary_path=None):
     """
     return os.path.exists(ll_path)
 
+def _elf_pt_loads(binary_path):
+    """Return validated ELF64 PT_LOAD descriptors, or None (fail closed)."""
+    if not binary_path or not os.path.isfile(binary_path):
+        return None
+    try:
+        with open(binary_path, "rb") as f:
+            hdr = f.read(64)
+            if len(hdr) != 64 or hdr[:4] != b"\x7fELF" or hdr[4] != 2 or hdr[5] != 1:
+                return None
+            e_phoff, = struct.unpack_from("<Q", hdr, 32)
+            e_phentsize, e_phnum = struct.unpack_from("<HH", hdr, 54)
+            if e_phentsize != 56 or not e_phnum or e_phnum > 4096:
+                return None
+            f.seek(e_phoff)
+            loads = []
+            for _ in range(e_phnum):
+                ph = f.read(56)
+                if len(ph) != 56:
+                    return None
+                typ, flags = struct.unpack_from("<II", ph, 0)
+                if typ != 1:
+                    continue
+                _, vaddr, _, filesz, memsz, align = struct.unpack_from("<QQQQQQ", ph, 8)
+                if not memsz or filesz > memsz or not align or align & (align - 1):
+                    return None
+                end = vaddr + memsz
+                if end > (1 << 64) - 1:
+                    return None
+                page = align if align >= 0x1000 else 0x1000
+                mapped_begin = vaddr & -page
+                mapped_end = (end + page - 1) & -page
+                if mapped_end <= end or mapped_end > (1 << 64) - 1:
+                    return None
+                loads.append((vaddr, filesz, memsz, flags, page, mapped_begin, mapped_end))
+            return loads or None
+    except (OSError, struct.error):
+        return None
+
+def _inject_pt_load_metadata(input_path, binary_path):
+    """Serialize proven loader mapping facts into a temporary bitcode module."""
+    loads = _elf_pt_loads(binary_path)
+    if not loads:
+        return input_path, None
+    llvm_dis = shutil.which("llvm-dis-21") or shutil.which("llvm-dis")
+    llvm_as = shutil.which("llvm-as-21") or shutil.which("llvm-as")
+    if not llvm_dis or not llvm_as:
+        return input_path, None
+    tmpdir = tempfile.mkdtemp(prefix="brighten-ptload-")
+    ll = os.path.join(tmpdir, "input.ll")
+    bc = os.path.join(tmpdir, "input.bc")
+    try:
+        if subprocess.run([llvm_dis, input_path, "-o", ll], capture_output=True).returncode:
+            shutil.rmtree(tmpdir, ignore_errors=True); return input_path, None
+        with open(ll, "a", encoding="utf-8") as f:
+            ids = []
+            # Numeric metadata definitions are required by llvm-as; reserve a
+            # high temporary range which LLVM renumbers on serialization.
+            for i, (vaddr, filesz, memsz, flags, page, mb, me) in enumerate(loads):
+                ident = f"!{900000 + i}"
+                ids.append(ident)
+                f.write(f"\n{ident} = !{{i64 {vaddr}, i64 {filesz}, i64 {memsz}, i64 {flags}, i64 {page}, i64 {mb}, i64 {me}}}")
+            f.write("\n!brighten.elf.pt_loads = !{" + ", ".join(ids) + "}\n")
+        if subprocess.run([llvm_as, ll, "-o", bc], capture_output=True).returncode:
+            shutil.rmtree(tmpdir, ignore_errors=True); return input_path, None
+        return bc, tmpdir
+    except OSError:
+        shutil.rmtree(tmpdir, ignore_errors=True); return input_path, None
+
+
+def _pt_load_guest_map_enabled():
+    """Return the explicit experimental opt-in for PT_LOAD address mapping.
+
+    The production path must not synthesize page-tail storage until 070 can
+    rewrite every potentially-aliasing writable use transactionally.
+    """
+    return os.environ.get("BRIGHTEN_ENABLE_PT_LOAD_MAP", "0").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _maybe_inject_pt_load_metadata(input_path, binary_path):
+    """Keep the PT_LOAD experiment out of the default production pipeline."""
+    if not _pt_load_guest_map_enabled():
+        return input_path, None
+    return _inject_pt_load_metadata(input_path, binary_path)
+
 def brighten_ir(input_path, output_path=None, binary_path=None):
     """
     Chạy llvm opt với các pass plugin làm đẹp IR (brightening) và dọn dẹp boilerplate
@@ -297,6 +449,15 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
     except FileNotFoundError:
         pass
 
+    # PT_LOAD-backed GuestAddressMap recovery is still experimental.  It fixes
+    # mapped page-tail accesses, but until recovered subobjects and the source
+    # segment are rewritten as one transaction it can create two host objects
+    # for the same writable guest bytes.  Keep production fail-closed: an
+    # explicit opt-in is required while the cross-object alias invariant is
+    # being completed and dataset differential gates are red.
+    input_path, ptload_tmpdir = _maybe_inject_pt_load_metadata(
+        input_path, binary_path
+    )
     # Build command
     cmd = [opt_bin]
 
@@ -373,33 +534,68 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         "BRIGHTEN_095_REPORT",
         f"{os.path.splitext(output_path)[0]}.095.json",
     )
-    cmd.extend([
-        f"-095-report={report_path}",
-        "-passes", pipeline,
-        input_path,
-        "-o", output_path
-    ])
+    cmd.extend([f"-095-report={report_path}"])
+
+    # ConstantExpr uniquing is only stable at an IR serialization boundary.
+    # Split at the final 080 canonicalizer: it sees all tail mutations, and
+    # its canonical fixed frame GEPs feed the final 040 pointer-slot consumer.
+    # The final cleanup reporter remains after every mutation.
+    late_anchor_pass = "brighten-address-canonicalize"
+    pipeline_parts = pipeline.split(",")
+    commands = []
+    checkpoint_path = None
+    if late_anchor_pass in pipeline_parts:
+        split_at = late_address_canonicalize_index(pipeline_parts)
+        if split_at == 0:
+            print(f"{Color.RED}[✗] Late 080 pass không thể đứng đầu pipeline.{Color.END}")
+            return False
+        checkpoint_path = f"{output_path}.pre_address_canonicalize.bc"
+        commands.append(
+            cmd + [
+                "-passes", ",".join(pipeline_parts[:split_at] + ["verify"]),
+                input_path, "-o", checkpoint_path,
+            ]
+        )
+        commands.append(
+            cmd + [
+                "-passes", ",".join(pipeline_parts[split_at:]),
+                checkpoint_path, "-o", output_path,
+            ]
+        )
+    else:
+        commands.append(cmd + ["-passes", pipeline, input_path, "-o", output_path])
     print(f"{Color.BLUE}[*] Đang thực thi brightening với: {opt_bin}{Color.END}")
-    print(f"{Color.GRAY}    Lệnh: {' '.join(cmd)}{Color.END}")
+    for command in commands:
+        print(f"{Color.GRAY}    Lệnh: {' '.join(command)}{Color.END}")
 
     try:
         env = os.environ.copy()
         env["REMILL_STACK_SSA_ALLOW_BOUNDARY"] = "1"
         opt_timeout = float(os.environ.get("BRIGHTEN_OPT_TIMEOUT", "180"))
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True,
-                                 env=env, timeout=opt_timeout)
+            outputs = []
+            res = None
+            for command in commands:
+                res = subprocess.run(command, capture_output=True, text=True,
+                                     env=env, timeout=opt_timeout)
+                outputs.extend([res.stdout or "", res.stderr or ""])
+                if res.returncode != 0:
+                    break
             dump_path = os.environ.get("BRIGHTEN_DUMP_OPT_LOG")
             if dump_path:
                 with open(dump_path, "w", encoding="utf-8") as dump:
-                    dump.write(res.stdout or "")
-                    dump.write(res.stderr or "")
+                    dump.write("".join(outputs))
         except subprocess.TimeoutExpired as exc:
             print(f"{Color.RED}[✗] opt timeout sau {opt_timeout:.1f}s; bỏ qua module để tránh treo batch.{Color.END}")
             if exc.stderr:
                 print(f"{Color.RED}    Stderr trước timeout: {exc.stderr}{Color.END}")
             return False
         if res.returncode == 0:
+            if checkpoint_path and os.environ.get("BRIGHTEN_SAVE_CHECKPOINTS", "0") != "1":
+                try:
+                    os.unlink(checkpoint_path)
+                except FileNotFoundError:
+                    pass
             native_report = parse_native_contract_reports(res.stderr)
             report_path = write_native_contract_report(
                 output_path,
@@ -436,6 +632,9 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
     except Exception as e:
         print(f"{Color.RED}[✗] Lỗi thực thi: {e}{Color.END}")
         return False
+    finally:
+        if ptload_tmpdir:
+            shutil.rmtree(ptload_tmpdir, ignore_errors=True)
 
 def main():
     parser = argparse.ArgumentParser(description="Chạy các pass brightening IR bằng các plugin .so có sẵn")

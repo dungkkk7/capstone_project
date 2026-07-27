@@ -12,6 +12,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace brighten_extern {
@@ -22,6 +23,11 @@ static constexpr uint64_t kOffRAX = 2216;
 static constexpr uint64_t kGPArgOffsets[] = {2296, 2280, 2264, 2248, 2344, 2360};
 static constexpr uint64_t kXMMArgOffsets[] = {16, 80, 144, 208, 272, 336, 400, 464};
 static constexpr uint64_t kOffRSP = 2312;
+
+static cl::opt<bool> TraceMaterializedVAList(
+    "brighten-extern-trace-materialized-valist", cl::Hidden,
+    cl::desc("Report fail-closed reasons for materialized va_list lowering"),
+    cl::init(false));
 
 static Module *FindModule(Value *V) {
   if (!V) return nullptr;
@@ -480,6 +486,97 @@ static unsigned FormatArgIndex(const LibcSignature &Sig) {
   }
 }
 
+// This is deliberately not a general libc attribute inference rule.  A
+// direct declaration recognized by the signature database is the external
+// identity proof; the format and every destination position must additionally
+// be exact before we state the narrow ABI fact that scanf does not retain the
+// destination pointer past the call.  The call still writes through it and
+// may alias any other pointer, so no memory-effect attributes are added.
+static bool IsStrictScanfDestinationSpec(const VarargSpecifier &Spec) {
+  StringRef Raw(Spec.Raw);
+  if (!Spec.ConsumesArg || Spec.Ty == VarargType::ScanfSuppressed ||
+      Raw.contains('$') || Raw.contains('*') || Raw.ends_with("n"))
+    return false;
+  switch (Spec.Ty) {
+  case VarargType::IntI32:
+  case VarargType::UintI32:
+  case VarargType::IntI64:
+  case VarargType::UintI64:
+  case VarargType::CharI8:
+  case VarargType::Pointer: // %s, %[, and %p destinations
+  case VarargType::Double:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool BrightenExternCallBridgePass::AnnotateDirectScanfDestinationNoCapture(
+    ExternCallContext &Ctx) {
+  bool Changed = false;
+  for (Function &F : Ctx.M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+      Function *Callee = CI->getCalledFunction();
+      if (!Callee || !Callee->isDeclaration())
+        continue;
+      const LibcSignature *Sig = Ctx.SigDB.lookup(Callee->getName());
+      if (!Sig || !Sig->IsVarArg || !isScanfFamilyKind(Sig->Special))
+        continue;
+
+      const unsigned FmtIndex = FormatArgIndex(*Sig);
+      const unsigned DestStart = FmtIndex + 1;
+      if (FmtIndex >= CI->arg_size() || DestStart > CI->arg_size())
+        continue;
+      std::string Format = ResolveFormatString(CI->getArgOperand(FmtIndex));
+      if (Format.empty())
+        continue;
+      StringRef FmtRef(Format);
+      if (!FmtRef.empty() && FmtRef.back() == '\0')
+        FmtRef = FmtRef.drop_back();
+      SmallVector<VarargSpecifier, 8> Specs;
+      if (!parseFormatString(FmtRef, Specs, /*IsScanfFamily=*/true))
+        continue;
+
+      SmallVector<unsigned, 8> DestArgs;
+      bool Safe = true;
+      for (const VarargSpecifier &Spec : Specs) {
+        if (!IsStrictScanfDestinationSpec(Spec)) {
+          Safe = false;
+          break;
+        }
+        DestArgs.push_back(DestStart + DestArgs.size());
+      }
+      // No partial annotation: an unaccounted vararg could be a destination
+      // whose position was parsed incorrectly, so preserve the whole call.
+      if (!Safe || DestArgs.empty() || DestStart + DestArgs.size() != CI->arg_size())
+        continue;
+      for (unsigned ArgNo : DestArgs)
+        if (!CI->getArgOperand(ArgNo)->getType()->isPointerTy()) {
+          Safe = false;
+          break;
+        }
+      if (!Safe)
+        continue;
+      for (unsigned ArgNo : DestArgs) {
+        if (!CI->doesNotCapture(ArgNo)) {
+          // LLVM 21 represents the source-level nocapture contract as the
+          // more precise captures(none) parameter attribute.
+          CI->addParamAttr(
+              ArgNo, Attribute::getWithCaptureInfo(Ctx.M.getContext(),
+                                                    CaptureInfo::none()));
+          Changed = true;
+        }
+      }
+    }
+  }
+  return Changed;
+}
+
 static Type *VarargLLVMType(LLVMContext &Ctx, VarargType VT, bool IsScanf) {
   switch (VT) {
   case VarargType::IntI32:
@@ -819,18 +916,113 @@ static std::optional<uint64_t> OffsetFromAlloca(Value *Ptr, AllocaInst *Root,
   return Offset.getZExtValue();
 }
 
-static Value *FindLocalStoreValue(CallInst *Before, AllocaInst *Root,
-                                  uint64_t WantedOffset,
-                                  const DataLayout &DL) {
+static StoreInst *FindLocalStore(CallInst *Before, AllocaInst *Root,
+                                 uint64_t WantedOffset,
+                                 const DataLayout &DL) {
   for (auto It = BasicBlock::reverse_iterator(Before->getIterator());
        It != Before->getParent()->rend(); ++It) {
     auto *SI = dyn_cast<StoreInst>(&*It);
     if (!SI) continue;
     auto Offset = OffsetFromAlloca(SI->getPointerOperand(), Root, DL);
     if (Offset && *Offset == WantedOffset)
-      return SI->getValueOperand();
+      return SI;
   }
   return nullptr;
+}
+
+static Value *FindLocalStoreValue(CallInst *Before, AllocaInst *Root,
+                                  uint64_t WantedOffset,
+                                  const DataLayout &DL) {
+  if (StoreInst *SI = FindLocalStore(Before, Root, WantedOffset, DL))
+    return SI->getValueOperand();
+  return nullptr;
+}
+
+// vsscanf writes through every recovered destination.  Unlike the legacy
+// vprintf/vscanf path, do not look through volatile or atomic va_list setup:
+// re-materialising such a call would change its observable memory effects.
+static StoreInst *FindPlainLocalStore(CallInst *Before, AllocaInst *Root,
+                                      uint64_t WantedOffset,
+                                      const DataLayout &DL) {
+  StoreInst *SI = FindLocalStore(Before, Root, WantedOffset, DL);
+  if (!SI || SI->isVolatile() || SI->isAtomic()) return nullptr;
+  return SI;
+}
+
+// A materialized va_list can still contain literal guest addresses.  Rebase
+// only an address covered by exactly one authoritative guest range; overlap,
+// one-past-end and unknown addresses deliberately keep the va_list call.
+static Value *ResolveUniqueGuestConstant(IRBuilder<> &B, Module &M,
+                                         ConstantInt *Address,
+                                         uint64_t Width,
+                                         StringRef *Failure = nullptr) {
+  auto Refuse = [&](StringRef Reason) -> Value * {
+    if (Failure) *Failure = Reason;
+    return nullptr;
+  };
+  if (!Address || !Address->getType()->isIntegerTy()) return Refuse("not-integer");
+  if (Width == 0) return Refuse("zero-width");
+  uint64_t A = Address->getZExtValue(), End = 0;
+  if (__builtin_add_overflow(A, Width, &End)) return Refuse("range-overflow");
+  GlobalVariable *Match = nullptr;
+  uint64_t Offset = 0;
+  bool SawRange = false;
+  bool SawContainingRange = false;
+  for (GlobalVariable &GV : M.globals()) {
+    MDNode *Range = GV.getMetadata("brighten.guest.range");
+    if (!Range || Range->getNumOperands() != 2) continue;
+    SawRange = true;
+    auto *BeginMD = dyn_cast<ConstantAsMetadata>(Range->getOperand(0));
+    auto *FinishMD = dyn_cast<ConstantAsMetadata>(Range->getOperand(1));
+    auto *Begin = BeginMD ? dyn_cast<ConstantInt>(BeginMD->getValue()) : nullptr;
+    auto *Finish = FinishMD ? dyn_cast<ConstantInt>(FinishMD->getValue()) : nullptr;
+    if (!Begin || !Finish || A < Begin->getZExtValue() ||
+        End > Finish->getZExtValue()) continue;
+    SawContainingRange = true;
+    uint64_t CandidateOffset = A - Begin->getZExtValue();
+    TypeSize Storage = M.getDataLayout().getTypeAllocSize(GV.getValueType());
+    if (Storage.isScalable() || CandidateOffset > Storage.getFixedValue() ||
+        Width > Storage.getFixedValue() - CandidateOffset)
+      continue;
+    if (Match) return Refuse("ambiguous-range");
+    Match = &GV;
+    Offset = CandidateOffset;
+  }
+  if (!Match)
+    return Refuse(SawContainingRange ? "storage-bounds" :
+                  (SawRange ? "outside-guest-range" : "no-guest-range"));
+  return B.CreateGEP(B.getInt8Ty(), Match, B.getInt64(Offset),
+                     "extern.vararg.guest.object");
+}
+
+static std::optional<uint64_t>
+ScanfDestinationWidth(const VarargSpecifier &Spec) {
+  switch (Spec.Ty) {
+  case VarargType::CharI8:
+    return 1;
+  case VarargType::IntI32:
+  case VarargType::UintI32:
+    return 4;
+  case VarargType::IntI64:
+  case VarargType::UintI64:
+  case VarargType::Double:
+    return 8;
+  case VarargType::Pointer:
+    // %s and %[ have an input-dependent write extent.  We cannot prove that
+    // extent here, but a direct native call needs the guest address rebased
+    // only when its first writable byte is in one unique recovered object.
+    // This preserves the original call's possible overrun behavior instead
+    // of manufacturing an unmapped inttoptr.  %p is fixed-width and retains
+    // its stricter eight-byte proof.
+    if (StringRef(Spec.Raw).ends_with("p"))
+      return 8;
+    if (StringRef(Spec.Raw).ends_with("s") || StringRef(Spec.Raw).contains('['))
+      return 1;
+    return std::nullopt;
+  default:
+    // %n and unknown pointer-shaped conversions remain fail-closed.
+    return std::nullopt;
+  }
 }
 
 static std::optional<int64_t> ConstantOffsetFrom(Value *Ptr, Value *Base,
@@ -1184,43 +1376,63 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       for (Instruction &I : instructions(F))
         if (auto *CI = dyn_cast<CallInst>(&I))
           if (Function *Callee = CI->getCalledFunction())
-            if ((Callee->getName() == "vprintf" ||
-                 Callee->getName() == "vscanf") && CI->arg_size() == 2)
+            if (((Callee->getName() == "vprintf" ||
+                  Callee->getName() == "vscanf") && CI->arg_size() == 2) ||
+                (Callee->getName() == "vsscanf" && CI->arg_size() == 3))
               Work.push_back(CI);
 
   bool Changed = false;
   for (CallInst *CI : Work) {
     Function *OldCallee = CI->getCalledFunction();
-    bool IsScanf = OldCallee->getName() == "vscanf";
-    AllocaInst *VAList = RootAlloca(CI->getArgOperand(1));
-    if (!VAList) continue;
-    Value *OverflowArea = FindLocalStoreValue(CI, VAList, 8, Ctx.DL);
+    auto Trace = [&](StringRef Reason) {
+      if (!TraceMaterializedVAList) return;
+      errs() << "[brighten-extern] materialized-va-list preserve: caller="
+             << CI->getFunction()->getName() << " callee="
+             << OldCallee->getName() << " reason=" << Reason << '\n';
+    };
+    bool IsSscanf = OldCallee->getName() == "vsscanf";
+    bool IsScanf = OldCallee->getName() == "vscanf" || IsSscanf;
+    unsigned VAIndex = IsSscanf ? 2 : 1;
+    unsigned FormatIndex = IsSscanf ? 1 : 0;
+    AllocaInst *VAList = RootAlloca(CI->getArgOperand(VAIndex));
+    if (!VAList) { Trace("root-va"); continue; }
+    auto LoadVAField = [&](uint64_t Offset) -> Value * {
+      if (!IsSscanf)
+        return FindLocalStoreValue(CI, VAList, Offset, Ctx.DL);
+      if (StoreInst *SI = FindPlainLocalStore(CI, VAList, Offset, Ctx.DL))
+        return SI->getValueOperand();
+      return nullptr;
+    };
+    Value *OverflowArea = LoadVAField(8);
     auto FrameAnchor = GetRecoveredFrameAnchor(OverflowArea, Ctx.DL);
-    if (IsScanf && OverflowArea && FrameAnchor)
+    // Keep the existing vscanf normalization path untouched.  A refused
+    // vsscanf recovery must leave its materialized va_list byte-for-byte.
+    if (IsScanf && !IsSscanf && OverflowArea && FrameAnchor)
       Changed |= NormalizeScanfOverflowSlots(CI, OverflowArea, *FrameAnchor,
                                              Ctx.DL);
 
-    std::string Format = ResolveFormatString(CI->getArgOperand(0));
-    if (Format.empty()) continue;
+    std::string Format = ResolveFormatString(CI->getArgOperand(FormatIndex));
+    if (Format.empty()) { Trace("format"); continue; }
 
     SmallVector<VarargSpecifier, 16> Specs;
-    if (!parseFormatString(Format, Specs, IsScanf)) continue;
+    if (!parseFormatString(Format, Specs, IsScanf)) { Trace("format-parse"); continue; }
 
-    Value *RegSaveValue = FindLocalStoreValue(CI, VAList, 16, Ctx.DL);
+    Value *RegSaveValue = LoadVAField(16);
     AllocaInst *RegSave = RootAlloca(RegSaveValue);
-    if (!RegSave) continue;
+    if (!RegSave) { Trace("regsave"); continue; }
     uint64_t OverflowOffset = 0;
 
     uint64_t GPOffset = 8;
-    if (Value *StoredGP = FindLocalStoreValue(CI, VAList, 0, Ctx.DL)) {
+    if (Value *StoredGP = LoadVAField(0)) {
       auto *GP = dyn_cast<ConstantInt>(StoredGP);
-      if (!GP || GP->getZExtValue() > 40) continue;
+      if (!GP || GP->getZExtValue() > 40) { Trace("gp"); continue; }
       GPOffset = GP->getZExtValue();
     }
 
     IRBuilder<> B(CI);
     SmallVector<Value *, 8> Args;
-    Args.push_back(CI->getArgOperand(0));
+    if (IsSscanf) Args.push_back(CI->getArgOperand(0));
+    Args.push_back(CI->getArgOperand(FormatIndex));
     bool Safe = true;
     for (const VarargSpecifier &Spec : Specs) {
       if (!Spec.ConsumesArg || Spec.Ty == VarargType::Percent ||
@@ -1241,7 +1453,13 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
         }
         OverflowOffset += 8;
       } else {
-        Stored = FindLocalStoreValue(CI, RegSave, GPOffset, Ctx.DL);
+        if (IsSscanf) {
+          StoreInst *SI = FindPlainLocalStore(CI, RegSave, GPOffset, Ctx.DL);
+          if (!SI) { Safe = false; break; }
+          Stored = SI->getValueOperand();
+        } else {
+          Stored = FindLocalStoreValue(CI, RegSave, GPOffset, Ctx.DL);
+        }
         GPOffset += 8;
       }
       if (!Stored) { Safe = false; break; }
@@ -1249,16 +1467,41 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       Value *Arg = nullptr;
       if (FromOverflow && IsScanf && Ty->isPointerTy())
         Arg = TranslateProvenFrameOffset(B, Stored, *FrameAnchor);
+      // scanf-family variadic operands are destination pointers.  A literal
+      // from the materialized register-save area is still a guest coordinate,
+      // not a host pointer: lowering it through CoerceToType would create a
+      // raw inttoptr and let libc write through an unmapped address.  Require
+      // the same unique guest-object proof for vscanf as for vsscanf.
+      if (!Arg && IsScanf && Ty->isPointerTy()) {
+        if (auto *Guest = dyn_cast<ConstantInt>(Stored)) {
+          auto Width = ScanfDestinationWidth(Spec);
+          if (!Width) { Trace("guest-width"); Safe = false; break; }
+          StringRef GuestFailure;
+          Arg = ResolveUniqueGuestConstant(B, Ctx.M, Guest, *Width,
+                                           &GuestFailure);
+          // A literal guest coordinate is never a host pointer merely because
+          // it has pointer width.  In particular, do not let CoerceToType
+          // below turn an ambiguous or out-of-range address into inttoptr.
+          if (!Arg) { Trace(GuestFailure); Safe = false; break; }
+        }
+        else if (!Stored->getType()->isPointerTy() &&
+                 !IsNativeProvenance(ClassifyPointerProvenance(Stored))) {
+          Safe = false;
+          break;
+        }
+      }
       if (!Arg)
         Arg = CoerceToType(B, Stored, Ty);
       if (!Arg) { Safe = false; break; }
       Args.push_back(Arg);
     }
-    if (!Safe) continue;
+    if (!Safe) { Trace("slot-or-provenance"); continue; }
 
-    FunctionType *FT = FunctionType::get(B.getInt32Ty(), {B.getPtrTy()}, true);
+    SmallVector<Type *, 2> FixedArgs{B.getPtrTy()};
+    if (IsSscanf) FixedArgs.push_back(B.getPtrTy());
+    FunctionType *FT = FunctionType::get(B.getInt32Ty(), FixedArgs, true);
     FunctionCallee Native = Ctx.M.getOrInsertFunction(
-        IsScanf ? "scanf" : "printf", FT);
+        IsSscanf ? "sscanf" : (IsScanf ? "scanf" : "printf"), FT);
     CallInst *NewCall = B.CreateCall(FT, Native.getCallee(), Args,
                                      "native.vararg.direct");
     NewCall->setCallingConv(CI->getCallingConv());

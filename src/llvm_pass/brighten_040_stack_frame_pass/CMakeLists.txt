@@ -19,4 +19,5 @@ include(AddLLVM)
 add_llvm_pass_plugin(BrightenStackFramePass
   src/main.cpp
   src/RuleRecoverStackFrame.cpp
+  src/RuleCompactPostStateFrame.cpp
 )

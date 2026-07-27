@@ -3136,7 +3136,14 @@ findConstantRecoveredGuestAddress(Module &M, Value *V, unsigned Depth = 0) {
   if (!GEP->accumulateConstantOffset(M.getDataLayout(), Offset) ||
       Offset.isNegative())
     return std::nullopt;
-  return *Base + Offset.getZExtValue();
+  uint64_t Delta = Offset.getZExtValue();
+  // Guest addresses are later used as exact identity keys.  Wrapping here
+  // can alias an unrelated recovered object and turn an unresolved pointer
+  // into a falsely proven one.  Refuse the rewrite when the address does not
+  // fit in the guest address width.
+  if (Delta > std::numeric_limits<uint64_t>::max() - *Base)
+    return std::nullopt;
+  return *Base + Delta;
 }
 
 struct ConstantGuestInteger {
@@ -3286,6 +3293,13 @@ static unsigned rewriteRecoveredPointerIntegerIdentities(Module &M,
 
   for (Function &F : M) {
     if (F.isDeclaration())
+      continue;
+    // The inverse guest-pointer bridge compares a runtime host pointer with
+    // the runtime address of each recovered object.  Its ptrtoint operands
+    // are object-identity proofs, not guest integer carriers.  Rewriting a
+    // base such as ptrtoint(@seg_404de8) to 0x404de8 makes every PIE host
+    // pointer miss the range and leaks a host address into guest RAX.
+    if (F.getName() == "__guest_pointer_to_address")
       continue;
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
@@ -4226,6 +4240,57 @@ static Value *refreshRecoveredDataPointerDispatch(Module &M, IRBuilder<> &B,
   return materializeRecoveredDataPointer(M, B, GuestAddress);
 }
 
+// A generated recovered-data dispatch is not necessarily used as a libc
+// argument.  In particular, an inlined lifted body can dereference it
+// directly after a later data-recovery sweep gives a residual segment its
+// guest range.  Refreshing only external-call operands leaves that old select
+// chain with a raw inttoptr fallback, even though the address is now proven to
+// belong to the residual native object.  Rebuild only outer generated select
+// roots whose coverage is incomplete; unknown addresses retain the original
+// fallback in materializeRecoveredDataPointer.
+static unsigned refreshIncompleteRecoveredDataPointerDispatches(
+    Module &M, bool &Changed) {
+  SmallVector<SelectInst *, 128> Roots;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *Sel = dyn_cast<SelectInst>(&I);
+        if (!Sel ||
+            !Sel->getName().starts_with("native.data.pointer.select"))
+          continue;
+        bool HasSelectParent = false;
+        for (User *U : Sel->users()) {
+          auto *Parent = dyn_cast<SelectInst>(U);
+          if (Parent &&
+              Parent->getName().starts_with("native.data.pointer.select")) {
+            HasSelectParent = true;
+            break;
+          }
+        }
+        if (!HasSelectParent)
+          Roots.push_back(Sel);
+      }
+    }
+  }
+
+  unsigned Rewritten = 0;
+  for (SelectInst *Root : Roots) {
+    if (!Root->getParent() || Root->use_empty())
+      continue;
+    IRBuilder<> B(Root);
+    Value *Refreshed = refreshRecoveredDataPointerDispatch(M, B, Root);
+    if (!Refreshed || Refreshed == Root ||
+        Refreshed->getType() != Root->getType())
+      continue;
+    Root->replaceAllUsesWith(Refreshed);
+    ++Rewritten;
+    Changed = true;
+  }
+  return Rewritten;
+}
+
 // Frame lowering preserves the contents of a guest stack slot, but that slot
 // can itself hold a guest BSS pointer.  The later load then becomes an
 // inttoptr whose operand has no remaining constant-expression provenance, so
@@ -4273,6 +4338,150 @@ static unsigned rewriteResidualRecoveredDataIntToPtrs(Module &M,
     if (NativePtr->getType() != ITP->getType())
       NativePtr = B.CreatePointerCast(NativePtr, ITP->getType(),
                                       "native.residual.ptr.cast");
+    ITP->replaceAllUsesWith(NativePtr);
+    ITP->eraseFromParent();
+    ++Rewritten;
+    Changed = true;
+  }
+  return Rewritten;
+}
+
+// A residual image can contain a relocated guest pointer as integer bytes.
+// Once a lifted load reads that slot, the following inttoptr no longer carries
+// the constant-expression provenance handled by rewriteDynamicGuestAddress-
+// IntToPtr.  Rebase only this exact producer->consumer form: the integer must
+// come from a non-volatile, non-atomic load whose address is rooted in a
+// preserved native_residual object with an authoritative guest range.  Do not
+// generalize this to arbitrary integer loads: native pointer tagging, integer
+// observations, and unrelated globals remain outside this recovery contract.
+static GlobalVariable *getRecoveredResidualLoadBase(Value *Pointer) {
+  SmallPtrSet<Value *, 8> Seen;
+  while (Pointer && Seen.insert(Pointer).second) {
+    Pointer = Pointer->stripPointerCasts();
+    if (auto *GEP = dyn_cast<GEPOperator>(Pointer)) {
+      Pointer = GEP->getPointerOperand();
+      continue;
+    }
+    break;
+  }
+
+  auto *GV = dyn_cast_or_null<GlobalVariable>(Pointer);
+  if (!GV || GV->isDeclaration() ||
+      !GV->getName().starts_with("native_residual_") ||
+      !GV->getMetadata("brighten.guest.range"))
+    return nullptr;
+  return GV;
+}
+
+static bool isConstantAffineRecurrence(Value *Candidate, PHINode *Root,
+                                       SmallPtrSetImpl<Value *> &Seen,
+                                       unsigned Depth = 0) {
+  if (!Candidate || Depth > 8 || !Seen.insert(Candidate).second)
+    return false;
+  if (Candidate == Root)
+    return true;
+  if (auto *Cast = dyn_cast<CastInst>(Candidate))
+    return isConstantAffineRecurrence(Cast->getOperand(0), Root, Seen,
+                                      Depth + 1);
+  auto *BO = dyn_cast<BinaryOperator>(Candidate);
+  if (!BO || (BO->getOpcode() != Instruction::Add &&
+              BO->getOpcode() != Instruction::Sub))
+    return false;
+  if (isa<ConstantInt>(BO->getOperand(1)))
+    return isConstantAffineRecurrence(BO->getOperand(0), Root, Seen,
+                                      Depth + 1);
+  if (BO->getOpcode() == Instruction::Add &&
+      isa<ConstantInt>(BO->getOperand(0)))
+    return isConstantAffineRecurrence(BO->getOperand(1), Root, Seen,
+                                      Depth + 1);
+  return false;
+}
+
+static bool isProvenResidualRelocationAddress(
+    Value *Address, SmallPtrSetImpl<Value *> &Seen, unsigned Depth = 0) {
+  if (!Address || Depth > 8 || !Seen.insert(Address).second)
+    return false;
+  if (auto *Load = dyn_cast<LoadInst>(Address))
+    return !Load->isVolatile() && !Load->isAtomic() &&
+           getRecoveredResidualLoadBase(Load->getPointerOperand());
+  if (auto *Cast = dyn_cast<CastInst>(Address))
+    return isProvenResidualRelocationAddress(Cast->getOperand(0), Seen,
+                                             Depth + 1);
+  if (auto *Phi = dyn_cast<PHINode>(Address)) {
+    if (Phi->getNumIncomingValues() == 0)
+      return false;
+    bool HasSeed = false;
+    for (Value *Incoming : Phi->incoming_values()) {
+      // Each incoming edge gets its own visited set: two safe edges may share
+      // the same residual load, which is not a cycle and must not reject the
+      // PHI.  Recursive PHIs remain bounded by Depth.
+      SmallPtrSet<Value *, 8> IncomingSeen;
+      if (isProvenResidualRelocationAddress(Incoming, IncomingSeen,
+                                            Depth + 1)) {
+        HasSeed = true;
+        continue;
+      }
+      SmallPtrSet<Value *, 8> RecurrenceSeen;
+      if (!isConstantAffineRecurrence(Incoming, Phi, RecurrenceSeen,
+                                      Depth + 1))
+        return false;
+    }
+    return HasSeed;
+  }
+
+// A relocation pointer commonly feeds byte-wise C string traversal.  Accept
+// only a wrapping add/sub by a literal byte displacement; the original
+// integer expression is passed to the range mapper unchanged, so this does
+// not assume no-overflow or alter signedness.  A PHI is accepted only when
+// every incoming value satisfies the same closed residual-load contract.  Do
+// not follow arbitrary arithmetic, selects, or tagged values.
+  auto *BO = dyn_cast<BinaryOperator>(Address);
+  if (!BO || (BO->getOpcode() != Instruction::Add &&
+              BO->getOpcode() != Instruction::Sub))
+    return false;
+  if (isa<ConstantInt>(BO->getOperand(1)))
+    return isProvenResidualRelocationAddress(BO->getOperand(0), Seen,
+                                             Depth + 1);
+  if (BO->getOpcode() == Instruction::Add &&
+      isa<ConstantInt>(BO->getOperand(0)))
+    return isProvenResidualRelocationAddress(BO->getOperand(1), Seen,
+                                             Depth + 1);
+  return false;
+}
+
+static unsigned rewriteProvenResidualRelocationLoads(Module &M,
+                                                      bool &Changed) {
+  SmallVector<IntToPtrInst *, 32> Candidates;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *ITP = dyn_cast<IntToPtrInst>(&I);
+        if (!ITP || !ITP->getOperand(0)->getType()->isIntegerTy() ||
+            ITP->getType()->getPointerAddressSpace() != 0)
+          continue;
+        Candidates.push_back(ITP);
+      }
+    }
+  }
+
+  unsigned Rewritten = 0;
+  for (IntToPtrInst *ITP : Candidates) {
+    if (!ITP->getParent())
+      continue;
+    SmallPtrSet<Value *, 8> Seen;
+    if (!isProvenResidualRelocationAddress(ITP->getOperand(0), Seen))
+      continue;
+
+    IRBuilder<> B(ITP);
+    Value *NativePtr =
+        materializeRecoveredDataPointer(M, B, ITP->getOperand(0), false);
+    if (!NativePtr)
+      continue;
+    if (NativePtr->getType() != ITP->getType())
+      NativePtr = B.CreatePointerCast(NativePtr, ITP->getType(),
+                                      "native.residual.relocation.ptr");
     ITP->replaceAllUsesWith(NativePtr);
     ITP->eraseFromParent();
     ++Rewritten;
@@ -6100,6 +6309,324 @@ static bool isGuestStackRegister(Value *V,
   return false;
 }
 
+static bool isRawByteStorageType(Type *Ty) {
+  while (auto *AT = dyn_cast<ArrayType>(Ty))
+    Ty = AT->getElementType();
+  return Ty->isIntegerTy(8);
+}
+
+static bool isGeneratedRawStorageName(StringRef Name) {
+  return Name.starts_with("native_frame") ||
+         Name.starts_with("native_stack") ||
+         Name.starts_with("frame_storage") ||
+         Name.starts_with("native_register_storage") ||
+         Name.starts_with("native_state_storage");
+}
+
+static bool containsGeneratedPointerFallback(
+    Value *V, SmallPtrSetImpl<Value *> &Seen, unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (V->getName().starts_with("native.address.fallback") ||
+      V->getName().starts_with("native.stack.address.fallback"))
+    return true;
+  if (auto *SI = dyn_cast<SelectInst>(V))
+    return containsGeneratedPointerFallback(SI->getTrueValue(), Seen,
+                                            Depth + 1) ||
+           containsGeneratedPointerFallback(SI->getFalseValue(), Seen,
+                                            Depth + 1);
+  if (auto *PN = dyn_cast<PHINode>(V))
+    for (Value *Incoming : PN->incoming_values())
+      if (containsGeneratedPointerFallback(Incoming, Seen, Depth + 1))
+        return true;
+  if (auto *CI = dyn_cast<CastInst>(V))
+    return containsGeneratedPointerFallback(CI->getOperand(0), Seen,
+                                            Depth + 1);
+  return false;
+}
+
+static bool containsPointerIntegerSource(
+    Value *V, SmallPtrSetImpl<Value *> &Seen, unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (isa<PtrToIntInst>(V))
+    return true;
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->getOpcode() == Instruction::PtrToInt)
+      return true;
+    for (Value *Op : CE->operands())
+      if (containsPointerIntegerSource(Op, Seen, Depth + 1))
+        return true;
+    return false;
+  }
+  if (auto *BO = dyn_cast<BinaryOperator>(V))
+    return containsPointerIntegerSource(BO->getOperand(0), Seen, Depth + 1) ||
+           containsPointerIntegerSource(BO->getOperand(1), Seen, Depth + 1) ||
+           ((BO->getOpcode() == Instruction::Add ||
+             BO->getOpcode() == Instruction::Sub) &&
+            (isa<ConstantInt>(BO->getOperand(0)) ||
+             isa<ConstantInt>(BO->getOperand(1))));
+  if (auto *CI = dyn_cast<CastInst>(V))
+    return containsPointerIntegerSource(CI->getOperand(0), Seen, Depth + 1);
+  if (auto *FI = dyn_cast<FreezeInst>(V))
+    return containsPointerIntegerSource(FI->getOperand(0), Seen, Depth + 1);
+  return false;
+}
+
+static bool containsRangeBoundedCompare(
+    Value *V, SmallPtrSetImpl<Value *> &Seen, unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+    Value *Address = nullptr;
+    if (isa<ConstantInt>(Cmp->getOperand(0)))
+      Address = Cmp->getOperand(1);
+    else if (isa<ConstantInt>(Cmp->getOperand(1)))
+      Address = Cmp->getOperand(0);
+    if (!Address)
+      return false;
+    SmallPtrSet<Value *, 16> SourceSeen;
+    return containsPointerIntegerSource(Address, SourceSeen);
+  }
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (!BO->getType()->isIntegerTy(1))
+      return false;
+    return containsRangeBoundedCompare(BO->getOperand(0), Seen, Depth + 1) ||
+           containsRangeBoundedCompare(BO->getOperand(1), Seen, Depth + 1);
+  }
+  if (auto *CI = dyn_cast<CastInst>(V))
+    return containsRangeBoundedCompare(CI->getOperand(0), Seen, Depth + 1);
+  return false;
+}
+
+static bool isRangeGuard(Value *V) {
+  SmallPtrSet<Value *, 16> Seen;
+  return containsRangeBoundedCompare(V, Seen);
+}
+
+static bool isGuardedPhi(PHINode &PN, bool RequireRangeGuard) {
+  auto IsGuard = [RequireRangeGuard](Instruction *Term) {
+    Value *Condition = nullptr;
+    if (auto *BI = dyn_cast<BranchInst>(Term)) {
+      if (BI->isConditional())
+        Condition = BI->getCondition();
+    } else if (auto *SI = dyn_cast<SwitchInst>(Term)) {
+      Condition = SI->getCondition();
+    }
+    return Condition && (!RequireRangeGuard || isRangeGuard(Condition));
+  };
+  for (BasicBlock *Incoming : PN.blocks()) {
+    if (IsGuard(Incoming->getTerminator()))
+      return true;
+    // A canonical selection diamond places the conditional branch one block
+    // before the PHI incoming blocks, whose own branches are unconditional.
+    for (BasicBlock *Pred : predecessors(Incoming))
+      if (IsGuard(Pred->getTerminator()))
+        return true;
+  }
+  return false;
+}
+
+struct IntegerPointerShape {
+  bool HasPtrToInt = false;
+  bool HasAffineArithmetic = false;
+  bool HasGuardedMerge = false;
+  bool HasRangeGuardedMerge = false;
+};
+
+static bool isAffinePointerIntegerOpcode(unsigned Opcode) {
+  return Opcode == Instruction::Add || Opcode == Instruction::Sub ||
+         Opcode == Instruction::Mul || Opcode == Instruction::Shl;
+}
+
+static void collectIntegerPointerShape(
+    Value *V, IntegerPointerShape &Shape, SmallPtrSetImpl<Value *> &Seen,
+    unsigned Depth = 0) {
+  if (!V || Depth > 16 || !Seen.insert(V).second)
+    return;
+  if (isa<PtrToIntInst>(V)) {
+    Shape.HasPtrToInt = true;
+    return;
+  }
+  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->getOpcode() == Instruction::PtrToInt) {
+      Shape.HasPtrToInt = true;
+      return;
+    }
+    if (isAffinePointerIntegerOpcode(CE->getOpcode()))
+      Shape.HasAffineArithmetic = true;
+    for (Value *Op : CE->operands())
+      collectIntegerPointerShape(Op, Shape, Seen, Depth + 1);
+    return;
+  }
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (isAffinePointerIntegerOpcode(BO->getOpcode()))
+      Shape.HasAffineArithmetic = true;
+    collectIntegerPointerShape(BO->getOperand(0), Shape, Seen, Depth + 1);
+    collectIntegerPointerShape(BO->getOperand(1), Shape, Seen, Depth + 1);
+    return;
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V)) {
+    Shape.HasGuardedMerge = true;
+    Shape.HasRangeGuardedMerge |= isRangeGuard(SI->getCondition());
+    collectIntegerPointerShape(SI->getTrueValue(), Shape, Seen, Depth + 1);
+    collectIntegerPointerShape(SI->getFalseValue(), Shape, Seen, Depth + 1);
+    return;
+  }
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    Shape.HasGuardedMerge |= isGuardedPhi(*PN, false);
+    Shape.HasRangeGuardedMerge |= isGuardedPhi(*PN, true);
+    for (Value *Incoming : PN->incoming_values())
+      collectIntegerPointerShape(Incoming, Shape, Seen, Depth + 1);
+    return;
+  }
+  if (auto *CI = dyn_cast<CastInst>(V))
+    collectIntegerPointerShape(CI->getOperand(0), Shape, Seen, Depth + 1);
+  else if (auto *FI = dyn_cast<FreezeInst>(V))
+    collectIntegerPointerShape(FI->getOperand(0), Shape, Seen, Depth + 1);
+}
+
+static IntegerPointerShape getIntegerPointerShape(Value *V) {
+  IntegerPointerShape Shape;
+  SmallPtrSet<Value *, 32> Seen;
+  collectIntegerPointerShape(V, Shape, Seen);
+  return Shape;
+}
+
+static bool containsRawIntToPtr(Value *V, SmallPtrSetImpl<Value *> &Seen,
+                                unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (isa<IntToPtrInst>(V))
+    return true;
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return containsRawIntToPtr(GEP->getPointerOperand(), Seen, Depth + 1);
+  if (auto *SI = dyn_cast<SelectInst>(V))
+    return containsRawIntToPtr(SI->getTrueValue(), Seen, Depth + 1) ||
+           containsRawIntToPtr(SI->getFalseValue(), Seen, Depth + 1);
+  if (auto *PN = dyn_cast<PHINode>(V))
+    for (Value *Incoming : PN->incoming_values())
+      if (containsRawIntToPtr(Incoming, Seen, Depth + 1))
+        return true;
+  if (auto *CI = dyn_cast<CastInst>(V))
+    return containsRawIntToPtr(CI->getOperand(0), Seen, Depth + 1);
+  return false;
+}
+
+static bool containsMappedPointerGEP(Value *V,
+                                     SmallPtrSetImpl<Value *> &Seen,
+                                     unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    SmallPtrSet<Value *, 8> RawSeen;
+    if (!containsRawIntToPtr(GEP->getPointerOperand(), RawSeen))
+      return true;
+    return containsMappedPointerGEP(GEP->getPointerOperand(), Seen,
+                                    Depth + 1);
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V))
+    return containsMappedPointerGEP(SI->getTrueValue(), Seen, Depth + 1) ||
+           containsMappedPointerGEP(SI->getFalseValue(), Seen, Depth + 1);
+  if (auto *PN = dyn_cast<PHINode>(V))
+    for (Value *Incoming : PN->incoming_values())
+      if (containsMappedPointerGEP(Incoming, Seen, Depth + 1))
+        return true;
+  if (auto *CI = dyn_cast<CastInst>(V))
+    return containsMappedPointerGEP(CI->getOperand(0), Seen, Depth + 1);
+  return false;
+}
+
+static bool hasRawAndMappedPointerArms(ArrayRef<Value *> Arms) {
+  bool HasRaw = false;
+  bool HasMapped = false;
+  for (Value *Arm : Arms) {
+    SmallPtrSet<Value *, 16> RawSeen;
+    SmallPtrSet<Value *, 16> MappedSeen;
+    HasRaw |= containsRawIntToPtr(Arm, RawSeen);
+    HasMapped |= containsMappedPointerGEP(Arm, MappedSeen);
+  }
+  return HasRaw && HasMapped;
+}
+
+static bool containsRangeDispatchedPointer(
+    Value *V, SmallPtrSetImpl<Value *> &Seen, unsigned Depth = 0) {
+  if (!V || Depth > 12 || !Seen.insert(V).second)
+    return false;
+  if (auto *SI = dyn_cast<SelectInst>(V)) {
+    Value *Arms[] = {SI->getTrueValue(), SI->getFalseValue()};
+    if (isRangeGuard(SI->getCondition()) && hasRawAndMappedPointerArms(Arms))
+      return true;
+    return containsRangeDispatchedPointer(SI->getTrueValue(), Seen,
+                                          Depth + 1) ||
+           containsRangeDispatchedPointer(SI->getFalseValue(), Seen,
+                                          Depth + 1);
+  }
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    SmallVector<Value *, 8> Arms(PN->incoming_values());
+    if (isGuardedPhi(*PN, true) && hasRawAndMappedPointerArms(Arms))
+      return true;
+    for (Value *Incoming : PN->incoming_values())
+      if (containsRangeDispatchedPointer(Incoming, Seen, Depth + 1))
+        return true;
+    return false;
+  }
+  if (auto *ITP = dyn_cast<IntToPtrInst>(V)) {
+    IntegerPointerShape Shape = getIntegerPointerShape(ITP->getOperand(0));
+    return Shape.HasPtrToInt && Shape.HasAffineArithmetic &&
+           Shape.HasRangeGuardedMerge;
+  }
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return containsRangeDispatchedPointer(GEP->getPointerOperand(), Seen,
+                                          Depth + 1);
+  if (auto *CI = dyn_cast<CastInst>(V))
+    return containsRangeDispatchedPointer(CI->getOperand(0), Seen, Depth + 1);
+  return false;
+}
+
+static bool reachesDispatcherHeader(BasicBlock *From, BasicBlock *Header,
+                                    unsigned MaxDepth = 6) {
+  SmallVector<std::pair<BasicBlock *, unsigned>, 16> Worklist;
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  Worklist.push_back({From, 0});
+  while (!Worklist.empty()) {
+    auto [BB, Depth] = Worklist.pop_back_val();
+    if (BB == Header)
+      return true;
+    if (Depth == MaxDepth || !Seen.insert(BB).second)
+      continue;
+    for (BasicBlock *Succ : successors(BB))
+      Worklist.push_back({Succ, Depth + 1});
+  }
+  return false;
+}
+
+static bool isSparseLoopCarriedDispatcher(SwitchInst &SI) {
+  auto *StatePhi = dyn_cast<PHINode>(SI.getCondition());
+  if (!StatePhi || SI.getNumCases() < 2 ||
+      StatePhi->getParent() != SI.getParent())
+    return false;
+
+  APInt Min = SI.case_begin()->getCaseValue()->getValue();
+  APInt Max = Min;
+  for (auto Case : SI.cases()) {
+    const APInt &V = Case.getCaseValue()->getValue();
+    if (V.slt(Min))
+      Min = V;
+    if (V.sgt(Max))
+      Max = V;
+  }
+  if (!(Max - Min).ugt(SI.getNumCases() * 4))
+    return false;
+
+  BasicBlock *Header = SI.getParent();
+  unsigned ReturningArms =
+      reachesDispatcherHeader(SI.getDefaultDest(), Header) ? 1 : 0;
+  for (auto Case : SI.cases())
+    ReturningArms += reachesDispatcherHeader(Case.getCaseSuccessor(), Header);
+  return ReturningArms >= 2;
+}
+
 static void collectNativeContractViolations(
     Module &M, SmallVectorImpl<std::string> &Findings) {
   for (StructType *ST : M.getIdentifiedStructTypes()) {
@@ -6125,6 +6652,8 @@ static void collectNativeContractViolations(
       addFinding(Findings, "collapsed unreachable native entrypoint", Name);
     if (isLiftedFunctionName(Name) || isLiftedABI(F))
       addFinding(Findings, "lifted function/ABI", Name);
+    if (Name == "__brighten_native_data_pointer")
+      addFinding(Findings, "segment pointer mapper", Name);
     if (Name.ends_with(".native") ||
         (F.arg_size() && F.getArg(0)->getType()->isPointerTy() &&
          F.getArg(0)->getName() == "state"))
@@ -6143,25 +6672,7 @@ static void collectNativeContractViolations(
     bool HasDispatcherLikeCFG = false;
     for (BasicBlock &BB : F) {
       auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
-      auto *StatePhi = SI ? dyn_cast<PHINode>(SI->getCondition()) : nullptr;
-      if (!SI || !StatePhi || SI->getNumCases() < 2 ||
-          SI->getDefaultDest() != &BB)
-        continue;
-      // OLLVM-style flattening uses a loop-carried pseudo-random state and a
-      // self-looping default arm.  A source-language switch may legitimately
-      // be sparse, so require both that structural signature and a non-dense
-      // case set before rejecting it as a dispatcher.  Basic-block names are
-      // deliberately irrelevant: an `inst_*` label can survive correct CFG
-      // recovery and has no runtime semantics.
-      APInt Min = SI->case_begin()->getCaseValue()->getValue();
-      APInt Max = Min;
-      for (auto Case : SI->cases()) {
-        const APInt &V = Case.getCaseValue()->getValue();
-        if (V.slt(Min)) Min = V;
-        if (V.sgt(Max)) Max = V;
-      }
-      APInt Span = Max - Min;
-      if (Span.ugt(SI->getNumCases() * 4)) {
+      if (SI && isSparseLoopCarriedDispatcher(*SI)) {
         HasDispatcherLikeCFG = true;
         break;
       }
@@ -6173,13 +6684,44 @@ static void collectNativeContractViolations(
       continue;
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
+        if (auto *AI = dyn_cast<AllocaInst>(&I);
+            AI && (AI->getMetadata("brighten.entry_guest_stack.transitional") ||
+                   AI->getName() == "entry_guest_stack"))
+          addFinding(Findings, "transitional entry guest stack", F.getName());
         for (Use &Op : I.operands()) {
           if (containsUndefined(Op.get())) {
             addFinding(Findings, "undef/poison", F.getName());
             break;
           }
         }
+        Value *MemoryPointer = nullptr;
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          MemoryPointer = LI->getPointerOperand();
+        else if (auto *ST = dyn_cast<StoreInst>(&I))
+          MemoryPointer = ST->getPointerOperand();
+        if (MemoryPointer) {
+          SmallPtrSet<Value *, 32> Seen;
+          if (containsRangeDispatchedPointer(MemoryPointer, Seen))
+            addFinding(
+                Findings,
+                "semantic_risk/memory_model: range-dispatched pointer "
+                "memory access",
+                F.getName());
+        }
         if (auto *ITP = dyn_cast<IntToPtrInst>(&I)) {
+          IntegerPointerShape Shape =
+              getIntegerPointerShape(ITP->getOperand(0));
+          if (Shape.HasPtrToInt && Shape.HasAffineArithmetic &&
+              Shape.HasGuardedMerge)
+            addFinding(
+                Findings,
+                "semantic_risk/pointer_model: integerized guarded pointer "
+                "reconstruction",
+                F.getName());
+          if (ITP->getName().starts_with("native.address.fallback") ||
+              ITP->getName().starts_with("native.stack.address.fallback"))
+            addFinding(Findings, "generated raw pointer fallback",
+                       F.getName());
           if (isa<ConstantInt>(ITP->getOperand(0)))
             addFinding(Findings, "constant guest address", F.getName());
           if (ITP->getName().starts_with("native.ptr") ||
@@ -6207,6 +6749,10 @@ static void collectNativeContractViolations(
           }
         }
         if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+          if (isGeneratedRawStorageName(AI->getName()) &&
+              isRawByteStorageType(AI->getAllocatedType()))
+            addFinding(Findings, "synthetic raw byte frame/storage",
+                       F.getName());
           if (auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType()))
             if (AT->getNumElements() >= 1024 * 1024 &&
                 AT->getElementType()->isIntegerTy(8) &&
@@ -6243,6 +6789,14 @@ static void collectNativeContractViolations(
               addFinding(Findings, "lifted call", Callee->getName());
           }
         }
+        if (auto *SI = dyn_cast<SelectInst>(&I)) {
+          SmallPtrSet<Value *, 32> Seen;
+          if (SI->getName().starts_with("native.data.pointer.select") ||
+              SI->getName().starts_with("native.stack.pointer.select") ||
+              containsGeneratedPointerFallback(SI, Seen))
+            addFinding(Findings, "surviving mapper/select fallback chain",
+                       F.getName());
+        }
       }
     }
   }
@@ -6259,6 +6813,13 @@ static void collectNativeContractViolations(
       addFinding(Findings, "lifted global", Name);
     if (Name.starts_with("frame_storage_backing."))
       addFinding(Findings, "guest stack backing global", Name);
+    if (Name.starts_with("native_residual_") ||
+        Name.starts_with("native_data_") || Name.starts_with("dyn_bytes_") ||
+        Name.starts_with("g_bytes_"))
+      addFinding(Findings, "residual image/map global", Name);
+    if (isGeneratedRawStorageName(Name) &&
+        isRawByteStorageType(GV.getValueType()))
+      addFinding(Findings, "synthetic raw byte frame/storage", Name);
     if (GV.hasInitializer() && containsUndefined(GV.getInitializer()))
       addFinding(Findings, "undef/poison global", Name);
     if (GV.getMetadata("brighten.guest.range"))
@@ -7054,29 +7615,129 @@ static unsigned eraseUnusedNativeDataArtifacts(
 // wrapper must provide one concrete backing object and seed the entry RSP
 // before calling the native body.  Create it only for that proven residual
 // stack-pointer case; ordinary modules keep the old no-synthetic-stack path.
+// This is intentionally a producer-only contract.  It does not authorize 090
+// to turn the global into an alloca: 040 consumes it only after its own closed
+// use-graph proof.  The three records bind the capability to (1) this exact
+// newly-created global, (2) this module, and (3) the entry function which was
+// the sole native-call boundary when it was synthesized.  In particular, a
+// legacy/pre-existing frame_storage_backing.main never acquires this contract.
+static void markSyntheticEntrypointStackLifetime(Module &M,
+                                                  GlobalVariable &Storage,
+                                                  Function &EntryOwner,
+                                                  CallBase &NativeCall) {
+  LLVMContext &Ctx = M.getContext();
+  constexpr uint64_t NativeStackBytes = 16 * 1024 * 1024;
+  constexpr uint64_t NativeStackTop = NativeStackBytes - 64 * 1024;
+  Storage.setMetadata(
+      "brighten.entry.stack.contract",
+      MDNode::get(Ctx, {ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 1)),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt64Ty(Ctx),
+                                             NativeStackBytes)),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt64Ty(Ctx),
+                                             NativeStackTop)),
+                        ConstantAsMetadata::get(
+                            ConstantInt::getTrue(Ctx))}));
+  EntryOwner.setMetadata(
+      "brighten.entry.stack.owner",
+      MDNode::get(Ctx, {ValueAsMetadata::get(&Storage),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 1))}));
+  M.getOrInsertNamedMetadata("brighten.entry.stack.producer")
+      ->addOperand(MDNode::get(
+          Ctx, {ValueAsMetadata::get(&Storage),
+                ConstantAsMetadata::get(
+                    ConstantInt::get(Type::getInt32Ty(Ctx), 1))}));
+
+  // This survives only if the exact native call is inlined into a resulting
+  // entry function.  040 treats it as provenance, not as a memory summary,
+  // and removes it only in the same transaction as the global replacement.
+  Function *Callee = NativeCall.getCalledFunction();
+  if (!Callee || Callee->isDeclaration() || Callee->empty())
+    return;
+  IRBuilder<> B(&*Callee->getEntryBlock().getFirstInsertionPt());
+  Function *SideEffect = Intrinsic::getDeclaration(&M, Intrinsic::sideeffect);
+  CallInst *Origin = B.CreateCall(SideEffect);
+  Origin->setMetadata(
+      "brighten.entry.stack.inline.origin",
+      MDNode::get(Ctx, {ValueAsMetadata::get(&Storage),
+                        ConstantAsMetadata::get(
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 1))}));
+}
+
+static bool hasSyntheticStackCreationRecord(GlobalVariable &Storage,
+                                            Function &EntryOwner) {
+  MDNode *Record = Storage.getMetadata("brighten.stack.synthetic.created");
+  if (!Record || Record->getNumOperands() != 2)
+    return false;
+  auto *Owner = dyn_cast<ValueAsMetadata>(Record->getOperand(0));
+  auto *Version = mdconst::dyn_extract<ConstantInt>(Record->getOperand(1));
+  return Owner && Owner->getValue() == &EntryOwner && Version &&
+         Version->getBitWidth() == 32 && Version->equalsInt(1);
+}
+
+static bool isExactSyntheticEntrypointBoundary(Function &Main,
+                                                CallBase *&NativeCall) {
+  NativeCall = nullptr;
+  if (Main.isDeclaration() || Main.hasLocalLinkage() || Main.isVarArg() ||
+      Main.getReturnType() != Type::getInt32Ty(Main.getContext()) ||
+      (Main.arg_size() != 2 && Main.arg_size() != 3) ||
+      !Main.getArg(0)->getType()->isIntegerTy(32) ||
+      !Main.getArg(1)->getType()->isPointerTy() ||
+      (Main.arg_size() == 3 && !Main.getArg(2)->getType()->isPointerTy()) ||
+      Main.hasAddressTaken())
+    return false;
+
+  for (BasicBlock &BB : Main) {
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      Function *Callee = CB->getCalledFunction();
+      if (Callee == &Main)
+        return false; // direct recursion makes process-global state observable.
+      if (!Callee || !Callee->getName().ends_with(".native"))
+        continue;
+      if (NativeCall)
+        return false; // exactly one entry-to-native invocation is required.
+      NativeCall = CB;
+    }
+  }
+  if (!NativeCall)
+    return false;
+  // Function::hasAddressTaken does not cover every constant-aggregate use on
+  // every LLVM version.  Inspect the complete use set: an entrypoint whose
+  // address is stored, aliased, or passed as a callback is not a one-shot C
+  // process boundary.
+  for (User *U : Main.users()) {
+    auto *CB = dyn_cast<CallBase>(U);
+    if (!CB || CB->getCalledFunction() != &Main)
+      return false;
+  }
+  Function *Callee = NativeCall->getCalledFunction();
+  // A single direct caller rules out a second entry path, callbacks, and
+  // direct recursion through this synthetic process-entry boundary.
+  return Callee && !Callee->isDeclaration() && !Callee->hasAddressTaken() &&
+         Callee->hasOneUse() && *Callee->user_begin() == NativeCall;
+}
+
 static GlobalVariable *ensureNativeEntrypointStackStorage(Module &M) {
   Function *Main = M.getFunction("main");
-  if (!Main || Main->isDeclaration() || Main->arg_size() == 2)
-    return nullptr;
-  if (Main->arg_size() < 2 || !Main->getReturnType()->isIntegerTy(32) ||
-      !Main->getArg(0)->getType()->isIntegerTy(32) ||
-      !Main->getArg(1)->getType()->isPointerTy())
+  CallBase *NativeCall = nullptr;
+  if (!Main || !isExactSyntheticEntrypointBoundary(*Main, NativeCall))
     return nullptr;
 
-  bool CallsNative = false;
-  for (BasicBlock &BB : *Main)
-    for (Instruction &I : BB)
-      if (auto *CB = dyn_cast<CallBase>(&I))
-        if (Function *Callee = CB->getCalledFunction();
-            Callee && Callee->getName().ends_with(".native")) {
-          CallsNative = true;
-          break;
-        }
-  if (!CallsNative)
-    return nullptr;
-
-  if (GlobalVariable *Existing = M.getNamedGlobal("frame_storage_backing.main"))
+  // Existing storage may be real program state.  Only a provenance record
+  // emitted at the NativeStateSSA allocation site lets this producer attest
+  // it; all other preexisting globals remain legacy compatibility state.
+  if (GlobalVariable *Existing = M.getNamedGlobal("frame_storage_backing.main")) {
+    if (!Existing->getMetadata("brighten.entry.stack.contract") &&
+        hasSyntheticStackCreationRecord(*Existing, *Main))
+      markSyntheticEntrypointStackLifetime(M, *Existing, *Main, *NativeCall);
     return Existing;
+  }
 
   bool HasResidualStackPointer = false;
   for (Function &F : M) {
@@ -7109,6 +7770,7 @@ static GlobalVariable *ensureNativeEntrypointStackStorage(Module &M) {
       M, StackTy, false, GlobalValue::InternalLinkage,
       ConstantAggregateZero::get(StackTy), "frame_storage_backing.main");
   Storage->setAlignment(Align(16));
+  markSyntheticEntrypointStackLifetime(M, *Storage, *Main, *NativeCall);
   return Storage;
 }
 
@@ -9718,6 +10380,34 @@ static bool proveAffineFrameBacking(GlobalVariable &Backing, Function &Owner,
   return true;
 }
 
+// Inlining owners merely to discover that the merged frame cannot be proven
+// affine is not reversible: it duplicates a lifted CFG and can erase the only
+// useful helper boundary.  Trial the exact bounded inlining sequence in a
+// clone first; the real module is changed only after the same owner, dispatcher
+// and affine proof all succeed in that isolated copy.
+static bool preflightAffineFrameBackingCompaction(GlobalVariable &Backing,
+                                                  uint64_t ObjectSize) {
+  Module &M = *Backing.getParent();
+  std::unique_ptr<Module> Trial = CloneModule(M);
+  GlobalVariable *TrialBacking =
+      Trial->getGlobalVariable(Backing.getName(), /*AllowInternal=*/true);
+  if (!TrialBacking)
+    return false;
+
+  bool TrialChanged = false;
+  if (!inlineBoundedUseFrameBackingCallees(*TrialBacking, TrialChanged))
+    return false;
+  Function *TrialOwner = nullptr;
+  if (!findSoleFrameBackingOwner(*TrialBacking, TrialOwner) ||
+      hasUnresolvedFlattenedDispatcher(*TrialOwner))
+    return false;
+
+  int64_t TrialMin = 0, TrialMax = 0;
+  Align TrialAlign = TrialBacking->getAlign().valueOrOne();
+  return proveAffineFrameBacking(*TrialBacking, *TrialOwner, ObjectSize,
+                                 TrialMin, TrialMax, TrialAlign);
+}
+
 static unsigned compactProvenAffineFrameBackings(Module &M, bool &Changed) {
   SmallVector<GlobalVariable *, 8> Candidates;
   for (GlobalVariable &GV : M.globals())
@@ -9737,6 +10427,13 @@ static unsigned compactProvenAffineFrameBackings(Module &M, bool &Changed) {
       continue;
 
     Function *Owner = nullptr;
+    if (!preflightAffineFrameBackingCompaction(*Backing, ObjectSize)) {
+      if (NativeAffineDebug)
+        errs() << "brighten-native-cleanup: affine frame "
+               << Backing->getName()
+               << " refused: transactional inline/proof preflight failed\n";
+      continue;
+    }
     if (!inlineBoundedUseFrameBackingCallees(*Backing, Changed)) {
       if (NativeAffineDebug)
         errs() << "brighten-native-cleanup: affine frame "
@@ -11045,96 +11742,29 @@ bool NativeCleanupPass::cleanupModule(
   // The final pipeline element is a verifier, not a second recovery pass.
   // Running the mutation pipeline again after O3 hides phase-ownership bugs.
   if (EnforceStrict) {
-    bool Changed = false;
-    unsigned PromotedDispatchers = promoteStackDispatcherStateSlots(M, Changed);
-    if (PromotedDispatchers)
-      errs() << "  final stack dispatcher state slots promoted to SSA: "
-             << PromotedDispatchers << "\n";
-    unsigned FinalRedundantFrameStores =
-        eraseRedundantExactFrameStores(M, Changed);
-    if (FinalRedundantFrameStores)
-      errs() << "  final redundant exact frame stores erased: "
-             << FinalRedundantFrameStores << "\n";
-    unsigned FinalConstantMapperPointers =
-        rewriteConstantRecoveredMapperCalls(M, Changed);
-    if (FinalConstantMapperPointers)
-      errs() << "  final constant recovered mapper calls lowered: "
-             << FinalConstantMapperPointers << "\n";
-    unsigned FinalPointerIntegers =
-        rewriteRecoveredPointerIntegerIdentities(M, Changed);
-    if (FinalPointerIntegers)
-      errs() << "  final recovered pointer integer identities lowered: "
-             << FinalPointerIntegers << "\n";
-    // Pointer-identity normalization above intentionally turns
-    // ptrtoint(recovered_global) back into its guest address.  Re-run the
-    // dynamic mapper immediately so expressions that also carry an index or
-    // field offset cannot leave the final pass as raw absolute inttoptrs.
-    unsigned FinalDynamicGuestPointers =
-        rewriteDynamicGuestAddressIntToPtr(M, Changed);
-    if (FinalDynamicGuestPointers)
-      errs() << "  final normalized dynamic guest pointers lowered: "
-             << FinalDynamicGuestPointers << "\n";
-    unsigned CollapsedNativeDispatches =
-        collapseProvenNativeRecoveredPointerDispatches(M, Changed);
-    if (CollapsedNativeDispatches) {
-      errs() << "  final proven native pointer dispatches collapsed: "
-             << CollapsedNativeDispatches << "\n";
-      cleanupNativeDeadInstructions(M);
-    }
-    unsigned FinalStackRecoveredGEPs =
-        rewriteRecoveredGlobalStackIndexedGEPs(M, Changed);
-    if (FinalStackRecoveredGEPs)
-      errs() << "  final recovered stack-indexed GEPs restored: "
-             << FinalStackRecoveredGEPs << "\n";
-    unsigned FinalVarargPointers =
-        rewriteRecoveredVarargSaveSlots(M, Changed);
-    if (FinalVarargPointers)
-      errs() << "  final recovered variadic pointer save slots lowered: "
-             << FinalVarargPointers << "\n";
-    unsigned LateConstantMapperPointers =
-        rewriteConstantRecoveredMapperCalls(M, Changed);
-    if (LateConstantMapperPointers)
-      errs() << "  final late constant mapper calls lowered: "
-             << LateConstantMapperPointers << "\n";
-    unsigned ThreadPointers = lowerX86ThreadPointerInlineAsm(M, Changed);
-    if (ThreadPointers)
-      errs() << "  final x86 TLS reads lowered to llvm.thread.pointer: "
-             << ThreadPointers << "\n";
-    unsigned DeadInlineAsm = eraseUnusedInlineAsmCalls(M, Changed);
-    if (DeadInlineAsm)
-      errs() << "  final unused inline-asm calls erased: " << DeadInlineAsm
-             << "\n";
-    unsigned FinalAffineCompactedFrames =
-        compactProvenAffineFrameBackings(M, Changed);
-    if (FinalAffineCompactedFrames)
-      errs() << "  final proven affine fake stack backings converted to "
-                "native frames: "
-             << FinalAffineCompactedFrames << "\n";
-    if (FinalAffineCompactedFrames && DeferCompactedFrameFinalization) {
-      M.getOrInsertNamedMetadata("brighten.final.frame.compacted");
-      return Changed;
-    }
-    unsigned FinalNativeDataArtifacts =
-        eraseUnusedNativeDataArtifacts(M, Changed, true);
-    if (FinalNativeDataArtifacts)
-      errs() << "  final unused recovered data artifacts removed: "
-             << FinalNativeDataArtifacts << "\n";
-    stripRemillMetadata(M, Changed);
+    (void)DeferCompactedFrameFinalization;
     reportNativeContract(M, 0, 0, true);
-    return Changed;
+    return false;
   }
 
   bool Changed = false;
   SmallVector<std::string, 32> Violations;
-  if (GlobalVariable *StackStorage = ensureNativeEntrypointStackStorage(M)) {
-    if (StackStorage->getName() == "frame_storage_backing.main" &&
-        StackStorage->getMetadata("brighten.stack.ensured") == nullptr) {
-      StackStorage->setMetadata("brighten.stack.ensured",
-                                MDNode::get(M.getContext(), {}));
-      Changed = true;
-      errs() << "  residual native stack backing ensured for entrypoint\n";
-    }
-  }
+  // Only a newly-created, structurally proven C-entry boundary receives the
+  // versioned producer contract inside ensureNativeEntrypointStackStorage.
+  // Do not attach the old empty brighten.stack.ensured capability to an
+  // existing global: zero initialization alone is process lifetime, not a
+  // proof of per-invocation reset.
+  GlobalVariable *EntrypointStorageBefore =
+      M.getNamedGlobal("frame_storage_backing.main");
+  const bool HadEntrypointStackStorage = EntrypointStorageBefore != nullptr;
+  const bool HadEntrypointStackContract =
+      EntrypointStorageBefore && EntrypointStorageBefore->getMetadata(
+                                    "brighten.entry.stack.contract");
+  GlobalVariable *EntrypointStorage = ensureNativeEntrypointStackStorage(M);
+  if ((!HadEntrypointStackStorage && EntrypointStorage) ||
+      (!HadEntrypointStackContract && EntrypointStorage &&
+       EntrypointStorage->getMetadata("brighten.entry.stack.contract")))
+    Changed = true;
   // Recovered guest ranges are required by the later scanf/external-pointer
   // lowering.  Strip them only after every such use has been materialized.
   stripRemillMetadata(M, Changed, false);
@@ -11269,7 +11899,6 @@ bool NativeCleanupPass::cleanupModule(
       Changed = true;
       errs() << "  oversized guest stack scratch buffer lowered\n";
     }
-
     // Preserve translated stack integer addresses until the pass can prove
     // their guest-frame provenance.  Rewriting them from affine patterns
     // alone changes valid guest pointers into host stack addresses.
@@ -11399,6 +12028,22 @@ bool NativeCleanupPass::cleanupModule(
   if (DataAliases)
     errs() << "  remaining guest data aliases lowered: " << DataAliases << "\n";
 
+  unsigned RefreshedDataDispatches =
+      refreshIncompleteRecoveredDataPointerDispatches(M, Changed);
+  if (RefreshedDataDispatches)
+    errs() << "  incomplete recovered data dispatches refreshed: "
+           << RefreshedDataDispatches << "\n";
+
+  // This runs after residual objects acquire their authoritative guest ranges.
+  // It deliberately does not depend on a State-SSA transaction: a residual
+  // relocation load may survive legal inlining or frame recovery even when a
+  // later State rewrite rolls back.
+  unsigned ResidualRelocationPointers =
+      rewriteProvenResidualRelocationLoads(M, Changed);
+  if (ResidualRelocationPointers)
+    errs() << "  residual relocation pointers rebased: "
+           << ResidualRelocationPointers << "\n";
+
   // Conservatively preserved residual segments acquire their exact guest
   // range while the final data_<addr> aliases are removed above.  Revisit
   // dynamic inttoptrs now: the earlier State-SSA-dependent sweep could not
@@ -11441,7 +12086,6 @@ bool NativeCleanupPass::cleanupModule(
   if (FinalVarargPointers)
     errs() << "  final recovered variadic pointer save slots lowered: "
            << FinalVarargPointers << "\n";
-
   unsigned ExactNativeSegmentGEPs =
       rewriteExactNativeSegmentGEPs(M, Changed);
   if (ExactNativeSegmentGEPs)

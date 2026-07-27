@@ -20,6 +20,7 @@ add_llvm_pass_plugin(BrightenTypeReconstructionPass
   main.cpp
   ObjectDiscovery.cpp
   PointerOffsetAnalysis.cpp
+  NativePointerProvenance.cpp
   AccessEvidenceCollector.cpp
   TypeConstraintSolver.cpp
   ArrayInference.cpp

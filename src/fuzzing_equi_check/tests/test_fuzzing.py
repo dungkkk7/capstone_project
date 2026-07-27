@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fuzzing_equi_check.fuzzing import (  # noqa: E402
     check_equivalence,
+    confirm_one_sided_timeout,
     DEFAULT_AFL_FUZZ_SECONDS,
     DEFAULT_AFL_INITIAL_CORPUS_LIMIT,
     DEFAULT_EXECUTION_TIMEOUT,
@@ -43,6 +44,69 @@ class TimeoutSemanticsTests(unittest.TestCase):
         )
         self.assertFalse(check_equivalence(shared, success)[0])
         self.assertFalse(is_inconclusive_pair(shared, success))
+
+    @patch("fuzzing_equi_check.fuzzing.run_binary")
+    def test_one_sided_timeout_is_rechecked_sequentially_with_larger_budget(
+        self, run
+    ):
+        timeout = {
+            "status": "timeout", "returncode": -1,
+            "stdout": b"", "stderr": b"",
+        }
+        success = {
+            "status": "success", "returncode": 0,
+            "stdout": b"40\n", "stderr": b"",
+        }
+        run.side_effect = [success, success]
+
+        confirmed = confirm_one_sided_timeout(
+            "candidate", "original", [], b"5 8\n", 0.5, success, timeout
+        )
+
+        self.assertEqual(confirmed, (success, success))
+        self.assertEqual(
+            run.call_args_list,
+            [
+                unittest.mock.call("candidate", [], b"5 8\n", 2.0),
+                unittest.mock.call("original", [], b"5 8\n", 2.0),
+            ],
+        )
+
+    @patch("fuzzing_equi_check.fuzzing.run_binary")
+    def test_confirmed_one_sided_timeout_remains_a_mismatch(self, run):
+        timeout = {
+            "status": "timeout", "returncode": -1,
+            "stdout": b"", "stderr": b"",
+        }
+        success = {
+            "status": "success", "returncode": 0,
+            "stdout": b"40\n", "stderr": b"",
+        }
+        run.side_effect = [success, timeout]
+
+        confirmed = confirm_one_sided_timeout(
+            "candidate", "original", [], b"5 8\n", 0.5, success, timeout
+        )
+
+        self.assertFalse(check_equivalence(*confirmed)[0])
+
+    @patch("fuzzing_equi_check.fuzzing.run_binary")
+    def test_non_timeout_mismatch_is_not_retried(self, run):
+        left = {
+            "status": "success", "returncode": 0,
+            "stdout": b"YES\n", "stderr": b"",
+        }
+        right = {
+            "status": "success", "returncode": 0,
+            "stdout": b"NO\n", "stderr": b"",
+        }
+        self.assertEqual(
+            confirm_one_sided_timeout(
+                "candidate", "original", [], b"x\n", 0.5, left, right
+            ),
+            (left, right),
+        )
+        run.assert_not_called()
 
     def test_shared_crash_with_same_signal_is_equivalent(self):
         shared = {

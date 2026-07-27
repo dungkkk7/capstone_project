@@ -63,6 +63,15 @@ static bool IsLongjmpName(StringRef Name) {
          Name == "siglongjmp";
 }
 
+// McSema's imported declaration can retain the lifted i64 register type even
+// for libc functions whose SysV ABI result is a pointer.  This intentionally
+// names only the documented strchr contract; a generic i64 result has no
+// provenance proof and must remain an integer.
+static bool HasLiftedIntegerPointerReturnABI(const Function &F) {
+  return F.getName() == "strchr" && F.getReturnType()->isIntegerTy(64) &&
+         F.arg_size() == 2;
+}
+
 static bool IsSupportedDirectABIType(Type *Ty) {
   return Ty->isVoidTy() || Ty->isIntegerTy() || Ty->isPointerTy() ||
          Ty->isFloatTy() || Ty->isDoubleTy();
@@ -644,7 +653,24 @@ static void RewriteStubToDirectCall(Function &Stub, Function *ExtFn,
   if (!ExtFTy->getReturnType()->isVoidTy() && Ret != nullptr) {
     if (ExtFTy->getReturnType()->isFloatingPointTy())
       StoreXMM0(B, StatePtr, Ret);
-    else
+    else if (Ret->getType()->isPointerTy()) {
+      // Lifted code performs subsequent pointer arithmetic in guest-address
+      // space. A direct libc call returns a host pointer, so preserve the
+      // original representation for known image objects before storing RAX.
+      // Unknown/dynamic provenance remains a host integer fallback.
+      Function *ToGuest = GetOrCreateGuestAddressFromPointer(*M);
+      Value *GuestAddress = B.CreateCall(ToGuest, {Ret}, "guest_return_addr");
+      StoreRAX(B, StatePtr, GuestAddress);
+    } else if (HasLiftedIntegerPointerReturnABI(*ExtFn)) {
+      // The direct call returned an ABI pointer in an i64 lifted declaration.
+      // Re-establish guest representation only for this exact libc contract.
+      Value *HostPointer = B.CreateIntToPtr(Ret, B.getPtrTy(),
+                                             "strchr_host_return");
+      Function *ToGuest = GetOrCreateGuestAddressFromPointer(*M);
+      Value *GuestAddress = B.CreateCall(ToGuest, {HostPointer},
+                                         "strchr_guest_return_addr");
+      StoreRAX(B, StatePtr, GuestAddress);
+    } else
       StoreRAX(B, StatePtr, Ret);
   }
 
