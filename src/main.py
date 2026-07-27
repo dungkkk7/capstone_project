@@ -635,7 +635,6 @@ def main(argv=None):
     if llm_recovery_mode:
         print(f"{Color.BLUE}[*] Chế độ LLM recovery: bổ sung vòng recover + fuzz sau semantic baseline.{Color.END}")
         llm_config = RecoveryConfig()
-        llm_config.fuzz_iterations = fuzz_iterations
         if run_mode in {"clean_pseudocode", "llvm2c", "clean_ir_and_pseudocode"}:
             llm_config.pseudo_backend = "llvm2c"
         elif run_mode in {"raw_ir", "clean_ir"}:

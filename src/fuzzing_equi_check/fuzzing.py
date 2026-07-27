@@ -1716,6 +1716,24 @@ int main(int argc, char** argv) {
                     f"rejected {len(rejected_inputs)} malformed mutation(s).{Color.END}"
                 )
 
+            if len(generated_inputs) < iterations:
+                needed = iterations - len(generated_inputs)
+                if input_contract is not None:
+                    supplement_inputs, _ = generate_contract_inputs(
+                        input_contract, afl_seed_inputs, needed
+                    )
+                    contract_supplement_count = len(supplement_inputs)
+                    generated_inputs = _dedupe_bytes(generated_inputs + supplement_inputs)
+                else:
+                    supplement_inputs = []
+                    for _ in range(needed):
+                        args, stdin_data = generator()
+                        payload = "\n".join(args).encode('utf-8') if uses_argv else stdin_data
+                        if payload:
+                            supplement_inputs.append(payload)
+                    contract_supplement_count = len(supplement_inputs)
+                    generated_inputs = _dedupe_bytes(generated_inputs + supplement_inputs)
+
             total_inputs = len(generated_inputs)
             run_inputs = generated_inputs[:iterations]
             

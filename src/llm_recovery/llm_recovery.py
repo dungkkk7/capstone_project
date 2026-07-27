@@ -3496,6 +3496,62 @@ def run_recovery_loop(
                             f"{retry_usage.get('candidates_token_count', retry_usage.get('candidatesTokenCount', '?'))}",
                             flush=True,
                         )
+        except LLMRateLimitError as exc:
+            # 429 rate limit: retry mỗi 30s, tối đa 120 lần (1 tiếng)
+            _RATE_LIMIT_RETRY_INTERVAL = 30      # giây giữa mỗi lần thử
+            _RATE_LIMIT_MAX_RETRIES    = 120     # tối đa 120 lần × 30s = 1 giờ
+            last_request_error = str(exc)
+            print(
+                f"[LLM] Model request lỗi: {last_request_error}",
+                flush=True,
+            )
+            _rl_success = False
+            for _rl_attempt in range(1, _RATE_LIMIT_MAX_RETRIES + 1):
+                print(
+                    f"[LLM] Rate limit 429 — chờ {_RATE_LIMIT_RETRY_INTERVAL}s rồi thử lại "
+                    f"(lần {_rl_attempt}/{_RATE_LIMIT_MAX_RETRIES})...",
+                    flush=True,
+                )
+                import time as _time
+                _time.sleep(_RATE_LIMIT_RETRY_INTERVAL)
+                try:
+                    response = (
+                        request_executor(send_request, request_context)
+                        if request_executor is not None
+                        else send_request()
+                    )
+                    total_model_calls += 1
+                    response_meta = dict(getattr(client, "last_response_meta", {}) or {})
+                    finish_reason = _text(response_meta.get("finish_reason"))
+                    usage = response_meta.get("usage_metadata") or {}
+                    print(
+                        f"[LLM] Rate limit retry thành công (lần {_rl_attempt}) | "
+                        f"finishReason={finish_reason or 'UNSPECIFIED'} | "
+                        f"promptTokens={usage.get('prompt_token_count', usage.get('promptTokenCount', '?'))} | "
+                        f"outputTokens={usage.get('candidates_token_count', usage.get('candidatesTokenCount', '?'))}",
+                        flush=True,
+                    )
+                    _rl_success = True
+                    break
+                except LLMRateLimitError as _rl_exc:
+                    last_request_error = str(_rl_exc)
+                    print(
+                        f"[LLM] Vẫn bị rate limit (lần {_rl_attempt}): {last_request_error}",
+                        flush=True,
+                    )
+                except RecoveryError as _rl_exc:
+                    last_request_error = str(_rl_exc)
+                    print(
+                        f"[LLM] Lỗi khác sau rate limit retry (lần {_rl_attempt}): {last_request_error}",
+                        flush=True,
+                    )
+                    raise
+            if not _rl_success:
+                print(
+                    f"[LLM] Đã thử {_RATE_LIMIT_MAX_RETRIES} lần trong 1 tiếng nhưng vẫn bị rate limit. Dừng.",
+                    flush=True,
+                )
+                raise RecoveryError(last_request_error or "Rate limit exhausted after 120 retries")
         except RecoveryError as exc:
             last_request_error = str(exc)
             print(f"[LLM] Model request lỗi: {last_request_error}")
