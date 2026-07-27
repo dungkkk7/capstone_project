@@ -1609,11 +1609,10 @@ int main(int argc, char** argv) {
             stats_file = os.path.join(out_dir, "default/fuzzer_stats")
             
             start_time = time.time()
-            max_fuzz_time = int(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "180"))
+            max_fuzz_time = float(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "2.0"))
             
             print(
-                f"{Color.BLUE}[*] AFL++ Mutation Hook: Waiting for AFL++ to complete {iterations} mutation executions "
-                f"(max timeout {max_fuzz_time}s)...{Color.END}"
+                f"{Color.BLUE}[*] AFL++ Mutation Hook: Running AFL++ mutation for {max_fuzz_time}s to collect mutated inputs...{Color.END}"
             )
             
             execs_done = 0
