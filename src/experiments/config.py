@@ -31,15 +31,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "paths": {
         "result_root": "result/experiments",
-        "ghidra_headless": "/opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless",
+        "llvm_to_c_transpiler": "tools/llvm_to_c.py",
         "ida_disassembler": "/opt/ida-pro-9.3/idat",
         "llvm_dis": "/usr/bin/llvm-dis-21",
         "clang": "/usr/bin/clang-21",
     },
     "representation": {
         "no_truncation": True,
-        "b0": {"ghidra_timeout_sec": 900, "use_cache": True},
-        "a0": {"allow_passes": [], "allow_optimizations": False},
+        "transpiler": {"timeout_sec": 60, "use_cache": True},
     },
     "llm": {
         "provider": "vertex_ai",
