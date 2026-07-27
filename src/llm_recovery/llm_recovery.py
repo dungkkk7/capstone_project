@@ -3497,9 +3497,10 @@ def run_recovery_loop(
                             flush=True,
                         )
         except LLMRateLimitError as exc:
-            # 429 rate limit: retry mỗi 30s, tối đa 120 lần (1 tiếng)
-            _RATE_LIMIT_RETRY_INTERVAL = 30      # giây giữa mỗi lần thử
-            _RATE_LIMIT_MAX_RETRIES    = 120     # tối đa 120 lần × 30s = 1 giờ
+            # 429 rate limit: exponential backoff with jitter
+            import time as _time
+            import random as _random
+            _RATE_LIMIT_MAX_RETRIES = 120
             last_request_error = str(exc)
             print(
                 f"[LLM] Model request lỗi: {last_request_error}",
@@ -3507,13 +3508,16 @@ def run_recovery_loop(
             )
             _rl_success = False
             for _rl_attempt in range(1, _RATE_LIMIT_MAX_RETRIES + 1):
+                # exponential backoff: 2, 4, 8, 16, 32, up to 60s, plus 0-5s jitter
+                backoff = min(60, (2 ** min(_rl_attempt, 6)) * 2)
+                jitter = _random.uniform(0, 5)
+                sleep_time = backoff + jitter
                 print(
-                    f"[LLM] Rate limit 429 — chờ {_RATE_LIMIT_RETRY_INTERVAL}s rồi thử lại "
+                    f"[LLM] Rate limit 429 — chờ {sleep_time:.1f}s rồi thử lại "
                     f"(lần {_rl_attempt}/{_RATE_LIMIT_MAX_RETRIES})...",
                     flush=True,
                 )
-                import time as _time
-                _time.sleep(_RATE_LIMIT_RETRY_INTERVAL)
+                _time.sleep(sleep_time)
                 try:
                     response = (
                         request_executor(send_request, request_context)
