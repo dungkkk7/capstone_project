@@ -41,6 +41,13 @@ from fuzzing_equi_check.input_contracts import (
     validate_contract_payload,
 )
 
+# Load default model from prompts_config.py
+try:
+    import configs.prompts_config as _prompts_cfg
+    DEFAULT_MODEL = getattr(_prompts_cfg, "MODEL", "gemini-3.5-flash")
+except ImportError:
+    DEFAULT_MODEL = "gemini-3.5-flash"
+
 # Supported Vertex AI regions for Gemini models
 VERTEX_GEMINI_REGIONS = [
     "us-central1",
@@ -356,7 +363,7 @@ def main():
     parser.add_argument("--pilot", type=int, default=None, help="Number of pilot cases to run")
     parser.add_argument("--fuzz-iterations", type=int, default=1000, help="Number of fuzz iterations")
     parser.add_argument("--max-workers", type=int, default=15, help="Max parallel flows running simultaneously")
-    parser.add_argument("--model", type=str, default="gemini-3.5-flash", help="Vertex AI model to use")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Vertex AI model to use")
     parser.add_argument("--no-rotate-regions", action="store_false", dest="rotate_regions", default=True, help="Disable regional endpoints rotation")
     args = parser.parse_args()
 
