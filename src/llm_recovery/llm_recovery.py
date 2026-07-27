@@ -1232,13 +1232,17 @@ def build_initial_prompt(
 - Do not invent source-level abstractions that are not proved by the IR."""
     )
 
+    # Read prompt from configs/prompts_config.py if available
+    if _prompts_cfg:
+        if use_pseudo and hasattr(_prompts_cfg, "PROMPT_CLEAN_PSEUDOCODE"):
+            return _prompts_cfg.PROMPT_CLEAN_PSEUDOCODE.replace("{CLEAN_PSEUDOCODE}", evidence)
+        elif not use_pseudo and hasattr(_prompts_cfg, "PROMPT_CLEAN_IR"):
+            return _prompts_cfg.PROMPT_CLEAN_IR.replace("{CLEAN_IR}", evidence)
+
+    # Built-in fallback
     return f"""Recover one behavior-preserving standalone C11 program from the
 supplied artifact. Use no facts absent from the artifact or explicit validation
 feedback.
-
-<INPUT_CONTEXT>
-{context or '- no trusted descriptive metadata'}
-</INPUT_CONTEXT>
 
 <MECHANICAL_EVIDENCE_INVENTORY>
 {inventory}
@@ -1248,32 +1252,7 @@ feedback.
 {evidence}
 </MODEL_INPUT_ARTIFACT>
 
-<MODE_SPECIFIC_RULES>
-{mode_rules}
-</MODE_SPECIFIC_RULES>
-
-Silently execute these reconstruction passes in order:
-1. Contract pass: enumerate every reachable input read, output write, exit,
-   allocation and observable library call.
-2. Function pass: recover each reachable helper's prototype and side effects
-   from body uses and callers, then recover the entry function.
-3. Storage pass: map slots/offsets to scalars, arrays, pointers or raw bytes
-   using complete def-use and alias evidence.
-4. Control-flow pass: structure only transitions that are proved; retain
-   labels/gotos for unresolved regions.
-5. Simulation pass: walk every output/exit path and verify values, call order,
-   widths, return codes and exact formatting.
-6. Source pass: emit and mentally compile one complete strict C11 unit.
-
-Acceptance audit:
-- every input conversion has compatible storage and variadic format types;
-- all output literals, spaces, ordering and newlines are exact;
-- loop counts, allocation sizes, dimensions and element widths agree with all accesses;
-- every reachable custom function and behavior-relevant branch is represented;
-- no decompiler scaffolding, invented behavior, placeholder or partial source remains.
-
-Return the complete raw C11 translation unit only. Do not return JSON,
-markdown, prose, a patch, or any text outside the C source.
+Return the complete raw C11 translation unit only.
 """
 
 
