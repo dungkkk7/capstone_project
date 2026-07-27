@@ -3,41 +3,20 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 
-#include <cstdlib>
-
 namespace brighten_devirt {
 
 using namespace llvm;
 
-// Diagnostic-only bisect gate.  It is intentionally opt-in and affects no
-// production invocation unless the environment explicitly names a rule.
-static bool RuleDisabled(StringRef Rule) {
-  const char *Value = std::getenv("BRIGHTEN_020_DISABLE_RULE");
-  if (!Value || !*Value)
-    return false;
-  SmallVector<StringRef, 8> Rules;
-  StringRef(Value).split(Rules, ',', /*MaxSplit=*/-1,
-                         /*KeepEmpty=*/false);
-  return llvm::is_contained(Rules, Rule);
-}
-
 PreservedAnalyses BrightenDevirtPass::run(Module &M, ModuleAnalysisManager &) {
   bool Changed = false;
 
-  if (!RuleDisabled("lower_external_calls"))
-    Changed |= LowerExternalCalls(M);
-  if (!RuleDisabled("devirtualize_remill_function_calls"))
-    Changed |= DevirtualizeRemillFunctionCalls(M);
-  if (!RuleDisabled("devirtualize_remill_jumps"))
-    Changed |= DevirtualizeRemillJumps(M);
-  if (!RuleDisabled("annotate_remill_returns"))
-    Changed |= AnnotateRemillReturns(M);
-  if (!RuleDisabled("cleanup_callback_thunks"))
-    Changed |= CleanupCallbackThunks(M);
-  if (!RuleDisabled("cleanup_unused_remill_dispatchers"))
-    Changed |= CleanupUnusedRemillDispatchers(M);
-  if (!RuleDisabled("lower_proven_constant_state_switches"))
-    Changed |= LowerProvenConstantStateSwitches(M);
+  Changed |= LowerExternalCalls(M);
+  Changed |= DevirtualizeRemillFunctionCalls(M);
+  Changed |= DevirtualizeRemillJumps(M);
+  Changed |= AnnotateRemillReturns(M);
+  Changed |= CleanupCallbackThunks(M);
+  Changed |= CleanupUnusedRemillDispatchers(M);
+  Changed |= LowerProvenConstantStateSwitches(M);
 
   VerifyDevirtualization(M);
 
@@ -63,8 +42,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                    ::llvm::ArrayRef<::llvm::PassBuilder::PipelineElement>) {
                   if (Name == "brighten-devirt-pass") {
                     MPM.addPass(brighten_devirt::BrightenDevirtPass());
-                    if (!brighten_devirt::RuleDisabled("global_dce"))
-                      MPM.addPass(::llvm::GlobalDCEPass());
+                    MPM.addPass(::llvm::GlobalDCEPass());
                     return true;
                   }
                   if (Name == "brighten-region-ssa-unflatten-pass") {
