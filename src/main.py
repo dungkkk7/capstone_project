@@ -586,14 +586,6 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
-    # The experiment harness is intentionally isolated from the legacy P0
-    # orchestration below.  P0 itself still enters the existing five-iteration
-    # recovery loop through a compatibility adapter.
-    if "experiment" in argv:
-        from experiments.cli import main_from_legacy
-
-        return main_from_legacy(argv)
-
     # Kiểm tra tham số
     if len(argv) < 1:
         print(f"{Color.YELLOW}Usage: python main.py <input.csv> [llm-recovery] [--no-cache] [--force-relift] [--pilot[=N]]{Color.END}")
