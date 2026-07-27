@@ -357,7 +357,7 @@ def main():
     parser.add_argument("--fuzz-iterations", type=int, default=1000, help="Number of fuzz iterations")
     parser.add_argument("--max-workers", type=int, default=15, help="Max parallel flows running simultaneously")
     parser.add_argument("--model", type=str, default="gemini-3.5-flash", help="Vertex AI model to use")
-    parser.add_argument("--rotate-regions", action="store_true", help="Rotate regional endpoints to bypass TPM rate limits")
+    parser.add_argument("--no-rotate-regions", action="store_false", dest="rotate_regions", default=True, help="Disable regional endpoints rotation")
     args = parser.parse_args()
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -373,8 +373,13 @@ def main():
         rows = rows[:args.pilot]
         
     print(f"[*] Running concurrent evaluation on {len(rows)} cases with model={args.model} and max_workers={args.max_workers}...", flush=True)
-    if args.rotate_regions or os.environ.get("VERTEX_ROTATE_REGIONS"):
-        print(f"[✓] Region rotation enabled. Distributing requests across: {', '.join(VERTEX_GEMINI_REGIONS)}")
+    rotate_enabled = args.rotate_regions
+    env_rotate = os.environ.get("VERTEX_ROTATE_REGIONS")
+    if env_rotate is not None:
+        rotate_enabled = env_rotate.lower() not in ["0", "false", "no"]
+
+    if rotate_enabled:
+        print(f"[✓] Region rotation enabled by default. Distributing requests across: {', '.join(VERTEX_GEMINI_REGIONS)}")
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"experiment_{timestamp}"
@@ -419,7 +424,7 @@ def main():
         # Add to the queue
         for flow in ["F1", "F2", "F3", "F4", "F5"]:
             # Determine location dynamically
-            if args.rotate_regions or os.environ.get("VERTEX_ROTATE_REGIONS"):
+            if rotate_enabled:
                 location = VERTEX_GEMINI_REGIONS[task_idx % len(VERTEX_GEMINI_REGIONS)]
             else:
                 location = os.environ.get("VERTEX_LOCATION", "global")
