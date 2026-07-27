@@ -58,7 +58,7 @@ VERTEX_GEMINI_REGIONS = [
     "asia-southeast1"
 ]
 
-# Custom VertexGemini client to intercept metrics
+# Custom VertexGemini client to intercept metrics and handle regional 404 fallbacks
 class ExperimentVertexGemini(VertexGemini):
     def __init__(self, config: RecoveryConfig, tracker: "CaseTracker"):
         super().__init__(config)
@@ -85,6 +85,16 @@ class ExperimentVertexGemini(VertexGemini):
         except Exception as e:
             latency = time.time() - t_start
             self.tracker.llm_latency += latency
+            
+            # Capture regional 404 NOT_FOUND errors and fallback to us-central1 (safe harbor)
+            err_msg = str(e)
+            if "404" in err_msg or "NOT_FOUND" in err_msg or "was not found" in err_msg or "does not have access" in err_msg:
+                if self.config.location != "us-central1":
+                    print(f"[!] Model [{self.config.model}] is not supported in region [{self.config.location}]. Falling back to [us-central1]...", flush=True)
+                    self.config.location = "us-central1"
+                    # Decrement the failed attempt call count before retrying
+                    self.tracker.llm_calls -= 1
+                    return self.generate(prompt, attachment_path, attachment_paths, system_instruction)
             raise e
 
 class CaseTracker:
