@@ -454,20 +454,26 @@ def main():
     
     all_trackers = []
     # Submit all tasks to the ProcessPoolExecutor
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
-        futures = {
-            executor.submit(flow_worker, *task): task for task in tasks_to_run
-        }
-        
-        for future in concurrent.futures.as_completed(futures):
-            task_info = futures[future]
-            sample_id, flow_id = task_info[0], task_info[1]
-            try:
-                tracker = future.result()
-                if tracker:
-                    all_trackers.append(tracker)
-            except Exception as exc:
-                print(f"[✗] Future task {flow_id} of {sample_id} generated an exception: {exc}", flush=True)
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+            futures = {
+                executor.submit(flow_worker, *task): task for task in tasks_to_run
+            }
+            
+            for future in concurrent.futures.as_completed(futures):
+                task_info = futures[future]
+                sample_id, flow_id = task_info[0], task_info[1]
+                try:
+                    tracker = future.result()
+                    if tracker:
+                        all_trackers.append(tracker)
+                except Exception as exc:
+                    print(f"[✗] Future task {flow_id} of {sample_id} generated an exception: {exc}", flush=True)
+    except KeyboardInterrupt:
+        print("\n[!] Ctrl+C detected! Instantly terminating all concurrent worker processes...", flush=True)
+        import os, signal
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+        sys.exit(1)
                 
     # Export metrics CSVs
     export_metrics_csvs(all_trackers, reports_dir, experiment_id)
