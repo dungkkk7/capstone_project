@@ -254,7 +254,7 @@ def _run_fuzzer_sync(
             generator=generator,
             timeout=timeout,
             compare_stderr=False,
-            num_workers=16,
+            num_workers=4,
         )
     finally:
         fuzzer.cleanup()
