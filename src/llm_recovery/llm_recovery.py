@@ -3555,6 +3555,10 @@ def run_recovery_loop(
         except RecoveryError as exc:
             last_request_error = str(exc)
             print(f"[LLM] Model request lỗi: {last_request_error}")
+            if isinstance(exc, LLMEmptyResponseError):
+                print(f"[LLM] [!] Nhận phản hồi rỗng từ Vertex REST (safety block/recitation/timeout). Bỏ qua và tiếp tục vòng lặp sửa lỗi.")
+                last_error = f"LLM empty response: {exc}"
+                continue
             raise
         if response is None:
             print(f"[LLM] Không nhận được phản hồi model ở iteration {iteration}")
