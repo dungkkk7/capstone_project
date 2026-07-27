@@ -603,10 +603,15 @@ def main(argv=None):
             print(f"{Color.RED}[✗] Giá trị --pilot phải là số nguyên dương.{Color.END}")
             return 1
     llm_recovery_mode = "llm-recovery" in argv or "--llm-recovery" in argv
+    mode_flag = next((a for a in argv if a.startswith("--mode=")), None)
+    run_mode = mode_flag.split("=", 1)[1] if mode_flag else "clean_ir_and_pseudocode"
+
+    print(f"{Color.BLUE}[*] Pipeline Execution Mode: {run_mode}{Color.END}")
+
     # Lọc ra các flag để lấy đường dẫn CSV
     positional_args = [a for a in argv if not a.startswith("--") and a != "llm-recovery"]
     if not positional_args:
-        print(f"{Color.YELLOW}Usage: python main.py <input.csv> [llm-recovery] [--no-cache] [--force-relift] [--pilot[=N]]{Color.END}")
+        print(f"{Color.YELLOW}Usage: python main.py <input.csv> [llm-recovery] [--mode=raw_ir|clean_pseudocode|clean_ir|clean_ir_and_pseudocode]{Color.END}")
         return 1
 
     # CSV chứa danh sách binary bị obfuscate
