@@ -2,7 +2,7 @@
 
 Dự án này xây dựng một hệ thống khôi phục mã nguồn C11 tự động từ các file nhị phân Linux (ELF x86_64) bị làm rối (obfuscate) bằng framework OLLVM (Control Flow Flattening - CFF, Bogus Control Flow - BCF, Mixed Boolean Arithmetic - MBA).
 
-Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass 010–100** (Làm sạch IR / Brightening), **LLVM-to-C Transpiler**, **Mô hình ngôn ngữ lớn LLM (Gemini)** với **4 Chế độ thực thi (4 Pipeline Modes)**, và bộ kiểm định tương đương ngữ nghĩa bằng **AFL++ Mutation Hook Differential Fuzzing (1,000 mutations)**.
+Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass 010–100** (Làm sạch IR / Brightening), **LLVM-to-C Transpiler**, **Mô hình ngôn ngữ lớn LLM (Gemini)** với **5 Chế độ thực thi (5 Pipeline Flows)**, và bộ kiểm định tương đương ngữ nghĩa bằng **AFL++ Mutation Hook Differential Fuzzing (1,000 mutations)**.
 
 ---
 
@@ -13,7 +13,7 @@ Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass
    - [Phase 1: Binary Lifting (McSema / Remill)](#phase-1-binary-lifting-mcsema--remill)
    - [Phase 2: LLVM Deobfuscation Pipeline (Passes 010 $\rightarrow$ 100)](#phase-2-llvm-deobfuscation-pipeline-passes-010--100)
    - [Phase 3: Transpilation (LLVM-to-C Transpiler)](#phase-3-transpilation-llvm-to-c-transpiler)
-   - [Phase 4: LLM-Assisted C Recovery (4 Pipeline Modes)](#phase-4-llm-assisted-c-recovery-4-pipeline-modes)
+   - [Phase 4: LLM-Assisted C Recovery (5 Pipeline Flows)](#phase-4-llm-assisted-c-recovery-5-pipeline-flows)
    - [Phase 5: Differential Fuzzing Verification (AFL++ Mutation Hook)](#phase-5-differential-fuzzing-verification-afl-mutation-hook)
    - [Phase 6: Metrics Evaluation & CSV Exporter](#phase-6-metrics-evaluation--csv-exporter)
 3. [Hướng Dẫn Cấu Hình (Configuration Guide)](#3-hướng-dẫn-cấu-hình-configuration-guide)
@@ -56,13 +56,14 @@ flowchart TD
     P100 --> C[Clean LLVM IR *_final.ll]
     C -->|tools/llvm_to_c.py| D[LLVM-to-C Pseudocode *_llvm2c.c]
 
-    subgraph LLM_Recovery_Engine ["LLM Recovery Engine (4 Modes)"]
-        C --> Mode3[Mode 3: Clean IR]
-        D --> Mode2[Mode 2: Clean Pseudocode]
-        B --> Mode1[Mode 1: Raw IR]
-        C & D --> Mode4[Mode 4: Clean IR + Pseudocode]
+    subgraph LLM_Recovery_Engine ["LLM Recovery Engine (5 Flows)"]
+        C --> Mode3[Flow 4: Clean IR]
+        D --> Mode2[Flow 1: Clean Pseudocode]
+        B --> Mode1[Flow 3: Raw IR]
+        C & D --> Mode4[Flow 2: Clean IR + Pseudocode]
+        C & D --> Mode5[Flow 5: Clean IR + Pseudocode One-shot]
         
-        Mode1 & Mode2 & Mode3 & Mode4 --> LLM[Vertex AI / Gemini Model]
+        Mode1 & Mode2 & Mode3 & Mode4 & Mode5 --> LLM[Vertex AI / Gemini Model]
     end
 
     LLM --> E[Recovered C11 Code]
@@ -120,29 +121,33 @@ Bộ pass LLVM tùy biến được thiết kế chạy tuần tự trong `src/l
 
 ---
 
-### Phase 4: LLM-Assisted C Recovery (4 Pipeline Modes)
+### Phase 4: LLM-Assisted C Recovery (5 Pipeline Flows)
 
-Hệ thống hỗ trợ 4 chế độ chạy chủ động thông qua tham số `--mode`:
+Hệ thống hỗ trợ 5 chế độ khôi phục mã nguồn C (Flows) thông qua tham số `--mode`:
 
 ```bash
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=<MODE_NAME>
 ```
 
-#### 1. Mode 1: `raw_ir`
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Raw LLVM IR` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C`
-- **Mục đích**: Đẩy trực tiếp mã LLVM IR thô chưa qua làm sạch vào LLM. Dùng để đánh giá khả năng tự deobfuscate của LLM khi không có sự hỗ trợ của LLVM Pass.
+#### 1. Flow 1: `clean_pseudocode` (Có Vòng Lặp Fuzzing)
+- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR` $\rightarrow$ `LLVM-to-C Transpiler` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi dựa trên feedback fuzzing).
+- **Mục đích**: Chuyển đổi Clean IR sang dạng mã giả C để giúp LLM dễ đọc hiểu cấu trúc logic thuật toán, kèm cơ chế tự sửa sai qua 5 vòng.
 
-#### 2. Mode 2: `clean_pseudocode`
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR` $\rightarrow$ `LLVM-to-C Transpiler` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C`
-- **Mục đích**: Đẩy mã giả C pseudocode thu được sau transpilation vào LLM để tái tạo mã C tiêu chuẩn.
+#### 2. Flow 2: `clean_ir_and_pseudocode` (Có Vòng Lặp Fuzzing)
+- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR + LLVM-to-C Pseudocode` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi dựa trên feedback fuzzing).
+- **Mục đích**: Cung cấp **song song cả 2 chứng cứ** (Clean IR cho chính xác toán học/memory, Pseudocode cho cấu trúc hàm/ABI), kết hợp sửa lỗi tự động.
 
-#### 3. Mode 3: `clean_ir`
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Passes 010-100` $\rightarrow$ `Clean IR` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C`
-- **Mục đích**: Đẩy mã LLVM IR sạch đã deobfuscate hoàn toàn bởi Pass 010-100 vào LLM.
+#### 3. Flow 3: `raw_ir` (Có Vòng Lặp Fuzzing)
+- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Raw LLVM IR` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi).
+- **Mục đích**: Đẩy trực tiếp mã LLVM IR thô chưa qua làm sạch vào LLM để đánh giá khả năng tự deobfuscate thô của mô hình.
 
-#### 4. Mode 4: `clean_ir_and_pseudocode` (Default - Dual Evidence)
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Passes 010-100` $\rightarrow$ `Clean IR + LLVM-to-C Pseudocode` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C`
-- **Mục đích**: Cung cấp **song song cả 2 chứng cứ** (Clean IR cho chính xác toán học/memory, Pseudocode cho cấu trúc hàm/ABI). Đây là chế độ đạt hiệu quả cao nhất.
+#### 4. Flow 4: `clean_ir` (Có Vòng Lặp Fuzzing)
+- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi).
+- **Mục đích**: Đẩy mã LLVM IR sạch đã được tối ưu hóa và gỡ rối hoàn toàn vào LLM.
+
+#### 5. Flow 5: `clean_ir_and_pseudocode` (One-shot - Không Có Vòng Lặp Fuzzing)
+- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR + LLVM-to-C Pseudocode` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (không qua vòng lặp sửa sai).
+- **Mục đích**: Đánh giá hiệu suất khôi phục mã nguồn trực tiếp trong 1 lượt duy nhất (One-shot) khi không có sự hỗ trợ của cơ chế phản hồi lỗi.
 
 ---
 
