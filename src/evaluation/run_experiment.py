@@ -92,6 +92,7 @@ class ExperimentVertexGemini(VertexGemini):
                 if self.config.location != "us-central1":
                     print(f"[!] Model [{self.config.model}] is not supported in region [{self.config.location}]. Falling back to [us-central1]...", flush=True)
                     self.config.location = "us-central1"
+                    self._client = None  # Force client re-initialization with the new location
                     # Decrement the failed attempt call count before retrying
                     self.tracker.llm_calls -= 1
                     return self.generate(prompt, attachment_path, attachment_paths, system_instruction)
