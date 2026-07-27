@@ -1609,7 +1609,7 @@ int main(int argc, char** argv) {
             stats_file = os.path.join(out_dir, "default/fuzzer_stats")
             
             start_time = time.time()
-            max_fuzz_time = float(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "3.0"))
+            max_fuzz_time = float(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "1.0"))
             
             print(
                 f"{Color.BLUE}[*] AFL++ Mutation Hook: Running AFL++ mutation for {max_fuzz_time}s to collect mutated inputs...{Color.END}"
@@ -1630,7 +1630,7 @@ int main(int argc, char** argv) {
                     break
                 if time.time() - start_time > max_fuzz_time:
                     break
-                time.sleep(0.5)
+                time.sleep(0.1)
                 
             proc_fuzz.terminate()
             try:
