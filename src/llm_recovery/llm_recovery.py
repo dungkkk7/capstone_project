@@ -2325,11 +2325,17 @@ class VertexGemini:
         except ImportError as exc:
             raise RecoveryError("Python package 'requests' is required.") from exc
 
-        if self.config.api_key:
+        adc_credentials = None
+        try:
+            adc_credentials = _load_adc_credentials()
+        except Exception:
+            adc_credentials = None
+
+        if self.config.api_key and not adc_credentials:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.model}:generateContent?key={self.config.api_key}"
             headers = {"Content-Type": "application/json"}
         else:
-            credentials = _load_adc_credentials()
+            credentials = adc_credentials or _load_adc_credentials()
             access_token = _request_access_token_via_refresh(credentials)
             project = self.config.project or _text(credentials.get("quota_project_id"))
             if not project:

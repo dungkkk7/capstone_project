@@ -6,11 +6,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL & SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL = "gemini-3.5-flash"          # Tên model Vertex AI / Gemini
+MODEL = "gemini-2.5-flash"          # Tên model Vertex AI / Gemini
 TEMPERATURE = 0.1                   # 0.0 = deterministic, 1.0 = creative
 MAX_OUTPUT_TOKENS = 65535           # Max output tokens (65,535 cho Gemini 2.5 Flash / Pro)
 MAX_REPAIR_ITERATIONS = 5           # Số vòng lặp sửa lỗi tối đa
 FUZZ_ITERATIONS = 1000              # Số mutation AFL++ cho semantic check
+
 
 UNIFIED_SYSTEM_PROMPT = r"""
 You are a senior reverse engineer, program-synthesis researcher and C11
@@ -160,28 +161,40 @@ translation unit.
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODE 1: Raw IR → LLM (Obfuscated binary → Raw LLVM IR → LLM → C)
-# {RAW_IR} = nội dung file .ll thô sau khi lifting, chưa deobfuscate
-# ─────────────────────────────────────────────────────────────────────────────
-PROMPT_RAW_IR = """Below is the raw LLVM IR lifted directly from an obfuscated binary.
-It contains OLLVM control flow flattening, bogus control flow and mixed boolean
-arithmetic that have NOT been cleaned. Recover the original C11 program from it.
+UNIFIED_RECONSTRUCTION_PROMPT = r"""
+Reconstruct a semantically equivalent standalone C11 translation unit from
+the following evidence bundle.
 
-<MODEL_INPUT_ARTIFACT type="raw lifted LLVM IR">
-{RAW_IR}
-</MODEL_INPUT_ARTIFACT>
+<RECONSTRUCTION_MODE>
+{MODE_NAME}
+</RECONSTRUCTION_MODE>
+
+<EVIDENCE_PROFILE>
+{EVIDENCE_PROFILE}
+</EVIDENCE_PROFILE>
+
+<EVIDENCE_BUNDLE>
+{ARTIFACT_BLOCKS}
+</EVIDENCE_BUNDLE>
+
+<PREVIOUS_CANDIDATE>
+{PREVIOUS_CANDIDATE}
+</PREVIOUS_CANDIDATE>
+
+<VALIDATION_FEEDBACK>
+{VALIDATION_FEEDBACK}
+</VALIDATION_FEEDBACK>
+
+Apply the common Evidence-Grounded CEGIS protocol.
+
+When PREVIOUS_CANDIDATE and VALIDATION_FEEDBACK are empty, synthesize the
+initial candidate.
+
+When they are present, locate the earliest evidence-supported semantic
+divergence and regenerate the complete corrected translation unit.
 
 Return the complete raw C11 translation unit only.
 """
-
-# Mô tả evidence tương ứng để điền vào {MODE_EVIDENCE} trong SYSTEM_PROMPT
-MODE_EVIDENCE_RAW_IR = (
-    "This request carries raw lifted LLVM IR. The IR still contains OLLVM "
-    "obfuscation; derive semantics from concrete def-use chains, literal "
-    "strings, ABI calls and memory widths. Ignore dispatcher constants."
-)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODE 2: Clean Pseudocode (LLVM-to-C transpiled) → LLM
