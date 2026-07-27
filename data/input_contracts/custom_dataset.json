@@ -109,7 +109,7 @@
       "termination": "n=0",
       "constraints": {
         "n_min": 1,
-        "n_max": 1000,
+        "n_max": 25,
         "values_per_count": 3,
         "count_offset": 0
       },
