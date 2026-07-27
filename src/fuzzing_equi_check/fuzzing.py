@@ -1600,50 +1600,68 @@ int main(int argc, char** argv) {
             fuzz_env["AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"] = "1"
             fuzz_env["AFL_PATH"] = self.afl_path
             
-            # 4. Run AFL++ with live mutation hook loop until requested iterations (1000) are collected
+            # 4. Run AFL++ and poll fuzzer_stats until execs_done >= iterations (1000 mutations tried)
             proc_fuzz = subprocess.Popen(cmd_fuzz, env=fuzz_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            generated_inputs = []
-            seen = set()
             queue_dir = os.path.join(out_dir, "default/queue")
             crashes_dir = os.path.join(out_dir, "default/crashes")
             hangs_dir = os.path.join(out_dir, "default/hangs")
+            stats_file = os.path.join(out_dir, "default/fuzzer_stats")
             
             start_time = time.time()
             max_fuzz_time = int(os.environ.get("BRIGHTEN_AFL_MAX_TIME", "180"))
             
             print(
-                f"{Color.BLUE}[*] AFL++ Mutation Hook: Polling AFL++ queue to generate {iterations} mutated inputs "
+                f"{Color.BLUE}[*] AFL++ Mutation Hook: Waiting for AFL++ to complete {iterations} mutation executions "
                 f"(max timeout {max_fuzz_time}s)...{Color.END}"
             )
             
-            while len(generated_inputs) < iterations:
-                for d in [queue_dir, crashes_dir, hangs_dir]:
-                    if os.path.exists(d):
-                        for filename in os.listdir(d):
-                            if filename.startswith("."):
-                                continue
-                            filepath = os.path.join(d, filename)
-                            if os.path.isfile(filepath):
-                                try:
-                                    with open(filepath, "rb") as f:
-                                        content = f.read()
-                                        if content not in seen:
-                                            seen.add(content)
-                                            generated_inputs.append(content)
-                                except Exception:
-                                    pass
-                if len(generated_inputs) >= iterations:
+            execs_done = 0
+            while execs_done < iterations:
+                if os.path.exists(stats_file):
+                    try:
+                        with open(stats_file, "r") as sf:
+                            for line in sf:
+                                if line.startswith("execs_done"):
+                                    execs_done = int(line.split(":")[1].strip())
+                                    break
+                    except Exception:
+                        pass
+                if execs_done >= iterations:
                     break
                 if time.time() - start_time > max_fuzz_time:
                     break
-                time.sleep(0.2)
+                time.sleep(0.5)
                 
             proc_fuzz.terminate()
             try:
                 proc_fuzz.wait(timeout=2)
             except Exception:
                 proc_fuzz.kill()
+
+            print(
+                f"{Color.BLUE}[*] AFL++ completed {execs_done} mutation executions. "
+                f"Collecting queue inputs for differential testing...{Color.END}"
+            )
+                
+            # Collect all inputs from queue/crashes/hangs for differential testing
+            generated_inputs = []
+            seen = set()
+            for d in [queue_dir, crashes_dir, hangs_dir]:
+                if os.path.exists(d):
+                    for filename in sorted(os.listdir(d)):
+                        if filename.startswith("."):
+                            continue
+                        filepath = os.path.join(d, filename)
+                        if os.path.isfile(filepath):
+                            try:
+                                with open(filepath, "rb") as f:
+                                    content = f.read()
+                                    if content not in seen:
+                                        seen.add(content)
+                                        generated_inputs.append(content)
+                            except Exception:
+                                pass
                 
             if not generated_inputs:
                 print(f"{Color.YELLOW}[!] AFL++ did not generate inputs. Using seeds.{Color.END}")
