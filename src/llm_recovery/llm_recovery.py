@@ -126,7 +126,7 @@ class RecoveryConfig:
         # HIGH can consume nearly the entire 65,535 output-token budget as
         # hidden thoughts, leaving only a few thousand tokens for C source.
         default_factory=lambda: _optional_env(
-            "LLM_RECOVERY_THINKING_LEVEL", "LOW"
+            "LLM_RECOVERY_THINKING_LEVEL", None
         )
     )
     llm_timeout: float = field(
@@ -2276,14 +2276,10 @@ def _vertex_generation_config(config: RecoveryConfig) -> Dict[str, Any]:
         generation_config["responseMimeType"] = "application/json"
         generation_config["responseSchema"] = _recovery_response_schema()
     thinking_level = _text(config.thinking_level).upper()
-    if thinking_level:
+    if thinking_level and ("pro" in _text(config.model).lower() or os.environ.get("LLM_RECOVERY_THINKING_LEVEL")):
         allowed = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
-        if thinking_level not in allowed:
-            raise RecoveryError(
-                f"Invalid LLM_RECOVERY_THINKING_LEVEL={config.thinking_level!r}; "
-                f"expected one of {sorted(allowed)}."
-            )
-        generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+        if thinking_level in allowed:
+            generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
     return generation_config
 
 
@@ -2434,9 +2430,9 @@ class VertexGemini:
                     f"Vertex REST context overflow: HTTP "
                     f"{response.status_code}: {detail}"
                 )
-            if response.status_code in {408, 409, 499, 500, 502, 503, 504}:
+            if response.status_code in {408, 409, 429, 499, 500, 502, 503, 504}:
                 raise LLMTransientError(
-                    f"Vertex REST transient failure: HTTP {response.status_code}: {detail}",
+                    f"Vertex REST transient rate-limit/failure: HTTP {response.status_code}: {detail}",
                     status_code=response.status_code,
                 )
             raise RecoveryError(f"Vertex REST failed: HTTP {response.status_code}: {detail}")
