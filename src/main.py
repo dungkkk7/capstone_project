@@ -635,19 +635,23 @@ def main(argv=None):
     if llm_recovery_mode:
         print(f"{Color.BLUE}[*] Chế độ LLM recovery: bổ sung vòng recover + fuzz sau semantic baseline.{Color.END}")
         llm_config = RecoveryConfig()
-        seed_mode = str(llm_config.pseudo_backend or "").strip().lower()
-        if seed_mode in {"1", "ida", "idapro", "idat", "ida-only", "idaonly"}:
-            seed_label = "1 (Ghidra pseudocode)"
-        elif seed_mode in {"2", "ir", "llvm", "raw_ir", "raw"}:
-            seed_label = "2 (direct IR)"
-        elif not seed_mode and llm_config.two_stage_recovery:
-            seed_label = "1 (Ghidra pseudocode - default)"
+        if run_mode in {"clean_pseudocode", "llvm2c", "clean_ir_and_pseudocode"}:
+            llm_config.pseudo_backend = "llvm2c"
+        elif run_mode in {"raw_ir", "clean_ir"}:
+            llm_config.pseudo_backend = "ir"
         else:
-            seed_label = seed_mode or "auto"
-        print(f"{Color.BLUE}[*] LLM model: {llm_config.model} | Vertex location: {llm_config.location}{Color.END}")
-        if not seed_mode:
-            seed_label = "1 (Ghidra pseudocode - default)"
-        print(f"{Color.BLUE}[*] LLM seed mode (1=Ghidra -> LLM, 2=IR -> LLM): {seed_label}{Color.END}")
+            llm_config.pseudo_backend = "llvm2c"
+        seed_mode = str(llm_config.pseudo_backend or "").strip().lower()
+        if seed_mode in {"llvm2c", "clean_pseudocode", "llvm-to-c"}:
+            seed_label = "LLVM-to-C Transpiler (pseudocode)"
+        elif seed_mode in {"2", "ir", "llvm", "raw_ir", "raw"}:
+            seed_label = "Direct IR"
+        elif seed_mode in {"1", "ghidra"}:
+            seed_label = "Ghidra pseudocode"
+        else:
+            seed_label = seed_mode
+        print(f"{Color.BLUE}[*] LLM model: {llm_config.model} | Max Tokens: {llm_config.max_output_tokens}{Color.END}")
+        print(f"{Color.BLUE}[*] LLM seed mode: {seed_label}{Color.END}")
 
     binary_paths = []
     try:

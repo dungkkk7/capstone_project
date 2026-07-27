@@ -112,6 +112,11 @@ class RecoveryConfig:
     top_p: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_TOP_P", "0.9"))
     )
+    api_key: Optional[str] = field(
+        default_factory=lambda: _optional_env("GEMINI_API_KEY")
+        or _optional_env("GOOGLE_API_KEY")
+        or (getattr(_prompts_cfg, "API_KEY", None) if _prompts_cfg else None)
+    )
     # The experiment protocol permits exactly one candidate per provider
     # response.  Keep this explicit instead of relying on provider defaults.
     candidate_count: int = 1
@@ -2297,13 +2302,18 @@ class VertexGemini:
             from google import genai
         except ImportError as exc:
             return None
-        kwargs: Dict[str, Any] = {"vertexai": True, "location": self.config.location}
-        if self.config.project:
-            kwargs["project"] = self.config.project
+        kwargs: Dict[str, Any] = {}
+        if self.config.api_key:
+            kwargs["api_key"] = self.config.api_key
+        else:
+            kwargs["vertexai"] = True
+            kwargs["location"] = self.config.location
+            if self.config.project:
+                kwargs["project"] = self.config.project
         try:
             self._client = genai.Client(**kwargs)
         except Exception as exc:
-            raise RecoveryError(f"Could not initialize Vertex Gemini client: {exc}") from exc
+            raise RecoveryError(f"Could not initialize Gemini client: {exc}") from exc
         return self._client
 
     def _generate_rest(
@@ -2313,26 +2323,36 @@ class VertexGemini:
         attachment_paths: Optional[Sequence[str]] = None,
         system_instruction: Optional[str] = None,
     ) -> str:
-        """Call Vertex AI generateContent through REST with ADC credentials."""
-        credentials = _load_adc_credentials()
-        access_token = _request_access_token_via_refresh(credentials)
-
-        project = self.config.project or _text(credentials.get("quota_project_id"))
-        if not project:
-            raise RecoveryError(
-                "Could not determine Vertex AI project. Set VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT."
-            )
-
+        """Call Gemini generateContent through REST with API Key or ADC credentials."""
         try:
             import requests
         except ImportError as exc:
             raise RecoveryError("Python package 'requests' is required.") from exc
 
-        url = (
-            f"{_vertex_api_base_url(self.config.location)}/"
-            f"v1/projects/{project}/locations/{self.config.location}/"
-            f"publishers/google/models/{self.config.model}:generateContent"
-        )
+        if self.config.api_key:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.model}:generateContent?key={self.config.api_key}"
+            headers = {"Content-Type": "application/json"}
+        else:
+            credentials = _load_adc_credentials()
+            access_token = _request_access_token_via_refresh(credentials)
+            project = self.config.project or _text(credentials.get("quota_project_id"))
+            if not project:
+                raise RecoveryError(
+                    "Could not determine Vertex AI project. Set VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT."
+                )
+            url = (
+                f"{_vertex_api_base_url(self.config.location)}/"
+                f"v1/projects/{project}/locations/{self.config.location}/"
+                f"publishers/google/models/{self.config.model}:generateContent"
+            )
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            }
+            quota_project = self.config.project or _text(credentials.get("quota_project_id"))
+            if quota_project:
+                headers["x-goog-user-project"] = quota_project
+
         paths: List[str] = []
         if attachment_path:
             paths.append(_text(attachment_path))
@@ -2380,13 +2400,6 @@ class VertexGemini:
             payload["systemInstruction"] = {
                 "parts": [{"text": str(system_instruction)}]
             }
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        }
-        quota_project = self.config.project or _text(credentials.get("quota_project_id"))
-        if quota_project:
-            headers["x-goog-user-project"] = quota_project
 
         try:
             timeout = self.config.request_timeout
@@ -2922,18 +2935,28 @@ def run_recovery_loop(
     )
 
     backend = _text(config.pseudo_backend).strip().lower()
-    if not backend:
-        backend = "1" if config.two_stage_recovery else "2"
-    if backend in {"1", "ghidra", "ghidra-only", "analyzeheadless"}:
+    if backend in {"llvm2c", "clean_pseudocode", "llvm-to-c", "llvm_to_c"}:
+        backend_mode = "llvm2c"
+    elif backend in {"1", "ghidra", "ghidra-only", "analyzeheadless"}:
         backend_mode = "ghidra"
     elif backend in {"2", "ir", "llvm", "raw_ir", "raw"}:
         backend_mode = "ir"
-    elif backend == "auto":
-        backend_mode = "ghidra"
     else:
-        raise RecoveryError(
-            f"pseudo_backend không hợp lệ: {backend}. Chỉ cho phép: 1/ghidra (Ghidra pseudo) hoặc 2/ir (IR raw)."
-        )
+        backend_mode = "llvm2c"
+
+    if backend_mode == "llvm2c":
+        print("[LLM] Mode 2: Transpile LLVM IR sang C Pseudocode (LLVM-to-C Transpiler) cho LLM.")
+        pseudo_path = os.path.join(output_dir, "clean_pseudocode.c")
+        input_ir = _text(metadata.get("input_ir")) if isinstance(metadata, Mapping) else ""
+        if input_ir and os.path.isfile(input_ir):
+            try:
+                from tools.llvm_to_c import transpile_llvm_ir_to_c
+                transpile_llvm_ir_to_c(input_ir, pseudo_path)
+                pseudo_source = Path(pseudo_path).read_text(encoding="utf-8", errors="replace")
+                print(f"[LLM] [✓] Đã transpile LLVM IR sang C pseudocode thành công: {pseudo_path}")
+            except Exception as e:
+                print(f"[LLM] [!] Lỗi transpile LLVM-to-C: {e}")
+        pseudo_path_for_api = pseudo_path
 
     use_two_stage = backend_mode == "ghidra"
     if use_two_stage:

@@ -8,6 +8,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 MODEL = "gemini-2.5-flash"          # Tên model Vertex AI / Gemini
 TEMPERATURE = 0.1                   # 0.0 = deterministic, 1.0 = creative
+MAX_OUTPUT_TOKENS = 65535           # Max output tokens (65,535 cho Gemini 2.5 Flash / Pro)
 MAX_REPAIR_ITERATIONS = 5           # Số vòng lặp sửa lỗi tối đa
 FUZZ_ITERATIONS = 1000              # Số mutation AFL++ cho semantic check
 
