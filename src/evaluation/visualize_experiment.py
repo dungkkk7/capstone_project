@@ -649,7 +649,7 @@ def _plot_heatmaps(df: pd.DataFrame, fig_dir: str):
     pivot_df = df.pivot(index="sample_id", columns="flow_id", values="status")
     # Convert status strings to numeric for heatmap coloring
     status_mapping = {"PASS": 3, "INCONCLUSIVE": 2, "FAIL_BEHAVIORAL": 1, "FAIL_COMPILE": 0}
-    numeric_pivot = pivot_df.replace(status_mapping)
+    numeric_pivot = pivot_df.replace(status_mapping).apply(pd.to_numeric, errors='coerce')
     
     fig, ax = plt.subplots(figsize=(8, 6))
     sns.heatmap(numeric_pivot, cmap="RdYlGn", annot=pivot_df, fmt="", cbar=False, ax=ax)
@@ -660,7 +660,7 @@ def _plot_heatmaps(df: pd.DataFrame, fig_dir: str):
 
     # Match rate heatmap
     df["match_rate"] = (df["fuzz_matches"] / df["fuzz_total"].replace(0, 1)) * 100
-    pivot_mr = df.pivot(index="sample_id", columns="flow_id", values="match_rate")
+    pivot_mr = df.pivot(index="sample_id", columns="flow_id", values="match_rate").apply(pd.to_numeric, errors='coerce')
     fig, ax = plt.subplots(figsize=(8, 6))
     sns.heatmap(pivot_mr, cmap="YlGnBu", annot=True, fmt=".1f", ax=ax)
     ax.set_title("Sample × Flow Input Match Rate Heatmap (%)")
