@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - supports direct CLI execution
     )
 
 
-DEFAULT_EXECUTION_TIMEOUT = 0.5
+DEFAULT_EXECUTION_TIMEOUT = 0.15
 DEFAULT_AFL_FUZZ_SECONDS = 1.0
 DEFAULT_AFL_INITIAL_CORPUS_LIMIT = 1000
 
