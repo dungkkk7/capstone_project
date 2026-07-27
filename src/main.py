@@ -1178,6 +1178,20 @@ def main(argv=None):
     print(f"{Color.BLUE}[*] Tất cả kết quả được lưu tại: {result_pipeline_root}{Color.END}")
     print(f"{Color.BLUE}{Color.BOLD}" + "="*80 + f"{Color.END}")
 
+    # ── Auto-run evaluation: collect metrics CSV ────────────────────────────
+    try:
+        import sys as _sys
+        _eval_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation")
+        if _eval_dir not in _sys.path:
+            _sys.path.insert(0, _eval_dir)
+        from evaluation.collect_metrics import run_collect  # type: ignore
+        _csv_path = os.path.join(result_pipeline_root, "metrics.csv")
+        print(f"\n{Color.BLUE}[*] Đang tạo metrics CSV...{Color.END}")
+        run_collect(result_pipeline_root, _csv_path)
+    except Exception as _e:
+        print(f"{Color.YELLOW}[!] Evaluation metrics skipped: {_e}{Color.END}")
+    # ────────────────────────────────────────────────────────────────────────
+
     return 0
 
 if __name__ == "__main__":

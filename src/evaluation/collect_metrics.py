@@ -206,6 +206,7 @@ def compute_semantic_metrics(fuzz_report):
 
     is_pass = (
         status == "pass"
+        or fuzz_report.get("is_fully_equivalent", False)
         or (total > 0 and mismatches == 0 and matches == total)
     )
 
@@ -214,7 +215,17 @@ def compute_semantic_metrics(fuzz_report):
         if compile_err:
             fail_reason = "compile_error"
         elif mismatches > 0:
-            fail_reason = f"fuzz_mismatch({mismatches})"
+            # Get specific reason from first mismatch example
+            ex = (fuzz_report.get("mismatch_examples") or [{}])[0]
+            detail = ex.get("reason", "") or ""
+            if "timeout" in detail.lower():
+                fail_reason = f"timeout_vs_success({mismatches})"
+            elif "returncode" in detail.lower():
+                fail_reason = f"returncode_mismatch({mismatches})"
+            elif "stdout" in detail.lower():
+                fail_reason = f"stdout_mismatch({mismatches})"
+            else:
+                fail_reason = f"fuzz_mismatch({mismatches})"
         elif timeouts > 0:
             fail_reason = f"timeout({timeouts})"
         elif crashes > 0:
@@ -223,12 +234,12 @@ def compute_semantic_metrics(fuzz_report):
             fail_reason = "unknown"
 
     return {
-        "semantic_pass":       "PASS" if is_pass else "FAIL",
-        "semantic_fail_reason": fail_reason,
-        "fuzz_total":          total,
-        "fuzz_matches":        matches,
-        "fuzz_mismatches":     mismatches,
-        "fuzz_match_pct":      round(matches / total * 100.0, 2) if total > 0 else 0.0,
+        "semantic_pass":        "PASS" if is_pass else "FAIL",
+        "semantic_fail_reason":  fail_reason,
+        "fuzz_total":           total,
+        "fuzz_matches":         matches,
+        "fuzz_mismatches":      mismatches,
+        "fuzz_match_pct":       round(matches / total * 100.0, 2) if total > 0 else 0.0,
     }
 
 
@@ -347,30 +358,25 @@ def collect_case(case_dir, pipeline_dir=None):
     return row
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Collect pipeline metrics into a CSV.")
-    parser.add_argument(
-        "--pipeline-dir", default="result/pipeline_20260727_170911",
-        help="Directory containing per-case result subdirectories"
-    )
-    parser.add_argument(
-        "--output", default="result/metrics.csv",
-        help="Output CSV path"
-    )
-    args = parser.parse_args()
+def _latest_pipeline_dir(base="result"):
+    """Auto-detect the latest pipeline_YYYYMMDD_HHMMSS directory."""
+    dirs = sorted(glob.glob(os.path.join(base, "pipeline_*")))
+    if dirs:
+        return dirs[-1]
+    return None
 
-    pipeline_dir = args.pipeline_dir
-    output_path  = args.output
 
+def run_collect(pipeline_dir: str, output_path: str) -> dict:
+    """Run metrics collection and return summary dict. Called by src/main.py."""
     case_dirs = sorted(
         d for d in glob.glob(os.path.join(pipeline_dir, "p*"))
         if os.path.isdir(d) and re.match(r"p\d+", Path(d).name)
     )
     if not case_dirs:
-        print(f"[!] No case directories found under: {pipeline_dir}")
-        sys.exit(1)
+        return {"error": f"No case dirs found under {pipeline_dir}"}
 
-    print(f"[*] Collecting metrics for {len(case_dirs)} cases from: {pipeline_dir}")
+    n = len(case_dirs)
+    print(f"[*] Evaluation: collecting metrics for {n} cases → {output_path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     rows = []
@@ -383,11 +389,10 @@ def main():
             loc_red = row.get("loc_reduction_pct", 0)
             bb_red  = row.get("bb_reduction_pct", 0)
             cc_red  = row.get("cyclomatic_reduction_pct", 0)
-            sw_elim = row.get("switch_elim_pct", 0)
             print(
-                f"  [{i:02d}/40] {case_id:<9} | LOC↓{loc_red:5.1f}% "
-                f"| BB↓{bb_red:5.1f}% | CC↓{cc_red:5.1f}% | SW↓{sw_elim:5.1f}% "
-                f"| Semantic: {sem}"
+                f"  [{i:02d}/{n}] {case_id:<9} | LOC↓{loc_red:5.1f}%"
+                f" | BB↓{bb_red:5.1f}% | CC↓{cc_red:5.1f}%"
+                f" | Semantic: {sem}"
             )
         except Exception as e:
             print(f"  [!] {case_id}: ERROR - {e}")
@@ -399,24 +404,58 @@ def main():
         for row in rows:
             writer.writerow({c: row.get(c, "") for c in CSV_COLUMNS})
 
-    print(f"\n[✓] Metrics CSV saved: {output_path}  ({len(rows)} rows × {len(CSV_COLUMNS)} columns)")
-
-    # Summary
     pass_count = sum(1 for r in rows if r.get("semantic_pass") == "PASS")
-    avg_loc = sum(float(r.get("loc_reduction_pct", 0) or 0) for r in rows) / len(rows)
-    avg_bb  = sum(float(r.get("bb_reduction_pct", 0) or 0)  for r in rows) / len(rows)
-    avg_cc  = sum(float(r.get("cyclomatic_reduction_pct", 0) or 0) for r in rows) / len(rows)
-    avg_sw  = sum(float(r.get("switch_elim_pct", 0) or 0)   for r in rows) / len(rows)
+    avg_loc = sum(float(r.get("loc_reduction_pct", 0) or 0) for r in rows) / n
+    avg_bb  = sum(float(r.get("bb_reduction_pct", 0) or 0)  for r in rows) / n
+    avg_cc  = sum(float(r.get("cyclomatic_reduction_pct", 0) or 0) for r in rows) / n
+
+    summary = {
+        "total_cases":    n,
+        "semantic_pass":  pass_count,
+        "semantic_fail":  n - pass_count,
+        "pass_rate_pct":  round(pass_count / n * 100, 1),
+        "avg_loc_reduction_pct": round(avg_loc, 2),
+        "avg_bb_reduction_pct":  round(avg_bb, 2),
+        "avg_cc_reduction_pct":  round(avg_cc, 2),
+        "csv_path":       output_path,
+    }
+
     print(f"\n{'='*65}")
-    print(f"  DATASET SUMMARY ({len(rows)} cases)")
+    print(f"  EVALUATION SUMMARY ({n} cases)")
     print(f"{'='*65}")
-    print(f"  Semantic PASS:            {pass_count}/{len(rows)} ({pass_count/len(rows)*100:.1f}%)")
-    print(f"  Avg LOC Reduction:        {avg_loc:.2f}%")
-    print(f"  Avg Basic Block Reduction:{avg_bb:.2f}%")
-    print(f"  Avg Cyclomatic Reduction: {avg_cc:.2f}%")
-    print(f"  Avg Switch Elimination:   {avg_sw:.2f}%")
+    print(f"  Semantic PASS:           {pass_count}/{n} ({summary['pass_rate_pct']}%)")
+    print(f"  Avg LOC Reduction:       {avg_loc:.2f}%")
+    print(f"  Avg BasicBlock Reduction:{avg_bb:.2f}%")
+    print(f"  Avg Cyclomatic Reduction:{avg_cc:.2f}%")
+    print(f"  CSV saved:               {output_path}")
     print(f"{'='*65}")
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect pipeline metrics into a CSV.")
+    parser.add_argument(
+        "--pipeline-dir", default=None,
+        help="Directory containing per-case result subdirectories (default: latest result/pipeline_*)"
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Output CSV path (default: <pipeline-dir>/metrics.csv)"
+    )
+    args = parser.parse_args()
+
+    pipeline_dir = args.pipeline_dir or _latest_pipeline_dir()
+    if not pipeline_dir or not os.path.isdir(pipeline_dir):
+        print(f"[!] Cannot find pipeline result directory. Use --pipeline-dir.")
+        sys.exit(1)
+
+    output_path = args.output or os.path.join(pipeline_dir, "metrics.csv")
+    result = run_collect(pipeline_dir, output_path)
+    if "error" in result:
+        print(f"[!] {result['error']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
