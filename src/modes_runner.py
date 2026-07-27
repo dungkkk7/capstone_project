@@ -11,41 +11,24 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from tools.llvm_to_c import transpile_llvm_ir_to_c
-from src.metrics_evaluator import calculate_ir_metrics, calculate_c_metrics
+from src.evaluation.metrics_evaluator import calculate_ir_metrics, calculate_c_metrics
 
-def load_env_config(env_path: str = None) -> dict:
-    if env_path is None:
-        env_path = os.path.join(PROJECT_ROOT, "configs", "pipeline_config.env")
-        
-    config = {
-        "LLM_MODEL": "gemini-2.5-flash",
-        "LLM_TEMPERATURE": "0.1",
-        "PROMPT_MODE_RAW_IR": "",
-        "PROMPT_MODE_CLEAN_PSEUDOCODE": "",
-        "PROMPT_MODE_CLEAN_IR": "",
-        "PROMPT_MODE_CLEAN_IR_AND_PSEUDOCODE": ""
+try:
+    import configs.prompts_config as prompts_config
+except Exception:
+    prompts_config = None
+
+
+def load_env_config() -> dict:
+    """Load config from configs.prompts_config."""
+    return {
+        "LLM_MODEL": getattr(prompts_config, "MODEL", "gemini-2.5-flash") if prompts_config else "gemini-2.5-flash",
+        "LLM_TEMPERATURE": str(getattr(prompts_config, "TEMPERATURE", 0.1)) if prompts_config else "0.1",
+        "PROMPT_MODE_RAW_IR": getattr(prompts_config, "PROMPT_RAW_IR", "") if prompts_config else "",
+        "PROMPT_MODE_CLEAN_PSEUDOCODE": getattr(prompts_config, "PROMPT_CLEAN_PSEUDOCODE", "") if prompts_config else "",
+        "PROMPT_MODE_CLEAN_IR": getattr(prompts_config, "PROMPT_CLEAN_IR", "") if prompts_config else "",
+        "PROMPT_MODE_CLEAN_IR_AND_PSEUDOCODE": getattr(prompts_config, "PROMPT_CLEAN_IR_AND_PSEUDOCODE", "") if prompts_config else "",
     }
-    
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            # Simple env parser
-            current_key = None
-            current_val = []
-            for line in content.splitlines():
-                if line.startswith("#") or not line.strip():
-                    continue
-                if "=" in line and not line.startswith(" ") and not line.startswith("\t"):
-                    if current_key:
-                        config[current_key] = "\n".join(current_val).strip('"').strip("'")
-                    k, v = line.split("=", 1)
-                    current_key = k.strip()
-                    current_val = [v.strip()]
-                elif current_key:
-                    current_val.append(line)
-            if current_key:
-                config[current_key] = "\n".join(current_val).strip('"').strip("'")
-    return config
 
 def run_pipeline_mode(
     mode: str,
