@@ -10,7 +10,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL & SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL = "gemini-3.5-flash"          # Tên model Vertex AI / Gemini
+MODEL = "gemini-3.5-flash"          # Tên model Vertex AI / Gemini (Mặc định)
+# MODEL = "gemini-2.5-flash"        # Hạn mức Unlimited (Không giới hạn) trên GCP dùng thử, chạy song song bứt tốc
+# MODEL = "gemini-1.5-pro"          # Hạn mức 4,000,000 tokens/phút rất cao, chất lượng phục hồi cao nhất, đắt tiền giúp tiêu $300 nhanh
+# MODEL = "gemini-2.5-pro-latest"   # Hạn mức 1,000,000 tokens/phút, dòng Pro thế hệ mới, thông minh nhất
 TEMPERATURE = 0.1                   # 0.0 = deterministic, 1.0 = creative
 MAX_OUTPUT_TOKENS = 65535           # Giới hạn output của model
 MAX_REPAIR_ITERATIONS = 5           # Số vòng lặp sửa lỗi tối đa
