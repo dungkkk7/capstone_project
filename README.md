@@ -330,6 +330,32 @@ python3 src/evaluation/collect_metrics.py \
     --output result/pipeline_20260727_145905/metrics.csv
 ```
 
+### 4. Chạy Chiến Dịch Đánh Giá Song Song (5 Flows Parallel Campaign - `run_experiment.py`)
+
+Hỗ trợ chạy song song đồng thời cả 5 luồng phục hồi LLM (Flow F1 đến F5) cho toàn bộ tập dữ liệu dataset một cách tối ưu, hỗ trợ cơ chế khôi phục (resume) và tự động tránh lỗi nghẽn cổng Vertex AI:
+
+```bash
+# Chạy chiến dịch song song (Khuyên dùng tối đa 3 workers cho tài khoản GCP Trial $300 để tránh 429)
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3
+```
+
+**Các tham số bổ sung hữu ích:**
+* `--resume <campaign_id>`: Tiếp tục chạy chiến dịch cũ bị gián đoạn (ví dụ: `--resume eval_20260728_041900`). Hệ thống sẽ tự động quét, đọc kết quả đã lưu trong các tệp `flow_result.json` và chỉ lập lịch chạy tiếp những case còn thiếu.
+* `--pilot <N>`: Chỉ chạy thử nghiệm trên N cases đầu tiên để kiểm chứng nhanh.
+* `--no-rotate-regions`: Tắt tính năng tự động xoay vòng vùng (mặc định luôn bật xoay vòng qua 6 Region: Mỹ, Đức, Pháp, Nhật, Singapore để tăng hạn ngạch RPM/TPM lên gấp 6 lần).
+* `--model <model_id>`: Chỉ định mô hình chạy Vertex AI (ví dụ: `gemini-2.5-pro` hoặc `gemini-2.5-flash`). Mặc định kế thừa biến `MODEL` từ file `configs/prompts_config.py`.
+
+*Lưu ý về cơ chế tự vệ:* Script tích hợp sẵn bộ kiểm soát **Automatic 404 Region Fallback**. Nếu mô hình (như `gemini-2.5-pro`) chưa khả dụng ở một region nào đó, client sẽ tự động chuyển hướng và gửi lại yêu cầu thông qua region an toàn `us-central1`. Nhấn `Ctrl+C` sẽ kết thúc sạch sẽ toàn bộ các tiến trình con ngay lập tức.
+
+### 5. Vẽ Biểu Đồ & Trực Quan Hóa Thực Nghiệm (`visualize_experiment.py`)
+
+Sau khi chạy chiến dịch hoàn tất, hệ thống tự động xuất 24 biểu đồ so sánh, bảng biểu LaTeX, markdown và trang Dashboard HTML tổng quan trong thư mục báo cáo tương ứng tại `reports/experiment_YYYYMMDD_HHMMSS/`:
+
+```bash
+# Tự vẽ lại biểu đồ thủ công từ thư mục báo cáo cũ:
+python3 src/evaluation/visualize_experiment.py reports/experiment_20260728_041900/
+```
+
 ---
 
 ## 5. CẤU TRÚC THƯ MỤC DỰ ÁN (DIRECTORY STRUCTURE)
