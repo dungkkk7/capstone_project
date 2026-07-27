@@ -471,7 +471,7 @@ def main():
                     print(f"[✗] Future task {flow_id} of {sample_id} generated an exception: {exc}", flush=True)
     except KeyboardInterrupt:
         print("\n[!] Ctrl+C detected! Instantly terminating all concurrent worker processes...", flush=True)
-        import os, signal
+        import signal
         os.killpg(os.getpgrp(), signal.SIGKILL)
         sys.exit(1)
                 
