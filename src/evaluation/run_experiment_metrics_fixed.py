@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Run the existing experiment with metric tracking fixed to the thesis definitions.
+"""Run the existing experiment with metric tracking aligned to the thesis definitions.
 
-Use this entry point instead of ``run_experiment.py``. It reuses the existing
-pipeline but patches metric collection so that:
+Use this entry point instead of ``run_experiment.py``. The exported CSV files use:
 
-* rate columns are numeric percentages and end in ``_pct``;
-* gain columns are numeric percentage points and end in ``_pp``;
-* counts end in ``_count``;
-* durations end in ``_seconds``;
-* undefined ratios are exported as an empty CSV cell, not as 0% or 100%;
-* Final RSR@R records whether any candidate built within the compiler-repair
-  budget, independently of later behavioral-repair regressions.
+* percentages for rate metrics (column suffix ``_pct``);
+* percentage points for gain metrics (column suffix ``_pp``);
+* counts for event/sample totals (column suffix ``_count``);
+* seconds for durations (column suffix ``_seconds``);
+* empty cells for undefined ratios.
+
+No supplementary recovery-rate metric is added beyond the approved metric set.
 """
 
 from __future__ import annotations
@@ -18,8 +17,8 @@ from __future__ import annotations
 import csv
 import json
 import os
+import statistics
 import sys
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 # Allow execution as ``python src/evaluation/run_experiment_metrics_fixed.py``.
@@ -47,14 +46,18 @@ from evaluation.metric_definitions import (
 EXTRA_DEFAULTS: Dict[str, Any] = {
     # Compilation stage
     "compile_success_ever_within_r": False,
-    "final_retained_executable": False,
     # Behavioral stage
     "fuzz_campaign_completed": False,
     "first_behavioral_pass": False,
     "final_behavioral_pass": False,
     "entered_behavioral_repair": False,
-    # Differential-run accounting
-    "fuzz_confirmed": 0,
+    # Final differential campaign
+    "final_fuzz_total": 0,
+    "final_fuzz_confirmed": 0,
+    "final_fuzz_matches": 0,
+    "final_fuzz_mismatches": 0,
+    "final_fuzz_inconclusive": 0,
+    # Reliability accounting across generated campaigns
     "generated_input_count": 0,
     "valid_generated_input_count": 0,
     "reported_counterexample_count": 0,
@@ -69,22 +72,39 @@ def _ensure_fields(tracker: Any) -> None:
 
 
 def _nullable(value: Optional[float]) -> str | float:
-    """Return an empty cell for an undefined metric."""
+    """Return an empty CSV cell for an undefined metric."""
 
     return "" if value is None else round(float(value), 4)
 
 
-def _fuzz_generated_counts(report: Dict[str, Any]) -> tuple[int, int]:
-    """Extract N_G and N_V from one fuzzing report.
+def _mean(values: List[int | float]) -> Optional[float]:
+    return None if not values else float(statistics.mean(values))
 
-    For AFL++, N_G is the number of candidate payloads presented to the input
-    contract and N_V is the number accepted by that contract. For fallback
-    contract generation, the accepted/rejected contract counts are used.
-    The executed differential corpus is deliberately not used as N_G because
-    it may include seeds and contract supplements.
+
+def _median(values: List[int | float]) -> Optional[float]:
+    return None if not values else float(statistics.median(values))
+
+
+def _minimum(values: List[int | float]) -> Optional[float]:
+    return None if not values else float(min(values))
+
+
+def _maximum(values: List[int | float]) -> Optional[float]:
+    return None if not values else float(max(values))
+
+
+def _fuzz_generated_counts(report: Dict[str, Any]) -> tuple[int, int]:
+    """Extract raw generated-input count N_G and valid-input count N_V.
+
+    For AFL++, ``afl_candidates`` is the number of payloads presented to the
+    input-contract filter and ``afl_accepted`` is the number accepted. For the
+    fallback contract generator, accepted and rejected contract counts are
+    used. When no raw-generation denominator is recorded, ``(0, 0)`` is
+    returned so Valid Input Rate is exported as undefined rather than 100%.
     """
 
     cfg = report.get("fuzz_config") or {}
+
     if "afl_candidates" in cfg:
         generated = int(cfg.get("afl_candidates", 0) or 0)
         valid = int(cfg.get("afl_accepted", 0) or 0)
@@ -95,13 +115,11 @@ def _fuzz_generated_counts(report: Dict[str, Any]) -> tuple[int, int]:
     if accepted or rejected:
         return accepted + rejected, accepted
 
-    # No raw-generation denominator was recorded. Returning zero makes the
-    # Valid Input Rate undefined rather than incorrectly reporting 100%.
     return 0, 0
 
 
 # ---------------------------------------------------------------------------
-# Patch tracker persistence
+# Tracker persistence
 # ---------------------------------------------------------------------------
 
 _original_to_dict = base.CaseTracker.to_dict
@@ -129,7 +147,7 @@ base.CaseTracker.from_dict = _from_dict_fixed
 
 
 # ---------------------------------------------------------------------------
-# Patch stage tracking
+# Stage tracking
 # ---------------------------------------------------------------------------
 
 _original_compile_check = base._run_compile_check_tracked
@@ -141,15 +159,19 @@ def _compile_check_fixed(
     output_dir: str,
     tracker: Any,
 ):
+    """Track first-pass build success and monotonic build success within R."""
+
     _ensure_fields(tracker)
     ok, diagnostics = _original_compile_check(candidate_path, output_dir, tracker)
-    attempt_number = int(tracker.compiler_attempts)
-    if attempt_number == 1:
+
+    if int(tracker.compiler_attempts) == 1:
         tracker.compile_success_first = bool(ok)
+
     if ok:
-        # This value is monotonic. A later semantic-repair candidate that does
-        # not build must not erase an earlier build success within R.
+        # Monotonic by definition: later behavioral-repair regressions must not
+        # erase a build success already achieved within the compiler budget.
         tracker.compile_success_ever_within_r = True
+
     return ok, diagnostics
 
 
@@ -162,8 +184,11 @@ def _fuzzing_fixed(
     tracker: Any,
     iterations: int,
 ) -> Dict[str, Any]:
+    """Track final-campaign correctness and campaign-level reliability data."""
+
     _ensure_fields(tracker)
-    is_first_campaign = not tracker.fuzz_campaign_completed
+    is_first_completed_campaign = not tracker.fuzz_campaign_completed
+
     report = _original_fuzzing(
         candidate_path,
         ref_binary,
@@ -184,28 +209,35 @@ def _fuzzing_fixed(
 
     completed = total > 0 and not report.get("error")
     fully_equivalent = bool(
-        report.get("is_fully_equivalent", False)
+        completed
+        and report.get("is_fully_equivalent", False)
         and mismatches == 0
         and inconclusive == 0
     )
 
     if completed:
+        if is_first_completed_campaign:
+            tracker.first_behavioral_pass = fully_equivalent
+
         tracker.fuzz_campaign_completed = True
-    tracker.fuzz_confirmed += confirmed
+        tracker.final_behavioral_pass = fully_equivalent
+        tracker.final_fuzz_total = total
+        tracker.final_fuzz_confirmed = confirmed
+        tracker.final_fuzz_matches = matches
+        tracker.final_fuzz_mismatches = mismatches
+        tracker.final_fuzz_inconclusive = inconclusive
 
     generated, valid = _fuzz_generated_counts(report)
     tracker.generated_input_count += generated
     tracker.valid_generated_input_count += valid
 
-    # Mismatches have already passed the fuzzer's stability checks; unstable
-    # observations are placed in the inconclusive bucket instead.
+    # The fuzzer moves unstable observations into the inconclusive bucket.
+    # Remaining mismatches are therefore confirmed counterexamples.
     tracker.reported_counterexample_count += mismatches
     tracker.reproduced_counterexample_count += mismatches
 
-    if is_first_campaign:
-        tracker.first_behavioral_pass = fully_equivalent
-    tracker.final_behavioral_pass = fully_equivalent
-    if mismatches > 0:
+    # F5 is one-shot and must not be counted as entering a repair stage.
+    if mismatches > 0 and tracker.flow_id != "F5":
         tracker.entered_behavioral_repair = True
 
     return report
@@ -227,7 +259,6 @@ PER_SAMPLE_COLUMNS = [
     "behavioral_repairs_count",
     "compile_success_first",
     "compile_success_ever_within_r",
-    "final_retained_executable",
     "compile_repair_rounds_count",
     "behavioral_repair_rounds_count",
     "fuzz_campaign_completed",
@@ -237,6 +268,8 @@ PER_SAMPLE_COLUMNS = [
     "fuzz_total_runs_count",
     "fuzz_confirmed_runs_count",
     "fuzz_matches_count",
+    "fuzz_mismatches_count",
+    "fuzz_inconclusive_runs_count",
     "generated_inputs_count",
     "valid_generated_inputs_count",
     "reported_counterexamples_count",
@@ -253,8 +286,6 @@ PER_SAMPLE_COLUMNS = [
 
 def _sample_row(t: Any) -> Dict[str, Any]:
     _ensure_fields(t)
-    # Preserve the existing final candidate state under an explicit name.
-    t.final_retained_executable = bool(t.compile_success_final)
     return {
         "sample_id": t.sample_id,
         "flow_id": t.flow_id,
@@ -263,16 +294,17 @@ def _sample_row(t: Any) -> Dict[str, Any]:
         "behavioral_repairs_count": t.behavioral_repairs,
         "compile_success_first": bool(t.compile_success_first),
         "compile_success_ever_within_r": bool(t.compile_success_ever_within_r),
-        "final_retained_executable": bool(t.final_retained_executable),
         "compile_repair_rounds_count": t.compile_repair_rounds,
         "behavioral_repair_rounds_count": t.behavioral_repair_rounds,
         "fuzz_campaign_completed": bool(t.fuzz_campaign_completed),
         "first_behavioral_pass": bool(t.first_behavioral_pass),
         "final_behavioral_pass": bool(t.final_behavioral_pass),
         "entered_behavioral_repair": bool(t.entered_behavioral_repair),
-        "fuzz_total_runs_count": t.fuzz_total,
-        "fuzz_confirmed_runs_count": t.fuzz_confirmed,
-        "fuzz_matches_count": t.fuzz_matches,
+        "fuzz_total_runs_count": t.final_fuzz_total,
+        "fuzz_confirmed_runs_count": t.final_fuzz_confirmed,
+        "fuzz_matches_count": t.final_fuzz_matches,
+        "fuzz_mismatches_count": t.final_fuzz_mismatches,
+        "fuzz_inconclusive_runs_count": t.final_fuzz_inconclusive,
         "generated_inputs_count": t.generated_input_count,
         "valid_generated_inputs_count": t.valid_generated_input_count,
         "reported_counterexamples_count": t.reported_counterexample_count,
@@ -287,7 +319,11 @@ def _sample_row(t: Any) -> Dict[str, Any]:
     }
 
 
-def _write_dict_csv(path: str, rows: Iterable[Dict[str, Any]], columns: List[str]) -> None:
+def _write_dict_csv(
+    path: str,
+    rows: Iterable[Dict[str, Any]],
+    columns: List[str],
+) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
@@ -297,65 +333,97 @@ def _write_dict_csv(path: str, rows: Iterable[Dict[str, Any]], columns: List[str
 def _flow_metrics(flow_ts: List[Any]) -> Dict[str, Any]:
     for tracker in flow_ts:
         _ensure_fields(tracker)
-        tracker.final_retained_executable = bool(tracker.compile_success_final)
 
     n = len(flow_ts)
+
+    # Compilation metrics
     initial_success = sum(bool(t.compile_success_first) for t in flow_ts)
-    ever_success = sum(bool(t.compile_success_ever_within_r) for t in flow_ts)
+    success_within_r = sum(bool(t.compile_success_ever_within_r) for t in flow_ts)
     initial_failures = n - initial_success
-    repaired_failures = sum(
+    repaired_initial_failures = sum(
         (not bool(t.compile_success_first))
         and bool(t.compile_success_ever_within_r)
         for t in flow_ts
     )
+    first_pct = first_pass_rsr(initial_success, n)
+    final_pct = final_rsr_at_r(success_within_r, n)
 
-    fuzzed = [t for t in flow_ts if t.fuzz_campaign_completed]
+    compile_rounds = [
+        int(t.compile_repair_rounds)
+        for t in flow_ts
+        if not bool(t.compile_success_first)
+    ]
+    compile_failed_after_budget = sum(
+        (not bool(t.compile_success_first))
+        and (not bool(t.compile_success_ever_within_r))
+        for t in flow_ts
+    )
+
+    # Behavioral correctness metrics use only completed final campaigns.
+    fuzzed = [t for t in flow_ts if bool(t.fuzz_campaign_completed)]
     nf = len(fuzzed)
     behavioral_passes = sum(bool(t.final_behavioral_pass) for t in fuzzed)
-    confirmed_runs = sum(int(t.fuzz_confirmed) for t in fuzzed)
-    matches = sum(int(t.fuzz_matches) for t in fuzzed)
-    cex_samples = sum(int(t.reported_counterexample_count) > 0 for t in fuzzed)
+    confirmed_runs = sum(int(t.final_fuzz_confirmed) for t in fuzzed)
+    matches = sum(int(t.final_fuzz_matches) for t in fuzzed)
 
-    repaired_behavior = [t for t in flow_ts if t.entered_behavioral_repair]
-    nbr = len(repaired_behavior)
-    nbrs = sum(bool(t.final_behavioral_pass) for t in repaired_behavior)
+    # A sample is counted once when at least one confirmed counterexample was
+    # found during its recovery process.
+    cex_samples = sum(
+        int(t.reported_counterexample_count) > 0
+        for t in fuzzed
+    )
+
+    # Behavioral repair metrics
+    repair_candidates = [
+        t for t in flow_ts if bool(t.entered_behavioral_repair)
+    ]
+    nbr = len(repair_candidates)
+    nbrs = sum(bool(t.final_behavioral_pass) for t in repair_candidates)
+    behavioral_rounds = [
+        int(t.behavioral_repair_rounds) for t in repair_candidates
+    ]
 
     before_behavior_rate = program_behavioral_pass_rate(
         sum(bool(t.first_behavioral_pass) for t in fuzzed),
         nf,
     )
-    after_behavior_rate = program_behavioral_pass_rate(behavioral_passes, nf)
+    after_behavior_rate = program_behavioral_pass_rate(
+        behavioral_passes,
+        nf,
+    )
 
+    # Reliability and E2E metrics
     generated = sum(int(t.generated_input_count) for t in flow_ts)
     valid_generated = sum(int(t.valid_generated_input_count) for t in flow_ts)
     reported_cex = sum(int(t.reported_counterexample_count) for t in flow_ts)
     reproduced_cex = sum(int(t.reproduced_counterexample_count) for t in flow_ts)
-    inconclusive = sum(t.status == "INCONCLUSIVE" for t in flow_ts)
-    e2e = sum(t.status == "PASS" for t in flow_ts)
-
-    first_pct = first_pass_rsr(initial_success, n)
-    final_pct = final_rsr_at_r(ever_success, n)
+    inconclusive_samples = sum(t.status == "INCONCLUSIVE" for t in flow_ts)
+    e2e_successes = sum(t.status == "PASS" for t in flow_ts)
 
     return {
         "sample_count": n,
+
         "initial_compile_success_count": initial_success,
-        "build_success_within_r_count": ever_success,
+        "build_success_within_r_count": success_within_r,
         "initial_compile_failure_count": initial_failures,
-        "repaired_initial_compile_failure_count": repaired_failures,
+        "repaired_initial_compile_failure_count": repaired_initial_failures,
+        "compiler_repair_failed_after_budget_count": compile_failed_after_budget,
         "first_pass_rsr_pct": _nullable(first_pct),
         "final_rsr_at_r_pct": _nullable(final_pct),
         "compilation_repair_gain_pp": _nullable(
             percentage_point_gain(final_pct, first_pct)
         ),
         "compilation_repair_success_rate_pct": _nullable(
-            compilation_repair_success_rate(repaired_failures, initial_failures)
-        ),
-        "final_retained_executable_rate_pct": _nullable(
-            first_pass_rsr(
-                sum(bool(t.final_retained_executable) for t in flow_ts),
-                n,
+            compilation_repair_success_rate(
+                repaired_initial_failures,
+                initial_failures,
             )
         ),
+        "mean_compile_repair_rounds_count": _nullable(_mean(compile_rounds)),
+        "median_compile_repair_rounds_count": _nullable(_median(compile_rounds)),
+        "min_compile_repair_rounds_count": _nullable(_minimum(compile_rounds)),
+        "max_compile_repair_rounds_count": _nullable(_maximum(compile_rounds)),
+
         "completed_fuzz_campaign_count": nf,
         "behavioral_pass_count": behavioral_passes,
         "program_behavioral_pass_rate_pct": _nullable(after_behavior_rate),
@@ -366,34 +434,73 @@ def _flow_metrics(flow_ts: List[Any]) -> Dict[str, Any]:
         "counterexample_detection_rate_pct": _nullable(
             counterexample_detection_rate(cex_samples, nf)
         ),
+
         "behavioral_repair_candidate_count": nbr,
         "successful_behavioral_repair_count": nbrs,
         "semantic_repair_success_rate_pct": _nullable(
             semantic_repair_success_rate(nbrs, nbr)
         ),
-        "behavioral_pass_rate_before_repair_pct": _nullable(before_behavior_rate),
-        "behavioral_pass_rate_after_repair_pct": _nullable(after_behavior_rate),
-        "behavioral_repair_gain_pp": _nullable(
-            percentage_point_gain(after_behavior_rate, before_behavior_rate)
+        "behavioral_pass_rate_before_repair_pct": _nullable(
+            before_behavior_rate
         ),
+        "behavioral_pass_rate_after_repair_pct": _nullable(
+            after_behavior_rate
+        ),
+        "behavioral_repair_gain_pp": _nullable(
+            percentage_point_gain(
+                after_behavior_rate,
+                before_behavior_rate,
+            )
+        ),
+        "mean_behavioral_repair_rounds_count": _nullable(
+            _mean(behavioral_rounds)
+        ),
+        "median_behavioral_repair_rounds_count": _nullable(
+            _median(behavioral_rounds)
+        ),
+        "min_behavioral_repair_rounds_count": _nullable(
+            _minimum(behavioral_rounds)
+        ),
+        "max_behavioral_repair_rounds_count": _nullable(
+            _maximum(behavioral_rounds)
+        ),
+
         "generated_inputs_count": generated,
         "valid_generated_inputs_count": valid_generated,
-        "valid_input_rate_pct": _nullable(valid_input_rate(valid_generated, generated)),
+        "valid_input_rate_pct": _nullable(
+            valid_input_rate(valid_generated, generated)
+        ),
         "reported_counterexamples_count": reported_cex,
         "reproduced_counterexamples_count": reproduced_cex,
         "counterexample_reproducibility_rate_pct": _nullable(
-            counterexample_reproducibility_rate(reproduced_cex, reported_cex)
+            counterexample_reproducibility_rate(
+                reproduced_cex,
+                reported_cex,
+            )
         ),
-        "inconclusive_sample_count": inconclusive,
-        "inconclusive_rate_pct": _nullable(inconclusive_rate(inconclusive, n)),
-        "e2e_recovery_count": e2e,
-        "e2e_recovery_rate_pct": _nullable(end_to_end_recovery_rate(e2e, n)),
-        "mean_llm_calls_count": round(sum(t.llm_calls for t in flow_ts) / n, 4),
+        "inconclusive_sample_count": inconclusive_samples,
+        "inconclusive_rate_pct": _nullable(
+            inconclusive_rate(inconclusive_samples, n)
+        ),
+
+        "e2e_recovery_count": e2e_successes,
+        "e2e_recovery_rate_pct": _nullable(
+            end_to_end_recovery_rate(e2e_successes, n)
+        ),
+
+        # Existing resource measurements retained with explicit units.
+        "mean_llm_calls_count": round(
+            sum(t.llm_calls for t in flow_ts) / n,
+            4,
+        ),
         "mean_tokens_count": round(
             sum(t.input_tokens + t.output_tokens for t in flow_ts) / n,
             4,
         ),
-        "mean_runtime_seconds": round(sum(t.total_runtime for t in flow_ts) / n, 4),
+        "mean_runtime_seconds": round(
+            sum(t.total_runtime for t in flow_ts) / n,
+            4,
+        ),
     }
 
 
@@ -431,16 +538,28 @@ def export_metrics_csvs_fixed(
             "flow_id",
             "initial_compile_failure_count",
             "repaired_initial_compile_failure_count",
+            "compiler_repair_failed_after_budget_count",
             "compilation_repair_success_rate_pct",
             "compilation_repair_gain_pp",
+            "mean_compile_repair_rounds_count",
+            "median_compile_repair_rounds_count",
+            "min_compile_repair_rounds_count",
+            "max_compile_repair_rounds_count",
             "behavioral_repair_candidate_count",
             "successful_behavioral_repair_count",
             "semantic_repair_success_rate_pct",
             "behavioral_repair_gain_pp",
+            "mean_behavioral_repair_rounds_count",
+            "median_behavioral_repair_rounds_count",
+            "min_behavioral_repair_rounds_count",
+            "max_behavioral_repair_rounds_count",
         ]
         _write_dict_csv(
             os.path.join(output_dir, "repair_metrics.csv"),
-            ({key: row.get(key, "") for key in repair_columns} for row in flow_rows),
+            (
+                {key: row.get(key, "") for key in repair_columns}
+                for row in flow_rows
+            ),
             repair_columns,
         )
 
@@ -457,7 +576,10 @@ def export_metrics_csvs_fixed(
         ]
         _write_dict_csv(
             os.path.join(output_dir, "reliability_metrics.csv"),
-            ({key: row.get(key, "") for key in reliability_columns} for row in flow_rows),
+            (
+                {key: row.get(key, "") for key in reliability_columns}
+                for row in flow_rows
+            ),
             reliability_columns,
         )
 
@@ -465,11 +587,13 @@ def export_metrics_csvs_fixed(
         "experiment_id": experiment_id,
         "rate_unit": "percent",
         "gain_unit": "percentage points",
+        "count_unit": "count",
         "duration_unit": "seconds",
         "undefined_ratio_encoding": "empty CSV cell",
         "input_match_denominator": "confirmed runs = matches + mismatches",
-        "final_rsr_definition": "candidate built at least once within compiler-repair budget R",
-        "final_retained_executable_definition": "last candidate after all repair stages still builds",
+        "final_rsr_definition": (
+            "candidate built at least once within compiler-repair budget R"
+        ),
     }
     with open(
         os.path.join(output_dir, "metric_units.json"),
@@ -480,7 +604,7 @@ def export_metrics_csvs_fixed(
 
     print(
         f"[✓] Canonical metric CSVs exported to {output_dir} "
-        "(% for rates, pp for gains, seconds for durations).",
+        "(% for rates, pp for gains, counts for totals, seconds for durations).",
         flush=True,
     )
 
