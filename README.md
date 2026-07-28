@@ -300,23 +300,66 @@ pip install -r requirements.txt
 python3 src/main.py data/custom_dataset.csv llm-recovery
 ```
 
-### 2. Chạy Theo Mode Cụ Thể (Mode 1, 2, 3 hoặc 4)
+### 2. Chạy Chiến Dịch Đánh Giá Song Song — 5 Flows (`run_experiment.py`) ⭐ Khuyên Dùng
+
+Đây là kịch bản thực nghiệm chính, chạy song song đồng thời **5 luồng phục hồi LLM (Flow F1 → F5)** cho toàn bộ tập dữ liệu, hỗ trợ resume và tự động xoay vùng Vertex AI:
 
 ```bash
-# Mode 1: Raw IR đẩy thẳng vào LLM
-python3 src/main.py data/custom_dataset.csv llm-recovery --mode=raw_ir
+# Chạy chiến dịch đầy đủ (40 cases × 5 flows = 200 tasks)
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3
 
-# Mode 2: Clean Pseudocode đẩy vào LLM
-python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_pseudocode
+# Nếu bị gián đoạn, tiếp tục từ vị trí bị dừng:
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3 --resume eval_20260728_124405
 
-# Mode 3: Clean IR đẩy vào LLM
-python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir
-
-# Mode 4: Dual Evidence (Clean IR + Pseudocode)
-python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir_and_pseudocode
+# Chạy thử nhanh N cases đầu tiên:
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv --pilot=3 --max-workers=3
 ```
 
-### 3. Chạy Độc Lập Bộ Thu Thập Metrics CSV (`collect_metrics.py`)
+#### Định Nghĩa 5 Flows (F1 → F5)
+
+| Flow | Evidence gửi vào LLM | Iterations | Tương đương `--mode` (main.py) | Mục đích |
+|:---:|:---|:---:|:---|:---|
+| **F1** | LLVM-to-C Pseudocode (Clean IR transpiled) | 5 | `--mode=clean_pseudocode` | Baseline: pseudocode thuần |
+| **F2** | LLVM-to-C Pseudocode + Clean IR (đính kèm) | 5 | `--mode=clean_ir_and_pseudocode` | Dual evidence: pseudo + IR |
+| **F3** | Raw LLVM IR (thô, chưa qua brightening) | 5 | `--mode=raw_ir` | Raw IR trực tiếp vào LLM |
+| **F4** | Clean LLVM IR (sau brightening, không pseudo) | 5 | `--mode=clean_ir` | Clean IR trực tiếp vào LLM |
+| **F5** | LLVM-to-C Pseudocode + Clean IR (đính kèm) | **1** | `--mode=clean_ir_and_pseudocode` | Ablation: tắt vòng lặp CEGIS |
+
+> **Lưu ý về F5**: F5 dùng cùng input với F2 nhưng chỉ cho LLM **1 lần thử duy nhất** (không có vòng lặp sửa lỗi CEGIS). So sánh F2 vs F5 chứng minh đóng góp của cơ chế lặp phản hồi fuzzer (+~20% pass rate).
+
+#### Kết Quả Thực Nghiệm (40 Cases × 5 Flows = 200 Tasks)
+
+| Flow | PASS | Tỉ lệ |
+|:---:|:---:|:---:|
+| F1 (Pseudocode) | 32/40 | **80.0%** |
+| F2 (Pseudocode + Clean IR) | 31/40 | **77.5%** |
+| F3 (Raw IR) | 25/40 | 62.5% |
+| F4 (Clean IR) | 32/40 | **80.0%** |
+| F5 (Pseudocode + Clean IR, 1 iter) | 23/40 | 57.5% |
+| **Tổng** | **143/200** | **71.5%** |
+
+### 3. Chạy Pipeline Đơn Tuần Tự theo Mode (`src/main.py`)
+
+Dùng khi muốn chạy tuần tự từng binary với một mode cụ thể (không có parallel workers, không sinh HTML report):
+
+```bash
+# Chạy toàn bộ dataset với mode mặc định (Dual Evidence - tương đương F2/F5)
+python3 src/main.py data/custom_dataset.csv llm-recovery
+
+# F1 — LLVM-to-C Pseudocode (không kèm Clean IR)
+python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_pseudocode
+
+# F2/F5 — Dual Evidence: Pseudocode + Clean IR
+python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir_and_pseudocode
+
+# F3 — Raw IR trực tiếp vào LLM
+python3 src/main.py data/custom_dataset.csv llm-recovery --mode=raw_ir
+
+# F4 — Clean IR trực tiếp vào LLM
+python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir
+```
+
+### 4. Chạy Độc Lập Bộ Thu Thập Metrics CSV (`collect_metrics.py`)
 
 Bộ thu thập metrics sẽ **tự động chạy** sau khi `src/main.py` hoàn thành. Nếu muốn thu thập lại thủ công cho một thư mục kết quả cụ thể:
 
@@ -330,31 +373,22 @@ python3 src/evaluation/collect_metrics.py \
     --output result/pipeline_20260727_145905/metrics.csv
 ```
 
-### 4. Chạy Chiến Dịch Đánh Giá Song Song (5 Flows Parallel Campaign - `run_experiment.py`)
-
-Hỗ trợ chạy song song đồng thời cả 5 luồng phục hồi LLM (Flow F1 đến F5) cho toàn bộ tập dữ liệu dataset một cách tối ưu, hỗ trợ cơ chế khôi phục (resume) và tự động tránh lỗi nghẽn cổng Vertex AI:
-
-```bash
-# Chạy chiến dịch song song (Khuyên dùng tối đa 3 workers cho tài khoản GCP Trial $300 để tránh 429)
-python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3
-```
-
-**Các tham số bổ sung hữu ích:**
-* `--resume <campaign_id>`: Tiếp tục chạy chiến dịch cũ bị gián đoạn (ví dụ: `--resume eval_20260728_041900`). Hệ thống sẽ tự động quét, đọc kết quả đã lưu trong các tệp `flow_result.json` và chỉ lập lịch chạy tiếp những case còn thiếu.
-* `--pilot <N>`: Chỉ chạy thử nghiệm trên N cases đầu tiên để kiểm chứng nhanh.
-* `--no-rotate-regions`: Tắt tính năng tự động xoay vòng vùng (mặc định luôn bật xoay vòng qua 6 Region: Mỹ, Đức, Pháp, Nhật, Singapore để tăng hạn ngạch RPM/TPM lên gấp 6 lần).
-* `--model <model_id>`: Chỉ định mô hình chạy Vertex AI (ví dụ: `gemini-2.5-pro` hoặc `gemini-2.5-flash`). Mặc định kế thừa biến `MODEL` từ file `configs/prompts_config.py`.
-
-*Lưu ý về cơ chế tự vệ:* Script tích hợp sẵn bộ kiểm soát **Automatic 404 Region Fallback**. Nếu mô hình (như `gemini-2.5-pro`) chưa khả dụng ở một region nào đó, client sẽ tự động chuyển hướng và gửi lại yêu cầu thông qua region an toàn `us-central1`. Nhấn `Ctrl+C` sẽ kết thúc sạch sẽ toàn bộ các tiến trình con ngay lập tức.
-
 ### 5. Vẽ Biểu Đồ & Trực Quan Hóa Thực Nghiệm (`visualize_experiment.py`)
 
 Sau khi chạy chiến dịch hoàn tất, hệ thống tự động xuất 24 biểu đồ so sánh, bảng biểu LaTeX, markdown và trang Dashboard HTML tổng quan trong thư mục báo cáo tương ứng tại `reports/experiment_YYYYMMDD_HHMMSS/`:
 
 ```bash
 # Tự vẽ lại biểu đồ thủ công từ thư mục báo cáo cũ:
-python3 src/evaluation/visualize_experiment.py reports/experiment_20260728_041900/
+python3 src/evaluation/visualize_experiment.py reports/experiment_20260728_124405/
 ```
+
+**Các tham số bổ sung hữu ích cho `run_experiment.py`:**
+* `--resume <campaign_id>`: Tiếp tục chạy chiến dịch cũ bị gián đoạn. Hệ thống tự động quét, đọc kết quả đã lưu trong các tệp `flow_result.json` và chỉ lập lịch chạy tiếp những case còn thiếu.
+* `--pilot <N>`: Chỉ chạy thử nghiệm trên N cases đầu tiên để kiểm chứng nhanh.
+* `--no-rotate-regions`: Tắt tính năng tự động xoay vòng vùng (mặc định bật xoay vòng qua 6 Region để tăng hạn ngạch RPM/TPM lên gấp 6 lần).
+* `--model <model_id>`: Chỉ định mô hình chạy (ví dụ: `gemini-2.5-pro` hoặc `ag/gemini-3-flash-agent`). Mặc định kế thừa biến `MODEL` từ file `configs/prompts_config.py`.
+
+*Lưu ý về cơ chế tự vệ:* Script tích hợp sẵn **Automatic 404 Region Fallback** — nếu mô hình chưa khả dụng ở một region, client tự động chuyển hướng sang `us-central1`. Nhấn `Ctrl+C` sẽ kết thúc sạch sẽ toàn bộ tiến trình con ngay lập tức.
 
 ---
 
