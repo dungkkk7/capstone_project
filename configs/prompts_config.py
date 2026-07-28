@@ -10,7 +10,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL & SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL = "gemini-2.5-pro"            # Dòng Pro thế hệ mới, thông minh nhất, hỗ trợ 2M context window
+MODEL = "ag/gemini-3-flash-agent"    # Sử dụng model Gemini 3.5 Flash thông qua 9router
+API_KEY = "sk-56d9318c7bdcdcad-dayiif-c44e8cb6"  # 9router API Key
+API_BASE_URL = "http://localhost:20128/v1"      # 9router API Base URL (thay thế generativelanguage)
+# MODEL = "gemini-2.5-pro"            # Dòng Pro thế hệ mới, thông minh nhất, hỗ trợ 2M context window
 # MODEL = "gemini-2.5-flash"        # Hạn mức Unlimited (Không giới hạn) trên GCP dùng thử, chạy song song bứt tốc
 # MODEL = "gemini-1.5-pro"          # Hạn mức 4,000,000 tokens/phút rất cao, chất lượng phục hồi cao nhất, đắt tiền giúp tiêu $300 nhanh
 #MODEL = "gemini-2.5-pro-latest"   # Hạn mức 1,000,000 tokens/phút, dòng Pro thế hệ mới, thông minh nhất

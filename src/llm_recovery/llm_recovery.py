@@ -2335,7 +2335,8 @@ class VertexGemini:
             adc_credentials = None
 
         if self.config.api_key and not adc_credentials:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.model}:generateContent?key={self.config.api_key}"
+            base_url = os.environ.get("GEMINI_API_BASE_URL") or getattr(_prompts_cfg, "API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+            url = f"{base_url}/models/{self.config.model}:generateContent?key={self.config.api_key}"
             headers = {"Content-Type": "application/json"}
         else:
             credentials = adc_credentials or _load_adc_credentials()
