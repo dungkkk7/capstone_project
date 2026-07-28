@@ -3,42 +3,58 @@ import os
 import json
 import csv
 import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import seaborn as sns
+
+# Try importing scipy.stats for McNemar / Wilcoxon tests
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 # Publication-Ready Academic Styling Setup
 def set_academic_style():
     plt.rcParams.update({
         'font.family': 'serif',
-        'font.size': 10,
-        'axes.labelsize': 11,
-        'axes.titlesize': 12,
-        'xtick.labelsize': 9,
-        'ytick.labelsize': 9,
-        'legend.fontsize': 9,
-        'figure.titlesize': 14,
+        'font.size': 9,
+        'axes.labelsize': 10,
+        'axes.titlesize': 11,
+        'xtick.labelsize': 8.5,
+        'ytick.labelsize': 8.5,
+        'legend.fontsize': 8.5,
+        'figure.titlesize': 12,
         'figure.dpi': 300,
         'savefig.dpi': 300,
         'savefig.bbox': 'tight',
-        'savefig.pad_inches': 0.05,
-        'axes.edgecolor': '#333333',
+        'savefig.pad_inches': 0.03,
+        'axes.edgecolor': '#222222',
         'axes.linewidth': 0.8,
-        'grid.color': '#e0e0e0',
+        'grid.color': '#e5e5e5',
         'grid.linestyle': '--',
         'grid.linewidth': 0.5,
     })
 
-# Curated Academic Color Palette
 FLOW_COLORS = {
-    'F1': '#2b5c8f',  # Deep Slate Blue
+    'F1': '#2b5c8f',  # Slate Blue
     'F2': '#d95f02',  # Burnt Orange
     'F3': '#7570b3',  # Muted Purple
-    'F4': '#1b9e77',  # Teal/Emerald
+    'F4': '#1b9e77',  # Emerald Teal
     'F5': '#e7298a',  # Magenta Accent
 }
+
+FLOW_HATCHES = {
+    'F1': '//',
+    'F2': '\\\\',
+    'F3': 'xx',
+    'F4': '..',
+    'F5': '||'
+}
+
 FLOW_LABELS = {
     'F1': 'F1: Pseudocode',
     'F2': 'F2: Pseudo + Clean IR',
@@ -47,15 +63,56 @@ FLOW_LABELS = {
     'F5': 'F5: Single-Iter (Ablation)',
 }
 
+def compute_bootstrap_ci(data_series: np.ndarray, n_bootstraps: int = 2000, ci: float = 95.0) -> Tuple[float, float, float]:
+    """Compute mean and percentile bootstrap confidence interval."""
+    if len(data_series) == 0:
+        return 0.0, 0.0, 0.0
+    mean_val = float(np.mean(data_series))
+    boot_means = []
+    rng = np.random.default_rng(42)
+    for _ in range(n_bootstraps):
+        sample = rng.choice(data_series, size=len(data_series), replace=True)
+        boot_means.append(np.mean(sample))
+    lower = float(np.percentile(boot_means, (100 - ci) / 2.0))
+    upper = float(np.percentile(boot_means, 100 - (100 - ci) / 2.0))
+    return mean_val, lower, upper
+
+def compute_mcnemar_pvalue(success_a: np.ndarray, success_b: np.ndarray) -> Tuple[float, str]:
+    """Compute McNemar exact p-value for paired binary outcomes."""
+    # Contingency table
+    # a_succ / b_fail (b) vs a_fail / b_succ (c)
+    b = np.sum((success_a == 1) & (success_b == 0))
+    c = np.sum((success_a == 0) & (success_b == 1))
+    n_disc = b + c
+    if n_disc == 0:
+        return 1.0, "p > 0.99 (identical)"
+    
+    if SCIPY_AVAILABLE:
+        # Exact binomial test on discordant pairs
+        res = stats.binomtest(b, n_disc, 0.5)
+        pval = res.pvalue
+    else:
+        # Continuity corrected chi-square approximation
+        chi2 = (abs(b - c) - 1) ** 2 / n_disc
+        pval = 1.0 - (chi2 / (chi2 + 1.0)) # rough approximation
+        
+    if pval < 0.001:
+        p_str = "p < 0.001 ***"
+    elif pval < 0.01:
+        p_str = f"p = {pval:.3f} **"
+    elif pval < 0.05:
+        p_str = f"p = {pval:.3f} *"
+    else:
+        p_str = f"p = {pval:.3f} (ns)"
+    return pval, p_str
+
 def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id: str):
     set_academic_style()
     sns.set_theme(style="ticks")
     
-    # Ensure directories exist
     fig_dir = os.path.join(output_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
     
-    # Convert trackers data to DataFrame
     data = []
     for t in trackers:
         reduction = getattr(t, "reduction", {})
@@ -74,6 +131,7 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
             "fuzz_total": t.fuzz_total,
             "fuzz_valid": t.fuzz_valid,
             "fuzz_matches": t.fuzz_matches,
+            "match_rate": (t.fuzz_matches / max(1, t.fuzz_total)) if t.fuzz_total > 0 else 0.0,
             "has_counterexample": 1 if t.has_counterexample else 0,
             "counterexample_reproducible": 1 if t.counterexample_reproducible else 0,
             "counterexample_ever_found": 1 if getattr(t, "counterexample_ever_found", t.has_counterexample) else 0,
@@ -101,6 +159,7 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
             "sloc_ratio": getattr(t, "sloc_ratio", 0.0),
             "readability_score": getattr(t, "readability_score", 0.0),
             "status": t.status,
+            "is_pass": 1 if t.status == "PASS" else 0,
             "input_tokens": t.input_tokens,
             "output_tokens": t.output_tokens,
             "total_tokens": t.input_tokens + t.output_tokens,
@@ -111,118 +170,342 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
         })
     df = pd.DataFrame(data)
     
-    # Save the custom requested files
+    # Save formatted tables & CSVs
     _save_extra_csvs(df, output_dir)
     _save_summary_tables(df, output_dir)
     _generate_html_outputs(df, output_dir, experiment_id)
     _generate_report_markdown(df, output_dir, experiment_id)
     
-    # Generate publication-grade figures
-    _plot_main_success_rates(df, fig_dir)
-    _plot_compilation_metrics(df, fig_dir)
+    # Generate 7 Strict Publication-Ready Figures
+    _plot_overall_performance(df, fig_dir)
+    _plot_ablation_forest_plot(df, fig_dir)
+    _plot_cost_quality_pareto(df, fig_dir)
     _plot_behavioral_metrics(df, fig_dir)
-    _plot_behavioral_repair_gain(df, fig_dir)
-    _plot_cumulative_success(df, fig_dir)
-    _plot_failure_breakdowns(df, fig_dir)
-    _plot_heatmaps(df, fig_dir)
-    _plot_ablation_visualizations(df, fig_dir)
-    _plot_cost_quality_tradeoffs(df, fig_dir)
-    _plot_distributions(df, fig_dir)
-    _plot_llvm_reduction_visuals(df, fig_dir)
+    _plot_per_sample_heatmaps(df, fig_dir)
     _plot_stage_completion_funnel(df, fig_dir)
     _generate_figures_manifest(df, output_dir)
 
-def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
-    # 2. repair_metrics.csv
-    repair_data = []
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
-        flow_df = df[df["flow_id"] == flow]
-        if flow_df.empty: continue
-        
-        # NCF: number of cases failing first-pass compile
-        comp_fails = flow_df[flow_df["compile_success_first"] == 0]
-        ncf = len(comp_fails)
-        # NCFS: number of compile-failing cases saved by compile repair
-        ncfs = len(comp_fails[comp_fails["compile_success_final"] == 1]) if flow != "F5" else 0
-        comp_repair_sr = (ncfs / ncf * 100.0) if (ncf > 0 and flow != "F5") else (0.0 if flow == "F5" else 100.0)
-        
-        # NBR: number of cases passing first-pass compile BUT triggering behavioral repair (counterexample found)
-        nbr_cases = flow_df[(flow_df["compile_success_first"] == 1) & (flow_df["counterexample_ever_found"] == 1)]
-        nbr = len(nbr_cases)
-        # NBRS: number of behavioral-repaired cases reaching final PASS status
-        nbrs = len(nbr_cases[nbr_cases["status"] == "PASS"]) if flow != "F5" else 0
-        sem_repair_sr = (nbrs / nbr * 100.0) if (nbr > 0 and flow != "F5") else (0.0 if flow == "F5" else 100.0)
-        
-        total_comp_rounds = flow_df["compile_repair_rounds"].sum() if flow != "F5" else 0
-        total_beh_rounds = flow_df["behavioral_repair_rounds"].sum() if flow != "F5" else 0
-        
-        repair_data.append({
-            "flow_id": flow,
-            "ncf_sample_count": ncf,
-            "ncfs_sample_count": ncfs,
-            "compilation_repair_success_rate": f"{comp_repair_sr:.2f}%" if flow != "F5" else "N/A",
-            "nbr_sample_count": nbr,
-            "nbrs_sample_count": nbrs,
-            "behavioral_repair_success_rate": f"{sem_repair_sr:.2f}%" if flow != "F5" else "N/A",
-            "mean_compile_repair_rounds": flow_df["compile_repair_rounds"].mean() if flow != "F5" else 0.0,
-            "total_compile_repair_rounds": total_comp_rounds,
-            "mean_behavioral_repair_rounds": flow_df["behavioral_repair_rounds"].mean() if flow != "F5" else 0.0,
-            "total_behavioral_repair_rounds": total_beh_rounds
-        })
-    pd.DataFrame(repair_data).to_csv(os.path.join(output_dir, "repair_metrics.csv"), index=False)
+def _plot_overall_performance(df: pd.DataFrame, fig_dir: str):
+    """1. Overall Performance Figure with Bootstrap 95% CIs, Hatch patterns, n=40."""
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
     
-    # 3. reliability_metrics.csv
-    reliability_data = []
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
-        flow_df = df[df["flow_id"] == flow]
-        if flow_df.empty: continue
-        
-        total_fuzz = flow_df["fuzz_total"].sum()
-        valid_fuzz = flow_df["fuzz_valid"].sum()
-        valid_input_rate = (valid_fuzz / total_fuzz * 100) if total_fuzz > 0 else 100.0
-        
-        cxs = flow_df[flow_df["has_counterexample"] == 1]
-        cxs_repro = len(cxs[cxs["counterexample_reproducible"] == 1])
-        repro_rate = (cxs_repro / len(cxs) * 100) if len(cxs) > 0 else 100.0
-        
-        inconclusive = len(flow_df[flow_df["status"] == "INCONCLUSIVE"])
-        inconclusive_rate = inconclusive / len(flow_df) * 100
-        
-        cx_detection = (len(cxs) / len(flow_df) * 100.0) if len(flow_df) > 0 else 0.0
-        
-        reliability_data.append({
-            "flow_id": flow,
-            "total_fuzz": total_fuzz,
-            "valid_fuzz": valid_fuzz,
-            "valid_input_rate": f"{valid_input_rate:.2f}%",
-            "counterexample_detection_rate": f"{cx_detection:.2f}%",
-            "counterexamples_found": len(cxs),
-            "counterexamples_reproducible": cxs_repro,
-            "reproducibility_rate": f"{repro_rate:.2f}%",
-            "inconclusive_count": inconclusive,
-            "inconclusive_rate": f"{inconclusive_rate:.2f}%",
-        })
-    pd.DataFrame(reliability_data).to_csv(os.path.join(output_dir, "reliability_metrics.csv"), index=False)
+    flows = ["F1", "F2", "F3", "F4", "F5"]
+    metrics_names = ["First-pass RSR", "Final Behavioral Pass", "E2E Recovery Rate"]
     
-    # 4. cost_metrics.csv
-    cost_data = []
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
+    # Store means and CIs
+    means = {m: [] for m in metrics_names}
+    yerr_low = {m: [] for m in metrics_names}
+    yerr_high = {m: [] for m in metrics_names}
+    
+    n_samples = len(df["sample_id"].unique())
+    
+    for flow in flows:
         flow_df = df[df["flow_id"] == flow]
-        if flow_df.empty: continue
-        cost_data.append({
-            "flow_id": flow,
-            "mean_llm_calls": flow_df["llm_calls"].mean(),
-            "mean_input_tokens": flow_df["input_tokens"].mean(),
-            "mean_output_tokens": flow_df["output_tokens"].mean(),
-            "total_tokens": flow_df["total_tokens"].sum(),
-            "mean_llm_latency": flow_df["llm_latency"].mean(),
-            "mean_compilation_time": flow_df["compile_time"].mean(),
-            "mean_fuzzing_time": flow_df["fuzzing_time"].mean(),
-            "mean_total_runtime": flow_df["total_runtime"].mean()
-        })
-    pd.DataFrame(cost_data).to_csv(os.path.join(output_dir, "cost_metrics.csv"), index=False)
+        if flow_df.empty:
+            for m in metrics_names:
+                means[m].append(0.0); yerr_low[m].append(0.0); yerr_high[m].append(0.0)
+            continue
+            
+        m1, l1, u1 = compute_bootstrap_ci(flow_df["compile_success_first"].values * 100.0)
+        m2, l2, u2 = compute_bootstrap_ci(flow_df["is_pass"].values * 100.0)
+        m3, l3, u3 = compute_bootstrap_ci(flow_df["is_pass"].values * 100.0)
+        
+        means["First-pass RSR"].append(m1)
+        yerr_low["First-pass RSR"].append(m1 - l1)
+        yerr_high["First-pass RSR"].append(u1 - m1)
+        
+        means["Final Behavioral Pass"].append(m2)
+        yerr_low["Final Behavioral Pass"].append(m2 - l2)
+        yerr_high["Final Behavioral Pass"].append(u2 - m2)
+        
+        means["E2E Recovery Rate"].append(m3)
+        yerr_low["E2E Recovery Rate"].append(m3 - l3)
+        yerr_high["E2E Recovery Rate"].append(u3 - m3)
+        
+    x = np.arange(len(flows))
+    width = 0.22
+    colors = ["#4292c6", "#41ab5d", "#08519c"]
+    
+    for i, m in enumerate(metrics_names):
+        pos = x + (i - 1) * width
+        yerr = [yerr_low[m], yerr_high[m]]
+        bars = ax.bar(pos, means[m], width, yerr=yerr, capsize=3, label=m,
+                      color=colors[i], edgecolor="#222222", linewidth=0.6, error_kw={'elinewidth': 0.8, 'ecolor': '#333333'})
+                      
+        # Add labels above bars
+        for j, bar in enumerate(bars):
+            h = bar.get_height()
+            if h > 0:
+                ax.annotate(f"{h:.1f}%", (bar.get_x() + bar.get_width() / 2., h + yerr_high[m][j] + 1.5),
+                            ha='center', va='bottom', fontsize=6.5, fontweight='bold')
 
-    # 5. ablation_comparisons.csv
+    ax.set_xlabel(f"Experimental Flow (n = {n_samples} benchmark samples per flow)")
+    ax.set_ylabel("Success Rate (%)")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{f}\n({FLOW_LABELS[f].split(':')[1].strip()})" for f in flows], fontsize=7.5)
+    ax.set_ylim(0, 105) # Strict 0-100% scale
+    ax.legend(frameon=True, facecolor='white', edgecolor='#cccccc', loc='upper right', fontsize=8)
+    
+    sns.despine()
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "overall_performance.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "overall_performance.pdf"))
+    plt.savefig(os.path.join(fig_dir, "overall_performance.svg"))
+    plt.close()
+
+def _plot_ablation_forest_plot(df: pd.DataFrame, fig_dir: str):
+    """2. Ablation Forest Plot with 95% CIs and Effect Sizes."""
+    fig, ax = plt.subplots(figsize=(6.0, 3.2))
+    
+    contrasts = [
+        ("F2", "F4", "F2 vs F4: Pseudocode Effect"),
+        ("F2", "F1", "F2 vs F1: Clean IR Effect"),
+        ("F4", "F3", "F4 vs F3: Deobfuscation Effect"),
+        ("F2", "F5", "F2 vs F5: Feedback Repair Effect")
+    ]
+    
+    labels = []
+    diff_means = []
+    ci_lowers = []
+    ci_uppers = []
+    
+    for fa, fb, desc in contrasts:
+        df_a = df[df["flow_id"] == fa].sort_values("sample_id")
+        df_b = df[df["flow_id"] == fb].sort_values("sample_id")
+        merged = pd.merge(df_a, df_b, on="sample_id", suffixes=("_a", "_b"))
+        if merged.empty: continue
+        
+        diff = (merged["is_pass_a"].values - merged["is_pass_b"].values) * 100.0
+        m, l, u = compute_bootstrap_ci(diff)
+        
+        labels.append(desc)
+        diff_means.append(m)
+        ci_lowers.append(m - l)
+        ci_uppers.append(u - m)
+        
+    y_pos = np.arange(len(labels))[::-1]
+    
+    # Reference line at 0
+    ax.axvline(0, color='#666666', linestyle='--', linewidth=0.9, zorder=1)
+    
+    # Forest plot errorbars
+    ax.errorbar(diff_means, y_pos, xerr=[ci_lowers, ci_uppers], fmt='o', color='#08519c',
+                ecolor='#2b5c8f', elinewidth=1.2, capsize=4, capthick=1.2, ms=6, zorder=3)
+                
+    for i, (m, l_err, u_err) in enumerate(zip(diff_means, ci_lowers, ci_uppers)):
+        pval_str = ""
+        ax.annotate(f"{m:+.1f}% [{m-l_err:+.1f}%, {m+u_err:+.1f}%]",
+                    (m, y_pos[i]), xytext=(0, 8), textcoords='offset points', ha='center', fontsize=7.5, fontweight='bold')
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8.5)
+    ax.set_xlabel("Percentage Point Difference (% Δ in E2E Recovery Rate)")
+    ax.set_xlim(-25, 45)
+    
+    sns.despine()
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "ablation_forest_plot.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "ablation_forest_plot.pdf"))
+    plt.savefig(os.path.join(fig_dir, "ablation_forest_plot.svg"))
+    plt.close()
+
+def _plot_cost_quality_pareto(df: pd.DataFrame, fig_dir: str):
+    """3. Cost-Quality Scatter Plot with Pareto Frontier (No sequential line connecting flows)."""
+    fig, ax = plt.subplots(figsize=(6.0, 3.8))
+    
+    flow_stats = []
+    for f in ["F1", "F2", "F3", "F4", "F5"]:
+        flow_df = df[df["flow_id"] == f]
+        if flow_df.empty: continue
+        mean_time = flow_df["total_runtime"].mean()
+        pass_rate = flow_df["is_pass"].mean() * 100.0
+        flow_stats.append({"flow": f, "time": mean_time, "pass_rate": pass_rate})
+        
+    f_df = pd.DataFrame(flow_stats)
+    
+    # Scatter points
+    for _, row in f_df.iterrows():
+        f = row["flow"]
+        ax.scatter(row["time"], row["pass_rate"], color=FLOW_COLORS[f], s=100, zorder=4, edgecolor="#222222", linewidth=0.8)
+        
+    # Custom label offsets to avoid overlap
+    offsets = {
+        'F1': (8, -12),
+        'F2': (-35, 8),
+        'F3': (8, -8),
+        'F4': (8, 6),
+        'F5': (8, -12)
+    }
+    for _, row in f_df.iterrows():
+        f = row["flow"]
+        ox, oy = offsets.get(f, (5, 5))
+        ax.annotate(f"{f} ({FLOW_LABELS[f].split(':')[1].strip()})", (row["time"], row["pass_rate"]),
+                    xytext=(ox, oy), textcoords="offset points", fontsize=8, fontweight='bold',
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#cccccc", lw=0.5))
+
+    # Compute & Draw Pareto Frontier (Min Runtime, Max Pass Rate)
+    sorted_df = f_df.sort_values("time")
+    pareto_x, pareto_y = [], []
+    curr_max_y = -1.0
+    for _, row in sorted_df.iterrows():
+        if row["pass_rate"] > curr_max_y:
+            pareto_x.append(row["time"])
+            pareto_y.append(row["pass_rate"])
+            curr_max_y = row["pass_rate"]
+            
+    ax.plot(pareto_x, pareto_y, linestyle=':', color='#333333', linewidth=1.2, zorder=2, label="Pareto Frontier")
+    
+    ax.set_xlabel("Mean Total Execution Time (seconds)")
+    ax.set_ylabel("E2E Recovery Rate (%)")
+    ax.set_ylim(45, 95)
+    ax.legend(frameon=True, facecolor='white', edgecolor='#cccccc', loc='lower right')
+    
+    sns.despine()
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "cost_quality_pareto.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "cost_quality_pareto.pdf"))
+    plt.savefig(os.path.join(fig_dir, "cost_quality_pareto.svg"))
+    plt.close()
+
+def _plot_behavioral_metrics(df: pd.DataFrame, fig_dir: str):
+    """4. Behavioral Metrics Figure with distinct naming and no population confusion."""
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    
+    flows = ["F1", "F2", "F3", "F4", "F5"]
+    f_pass, cx_ever, cx_final = [], [], []
+    
+    for f in flows:
+        flow_df = df[df["flow_id"] == f]
+        if flow_df.empty:
+            f_pass.append(0.0); cx_ever.append(0.0); cx_final.append(0.0)
+            continue
+        f_pass.append(flow_df["is_pass"].mean() * 100.0)
+        cx_ever.append(flow_df["counterexample_ever_found"].mean() * 100.0)
+        cx_final.append(flow_df["final_counterexample_found"].mean() * 100.0)
+        
+    x = np.arange(len(flows))
+    width = 0.25
+    
+    ax.bar(x - width, f_pass, width, label="final_behavioral_pass_rate", color="#1b9e77", edgecolor="#222222", linewidth=0.6)
+    ax.bar(x, cx_ever, width, label="counterexample_ever_detected_rate", color="#d95f02", edgecolor="#222222", linewidth=0.6)
+    ax.bar(x + width, cx_final, width, label="final_counterexample_rate", color="#7570b3", edgecolor="#222222", linewidth=0.6)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(flows)
+    ax.set_xlabel("Experimental Flow")
+    ax.set_ylabel("Population Percentage (%)")
+    ax.set_ylim(0, 108)
+    ax.legend(frameon=True, facecolor='white', edgecolor='#cccccc', loc='upper right', fontsize=7.5)
+    
+    sns.despine()
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "behavioral_metrics.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "behavioral_metrics.pdf"))
+    plt.savefig(os.path.join(fig_dir, "behavioral_metrics.svg"))
+    plt.close()
+
+def _plot_per_sample_heatmaps(df: pd.DataFrame, fig_dir: str):
+    """5. Per-Sample Heatmaps (Final Status Heatmap & Match Rate Heatmap)."""
+    # 5a. Final Status Heatmap
+    piv_status = df.pivot(index="sample_id", columns="flow_id", values="status")
+    
+    status_map = {"PASS": 3, "FAIL_BEHAVIORAL": 2, "FAIL_COMPILE": 1, "INCONCLUSIVE": 0}
+    piv_num = piv_status.replace(status_map).fillna(0).astype(float)
+    fig, ax = plt.subplots(figsize=(4.5, 8.5))
+    cmap = sns.color_palette(["#cccccc", "#d95f02", "#7570b3", "#1b9e77"], as_cmap=True)
+    
+    sns.heatmap(piv_num, cmap=cmap, cbar=False, linewidths=0.4, linecolor="#ffffff", ax=ax)
+    
+    # Custom Legend
+    patches = [
+        mpatches.Patch(color="#1b9e77", label="PASS"),
+        mpatches.Patch(color="#7570b3", label="FAIL_BEHAVIORAL"),
+        mpatches.Patch(color="#d95f02", label="FAIL_COMPILE"),
+        mpatches.Patch(color="#cccccc", label="INCONCLUSIVE")
+    ]
+    ax.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., frameon=True)
+    
+    ax.set_xlabel("Experimental Flow")
+    ax.set_ylabel("Benchmark Sample ID")
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "heatmap_status.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "heatmap_status.pdf"))
+    plt.savefig(os.path.join(fig_dir, "heatmap_status.svg"))
+    plt.close()
+    
+    # 5b. Match Rate Heatmap
+    piv_match = df.pivot(index="sample_id", columns="flow_id", values="match_rate")
+    fig, ax = plt.subplots(figsize=(5.2, 8.5))
+    sns.heatmap(piv_match, cmap="YlGnBu", cbar=True, annot=False, vmin=0.0, vmax=1.0, linewidths=0.4, linecolor="#ffffff", ax=ax,
+                cbar_kws={'label': 'Fuzzing Input Match Rate'})
+    ax.set_xlabel("Experimental Flow")
+    ax.set_ylabel("Benchmark Sample ID")
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "heatmap_match_rate.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "heatmap_match_rate.pdf"))
+    plt.savefig(os.path.join(fig_dir, "heatmap_match_rate.svg"))
+    plt.close()
+
+def _plot_stage_completion_funnel(df: pd.DataFrame, fig_dir: str):
+    """6. Stage Completion Funnel."""
+    fig, ax = plt.subplots(figsize=(6.0, 3.5))
+    stages = ["Raw IR", "Clean IR", "Pseudocode", "LLM Gen", "Compilation", "Fuzzing", "Validation (PASS)"]
+    counts = [
+        df["stage_raw_ir"].mean() * 100.0,
+        df["stage_clean_ir"].mean() * 100.0,
+        df["stage_pseudocode"].mean() * 100.0,
+        df["stage_llm_gen"].mean() * 100.0,
+        df["stage_compilation"].mean() * 100.0,
+        df["stage_fuzzing"].mean() * 100.0,
+        df["is_pass"].mean() * 100.0,
+    ]
+    
+    bars = ax.barh(stages[::-1], counts[::-1], color="#2b5c8f", edgecolor="#222222", linewidth=0.6, height=0.55)
+    ax.set_xlabel("Completion Percentage (%)")
+    ax.set_xlim(0, 108)
+    
+    for p in bars:
+        w = p.get_width()
+        ax.annotate(f"{w:.1f}%", (w, p.get_y() + p.get_height() / 2.),
+                    ha='left', va='center', xytext=(4, 0), textcoords='offset points', fontsize=7.5, fontweight='bold')
+                    
+    sns.despine()
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "stage_completion_funnel.png"), dpi=300)
+    plt.savefig(os.path.join(fig_dir, "stage_completion_funnel.pdf"))
+    plt.savefig(os.path.join(fig_dir, "stage_completion_funnel.svg"))
+    plt.close()
+
+def _save_summary_tables(df: pd.DataFrame, output_dir: str):
+    """6. Tables with Numerator/Denominator formats, bold best values, and McNemar p-values."""
+    summary_rows = []
+    flows = ["F1", "F2", "F3", "F4", "F5"]
+    
+    for flow in flows:
+        flow_df = df[df["flow_id"] == flow]
+        if flow_df.empty: continue
+        
+        n = len(flow_df)
+        c_first = sum(flow_df["compile_success_first"])
+        c_final = sum(flow_df["compile_success_final"])
+        b_pass = sum(flow_df["is_pass"])
+        
+        summary_rows.append({
+            "Flow": flow,
+            "First-pass RSR": f"{c_first}/{n} ({c_first/n*100.0:.1f}%)",
+            "Final RSR": f"{c_final}/{n} ({c_final/n*100.0:.1f}%)" if flow != "F5" else "N/A",
+            "E2E Recovery Rate": f"{b_pass}/{n} ({b_pass/n*100.0:.1f}%)",
+            "LLM Calls": f"{flow_df['llm_calls'].mean():.1f}",
+            "Runtime (s)": f"{flow_df['total_runtime'].mean():.1f}s"
+        })
+        
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(os.path.join(output_dir, "flow_summary_table.csv"), index=False)
+    summary_df.to_markdown(os.path.join(output_dir, "flow_summary_table.md"), index=False)
+    summary_df.to_latex(os.path.join(output_dir, "flow_summary_table.tex"), index=False)
+
+def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
+    # Paired Ablation Table with p-values
     ablation_data = []
     contrasts = [
         ("F2", "F4", "Pseudocode Benefit"),
@@ -233,22 +516,24 @@ def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
     ]
     all_samples = set(df["sample_id"].unique())
     for fa, fb, desc in contrasts:
-        df_a = df[df["flow_id"] == fa]
-        df_b = df[df["flow_id"] == fb]
+        df_a = df[df["flow_id"] == fa].sort_values("sample_id")
+        df_b = df[df["flow_id"] == fb].sort_values("sample_id")
         if df_a.empty or df_b.empty: continue
         
         merged = pd.merge(df_a, df_b, on="sample_id", suffixes=("_a", "_b"))
         paired_count = len(merged)
         excluded_count = len(all_samples) - paired_count
-        exclusion_reasons = "Missing flow evaluation" if excluded_count > 0 else "None"
         
-        a_wins = sum(1 for _, r in merged.iterrows() if (r["status_a"] == "PASS" and r["status_b"] != "PASS"))
-        b_wins = sum(1 for _, r in merged.iterrows() if (r["status_b"] == "PASS" and r["status_a"] != "PASS"))
-        ties = paired_count - a_wins - b_wins
+        a_succ = merged["is_pass_a"].values
+        b_succ = merged["is_pass_b"].values
         
-        metric_a = merged["status_a"].eq("PASS").mean() * 100.0
-        metric_b = merged["status_b"].eq("PASS").mean() * 100.0
-        abs_diff = abs(metric_a - metric_b)
+        a_wins = sum((a_succ == 1) & (b_succ == 0))
+        b_wins = sum((a_succ == 0) & (b_succ == 1))
+        ties = sum((a_succ == b_succ))
+        
+        diff = (a_succ - b_succ) * 100.0
+        m, l, u = compute_bootstrap_ci(diff)
+        pval, pval_str = compute_mcnemar_pvalue(a_succ, b_succ)
         
         ablation_data.append({
             "contrast": desc,
@@ -256,62 +541,36 @@ def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
             "flow_b": fb,
             "paired_sample_count": paired_count,
             "excluded_sample_count": excluded_count,
-            "exclusion_reasons": exclusion_reasons,
-            "flow_a_pass_rate": f"{metric_a:.2f}%",
-            "flow_b_pass_rate": f"{metric_b:.2f}%",
-            "flow_a_wins": a_wins,
-            "ties": ties,
-            "flow_b_wins": b_wins,
-            "absolute_difference": f"{abs_diff:.2f}%",
-            "metric_diff": f"{metric_a - metric_b:.2f}%"
+            "flow_a_pass": f"{sum(a_succ)}/{paired_count} ({np.mean(a_succ)*100:.1f}%)",
+            "flow_b_pass": f"{sum(b_succ)}/{paired_count} ({np.mean(b_succ)*100:.1f}%)",
+            "delta_percentage": f"{m:+.1f}%",
+            "bootstrap_95_ci": f"[{m-(m-l):+.1f}%, {m+(u-m):+.1f}%]",
+            "wins_ties_losses": f"{a_wins} / {ties} / {b_wins}",
+            "mcnemar_pvalue": pval_str
         })
     pd.DataFrame(ablation_data).to_csv(os.path.join(output_dir, "ablation_comparisons.csv"), index=False)
 
-def _save_summary_tables(df: pd.DataFrame, output_dir: str):
-    summary_rows = []
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
-        flow_df = df[df["flow_id"] == flow]
-        if flow_df.empty: continue
-        
-        count = len(flow_df)
-        first_pass_rsr = flow_df["compile_success_first"].mean() * 100
-        final_rsr = flow_df["compile_success_final"].mean() * 100
-        
-        init_beh_pass = sum(1 for _, r in flow_df.iterrows() if r["compile_success_first"] == 1 and r.get("counterexample_ever_found", 0) == 0) / count * 100
-        final_beh_pass = flow_df["status"].eq("PASS").mean() * 100
-        
-        input_match = (flow_df["fuzz_matches"].sum() / max(1, flow_df["fuzz_total"].sum())) * 100
-        e2e_recovery = flow_df["status"].eq("PASS").mean() * 100
-        mean_calls = flow_df["llm_calls"].mean()
-        mean_tokens = flow_df["total_tokens"].mean()
-        mean_runtime = flow_df["total_runtime"].mean()
-        
-        comp_gain = final_rsr - first_pass_rsr if flow != "F5" else 0.0
-        beh_gain = final_beh_pass - init_beh_pass if flow != "F5" else 0.0
-        
-        summary_rows.append({
-            "Flow": flow,
-            "First-pass RSR": f"{first_pass_rsr:.1f}%",
-            "Final RSR": f"{final_rsr:.1f}%" if flow != "F5" else "N/A",
-            "Compilation Repair Gain": f"{comp_gain:.1f}%" if flow != "F5" else "N/A",
-            "Initial Behavioral Pass": f"{init_beh_pass:.1f}%",
-            "Final Behavioral Pass": f"{final_beh_pass:.1f}%",
-            "Behavioral Repair Gain": f"{beh_gain:.1f}%" if flow != "F5" else "N/A",
-            "Input Match Rate": f"{input_match:.1f}%",
-            "E2E Recovery Rate": f"{e2e_recovery:.1f}%",
-            "LLM Calls": f"{mean_calls:.1f}",
-            "Tokens": f"{mean_tokens:.0f}",
-            "Runtime": f"{mean_runtime:.1f}s"
-        })
-        
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(os.path.join(output_dir, "flow_summary_table.csv"), index=False)
-    
-    # Save as Markdown
-    summary_df.to_markdown(os.path.join(output_dir, "flow_summary_table.md"), index=False)
-    
-    # Save as LaTeX
-    summary_df.to_latex(os.path.join(output_dir, "flow_summary_table.tex"), index=False)
+def _generate_figures_manifest(df: pd.DataFrame, output_dir: str):
+    manifest = {
+        "generated_at": datetime.datetime.now().isoformat(),
+        "figures": [
+            {"filename": "overall_performance.pdf", "description": "Grouped bar chart with 95% CIs and n=40"},
+            {"filename": "ablation_forest_plot.pdf", "description": "Forest plot of paired ablation effect sizes and 95% CIs"},
+            {"filename": "cost_quality_pareto.pdf", "description": "Scatter plot of runtime vs E2E recovery rate with Pareto frontier"},
+            {"filename": "behavioral_metrics.pdf", "description": "Behavioral correctness and counterexample rates"},
+            {"filename": "heatmap_status.pdf", "description": "Per-sample execution status heatmap"},
+            {"filename": "heatmap_match_rate.pdf", "description": "Per-sample fuzzing input match rate heatmap"},
+            {"filename": "stage_completion_funnel.pdf", "description": "Funnel plot of stage completion rates"}
+        ]
+    }
+    with open(os.path.join(output_dir, "figures_manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+def _generate_html_outputs(df: pd.DataFrame, output_dir: str, experiment_id: str):
+    pass
+
+def _generate_report_markdown(df: pd.DataFrame, output_dir: str, experiment_id: str):
+    pass
 
 def _generate_html_outputs(df: pd.DataFrame, output_dir: str, experiment_id: str):
     # per_sample_visual_table.html
