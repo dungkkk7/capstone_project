@@ -2398,6 +2398,7 @@ class VertexGemini:
                 "messages": messages,
                 "temperature": self.config.temperature or 0.1,
                 "max_tokens": self.config.max_output_tokens or 8192,
+                "stream": False,
             }
         else:
             file_parts = []
