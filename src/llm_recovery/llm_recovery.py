@@ -2479,7 +2479,10 @@ class VertexGemini:
                 )
             raise RecoveryError(f"Vertex REST failed: HTTP {response.status_code}: {detail}")
 
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception as json_err:
+            raise RecoveryError(f"Failed to parse response JSON. HTTP Status: {response.status_code}. Raw Body: {response.text[:1000]}") from json_err
         if use_openai_format:
             choices = data.get("choices") or []
             if not choices:
