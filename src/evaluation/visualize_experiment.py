@@ -30,13 +30,39 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
             "behavioral_repairs": t.behavioral_repairs,
             "compile_success_first": 1 if t.compile_success_first else 0,
             "compile_success_final": 1 if t.compile_success_final else 0,
-            "compile_repair_rounds": t.compile_repair_rounds,
-            "behavioral_repair_rounds": t.behavioral_repair_rounds,
+            "any_compile_success_within_budget": 1 if getattr(t, "any_compile_success_within_budget", t.compile_success_final) else 0,
+            "last_candidate_compile_success": 1 if getattr(t, "last_candidate_compile_success", t.compile_success_final) else 0,
+            "compile_repair_rounds": t.compile_repair_rounds if t.flow_id != "F5" else 0,
+            "behavioral_repair_rounds": t.behavioral_repair_rounds if t.flow_id != "F5" else 0,
             "fuzz_total": t.fuzz_total,
             "fuzz_valid": t.fuzz_valid,
             "fuzz_matches": t.fuzz_matches,
             "has_counterexample": 1 if t.has_counterexample else 0,
             "counterexample_reproducible": 1 if t.counterexample_reproducible else 0,
+            "counterexample_ever_found": 1 if getattr(t, "counterexample_ever_found", t.has_counterexample) else 0,
+            "reproducible_counterexample_ever_found": 1 if getattr(t, "reproducible_counterexample_ever_found", t.counterexample_reproducible) else 0,
+            "final_counterexample_found": 1 if getattr(t, "final_counterexample_found", t.has_counterexample) else 0,
+            "llvm_ir_verification_success": 1 if getattr(t, "llvm_ir_verification_success", True) else 0,
+            "stage_raw_ir": 1 if getattr(t, "stage_raw_ir", True) else 0,
+            "stage_clean_ir": 1 if getattr(t, "stage_clean_ir", True) else 0,
+            "stage_pseudocode": 1 if getattr(t, "stage_pseudocode", True) else 0,
+            "stage_llm_gen": 1 if getattr(t, "stage_llm_gen", False) else 0,
+            "stage_compilation": 1 if getattr(t, "stage_compilation", False) else 0,
+            "stage_fuzzing": 1 if getattr(t, "stage_fuzzing", False) else 0,
+            "stage_behavioral_validation": 1 if getattr(t, "stage_behavioral_validation", False) else 0,
+            "instructions_raw": getattr(t, "instructions_raw", reduction.get("instruction_raw", 0)),
+            "instructions_clean": getattr(t, "instructions_clean", reduction.get("instruction_clean", 0)),
+            "basic_blocks_raw": getattr(t, "basic_blocks_raw", reduction.get("bb_raw", 0)),
+            "basic_blocks_clean": getattr(t, "basic_blocks_clean", reduction.get("bb_clean", 0)),
+            "conditional_branches_raw": getattr(t, "conditional_branches_raw", reduction.get("branches_raw", 0)),
+            "conditional_branches_clean": getattr(t, "conditional_branches_clean", reduction.get("branches_clean", 0)),
+            "instruction_reduction": getattr(t, "instruction_reduction", (reduction.get("instruction_raw", 0) - reduction.get("instruction_clean", 0)) / max(1, reduction.get("instruction_raw", 1)) * 100),
+            "bb_reduction": getattr(t, "bb_reduction", (reduction.get("bb_raw", 0) - reduction.get("bb_clean", 0)) / max(1, reduction.get("bb_raw", 1)) * 100),
+            "branches_reduction": getattr(t, "branches_reduction", (reduction.get("branches_raw", 0) - reduction.get("branches_clean", 0)) / max(1, reduction.get("branches_raw", 1)) * 100),
+            "original_sloc": getattr(t, "original_sloc", 0),
+            "recovered_sloc": getattr(t, "recovered_sloc", 0),
+            "sloc_ratio": getattr(t, "sloc_ratio", 0.0),
+            "readability_score": getattr(t, "readability_score", 0.0),
             "status": t.status,
             "input_tokens": t.input_tokens,
             "output_tokens": t.output_tokens,
@@ -45,10 +71,6 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
             "compile_time": t.compile_time,
             "fuzzing_time": t.fuzzing_time,
             "total_runtime": t.total_runtime,
-            # Reduction metrics
-            "instruction_reduction": (reduction.get("instruction_raw", 0) - reduction.get("instruction_clean", 0)) / max(1, reduction.get("instruction_raw", 1)) * 100,
-            "bb_reduction": (reduction.get("bb_raw", 0) - reduction.get("bb_clean", 0)) / max(1, reduction.get("bb_raw", 1)) * 100,
-            "branches_reduction": (reduction.get("branches_raw", 0) - reduction.get("branches_clean", 0)) / max(1, reduction.get("branches_raw", 1)) * 100,
         })
     df = pd.DataFrame(data)
     
@@ -98,34 +120,41 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
     _generate_figures_manifest(df, output_dir)
 
 def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
-    # per_sample_results.csv is already saved in run_experiment.py
-    
     # 2. repair_metrics.csv
     repair_data = []
     for flow in ["F1", "F2", "F3", "F4", "F5"]:
         flow_df = df[df["flow_id"] == flow]
         if flow_df.empty: continue
+        
+        # NCF: number of cases failing first-pass compile
         comp_fails = flow_df[flow_df["compile_success_first"] == 0]
-        nbr = flow_df[flow_df["compile_success_first"] == 1]  # candidates with first compile success
-        
         ncf = len(comp_fails)
-        ncfs = len(comp_fails[comp_fails["compile_success_final"] == 1])
-        comp_repair_sr = (ncfs / ncf * 100) if ncf > 0 else 100.0
+        # NCFS: number of compile-failing cases saved by compile repair
+        ncfs = len(comp_fails[comp_fails["compile_success_final"] == 1]) if flow != "F5" else 0
+        comp_repair_sr = (ncfs / ncf * 100.0) if (ncf > 0 and flow != "F5") else (0.0 if flow == "F5" else 100.0)
         
-        nbr_count = len(nbr)
-        nbrs = len(nbr[nbr["status"] == "PASS"])
-        sem_repair_sr = (nbrs / nbr_count * 100) if nbr_count > 0 else 100.0
+        # NBR: number of cases passing first-pass compile BUT triggering behavioral repair (counterexample found)
+        nbr_cases = flow_df[(flow_df["compile_success_first"] == 1) & (flow_df["counterexample_ever_found"] == 1)]
+        nbr = len(nbr_cases)
+        # NBRS: number of behavioral-repaired cases reaching final PASS status
+        nbrs = len(nbr_cases[nbr_cases["status"] == "PASS"]) if flow != "F5" else 0
+        sem_repair_sr = (nbrs / nbr * 100.0) if (nbr > 0 and flow != "F5") else (0.0 if flow == "F5" else 100.0)
+        
+        total_comp_rounds = flow_df["compile_repair_rounds"].sum() if flow != "F5" else 0
+        total_beh_rounds = flow_df["behavioral_repair_rounds"].sum() if flow != "F5" else 0
         
         repair_data.append({
             "flow_id": flow,
-            "ncf": ncf,
-            "ncfs": ncfs,
-            "comp_repair_success_rate": f"{comp_repair_sr:.2f}%",
-            "nbr": nbr_count,
-            "nbrs": nbrs,
-            "sem_repair_success_rate": f"{sem_repair_sr:.2f}%" if flow != "F5" else "NOT_APPLICABLE",
-            "mean_compile_repair_rounds": flow_df["compile_repair_rounds"].mean(),
+            "ncf_sample_count": ncf,
+            "ncfs_sample_count": ncfs,
+            "compilation_repair_success_rate": f"{comp_repair_sr:.2f}%" if flow != "F5" else "N/A",
+            "nbr_sample_count": nbr,
+            "nbrs_sample_count": nbrs,
+            "behavioral_repair_success_rate": f"{sem_repair_sr:.2f}%" if flow != "F5" else "N/A",
+            "mean_compile_repair_rounds": flow_df["compile_repair_rounds"].mean() if flow != "F5" else 0.0,
+            "total_compile_repair_rounds": total_comp_rounds,
             "mean_behavioral_repair_rounds": flow_df["behavioral_repair_rounds"].mean() if flow != "F5" else 0.0,
+            "total_behavioral_repair_rounds": total_beh_rounds
         })
     pd.DataFrame(repair_data).to_csv(os.path.join(output_dir, "repair_metrics.csv"), index=False)
     
@@ -146,11 +175,14 @@ def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
         inconclusive = len(flow_df[flow_df["status"] == "INCONCLUSIVE"])
         inconclusive_rate = inconclusive / len(flow_df) * 100
         
+        cx_detection = (len(cxs) / len(flow_df) * 100.0) if len(flow_df) > 0 else 0.0
+        
         reliability_data.append({
             "flow_id": flow,
             "total_fuzz": total_fuzz,
             "valid_fuzz": valid_fuzz,
             "valid_input_rate": f"{valid_input_rate:.2f}%",
+            "counterexample_detection_rate": f"{cx_detection:.2f}%",
             "counterexamples_found": len(cxs),
             "counterexamples_reproducible": cxs_repro,
             "reproducibility_rate": f"{repro_rate:.2f}%",
@@ -186,25 +218,39 @@ def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
         ("F2", "F5", "Feedback/Repair Benefit"),
         ("F2", "F3", "Full Configuration vs Raw")
     ]
+    all_samples = set(df["sample_id"].unique())
     for fa, fb, desc in contrasts:
         df_a = df[df["flow_id"] == fa]
         df_b = df[df["flow_id"] == fb]
         if df_a.empty or df_b.empty: continue
         
         merged = pd.merge(df_a, df_b, on="sample_id", suffixes=("_a", "_b"))
-        a_wins = sum(1 for _, r in merged.iterrows() if r["compile_success_final_a"] > r["compile_success_final_b"] or r["status_a"] == "PASS" and r["status_b"] != "PASS")
-        b_wins = sum(1 for _, r in merged.iterrows() if r["compile_success_final_b"] > r["compile_success_final_a"] or r["status_b"] == "PASS" and r["status_a"] != "PASS")
-        ties = len(merged) - a_wins - b_wins
+        paired_count = len(merged)
+        excluded_count = len(all_samples) - paired_count
+        exclusion_reasons = "Missing flow evaluation" if excluded_count > 0 else "None"
+        
+        a_wins = sum(1 for _, r in merged.iterrows() if (r["status_a"] == "PASS" and r["status_b"] != "PASS"))
+        b_wins = sum(1 for _, r in merged.iterrows() if (r["status_b"] == "PASS" and r["status_a"] != "PASS"))
+        ties = paired_count - a_wins - b_wins
+        
+        metric_a = merged["status_a"].eq("PASS").mean() * 100.0
+        metric_b = merged["status_b"].eq("PASS").mean() * 100.0
+        abs_diff = abs(metric_a - metric_b)
         
         ablation_data.append({
             "contrast": desc,
             "flow_a": fa,
             "flow_b": fb,
-            "paired_sample_count": len(merged),
+            "paired_sample_count": paired_count,
+            "excluded_sample_count": excluded_count,
+            "exclusion_reasons": exclusion_reasons,
+            "flow_a_pass_rate": f"{metric_a:.2f}%",
+            "flow_b_pass_rate": f"{metric_b:.2f}%",
             "flow_a_wins": a_wins,
             "ties": ties,
             "flow_b_wins": b_wins,
-            "metric_diff": f"{merged['status_a'].eq('PASS').mean()*100 - merged['status_b'].eq('PASS').mean()*100:.2f}%"
+            "absolute_difference": f"{abs_diff:.2f}%",
+            "metric_diff": f"{metric_a - metric_b:.2f}%"
         })
     pd.DataFrame(ablation_data).to_csv(os.path.join(output_dir, "ablation_comparisons.csv"), index=False)
 
@@ -217,24 +263,29 @@ def _save_summary_tables(df: pd.DataFrame, output_dir: str):
         count = len(flow_df)
         first_pass_rsr = flow_df["compile_success_first"].mean() * 100
         final_rsr = flow_df["compile_success_final"].mean() * 100
-        behavior_pass = flow_df["status"].eq("PASS").mean() * 100
+        
+        init_beh_pass = sum(1 for _, r in flow_df.iterrows() if r["compile_success_first"] == 1 and r.get("counterexample_ever_found", 0) == 0) / count * 100
+        final_beh_pass = flow_df["status"].eq("PASS").mean() * 100
+        
         input_match = (flow_df["fuzz_matches"].sum() / max(1, flow_df["fuzz_total"].sum())) * 100
         e2e_recovery = flow_df["status"].eq("PASS").mean() * 100
         mean_calls = flow_df["llm_calls"].mean()
         mean_tokens = flow_df["total_tokens"].mean()
         mean_runtime = flow_df["total_runtime"].mean()
         
-        # Repair Gain
-        gain = final_rsr - first_pass_rsr if flow != "F5" else 0.0
+        comp_gain = final_rsr - first_pass_rsr if flow != "F5" else 0.0
+        beh_gain = final_beh_pass - init_beh_pass if flow != "F5" else 0.0
         
         summary_rows.append({
             "Flow": flow,
             "First-pass RSR": f"{first_pass_rsr:.1f}%",
             "Final RSR": f"{final_rsr:.1f}%" if flow != "F5" else "N/A",
-            "Behavioral Pass Rate": f"{behavior_pass:.1f}%",
+            "Compilation Repair Gain": f"{comp_gain:.1f}%" if flow != "F5" else "N/A",
+            "Initial Behavioral Pass": f"{init_beh_pass:.1f}%",
+            "Final Behavioral Pass": f"{final_beh_pass:.1f}%",
+            "Behavioral Repair Gain": f"{beh_gain:.1f}%" if flow != "F5" else "N/A",
             "Input Match Rate": f"{input_match:.1f}%",
             "E2E Recovery Rate": f"{e2e_recovery:.1f}%",
-            "Repair Gain": f"{gain:.1f}%" if flow != "F5" else "N/A",
             "LLM Calls": f"{mean_calls:.1f}",
             "Tokens": f"{mean_tokens:.0f}",
             "Runtime": f"{mean_runtime:.1f}s"

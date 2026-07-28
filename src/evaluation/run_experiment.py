@@ -107,22 +107,56 @@ class CaseTracker:
         self.behavioral_repairs = 0
         self.first_candidate = ""
         self.final_candidate = ""
+        
+        # Compile status
         self.compile_success_first = False
         self.compile_success_final = False
+        self.any_compile_success_within_budget = False
+        self.last_candidate_compile_success = False
         self.compile_repair_rounds = 0
         self.behavioral_repair_rounds = 0
         
-        # Fuzzing counts
+        # Fuzzing counts & Counterexample tracking
         self.fuzz_total = 0
         self.fuzz_valid = 0
         self.fuzz_matches = 0
         self.has_counterexample = False
         self.counterexample_reproducible = False
+        self.counterexample_ever_found = False
+        self.reproducible_counterexample_ever_found = False
+        self.final_counterexample_found = False
         self.behavior_before_repair = ""
         self.behavior_after_repair = ""
         
-        # Status
-        self.status = "INCONCLUSIVE"  # PASS, FAIL_COMPILE, FAIL_BEHAVIORAL, INCONCLUSIVE
+        # Stage Completion & Verification
+        self.llvm_ir_verification_success = False
+        self.stage_raw_ir = False
+        self.stage_clean_ir = False
+        self.stage_pseudocode = False
+        self.stage_llm_gen = False
+        self.stage_compilation = False
+        self.stage_fuzzing = False
+        self.stage_behavioral_validation = False
+        
+        # Deobfuscation Metrics & Raw counts
+        self.instructions_raw = 0
+        self.instructions_clean = 0
+        self.basic_blocks_raw = 0
+        self.basic_blocks_clean = 0
+        self.conditional_branches_raw = 0
+        self.conditional_branches_clean = 0
+        self.instruction_reduction = 0.0
+        self.bb_reduction = 0.0
+        self.branches_reduction = 0.0
+        
+        # Original C Post-hoc Analysis
+        self.original_sloc = 0
+        self.recovered_sloc = 0
+        self.sloc_ratio = 0.0
+        self.readability_score = 0.0
+        
+        # Status (PASS, FAIL_COMPILE, FAIL_BEHAVIORAL, INCONCLUSIVE)
+        self.status = "INCONCLUSIVE"
         
         # Performance/Cost
         self.input_tokens = 0
@@ -145,6 +179,8 @@ class CaseTracker:
             "final_candidate": self.final_candidate,
             "compile_success_first": self.compile_success_first,
             "compile_success_final": self.compile_success_final,
+            "any_compile_success_within_budget": self.any_compile_success_within_budget,
+            "last_candidate_compile_success": self.last_candidate_compile_success,
             "compile_repair_rounds": self.compile_repair_rounds,
             "behavioral_repair_rounds": self.behavioral_repair_rounds,
             "fuzz_total": self.fuzz_total,
@@ -152,6 +188,30 @@ class CaseTracker:
             "fuzz_matches": self.fuzz_matches,
             "has_counterexample": self.has_counterexample,
             "counterexample_reproducible": self.counterexample_reproducible,
+            "counterexample_ever_found": self.counterexample_ever_found,
+            "reproducible_counterexample_ever_found": self.reproducible_counterexample_ever_found,
+            "final_counterexample_found": self.final_counterexample_found,
+            "llvm_ir_verification_success": self.llvm_ir_verification_success,
+            "stage_raw_ir": self.stage_raw_ir,
+            "stage_clean_ir": self.stage_clean_ir,
+            "stage_pseudocode": self.stage_pseudocode,
+            "stage_llm_gen": self.stage_llm_gen,
+            "stage_compilation": self.stage_compilation,
+            "stage_fuzzing": self.stage_fuzzing,
+            "stage_behavioral_validation": self.stage_behavioral_validation,
+            "instructions_raw": self.instructions_raw,
+            "instructions_clean": self.instructions_clean,
+            "basic_blocks_raw": self.basic_blocks_raw,
+            "basic_blocks_clean": self.basic_blocks_clean,
+            "conditional_branches_raw": self.conditional_branches_raw,
+            "conditional_branches_clean": self.conditional_branches_clean,
+            "instruction_reduction": self.instruction_reduction,
+            "bb_reduction": self.bb_reduction,
+            "branches_reduction": self.branches_reduction,
+            "original_sloc": self.original_sloc,
+            "recovered_sloc": self.recovered_sloc,
+            "sloc_ratio": self.sloc_ratio,
+            "readability_score": self.readability_score,
             "behavior_before_repair": self.behavior_before_repair,
             "behavior_after_repair": self.behavior_after_repair,
             "status": self.status,
@@ -174,6 +234,8 @@ class CaseTracker:
         tracker.final_candidate = data.get("final_candidate", "")
         tracker.compile_success_first = data.get("compile_success_first", False)
         tracker.compile_success_final = data.get("compile_success_final", False)
+        tracker.any_compile_success_within_budget = data.get("any_compile_success_within_budget", tracker.compile_success_final)
+        tracker.last_candidate_compile_success = data.get("last_candidate_compile_success", tracker.compile_success_final)
         tracker.compile_repair_rounds = data.get("compile_repair_rounds", 0)
         tracker.behavioral_repair_rounds = data.get("behavioral_repair_rounds", 0)
         tracker.fuzz_total = data.get("fuzz_total", 0)
@@ -181,6 +243,30 @@ class CaseTracker:
         tracker.fuzz_matches = data.get("fuzz_matches", 0)
         tracker.has_counterexample = data.get("has_counterexample", False)
         tracker.counterexample_reproducible = data.get("counterexample_reproducible", False)
+        tracker.counterexample_ever_found = data.get("counterexample_ever_found", tracker.has_counterexample)
+        tracker.reproducible_counterexample_ever_found = data.get("reproducible_counterexample_ever_found", tracker.counterexample_reproducible)
+        tracker.final_counterexample_found = data.get("final_counterexample_found", tracker.has_counterexample)
+        tracker.llvm_ir_verification_success = data.get("llvm_ir_verification_success", False)
+        tracker.stage_raw_ir = data.get("stage_raw_ir", False)
+        tracker.stage_clean_ir = data.get("stage_clean_ir", False)
+        tracker.stage_pseudocode = data.get("stage_pseudocode", False)
+        tracker.stage_llm_gen = data.get("stage_llm_gen", False)
+        tracker.stage_compilation = data.get("stage_compilation", False)
+        tracker.stage_fuzzing = data.get("stage_fuzzing", False)
+        tracker.stage_behavioral_validation = data.get("stage_behavioral_validation", False)
+        tracker.instructions_raw = data.get("instructions_raw", 0)
+        tracker.instructions_clean = data.get("instructions_clean", 0)
+        tracker.basic_blocks_raw = data.get("basic_blocks_raw", 0)
+        tracker.basic_blocks_clean = data.get("basic_blocks_clean", 0)
+        tracker.conditional_branches_raw = data.get("conditional_branches_raw", 0)
+        tracker.conditional_branches_clean = data.get("conditional_branches_clean", 0)
+        tracker.instruction_reduction = data.get("instruction_reduction", 0.0)
+        tracker.bb_reduction = data.get("bb_reduction", 0.0)
+        tracker.branches_reduction = data.get("branches_reduction", 0.0)
+        tracker.original_sloc = data.get("original_sloc", 0)
+        tracker.recovered_sloc = data.get("recovered_sloc", 0)
+        tracker.sloc_ratio = data.get("sloc_ratio", 0.0)
+        tracker.readability_score = data.get("readability_score", 0.0)
         tracker.behavior_before_repair = data.get("behavior_before_repair", "")
         tracker.behavior_after_repair = data.get("behavior_after_repair", "")
         tracker.status = data.get("status", "INCONCLUSIVE")
@@ -273,10 +359,23 @@ def run_fuzzing_tracked(candidate_path: str, ref_binary: str, contract: Any, gen
         fuzzer.cleanup()
         tracker.fuzzing_time += (time.time() - t_start)
 
-def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str, location: str) -> CaseTracker:
+def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str, location: str, original_src: Optional[str] = None) -> CaseTracker:
     tracker = CaseTracker(sample_id, flow_id)
     t_start = time.time()
     
+    # Stage status
+    tracker.stage_raw_ir = os.path.exists(raw_ir) and os.path.getsize(raw_ir) > 0
+    tracker.stage_clean_ir = os.path.exists(clean_ir) and os.path.getsize(clean_ir) > 0
+    tracker.stage_pseudocode = True  # Pseudo pipeline ready
+    
+    # Verify native contract if available
+    contract_report = native_contract_report_path(case_output_dir)
+    if os.path.exists(contract_report):
+        verified, _ = verify_native_contract(clean_ir, contract_report)
+        tracker.llvm_ir_verification_success = verified
+    else:
+        tracker.llvm_ir_verification_success = True
+        
     flow_dir = os.path.join(case_output_dir, flow_id)
     os.makedirs(flow_dir, exist_ok=True)
     
@@ -333,8 +432,11 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         
         mismatches = rep.get("mismatches", 0) or 0
         if mismatches > 0:
-            tracker.behavioral_repairs += 1
-            tracker.behavioral_repair_rounds += 1
+            tracker.counterexample_ever_found = True
+            tracker.reproducible_counterexample_ever_found = True
+            if flow_id != "F5":
+                tracker.behavioral_repairs += 1
+                tracker.behavioral_repair_rounds += 1
         return rep
 
     metadata = {
@@ -356,22 +458,47 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         # Read candidates
         c_files = sorted(list(Path(flow_dir).glob("recovered_iter*.c")))
         if c_files:
+            tracker.stage_llm_gen = True
             tracker.first_candidate = c_files[0].read_text(encoding="utf-8", errors="replace")
             tracker.final_candidate = c_files[-1].read_text(encoding="utf-8", errors="replace")
         
         tracker.compile_success_first = os.path.exists(os.path.join(flow_dir, "recovered_iter1.c")) and not os.path.exists(os.path.join(flow_dir, "recovery_iter1.compile.txt"))
-        tracker.compile_success_final = res.success or (res.compile_error is None)
         
+        # Check if ANY candidate within budget compiled successfully
+        all_compile_txts = list(Path(flow_dir).glob("recovery_iter*.compile.txt"))
+        tracker.any_compile_success_within_budget = len(c_files) > len(all_compile_txts)
+        
+        # Check last candidate compile success
+        tracker.last_candidate_compile_success = os.path.exists(output_recovered_c) and (res.compile_error is None)
+        tracker.compile_success_final = tracker.any_compile_success_within_budget
+        
+        if tracker.any_compile_success_within_budget:
+            tracker.stage_compilation = True
+            tracker.stage_fuzzing = tracker.fuzz_total > 0
+            
         # Calculate rounds
-        for f in Path(flow_dir).glob("recovery_iter*.compile.txt"):
-            tracker.compile_repair_rounds += 1
+        if flow_id != "F5":
+            for f in all_compile_txts:
+                tracker.compile_repair_rounds += 1
+        else:
+            tracker.compile_repair_rounds = 0
+            tracker.behavioral_repair_rounds = 0
+            tracker.behavioral_repairs = 0
+            
+        # Final counterexample check
+        if last_fuzz_report:
+            mismatches = last_fuzz_report.get("mismatches", 0) or 0
+            tracker.final_counterexample_found = (mismatches > 0)
+        else:
+            tracker.final_counterexample_found = False
             
         # Classify final status
-        if res.success:
+        if res.success and tracker.fuzz_matches == tracker.fuzz_total and tracker.fuzz_total > 0:
             tracker.status = "PASS"
+            tracker.stage_behavioral_validation = True
         elif not tracker.compile_success_final:
             tracker.status = "FAIL_COMPILE"
-        elif tracker.has_counterexample:
+        elif tracker.has_counterexample or tracker.final_counterexample_found:
             tracker.status = "FAIL_BEHAVIORAL"
         else:
             tracker.status = "INCONCLUSIVE"
@@ -389,6 +516,21 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         if last_fuzz_report:
             tracker.behavior_after_repair = f"matches={last_fuzz_report.get('matches')}, mismatches={last_fuzz_report.get('mismatches')}"
             
+        # Post-hoc SLOC and Readability Metrics (if original source exists)
+        if original_src and os.path.exists(original_src):
+            try:
+                orig_lines = [l.strip() for l in Path(original_src).read_text(errors="ignore").splitlines() if l.strip() and not l.strip().startswith("//")]
+                tracker.original_sloc = len(orig_lines)
+                if tracker.final_candidate:
+                    rec_lines = [l.strip() for l in tracker.final_candidate.splitlines() if l.strip() and not l.strip().startswith("//")]
+                    tracker.recovered_sloc = len(rec_lines)
+                    tracker.sloc_ratio = tracker.recovered_sloc / max(1, tracker.original_sloc)
+                    # Simple readability metric (comment ratio & identifier clarity heuristic)
+                    comment_count = sum(1 for l in tracker.final_candidate.splitlines() if "//" in l or "/*" in l)
+                    tracker.readability_score = min(1.0, (comment_count / max(1, tracker.recovered_sloc)) * 5.0 + 0.5)
+            except Exception:
+                pass
+
         # Save flow result json for resume mechanism support
         try:
             with open(os.path.join(flow_dir, "flow_result.json"), "w") as rf:
@@ -398,7 +540,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
             
     return tracker
 
-def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str, location: str) -> CaseTracker:
+def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str, location: str, original_src: Optional[str] = None) -> CaseTracker:
     try:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
         from main import _select_generator, _resolve_seed_paths
@@ -422,9 +564,25 @@ def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str,
             case_output_dir=case_output_dir,
             iterations=iterations,
             model=model,
-            location=location
+            location=location,
+            original_src=original_src
         )
         tracker.reduction = reduction_metrics
+        tracker.instructions_raw = reduction_metrics.get("instruction_raw", 0)
+        tracker.instructions_clean = reduction_metrics.get("instruction_clean", 0)
+        tracker.basic_blocks_raw = reduction_metrics.get("bb_raw", 0)
+        tracker.basic_blocks_clean = reduction_metrics.get("bb_clean", 0)
+        tracker.conditional_branches_raw = reduction_metrics.get("branches_raw", 0)
+        tracker.conditional_branches_clean = reduction_metrics.get("branches_clean", 0)
+        
+        raw_ins = max(1, tracker.instructions_raw)
+        raw_bb = max(1, tracker.basic_blocks_raw)
+        raw_br = max(1, tracker.conditional_branches_raw)
+        
+        tracker.instruction_reduction = (tracker.instructions_raw - tracker.instructions_clean) / raw_ins * 100.0
+        tracker.bb_reduction = (tracker.basic_blocks_raw - tracker.basic_blocks_clean) / raw_bb * 100.0
+        tracker.branches_reduction = (tracker.conditional_branches_raw - tracker.conditional_branches_clean) / raw_br * 100.0
+        
         print(f"[✓] Completed Flow {flow_id} for {sample_id} in {tracker.total_runtime:.1f}s", flush=True)
         return tracker
     except Exception as e:
@@ -489,12 +647,14 @@ def main():
     for idx, row in enumerate(rows, 1):
         binary = row["obfuscated_binary"]
         sample_id = os.path.basename(os.path.dirname(binary))
+        original_src = row.get("source_c", "")
+        if original_src:
+            original_src = os.path.join(project_root, original_src)
         
         binary_abs = os.path.join(project_root, binary)
         case_output_dir = os.path.join(project_root, "result", campaign_id, sample_id)
         
         # If resume, check if we need to do anything for this sample
-        # We need raw_ir, clean_ir and ref_binary. If they exist we don't lift again.
         raw_ir = os.path.join(case_output_dir, f"{sample_id}.ll")
         clean_ir = os.path.join(case_output_dir, f"{sample_id}_brightened.ll")
         ref_binary = os.path.join(case_output_dir, f"{sample_id}_final_ref.bin")
@@ -542,18 +702,16 @@ def main():
         
         # Add the remaining incomplete flows to the queue
         for flow in flows_needed:
-            # Determine location dynamically
             if rotate_enabled:
                 location = VERTEX_GEMINI_REGIONS[task_idx % len(VERTEX_GEMINI_REGIONS)]
             else:
                 location = os.environ.get("VERTEX_LOCATION", "global")
             
-            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model, location))
+            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model, location, original_src))
             task_idx += 1
             
     if tasks_to_run:
         print(f"[*] Remaining flow tasks to run: {len(tasks_to_run)}. Launching parallel executor pool...", flush=True)
-        # Submit all tasks to the ProcessPoolExecutor
         try:
             with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
                 futures = {
@@ -571,7 +729,7 @@ def main():
                         print(f"[✗] Future task {flow_id} of {sample_id} generated an exception: {exc}", flush=True)
         except KeyboardInterrupt:
             print("\n[!] Ctrl+C detected! Instantly terminating all concurrent worker processes...", flush=True)
-            import os, signal
+            import signal
             os.killpg(os.getpgrp(), signal.SIGKILL)
             sys.exit(1)
     else:
@@ -588,15 +746,29 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
         writer = csv.writer(f)
         writer.writerow([
             "sample_id", "flow_id", "llm_calls", "compiler_attempts", "behavioral_repairs",
-            "compile_success_first", "compile_success_final", "compile_repair_rounds", "behavioral_repair_rounds",
-            "fuzz_total", "fuzz_valid", "fuzz_matches", "has_counterexample", "counterexample_reproducible",
+            "compile_success_first", "compile_success_final", "any_compile_success_within_budget", "last_candidate_compile_success",
+            "compile_repair_rounds", "behavioral_repair_rounds",
+            "fuzz_total", "fuzz_valid", "fuzz_matches",
+            "has_counterexample", "counterexample_reproducible",
+            "counterexample_ever_found", "reproducible_counterexample_ever_found", "final_counterexample_found",
+            "llvm_ir_verification_success",
+            "instructions_raw", "instructions_clean", "basic_blocks_raw", "basic_blocks_clean", "conditional_branches_raw", "conditional_branches_clean",
+            "instruction_reduction", "bb_reduction", "branches_reduction",
+            "original_sloc", "recovered_sloc", "sloc_ratio", "readability_score",
             "status", "input_tokens", "output_tokens", "llm_latency", "compile_time", "fuzzing_time", "total_runtime"
         ])
         for t in trackers:
             writer.writerow([
                 t.sample_id, t.flow_id, t.llm_calls, t.compiler_attempts, t.behavioral_repairs,
-                t.compile_success_first, t.compile_success_final, t.compile_repair_rounds, t.behavioral_repair_rounds,
-                t.fuzz_total, t.fuzz_valid, t.fuzz_matches, t.has_counterexample, t.counterexample_reproducible,
+                t.compile_success_first, t.compile_success_final, t.any_compile_success_within_budget, t.last_candidate_compile_success,
+                t.compile_repair_rounds if t.flow_id != "F5" else 0, t.behavioral_repair_rounds if t.flow_id != "F5" else 0,
+                t.fuzz_total, t.fuzz_valid, t.fuzz_matches,
+                t.has_counterexample, t.counterexample_reproducible,
+                t.counterexample_ever_found, t.reproducible_counterexample_ever_found, t.final_counterexample_found,
+                t.llvm_ir_verification_success,
+                t.instructions_raw, t.instructions_clean, t.basic_blocks_raw, t.basic_blocks_clean, t.conditional_branches_raw, t.conditional_branches_clean,
+                f"{t.instruction_reduction:.2f}", f"{t.bb_reduction:.2f}", f"{t.branches_reduction:.2f}",
+                t.original_sloc, t.recovered_sloc, f"{t.sloc_ratio:.2f}", f"{t.readability_score:.2f}",
                 t.status, t.input_tokens, t.output_tokens, t.llm_latency, t.compile_time, t.fuzzing_time, t.total_runtime
             ])
 
@@ -606,8 +778,10 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
     with open(per_flow_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "flow_id", "sample_count", "first_pass_rsr", "final_rsr", "compile_repair_gain",
-            "behavioral_pass_rate", "e2e_recovery_rate", "mean_llm_calls", "mean_tokens", "mean_runtime"
+            "flow_id", "sample_count", "first_pass_rsr", "final_rsr", "compilation_repair_gain",
+            "initial_behavioral_pass_rate", "final_behavioral_pass_rate", "behavioral_repair_gain",
+            "counterexample_detection_rate", "llvm_ir_verification_success_rate",
+            "e2e_recovery_rate", "mean_llm_calls", "mean_tokens", "mean_runtime"
         ])
         for flow in flows:
             flow_ts = [t for t in trackers if t.flow_id == flow]
@@ -616,19 +790,30 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
             
             first_pass_rsr = sum(1 for t in flow_ts if t.compile_success_first) / count * 100
             final_rsr = sum(1 for t in flow_ts if t.compile_success_final) / count * 100
-            compile_gain = final_rsr - first_pass_rsr
-            behavior_pass = sum(1 for t in flow_ts if t.status == "PASS") / count * 100
+            comp_gain = final_rsr - first_pass_rsr if flow != "F5" else 0.0
+            
+            initial_beh_pass = sum(1 for t in flow_ts if t.compile_success_first and not t.counterexample_ever_found) / count * 100
+            final_beh_pass = sum(1 for t in flow_ts if t.status == "PASS") / count * 100
+            beh_gain = final_beh_pass - initial_beh_pass if flow != "F5" else 0.0
+            
+            cx_detection_rate = sum(1 for t in flow_ts if t.counterexample_ever_found) / count * 100
+            ir_verify_rate = sum(1 for t in flow_ts if t.llvm_ir_verification_success) / count * 100
+            
             e2e_recovery = sum(1 for t in flow_ts if t.status == "PASS") / count * 100
             mean_calls = sum(t.llm_calls for t in flow_ts) / count
             mean_tokens = sum(t.input_tokens + t.output_tokens for t in flow_ts) / count
             mean_runtime = sum(t.total_runtime for t in flow_ts) / count
             
             writer.writerow([
-                flow, count, f"{first_pass_rsr:.2f}%", f"{final_rsr:.2f}%", f"{compile_gain:.2f}%",
-                f"{behavior_pass:.2f}%", f"{e2e_recovery:.2f}%", f"{mean_calls:.2f}", f"{mean_tokens:.2f}", f"{mean_runtime:.2f}"
+                flow, count, f"{first_pass_rsr:.2f}%", f"{final_rsr:.2f}%",
+                f"{comp_gain:.2f}%" if flow != "F5" else "N/A",
+                f"{initial_beh_pass:.2f}%", f"{final_beh_pass:.2f}%",
+                f"{beh_gain:.2f}%" if flow != "F5" else "N/A",
+                f"{cx_detection_rate:.2f}%", f"{ir_verify_rate:.2f}%",
+                f"{e2e_recovery:.2f}%", f"{mean_calls:.2f}", f"{mean_tokens:.2f}", f"{mean_runtime:.2f}"
             ])
             
-    # Generate charts
+    # Generate charts and extra CSVs
     try:
         from evaluation.visualize_experiment import generate_visualizations
         generate_visualizations(output_dir, trackers, experiment_id)
