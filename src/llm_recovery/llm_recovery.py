@@ -2334,10 +2334,19 @@ class VertexGemini:
         except Exception:
             adc_credentials = None
 
-        if self.config.api_key and not adc_credentials:
+        use_openai_format = False
+        if self.config.api_key:
             base_url = os.environ.get("GEMINI_API_BASE_URL") or getattr(_prompts_cfg, "API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
-            url = f"{base_url}/models/{self.config.model}:generateContent?key={self.config.api_key}"
-            headers = {"Content-Type": "application/json"}
+            use_openai_format = "v1" in base_url and "googleapis.com" not in base_url
+            if use_openai_format:
+                url = f"{base_url}/chat/completions"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.config.api_key}"
+                }
+            else:
+                url = f"{base_url}/models/{self.config.model}:generateContent?key={self.config.api_key}"
+                headers = {"Content-Type": "application/json"}
         else:
             credentials = adc_credentials or _load_adc_credentials()
             access_token = _request_access_token_via_refresh(credentials)
@@ -2366,46 +2375,69 @@ class VertexGemini:
             paths.extend(_text(path) for path in attachment_paths)
         paths = list(dict.fromkeys(path for path in paths if path))
 
-        file_parts: List[Dict[str, Any]] = []
-        for path in paths:
-            attachment = Path(path)
-            if not attachment.is_file():
-                raise RecoveryError(f"File attachment không tồn tại: {path}")
-            file_size = attachment.stat().st_size
-            if (
-                self.config.file_api_inline_max_bytes
-                and file_size > self.config.file_api_inline_max_bytes
-            ):
-                raise RecoveryError(
-                    f"File attachment quá lớn cho inlineData ({file_size} bytes > {self.config.file_api_inline_max_bytes})."
-                )
-            raw = attachment.read_bytes()
-            mime_type = _vertex_inline_mime_type(attachment)
-            file_parts.append(
-                {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": base64.b64encode(raw).decode("ascii"),
-                    }
-                }
-            )
-        parts = file_parts + [{"text": prompt}]
-
-        generation_config = _vertex_generation_config(self.config)
-
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": parts,
-                }
-            ],
-            "generationConfig": generation_config,
-        }
-        if _text(system_instruction):
-            payload["systemInstruction"] = {
-                "parts": [{"text": str(system_instruction)}]
+        if use_openai_format:
+            content_parts = []
+            for path in paths:
+                attachment = Path(path)
+                if attachment.is_file():
+                    try:
+                        file_text = attachment.read_text(encoding="utf-8", errors="replace")
+                        content_parts.append(f"=== File: {attachment.name} ===\n{file_text}\n")
+                    except Exception:
+                        pass
+            content_parts.append(prompt)
+            full_prompt = "\n".join(content_parts)
+            
+            messages = []
+            if _text(system_instruction):
+                messages.append({"role": "system", "content": str(system_instruction)})
+            messages.append({"role": "user", "content": full_prompt})
+            
+            payload = {
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": self.config.temperature or 0.1,
+                "max_tokens": self.config.max_output_tokens or 8192,
             }
+        else:
+            file_parts = []
+            for path in paths:
+                attachment = Path(path)
+                if not attachment.is_file():
+                    raise RecoveryError(f"File attachment không tồn tại: {path}")
+                file_size = attachment.stat().st_size
+                if (
+                    self.config.file_api_inline_max_bytes
+                    and file_size > self.config.file_api_inline_max_bytes
+                ):
+                    raise RecoveryError(
+                        f"File attachment quá lớn cho inlineData ({file_size} bytes > {self.config.file_api_inline_max_bytes})."
+                    )
+                raw = attachment.read_bytes()
+                mime_type = _vertex_inline_mime_type(attachment)
+                file_parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        }
+                    }
+                )
+            parts = file_parts + [{"text": prompt}]
+            generation_config = _vertex_generation_config(self.config)
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": parts,
+                    }
+                ],
+                "generationConfig": generation_config,
+            }
+            if _text(system_instruction):
+                payload["systemInstruction"] = {
+                    "parts": [{"text": str(system_instruction)}]
+                }
 
         try:
             timeout = self.config.request_timeout
@@ -2448,6 +2480,25 @@ class VertexGemini:
             raise RecoveryError(f"Vertex REST failed: HTTP {response.status_code}: {detail}")
 
         data = response.json()
+        if use_openai_format:
+            choices = data.get("choices") or []
+            if not choices:
+                self.last_response_meta = {
+                    "finish_reason": "EMPTY",
+                    "finish_message": "missing choices in OpenAI response",
+                    "usage_metadata": data.get("usage") or {},
+                }
+                raise LLMEmptyResponseError("OpenAI REST returned empty payload: missing choices.")
+            first_choice = choices[0]
+            self.last_response_meta = {
+                "model_version": data.get("model", self.config.model),
+                "finish_reason": _text(first_choice.get("finish_reason", "STOP")).upper(),
+                "finish_message": "OpenAI completions",
+                "usage_metadata": data.get("usage") or {},
+            }
+            result = first_choice.get("message", {}).get("content", "").strip()
+            return result
+
         usage = data.get("usageMetadata") or {}
         candidates = data.get("candidates") or []
         if not candidates:
