@@ -493,7 +493,7 @@ def _save_summary_tables(df: pd.DataFrame, output_dir: str):
         summary_rows.append({
             "Flow": flow,
             "First-pass RSR": f"{c_first}/{n} ({c_first/n*100.0:.1f}%)",
-            "Final RSR": f"{c_final}/{n} ({c_final/n*100.0:.1f}%)" if flow != "F5" else "N/A",
+            "Final RSR": f"{c_final}/{n} ({c_final/n*100.0:.1f}%)",
             "E2E Recovery Rate": f"{b_pass}/{n} ({b_pass/n*100.0:.1f}%)",
             "LLM Calls": f"{flow_df['llm_calls'].mean():.1f}",
             "Runtime (s)": f"{flow_df['total_runtime'].mean():.1f}s"
