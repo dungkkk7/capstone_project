@@ -15,7 +15,7 @@ MODEL = "gemini-2.5-pro"            # Dòng Pro thế hệ mới, thông minh nh
 # MODEL = "gemini-1.5-pro"          # Hạn mức 4,000,000 tokens/phút rất cao, chất lượng phục hồi cao nhất, đắt tiền giúp tiêu $300 nhanh
 #MODEL = "gemini-2.5-pro-latest"   # Hạn mức 1,000,000 tokens/phút, dòng Pro thế hệ mới, thông minh nhất
 TEMPERATURE = 0.1                   # 0.0 = deterministic, 1.0 = creative
-MAX_OUTPUT_TOKENS = 65535           # Giới hạn output của model
+MAX_OUTPUT_TOKENS = 8192            # Giới hạn output an toàn & tiết kiệm (mặc định cũ: 65535)
 MAX_REPAIR_ITERATIONS = 5           # Số vòng lặp sửa lỗi tối đa
 FUZZ_ITERATIONS = 1000              # Số mutation AFL++ cho semantic check
 
