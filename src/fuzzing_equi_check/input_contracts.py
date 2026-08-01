@@ -12,6 +12,7 @@ import json
 import math
 import random
 import re
+import string
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -1306,6 +1307,139 @@ def _validate_p00788(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, st
     return False, "p00788_terminator"
 
 
+def _validate_p04028(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    constraints = contract.get("constraints", {})
+    if (
+        len(lines) != 2
+        or (constraints.get("newline_required") and not payload.endswith(b"\n"))
+    ):
+        return False, "p04028_lines"
+
+    if not re.fullmatch(r"[+]?[0-9]+", lines[0]):
+        return False, "p04028_length"
+    n = int(lines[0])
+    if not int(constraints.get("n_min", 1)) <= n <= int(
+        constraints.get("n_max", 512)
+    ):
+        return False, "p04028_length_bounds"
+
+    value = lines[1]
+    if not value or re.search(r"\s", value):
+        return False, "p04028_string"
+    if len(value.encode("utf-8")) > n:
+        return False, "p04028_string_too_long"
+    return True, ""
+
+
+def _validate_p03430(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    constraints = contract.get("constraints", {})
+    if (
+        len(lines) != 2
+        or (constraints.get("newline_required") and not payload.endswith(b"\n"))
+    ):
+        return False, "p03430_lines"
+
+    value = lines[0]
+    if not value or re.search(r"\s", value):
+        return False, "p03430_string"
+    if len(value.encode("utf-8")) > int(constraints.get("string_max_length", 64)):
+        return False, "p03430_string_too_long"
+
+    if not re.fullmatch(r"[+]?[0-9]+", lines[1]):
+        return False, "p03430_k"
+    k = int(lines[1])
+    if not int(constraints.get("k_min", 0)) <= k <= int(
+        constraints.get("k_max", 8)
+    ):
+        return False, "p03430_k_bounds"
+    return True, ""
+
+
+def _validate_p03199(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _case_integer_values(payload, "p03199_integer")
+    if values is None or len(values) < 2:
+        return False, reason or "p03199_header"
+    constraints = contract.get("constraints", {})
+    n, count = values[:2]
+    if not int(constraints.get("n_min", 3)) <= n <= int(
+        constraints.get("n_max", 256)
+    ):
+        return False, "p03199_n_bounds"
+    if not int(constraints.get("m_min", 0)) <= count <= int(
+        constraints.get("m_max", 512)
+    ):
+        return False, "p03199_m_bounds"
+    if len(values) != 2 + 3 * count:
+        return False, "p03199_size"
+    for a, b, bit in zip(values[2::3], values[3::3], values[4::3]):
+        if not (1 <= a <= n and 1 <= b <= n and bit in (0, 1)):
+            return False, "p03199_edge_bounds"
+    return True, ""
+
+
+def _validate_p03835(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _case_integer_values(payload, "p03835_integer")
+    if values is None or len(values) != 2:
+        return False, reason or "p03835_shape"
+    constraints = contract.get("constraints", {})
+    k, target = values
+    if not int(constraints.get("k_min", 0)) <= k <= int(
+        constraints.get("k_max", 2500)
+    ):
+        return False, "p03835_k_bounds"
+    if not 0 <= target <= 3 * k:
+        return False, "p03835_target_bounds"
+    return True, ""
+
+
+def _validate_p03261(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    lines = _lines(payload)
+    constraints = contract.get("constraints", {})
+    if (
+        len(lines) < 2
+        or (constraints.get("newline_required") and not payload.endswith(b"\n"))
+        or not re.fullmatch(r"[+]?[0-9]+", lines[0])
+    ):
+        return False, "p03261_header"
+    count = int(lines[0])
+    if not int(constraints.get("n_min", 1)) <= count <= int(
+        constraints.get("n_max", 100)
+    ):
+        return False, "p03261_count_bounds"
+    if len(lines) != count + 1:
+        return False, "p03261_size"
+    word_max = int(constraints.get("word_max_length", 10))
+    if any(
+        not re.fullmatch(r"[a-z]+", word) or len(word) > word_max
+        for word in lines[1:]
+    ):
+        return False, "p03261_word"
+    return True, ""
+
+
+def _validate_p03776(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
+    values, reason = _case_integer_values(payload, "p03776_integer")
+    if values is None or len(values) < 3:
+        return False, reason or "p03776_header"
+    constraints = contract.get("constraints", {})
+    count, lower, upper = values[:3]
+    if not int(constraints.get("n_min", 1)) <= count <= int(
+        constraints.get("n_max", 50)
+    ):
+        return False, "p03776_count_bounds"
+    if not 1 <= lower <= upper <= count:
+        return False, "p03776_selection_bounds"
+    if len(values) != count + 3:
+        return False, "p03776_size"
+    value_min = int(constraints.get("value_min", 1))
+    value_max = int(constraints.get("value_max", 10**15))
+    if any(not value_min <= value <= value_max for value in values[3:]):
+        return False, "p03776_value_bounds"
+    return True, ""
+
+
 def _validate_p02788(payload: bytes, contract: Dict[str, Any]) -> Tuple[bool, str]:
     values, reason = _case_integer_values(payload, "p02788_integer")
     if values is None or len(values) < 3:
@@ -1614,7 +1748,13 @@ _CASE_VALIDATORS = {
     "p02029": _validate_p02029,
     "p02788": _validate_p02788,
     "p02814": _validate_p02814,
+    "p03199": _validate_p03199,
     "p03142": _validate_p03142,
+    "p03261": _validate_p03261,
+    "p03430": _validate_p03430,
+    "p03776": _validate_p03776,
+    "p03835": _validate_p03835,
+    "p04028": _validate_p04028,
 }
 
 
@@ -2231,6 +2371,71 @@ def _random_valid_case_payload(contract: Dict[str, Any]) -> Optional[bytes]:
             )
             pairs.append((p, n))
         return ("\n".join(f"{p} {n}" for p, n in pairs) + "\n0 0\n").encode()
+    if case_id == "p04028":
+        n = random.randint(
+            int(constraints.get("n_min", 1)),
+            int(constraints.get("n_max", 512)),
+        )
+        length = random.randint(1, n)
+        value = "".join(random.choice("01") for _ in range(length))
+        return f"{n}\n{value}\n".encode()
+    if case_id == "p03430":
+        length = random.randint(1, int(constraints.get("string_max_length", 64)))
+        value = "".join(random.choice("abcxyz") for _ in range(length))
+        k = random.randint(
+            int(constraints.get("k_min", 0)),
+            min(int(constraints.get("k_max", 8)), length),
+        )
+        return f"{value}\n{k}\n".encode()
+    if case_id == "p03199":
+        n = random.randint(
+            int(constraints.get("n_min", 3)),
+            int(constraints.get("n_max", 256)),
+        )
+        count = random.randint(
+            int(constraints.get("m_min", 0)),
+            min(int(constraints.get("m_max", 512)), 16),
+        )
+        triples = [
+            f"{random.randint(1, n)} {random.randint(1, n)} {random.randint(0, 1)}"
+            for _ in range(count)
+        ]
+        return (f"{n} {count}\n" + "\n".join(triples) + ("\n" if triples else "")).encode()
+    if case_id == "p03835":
+        k = random.randint(
+            int(constraints.get("k_min", 0)),
+            int(constraints.get("k_max", 2500)),
+        )
+        return f"{k} {random.randint(0, 3 * k)}\n".encode()
+    if case_id == "p03261":
+        count = random.randint(
+            int(constraints.get("n_min", 1)),
+            min(int(constraints.get("n_max", 100)), 12),
+        )
+        word_max = int(constraints.get("word_max_length", 10))
+        words = [
+            "".join(
+                random.choice(string.ascii_lowercase)
+                for _ in range(random.randint(1, word_max))
+            )
+            for _ in range(count)
+        ]
+        return (str(count) + "\n" + "\n".join(words) + "\n").encode()
+    if case_id == "p03776":
+        count = random.randint(
+            int(constraints.get("n_min", 1)),
+            int(constraints.get("n_max", 50)),
+        )
+        lower = random.randint(1, count)
+        upper = random.randint(lower, count)
+        value_min = int(constraints.get("value_min", 1))
+        value_max = int(constraints.get("value_max", 10**15))
+        values = [random.randint(value_min, value_max) for _ in range(count)]
+        return (
+            f"{count} {lower} {upper}\n"
+            + " ".join(map(str, values))
+            + "\n"
+        ).encode()
     if case_id == "p01296":
         output = []
         for _ in range(random.randint(1, 3)):

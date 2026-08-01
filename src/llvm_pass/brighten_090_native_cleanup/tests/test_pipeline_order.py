@@ -7,6 +7,10 @@ from pathlib import Path
 
 pipeline_file = Path(__file__).resolve().parents[2] / "britening_ir.py"
 ownership_file = Path(__file__).resolve().parents[1] / "OWNERSHIP.md"
+bundle_file = (
+    Path(__file__).resolve().parents[2]
+    / "brighten_100_delift_bundle/run_brighten_delift_pipeline.sh"
+)
 
 assert ownership_file.is_file(), "090 ownership boundary must be documented"
 ownership = ownership_file.read_text(encoding="utf-8")
@@ -120,6 +124,7 @@ assert late_state < region_unflatten < final, (
     "region-SSA unflattening must consume promoted state before final reporting"
 )
 heap_resolver = passes.index("brighten-heap-proven-resolver-collapse")
+post_frame_cleanup = passes.index("brighten-native-cleanup-post-frame-pass")
 assert len(address_canonicalize) == 4, (
     "address canonicalization must precede both ordinary 040 frame passes and "
     "the post-State 040 consumer"
@@ -130,15 +135,66 @@ assert address_canonicalize[0] < early_stack, (
 )
 assert (region_unflatten < address_canonicalize[-2] < late_jump_threading
         < o3[1] < address_canonicalize[-1]
-        < post_state_frame < heap_resolver
+        < post_state_frame < heap_resolver < post_frame_cleanup
         < passes.index("dce", heap_resolver + 1)
         < passes.index("globaldce", heap_resolver + 1) < final
         < verify), (
     "heap resolver recovery must consume final 040 pointer slots before reporting"
 )
+assert passes.count("brighten-native-cleanup-post-frame-pass") == 1, (
+    "late frame products require exactly one narrow post-frame consumer"
+)
 assert final + 1 == verify, (
     "no mutation pass may run after the final native contract report"
 )
+
+bundle = bundle_file.read_text(encoding="utf-8")
+assert "-passes=095 -095-disable-deflatten" in bundle, (
+    "the post-delift 095 cleanup must not deflatten an already rewritten CFG"
+)
+bundle_post_frame = "brighten-native-cleanup-post-frame-pass"
+assert bundle.count(bundle_post_frame) == 2, (
+    "the final bundle must run exactly two bounded post-frame consumers"
+)
+bundle_pipeline = next(
+    line for line in bundle.splitlines()
+    if "-passes='brighten-native-cleanup-post-frame-pass" in line
+)
+assert bundle_pipeline.count(bundle_post_frame) == 2
+assert bundle_pipeline.index(bundle_post_frame) < bundle_pipeline.index(
+    "internalize"
+) < bundle_pipeline.index(
+    "ipsccp"
+) < bundle_pipeline.index(
+    "deadargelim"
+) < bundle_pipeline.index(
+    "globalopt"
+) < bundle_pipeline.index(
+    "function(instcombine"
+) < bundle_pipeline.rindex(bundle_post_frame) < bundle_pipeline.index(
+    "brighten-native-cleanup-final-pass"
+), "whole-program linkage and typed state/global products must be consumed before reporting"
+assert bundle_pipeline.count("deadargelim") == 2, (
+    "closed-callgraph ABI cleanup must consume both the initial and late "
+    "post-frame products"
+)
+assert bundle_pipeline.count("ipsccp") == 2, (
+    "closed-callgraph constant State arguments must be exposed before each "
+    "dead-argument boundary"
+)
+assert bundle_pipeline.rindex("deadargelim") < bundle_pipeline.rindex(
+    bundle_post_frame
+) and bundle_pipeline.rindex("function(instcombine") < bundle_pipeline.rindex(
+    bundle_post_frame
+), (
+    "the second post-frame fixed point must consume every late ABI/scalar "
+    "product, including poison aggregate seeds recreated by instcombine"
+)
+for forbidden in ("attributor", "function-attrs"):
+    assert forbidden not in bundle_pipeline, (
+        f"{forbidden} may exploit latent lifted-IR UB/provenance and must not "
+        "be added to the equivalence-preserving final bundle"
+    )
 
 disabled_passes = {
     "BRIGHTEN_DISABLE_ABI_RECOVERY": "brighten-abi-recovery-pass",

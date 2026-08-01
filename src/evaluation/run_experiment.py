@@ -20,6 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from binary_lifting.lifting import lift_binary
 from llvm_pass.britening_ir import (
     brighten_ir,
+    finalize_ir,
     native_contract_report_path,
     read_native_contract_report,
     verify_native_contract,
@@ -40,6 +41,7 @@ from fuzzing_equi_check.input_contracts import (
     resolve_input_contract,
     validate_contract_payload,
 )
+from evaluation.schema import FLOW_SPECS, flow_contract
 
 # Load default model from prompts_config.py
 try:
@@ -75,9 +77,25 @@ class ExperimentVertexGemini(VertexGemini):
             
             # Record tokens
             meta = self.last_response_meta or {}
+            meta["latency_seconds"] = latency
+            meta["model"] = self.config.model
+            meta["temperature"] = self.config.temperature
+            meta["top_p"] = self.config.top_p
+            meta["max_tokens"] = self.config.max_output_tokens
+            self.last_response_meta = meta
             usage = meta.get("usage_metadata") or {}
-            in_t = usage.get("prompt_token_count", usage.get("promptTokenCount", 0)) or 0
-            out_t = usage.get("candidates_token_count", usage.get("candidatesTokenCount", 0)) or 0
+            in_t = (
+                usage.get("prompt_tokens")
+                or usage.get("prompt_token_count")
+                or usage.get("promptTokenCount")
+                or 0
+            )
+            out_t = (
+                usage.get("completion_tokens")
+                or usage.get("candidates_token_count")
+                or usage.get("candidatesTokenCount")
+                or 0
+            )
             self.tracker.input_tokens += in_t
             self.tracker.output_tokens += out_t
             
@@ -327,18 +345,124 @@ def _run_compile_check_tracked(candidate_path: str, output_dir: str, tracker: Ca
     compiler = find_clang()
     cmd = [compiler, "-O2", candidate_path, "-o", binary_path, "-lm"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    tracker.compile_time += (time.time() - t_start)
-    if proc.returncode == 0:
-        return True, ""
+    elapsed = time.time() - t_start
+    tracker.compile_time += elapsed
+    success = (
+        proc.returncode == 0
+        and os.path.isfile(binary_path)
+        and os.path.getsize(binary_path) > 0
+    )
+    diagnostics = proc.stderr or proc.stdout or ""
+    lowered = diagnostics.lower()
+    if success:
+        failure_category = None
+    elif "timed out" in lowered or "timeout" in lowered:
+        failure_category = "COMPILER_TIMEOUT"
+    elif "undeclared identifier" in lowered:
+        failure_category = "UNDECLARED_SYMBOL"
+    elif "file not found" in lowered or "no such file" in lowered:
+        failure_category = "MISSING_HEADER"
+    elif "undefined reference" in lowered or "undefined symbol" in lowered:
+        failure_category = "UNRESOLVED_EXTERNAL"
+    elif "linker command failed" in lowered:
+        failure_category = "LINKER_ERROR"
+    elif "incompatible" in lowered or "invalid operands" in lowered:
+        failure_category = "TYPE_ERROR"
+    elif "expected " in lowered or "syntax error" in lowered:
+        failure_category = "SYNTAX_ERROR"
     else:
-        return False, proc.stderr
+        failure_category = "OTHER"
+    try:
+        compiler_version = subprocess.run(
+            [compiler, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.splitlines()[0]
+    except Exception:
+        compiler_version = None
+    iteration = Path(candidate_path).stem.removeprefix("recovered_iter")
+    compile_record = {
+        "attempt_index": tracker.compiler_attempts,
+        "candidate_index": tracker.compiler_attempts,
+        "generation_iteration": int(iteration) if iteration.isdigit() else None,
+        "compile_command": cmd,
+        "compiler_version": compiler_version,
+        "compile_exit_code": proc.returncode,
+        "compile_success": success,
+        "link_success": success,
+        "executable_created": success,
+        "executable_path": binary_path if success else None,
+        "executable_hash": None,
+        "compile_time": elapsed,
+        "diagnostics_path": (
+            os.path.join(output_dir, f"recovery_iter{iteration}.compile.txt")
+            if not success
+            else None
+        ),
+        "failure_category": failure_category,
+        "is_compile_repair_attempt": tracker.compiler_attempts > 1,
+    }
+    if success:
+        digest = hashlib.sha256()
+        with open(binary_path, "rb") as executable:
+            for block in iter(lambda: executable.read(1024 * 1024), b""):
+                digest.update(block)
+        compile_record["executable_hash"] = digest.hexdigest()
+    record_path = os.path.join(
+        output_dir, f"recovery_iter{iteration}.compile.json"
+    )
+    with open(record_path, "w", encoding="utf-8") as record_file:
+        json.dump(compile_record, record_file, indent=2)
+    return (True, "") if success else (False, diagnostics)
 
 def run_fuzzing_tracked(candidate_path: str, ref_binary: str, contract: Any, generator: Any, seeds: list, tracker: CaseTracker, iterations: int) -> Dict[str, Any]:
     t_start = time.time()
     fuzzer = SemanticFuzzer(candidate_path, ref_binary, seed_paths=seeds, input_contract=contract)
     try:
         fuzzer.compile()
-        report = fuzzer.run_differential_test(iterations=iterations, generator=generator, timeout=0.1, num_workers=4)
+        report = fuzzer.run_differential_test(
+            iterations=iterations,
+            generator=generator,
+            timeout=0.1,
+            num_workers=4,
+            compare_stderr=True,
+            strict_oracle=True,
+        )
+        iteration = Path(candidate_path).stem.removeprefix("recovered_iter")
+        report["evaluation_metadata"] = {
+            "campaign_index": getattr(tracker, "fuzz_campaign_count", 0) + 1,
+            "candidate_generation_iteration": (
+                int(iteration) if iteration.isdigit() else None
+            ),
+            "fuzzing_time_seconds": time.time() - t_start,
+            "reference_executable": ref_binary,
+            "reference_executable_kind": "OBFUSCATED_BINARY",
+            "strict_behavior_tuple": True,
+            "replay_policy": "two additional executions per side",
+        }
+        tracker.fuzz_campaign_count = (
+            report["evaluation_metadata"]["campaign_index"]
+        )
+        report_path = Path(candidate_path).parent / (
+            f"recovery_iter{iteration}.fuzz.json"
+        )
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        counterexample_dir = Path(candidate_path).parent / "counterexamples"
+        counterexample_dir.mkdir(exist_ok=True)
+        import base64
+
+        for example_index, example in enumerate(
+            report.get("mismatch_examples") or [], 1
+        ):
+            encoded = example.get("stdin_base64")
+            if encoded:
+                (counterexample_dir / (
+                    f"iter{iteration}_example{example_index}.bin"
+                )).write_bytes(base64.b64decode(encoded))
         tracker.fuzz_total = report.get("total_runs", 0) or 0
         tracker.fuzz_matches = report.get("matches", 0) or 0
         tracker.fuzz_valid = tracker.fuzz_total
@@ -378,38 +502,78 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         
     flow_dir = os.path.join(case_output_dir, flow_id)
     os.makedirs(flow_dir, exist_ok=True)
+    Path(os.path.join(flow_dir, "oracle_contract.json")).write_text(
+        json.dumps(
+            {
+                "reference_executable_path": original_binary,
+                "reference_executable_kind": "OBFUSCATED_BINARY",
+                "compare_stdout_bytes": True,
+                "compare_stderr_bytes": True,
+                "compare_exit_code": True,
+                "compare_terminating_signal": True,
+                "compare_timeout_status": True,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     
     config = RecoveryConfig()
     config.fuzz_iterations = iterations
     config.model = model
     config.location = location  # Round-robin assigned region to distribute quota load
     
-    # Configure flow modes
+    # Configure the full-first ablation layout. Every iterative flow receives
+    # the same error-context policy; F2 is the sole one-shot ablation.
+    flow_spec = FLOW_SPECS[flow_id]
     if flow_id == "F1":
         config.pseudo_backend = "llvm2c"
-        config.attach_clean_ir = False
+        config.ir_representation = "clean"
+        config.attach_clean_ir = True
         config.max_iterations = 5
         ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
     elif flow_id == "F2":
         config.pseudo_backend = "llvm2c"
+        config.ir_representation = "clean"
         config.attach_clean_ir = True
-        config.max_iterations = 5
+        config.max_iterations = 1
         ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
     elif flow_id == "F3":
         config.pseudo_backend = "ir"
+        config.ir_representation = "clean"
         config.attach_clean_ir = False
         config.max_iterations = 5
-        ir_text = Path(raw_ir).read_text(encoding="utf-8", errors="replace")
+        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
     elif flow_id == "F4":
-        config.pseudo_backend = "ir"
+        config.pseudo_backend = "llvm2c"
+        config.ir_representation = "clean"
         config.attach_clean_ir = False
         config.max_iterations = 5
         ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
     elif flow_id == "F5":
-        config.pseudo_backend = "llvm2c"
-        config.attach_clean_ir = True
-        config.max_iterations = 1
-        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
+        config.pseudo_backend = "ir"
+        config.ir_representation = "raw"
+        config.attach_clean_ir = False
+        config.max_iterations = 5
+        ir_text = Path(raw_ir).read_text(encoding="utf-8", errors="replace")
+    else:
+        raise ValueError(f"Unknown flow_id: {flow_id}")
+
+    Path(os.path.join(flow_dir, "flow_contract.json")).write_text(
+        json.dumps(
+            {
+                **flow_contract(flow_spec),
+                "max_iterations": config.max_iterations,
+                "pseudo_backend": config.pseudo_backend,
+                "ir_representation": config.ir_representation,
+                "attach_clean_ir": config.attach_clean_ir,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
         
     client = ExperimentVertexGemini(config, tracker)
     
@@ -425,7 +589,18 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
     
     def custom_fuzzer_callback(cand_path: str):
         nonlocal first_fuzz_report, last_fuzz_report
-        rep = run_fuzzing_tracked(cand_path, ref_binary, contract, generator, seeds, tracker, iterations)
+        # The experiment oracle is the supplied obfuscated binary itself.
+        # ``ref_binary`` is retained in the signature for resume compatibility
+        # with historical campaigns but is no longer used as the oracle.
+        rep = run_fuzzing_tracked(
+            cand_path,
+            original_binary,
+            contract,
+            generator,
+            seeds,
+            tracker,
+            iterations,
+        )
         last_fuzz_report = rep
         if first_fuzz_report is None:
             first_fuzz_report = rep
@@ -434,13 +609,13 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         if mismatches > 0:
             tracker.counterexample_ever_found = True
             tracker.reproducible_counterexample_ever_found = True
-            if flow_id != "F5":
+            if flow_spec.iterative:
                 tracker.behavioral_repairs += 1
                 tracker.behavioral_repair_rounds += 1
         return rep
 
     metadata = {
-        "input_ir": clean_ir if flow_id != "F3" else raw_ir,
+        "input_ir": raw_ir if flow_spec.requires_raw_ir else clean_ir,
         "original_binary": original_binary,
     }
     
@@ -477,7 +652,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
             tracker.stage_fuzzing = tracker.fuzz_total > 0
             
         # Calculate rounds
-        if flow_id != "F5":
+        if flow_spec.iterative:
             for f in all_compile_txts:
                 tracker.compile_repair_rounds += 1
         else:
@@ -656,7 +831,10 @@ def main():
         
         # If resume, check if we need to do anything for this sample
         raw_ir = os.path.join(case_output_dir, f"{sample_id}.ll")
-        clean_ir = os.path.join(case_output_dir, f"{sample_id}_brightened.ll")
+        brightened_ir = os.path.join(
+            case_output_dir, f"{sample_id}_brightened.ll"
+        )
+        clean_ir = os.path.join(case_output_dir, f"{sample_id}_final.ll")
         ref_binary = os.path.join(case_output_dir, f"{sample_id}_final_ref.bin")
         
         # Check how many flows are already completed
@@ -682,20 +860,44 @@ def main():
         print(f"[*] Preparing Case {idx}/{len(rows)}: {sample_id} (Evaluating flows: {', '.join(flows_needed)})...", flush=True)
         os.makedirs(case_output_dir, exist_ok=True)
         
-        # Lift & Brighten case (if clean_ir or ref_binary doesn't exist)
+        # Lift, brighten, and finalize. The brightened artifact is deliberately
+        # intermediate; every clean-IR flow consumes the canonical final IR.
         if not os.path.exists(clean_ir) or not os.path.exists(ref_binary):
-            output_bc = os.path.join(case_output_dir, f"{sample_id}.bc")
-            lift_success = lift_binary(binary_path=binary_abs, output=output_bc, use_cache=True, force_relift=False)
-            if not lift_success:
-                print(f"[✗] Lifting failed for {sample_id}", flush=True)
+            if not os.path.exists(brightened_ir):
+                output_bc = os.path.join(case_output_dir, f"{sample_id}.bc")
+                lift_success = lift_binary(
+                    binary_path=binary_abs,
+                    output=output_bc,
+                    use_cache=True,
+                    force_relift=False,
+                )
+                if not lift_success:
+                    print(f"[✗] Lifting failed for {sample_id}", flush=True)
+                    continue
+
+                output_brightened_bc = os.path.join(
+                    case_output_dir, f"{sample_id}_brightened.bc"
+                )
+                brighten_success = brighten_ir(
+                    output_bc,
+                    output_brightened_bc,
+                    binary_path=binary_abs,
+                )
+                if not brighten_success:
+                    print(f"[✗] Brightening failed for {sample_id}", flush=True)
+                    continue
+
+            clean_ir, finalize_status, finalize_log = finalize_ir(
+                brightened_ir,
+                os.path.join(case_output_dir, f"{sample_id}_final"),
+            )
+            if finalize_status != "applied" or not clean_ir:
+                print(
+                    f"[✗] Finalization failed for {sample_id}: "
+                    f"{finalize_status} ({finalize_log})",
+                    flush=True,
+                )
                 continue
-                
-            output_brightened_bc = os.path.join(case_output_dir, f"{sample_id}_brightened.bc")
-            brighten_success = brighten_ir(output_bc, output_brightened_bc, binary_path=binary_abs)
-            if not brighten_success:
-                print(f"[✗] Brightening failed for {sample_id}", flush=True)
-                continue
-                
             compile_to_binary(clean_ir, ref_binary)
             
         reduction_metrics = run_deobfuscation_metrics(raw_ir, clean_ir)
@@ -761,7 +963,8 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
             writer.writerow([
                 t.sample_id, t.flow_id, t.llm_calls, t.compiler_attempts, t.behavioral_repairs,
                 t.compile_success_first, t.compile_success_final, t.any_compile_success_within_budget, t.last_candidate_compile_success,
-                t.compile_repair_rounds if t.flow_id != "F5" else 0, t.behavioral_repair_rounds if t.flow_id != "F5" else 0,
+                t.compile_repair_rounds if FLOW_SPECS[t.flow_id].iterative else 0,
+                t.behavioral_repair_rounds if FLOW_SPECS[t.flow_id].iterative else 0,
                 t.fuzz_total, t.fuzz_valid, t.fuzz_matches,
                 t.has_counterexample, t.counterexample_reproducible,
                 t.counterexample_ever_found, t.reproducible_counterexample_ever_found, t.final_counterexample_found,
@@ -790,11 +993,12 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
             
             first_pass_rsr = sum(1 for t in flow_ts if t.compile_success_first) / count * 100
             final_rsr = sum(1 for t in flow_ts if t.compile_success_final) / count * 100
-            comp_gain = final_rsr - first_pass_rsr if flow != "F5" else 0.0
+            iterative = FLOW_SPECS[flow].iterative
+            comp_gain = final_rsr - first_pass_rsr if iterative else None
             
             initial_beh_pass = sum(1 for t in flow_ts if t.compile_success_first and not t.counterexample_ever_found) / count * 100
             final_beh_pass = sum(1 for t in flow_ts if t.status == "PASS") / count * 100
-            beh_gain = final_beh_pass - initial_beh_pass if flow != "F5" else 0.0
+            beh_gain = final_beh_pass - initial_beh_pass if iterative else None
             
             cx_detection_rate = sum(1 for t in flow_ts if t.counterexample_ever_found) / count * 100
             ir_verify_rate = sum(1 for t in flow_ts if t.llvm_ir_verification_success) / count * 100
@@ -806,9 +1010,9 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
             
             writer.writerow([
                 flow, count, f"{first_pass_rsr:.2f}%", f"{final_rsr:.2f}%",
-                f"{comp_gain:.2f}%" if flow != "F5" else "N/A",
+                f"{comp_gain:.2f}%" if comp_gain is not None else "N/A",
                 f"{initial_beh_pass:.2f}%", f"{final_beh_pass:.2f}%",
-                f"{beh_gain:.2f}%" if flow != "F5" else "N/A",
+                f"{beh_gain:.2f}%" if beh_gain is not None else "N/A",
                 f"{cx_detection_rate:.2f}%", f"{ir_verify_rate:.2f}%",
                 f"{e2e_recovery:.2f}%", f"{mean_calls:.2f}", f"{mean_tokens:.2f}", f"{mean_runtime:.2f}"
             ])
@@ -819,6 +1023,25 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
         generate_visualizations(output_dir, trackers, experiment_id)
     except Exception as e:
         print(f"Error generating charts: {e}")
+        traceback.print_exc()
+
+    # Canonical schema-v2 export is the final reporting step.  It reads the
+    # just-created artifacts and never re-enters recovery, compilation, or
+    # fuzzing.
+    try:
+        from evaluation.artifact_loader import load_campaign
+        from evaluation.reporting import export_report
+
+        project_root = Path(__file__).resolve().parents[2]
+        campaign_id = experiment_id.replace("experiment_", "eval_", 1)
+        campaign_dir = project_root / "result" / campaign_id
+        if campaign_dir.is_dir():
+            export_report(
+                load_campaign(project_root, campaign_dir, experiment_id),
+                Path(output_dir),
+            )
+    except Exception as exc:
+        print(f"Error generating schema-v2 evaluation report: {exc}")
         traceback.print_exc()
 
 if __name__ == "__main__":

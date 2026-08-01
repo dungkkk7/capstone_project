@@ -86,7 +86,7 @@ PLUGINS = [
     "deobfuscate_095_deobfus_ollvm/build/lib095.so"
 ]
 PASS_PIPELINE = (
-    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-guest-pointer-resolver-canonicalize,095,brighten-devirt-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-type-reconstruct,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-late-residual-format-string-recovery,brighten-guest-pointer-resolver-canonicalize,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,brighten-address-canonicalize,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-address-canonicalize,brighten-post-state-frame-pass,brighten-heap-proven-resolver-collapse,dce,globaldce,brighten-native-cleanup-final-pass,verify"
+    "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-guest-pointer-resolver-canonicalize,095,brighten-devirt-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-type-reconstruct,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-late-residual-format-string-recovery,brighten-guest-pointer-resolver-canonicalize,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,brighten-address-canonicalize,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-address-canonicalize,brighten-post-state-frame-pass,brighten-heap-proven-resolver-collapse,brighten-native-cleanup-post-frame-pass,dce,globaldce,brighten-native-cleanup-final-pass,verify"
 )
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
@@ -251,6 +251,63 @@ def verify_native_contract(input_path):
         and report
         and report.get("is_fully_native", False)
     )
+
+def finalize_ir(input_ll, output_prefix, timeout=None):
+    """Produce the canonical post-delift IR and binary artifacts.
+
+    ``*_brightened.ll`` is a pipeline intermediate. Downstream recovery and
+    evaluation must consume this bundle output instead of silently granting
+    final authority to the intermediate.
+    """
+    runner = os.path.join(
+        SCRIPT_DIR,
+        "brighten_100_delift_bundle",
+        "run_brighten_delift_pipeline.sh",
+    )
+    log_path = f"{output_prefix}_delift_bundle.log"
+    output_ll = f"{output_prefix}.ll"
+    if not os.path.isfile(input_ll):
+        return None, "missing_input", log_path
+    if not os.path.isfile(runner):
+        return None, "missing_runner", log_path
+    try:
+        result = subprocess.run(
+            ["bash", runner, input_ll, output_prefix],
+            capture_output=True,
+            text=True,
+            timeout=(
+                timeout
+                if timeout is not None
+                else float(os.environ.get("BRIGHTEN_DELIFT_TIMEOUT", "180"))
+            ),
+        )
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(result.stdout or "")
+            handle.write(result.stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(exc.stdout or "")
+            handle.write(exc.stderr or "")
+            handle.write("\nDelift bundle timed out.\n")
+        return None, "timeout", log_path
+    except OSError as exc:
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write(f"{exc}\n")
+        return None, "execution_error", log_path
+    if result.returncode != 0 or not os.path.isfile(output_ll):
+        return None, f"failed:{result.returncode}", log_path
+    # The bundle performs its final native reporter after every O3/095
+    # mutation. Persist that last report beside the authoritative *_final.ll;
+    # downstream tools must never reuse the earlier brightened-intermediate
+    # report for a different module.
+    native_report = parse_native_contract_reports(
+        (result.stdout or "") + (result.stderr or "")
+    )
+    write_native_contract_report(
+        output_ll, native_report, strict_enforced=False
+    )
+    return output_ll, "applied", log_path
+
 
 def clean_unused_types_and_globals(content):
     # 1. Skip function stripping (keep all defined functions to avoid undefined reference errors)
@@ -494,6 +551,19 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
         "0", "false", "off", "no"
     }:
         cmd.append("-brighten-native-state-ssa")
+    # This pipeline is an IR recovery pipeline, not a code-generation
+    # benchmark. Vectorization and complete/partial loop unrolling obscure
+    # recovered source loops without adding source-level information. Keep
+    # both transformations opt-in; the scalar simplification passes still
+    # canonicalize the loop body and induction variables.
+    if os.environ.get("BRIGHTEN_ENABLE_VECTORIZATION", "0").lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        cmd.extend(["-vectorize-loops=false", "-vectorize-slp=false"])
+    if os.environ.get("BRIGHTEN_ENABLE_LOOP_UNROLLING", "0").lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        cmd.append("-disable-loop-unrolling")
 
     # Keep deobfuscation proof budgets explicit in the production command.
     # LLVM command-line option defaults from a dynamically loaded plugin are

@@ -224,6 +224,7 @@ static Value *FindStoreToStackOffset(AllocaInst *AI, uint64_t Offset, Instructio
   return Best ? Best->getValueOperand() : nullptr;
 }
 
+static bool IsNativeProvenance(PointerProvenance P);
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth = 0);
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
   if (!V || Depth > 8)
@@ -321,6 +322,21 @@ static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
     return ClassifyPointerProvenance(PTI->getOperand(0), Depth + 1);
   }
 
+  if (auto *BO = dyn_cast<BinaryOperator>(Stripped)) {
+    PointerProvenance L =
+        ClassifyPointerProvenance(BO->getOperand(0), Depth + 1);
+    PointerProvenance R =
+        ClassifyPointerProvenance(BO->getOperand(1), Depth + 1);
+    bool LNative = L == PointerProvenance::NativeHeapObject;
+    bool RNative = R == PointerProvenance::NativeHeapObject;
+    if (BO->getOpcode() == Instruction::Add && LNative != RNative &&
+        (LNative ? R : L) == PointerProvenance::Unknown)
+      return LNative ? L : R;
+    if (BO->getOpcode() == Instruction::Sub && LNative && !RNative &&
+        R == PointerProvenance::Unknown)
+      return L;
+  }
+
   // PHI node: if all incoming values have same provenance, use it
   if (auto *Phi = dyn_cast<PHINode>(Stripped)) {
     if (Phi->getNumIncomingValues() == 0)
@@ -332,7 +348,8 @@ static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
     for (unsigned I = 1; I < Phi->getNumIncomingValues(); ++I) {
       PointerProvenance P =
           ClassifyPointerProvenance(Phi->getIncomingValue(I), Depth + 1);
-      if (P != First)
+      if (P != First &&
+          !(IsNativeProvenance(P) && IsNativeProvenance(First)))
         return PointerProvenance::Unknown;
     }
     return First;
@@ -345,6 +362,8 @@ static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
     PointerProvenance F =
         ClassifyPointerProvenance(Sel->getFalseValue(), Depth + 1);
     if (T == F && T != PointerProvenance::Unknown)
+      return T;
+    if (IsNativeProvenance(T) && IsNativeProvenance(F))
       return T;
   }
 

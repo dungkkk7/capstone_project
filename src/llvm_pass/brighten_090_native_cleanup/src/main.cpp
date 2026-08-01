@@ -13,6 +13,13 @@ PreservedAnalyses NativeCleanupPass::run(Module &M,
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
+PreservedAnalyses NativeCleanupPostFramePass::run(
+    Module &M, ModuleAnalysisManager &AM) {
+  (void)AM;
+  bool Changed = NativeCleanupPass::finalizeCompactedFrames(M);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
 } // namespace brighten_native_cleanup
 
 extern "C" LLVM_ATTRIBUTE_WEAK llvm::PassPluginLibraryInfo
@@ -32,6 +39,11 @@ llvmGetPassPluginInfo() {
                   if (Name == "brighten-native-cleanup-final-pass") {
                     MPM.addPass(
                         brighten_native_cleanup::NativeCleanupPass(true));
+                    return true;
+                  }
+                  if (Name == "brighten-native-cleanup-post-frame-pass") {
+                    MPM.addPass(brighten_native_cleanup::
+                                    NativeCleanupPostFramePass());
                     return true;
                   }
                   return false;

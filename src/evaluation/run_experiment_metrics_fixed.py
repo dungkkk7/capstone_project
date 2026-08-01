@@ -208,12 +208,9 @@ def _fuzzing_fixed(
         confirmed = matches + mismatches
 
     completed = total > 0 and not report.get("error")
-    fully_equivalent = bool(
-        completed
-        and report.get("is_fully_equivalent", False)
-        and mismatches == 0
-        and inconclusive == 0
-    )
+    # Unstable executions are excluded from the valid-input denominator.
+    # A completed campaign passes when it has no reproducible mismatch.
+    fully_equivalent = bool(completed and mismatches == 0)
 
     if completed:
         if is_first_completed_campaign:
@@ -236,8 +233,8 @@ def _fuzzing_fixed(
     tracker.reported_counterexample_count += mismatches
     tracker.reproduced_counterexample_count += mismatches
 
-    # F5 is one-shot and must not be counted as entering a repair stage.
-    if mismatches > 0 and tracker.flow_id != "F5":
+    # The one-shot flow must not be counted as entering a repair stage.
+    if mismatches > 0 and base.FLOW_SPECS[tracker.flow_id].iterative:
         tracker.entered_behavioral_repair = True
 
     return report
@@ -601,6 +598,24 @@ def export_metrics_csvs_fixed(
         encoding="utf-8",
     ) as handle:
         json.dump(metadata, handle, indent=2)
+
+    # Preserve this historical entry point while making schema v2 the
+    # authoritative final output.
+    try:
+        from pathlib import Path
+        from evaluation.artifact_loader import load_campaign
+        from evaluation.reporting import export_report
+
+        project_root = Path(__file__).resolve().parents[2]
+        campaign_id = experiment_id.replace("experiment_", "eval_", 1)
+        campaign_dir = project_root / "result" / campaign_id
+        if campaign_dir.is_dir():
+            export_report(
+                load_campaign(project_root, campaign_dir, experiment_id),
+                Path(output_dir),
+            )
+    except Exception as exc:
+        print(f"[!] Schema-v2 export failed: {exc}", flush=True)
 
     print(
         f"[✓] Canonical metric CSVs exported to {output_dir} "

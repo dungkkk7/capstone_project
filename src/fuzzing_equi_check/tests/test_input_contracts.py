@@ -116,6 +116,12 @@ class InputContractManifestTests(unittest.TestCase):
             ("p02814", "s915631953"): b"2 50\n5 10\n",
             ("p02950", "s864110221"): p02950_timeout,
             ("p03142", "s710805295"): b"3 3\n9 2\n5 3\n3 3\n",
+            ("p03199", "s752471056"): b"5 3\n1 1 $\n3 1 0\n60238\n2 8 1\n",
+            ("p03261", "s577603531"): b"39718\n0\nh_pn\nemrdifh\nbtgn\ncnzemq\n",
+            ("p03430", "s601450783"): b"34808\nybcqbcmbh\nc\n",
+            ("p03776", "s721771429"): b"4 -12281 1 1 2 3 1000000\n",
+            ("p03835", "s836003439"): b"17342 -834724\n",
+            ("p04028", "s626776881"): b"4041\n4\n8\n",
         }
         for key, payload in invalid.items():
             if key in contracts:
@@ -137,6 +143,12 @@ class InputContractManifestTests(unittest.TestCase):
             ("p02814", "s915631953"),
             ("p02950", "s864110221"),
             ("p03142", "s710805295"),
+            ("p03199", "s752471056"),
+            ("p03261", "s577603531"),
+            ("p03430", "s601450783"),
+            ("p03776", "s721771429"),
+            ("p03835", "s836003439"),
+            ("p04028", "s626776881"),
         }
         for key in cases:
             case_id, _ = key

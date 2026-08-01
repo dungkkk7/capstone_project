@@ -13,7 +13,7 @@ Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass
    - [Phase 1: Binary Lifting (McSema / Remill)](#phase-1-binary-lifting-mcsema--remill)
    - [Phase 2: LLVM Deobfuscation Pipeline (Passes 010 $\rightarrow$ 100)](#phase-2-llvm-deobfuscation-pipeline-passes-010--100)
    - [Phase 3: Transpilation (LLVM-to-C Transpiler)](#phase-3-transpilation-llvm-to-c-transpiler)
-   - [Phase 4: LLM-Assisted C Recovery (5 Pipeline Flows)](#phase-4-llm-assisted-c-recovery-5-pipeline-flows)
+   - [Phase 4: LLM-Assisted C Recovery (6 Evaluation Flows)](#phase-4-llm-assisted-c-recovery-6-evaluation-flows)
    - [Phase 5: Differential Fuzzing Verification (AFL++ Mutation Hook)](#phase-5-differential-fuzzing-verification-afl-mutation-hook)
    - [Phase 6: Metrics Evaluation & CSV Exporter](#phase-6-metrics-evaluation--csv-exporter)
 3. [Hướng Dẫn Cấu Hình (Configuration Guide)](#3-hướng-dẫn-cấu-hình-configuration-guide)
@@ -117,76 +117,31 @@ Bộ pass LLVM tùy biến được thiết kế chạy tuần tự trong `src/l
 ### Phase 3: Transpilation (LLVM-to-C Transpiler)
 - **Công cụ**: [`tools/llvm_to_c.py`](tools/llvm_to_c.py)
 - **Chức năng**: Chuyển đổi mã LLVM IR sạch (`*_final.ll`) thành mã C pseudocode có cấu trúc (`*_llvm2c.c`).
-- **Ưu điểm**: Tạo ra mã giả C ngắn hơn **54.6%** so với output của Ghidra decompiler, giúp LLM dễ dàng đọc hiểu cấu trúc vòng lặp và câu lệnh rẽ nhánh mà không bị tràn context window.
+- **Vai trò**: Cung cấp C-like structural evidence cho LLM mà không đưa
+  Original C vào prompt. Giá trị của pseudocode được đo bằng paired ablation,
+  không suy ra semantic correctness từ độ ngắn của source.
 
 ---
 
-### Phase 4: LLM-Assisted C Recovery (5 Pipeline Flows)
+### Phase 4: LLM-Assisted C Recovery (6 Evaluation Flows)
 
-Hệ thống hỗ trợ 5 chế độ khôi phục mã nguồn C (Flows) thông qua tham số `--mode`:
+Production pseudocode được sinh bằng LLVM2C. Bốn representation mode của
+`src/main.py` là `clean_ir_and_pseudocode`, `clean_pseudocode`, `clean_ir`
+và `raw_ir`. Evaluation runner áp repair policy lên các representation đó để
+tạo F1–F5; report generator tạo F6 derived:
 
-```bash
-python3 src/main.py data/custom_dataset.csv llm-recovery --mode=<MODE_NAME>
-```
-
-#### 1. Flow 1: `clean_pseudocode` (Có Vòng Lặp Fuzzing)
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR` $\rightarrow$ `LLVM-to-C Transpiler` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi dựa trên feedback fuzzing).
-- **Mục đích**: Chuyển đổi Clean IR sang dạng mã giả C để giúp LLM dễ đọc hiểu cấu trúc logic thuật toán, kèm cơ chế tự sửa sai qua 5 vòng.
-
-#### 2. Flow 2: `clean_ir_and_pseudocode` (Có Vòng Lặp Fuzzing)
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR + LLVM-to-C Pseudocode` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi dựa trên feedback fuzzing).
-- **Mục đích**: Cung cấp **song song cả 2 chứng cứ** (Clean IR cho chính xác toán học/memory, Pseudocode cho cấu trúc hàm/ABI), kết hợp sửa lỗi tự động.
-
-#### 3. Flow 3: `raw_ir` (Có Vòng Lặp Fuzzing)
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Raw LLVM IR` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi).
-- **Mục đích**: Đẩy trực tiếp mã LLVM IR thô chưa qua làm sạch vào LLM để đánh giá khả năng tự deobfuscate thô của mô hình.
-
-#### 4. Flow 4: `clean_ir` (Có Vòng Lặp Fuzzing)
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (qua vòng lặp sửa lỗi).
-- **Mục đích**: Đẩy mã LLVM IR sạch đã được tối ưu hóa và gỡ rối hoàn toàn vào LLM.
-
-#### 5. Flow 5: `clean_ir_and_pseudocode` (One-shot - Không Có Vòng Lặp Fuzzing)
-- **Luồng**: `Obfuscated Binary` $\rightarrow$ `Clean IR + LLVM-to-C Pseudocode` $\rightarrow$ `LLM` $\rightarrow$ `Recovered C` (không qua vòng lặp sửa sai).
-- **Mục đích**: Đánh giá hiệu suất khôi phục mã nguồn trực tiếp trong 1 lượt duy nhất (One-shot) khi không có sự hỗ trợ của cơ chế phản hồi lỗi.
-
----
-
-### 🔄 Cơ Chế Feedback & Error Context Trong Vòng Lặp Sửa Lỗi (LLM Repair Loop)
-
-Khi mã C11 do LLM tạo ra ở các bước lặp trước gặp lỗi (biên dịch thất bại hoặc sai ngữ nghĩa khi fuzzing), hệ thống tự động tổng hợp một khối `<VALIDATION_FEEDBACK>` cực kỳ chi tiết gửi lại cho LLM sửa đổi:
-
-#### 1. Các Giới Hạn Dung Lượng Context (Context Limits)
-
-| Thành Phần Context | Dung Lượng Tối Đa (Max Bounds) | Ý Nghĩa / Nội Dung |
+| Flow | Evidence | Error context |
 |---|---|---|
-| **`max_feedback_chars`** | **48,000 ký tự** (`48_000`) | Giới hạn dung lượng toàn bộ thông điệp báo lỗi feedback gửi lại cho LLM. |
-| **`max_candidate_chars`** | **160,000 ký tự** (`160_000`) | Giới hạn mã C khôi phục cũ (kèm số dòng) ở lần lặp trước đó. |
-| **Số ví dụ Counterexamples** | **Tối đa 5 ví dụ** (`examples[:5]`) | Chọn tối đa 5 trường hợp sai ngữ nghĩa tiêu biểu nhất từ AFL++ fuzzer. |
-| **Dung lượng Stdin Per Example** | **8,000 chars** (Text) / **12,000 chars** (b64/hex) | Đầu vào Stdin gây lỗi ở 3 định dạng: Raw Text, Base64 và Hexadecimal. |
+| F1 Full | Clean IR + LLVM2C pseudocode | Có, iterative |
+| F2 No error context | Clean IR + LLVM2C pseudocode | Không, one-call |
+| F3 No pseudocode | Clean IR | Có, iterative |
+| F4 No direct Clean IR | LLVM2C pseudocode | Có, iterative |
+| F5 Raw IR baseline | Raw IR | Có, iterative |
+| F6 Raw IR no error context | Raw IR | Không, derived từ first provider call của F5 |
 
-#### 2. Cấu Trúc Nội Dung Error Feedback Gửi Cho LLM
-
-##### A. Trường hợp Lỗi Biên Dịch (Compiler Error):
-- **Compiler Output**: Toàn bộ thông báo lỗi và cảnh báo từ Clang/GCC (`syntax error`, `missing declaration`, `type mismatch`, `undefined symbol`).
-- **Line-numbered Candidate Source**: Toàn bộ mã C khôi phục cũ được đánh số dòng để LLM dễ dàng định vị dòng bị lỗi.
-
-##### B. Trường hợp Lỗi Sai Ngữ Nghĩa (Fuzzing Semantic Mismatch):
-- **Báo cáo Thống kê**: Số lượt test (`total_runs`), số lượt match (`matches`), số lượt mismatch (`mismatches`), tỷ lệ tương đương (`equivalence_ratio`).
-- **Tối đa 5 Counterexamples chi tiết (`COUNTEREXAMPLE #1..#5`)**:
-  1. **Phân loại lỗi (`class`)**: `crash`, `timeout`, `stdout_mismatch`, `returncode_mismatch`.
-  2. **Lý do lỗi (`reason`)**: Mô tả chi tiết nguyên nhân (ví dụ: `Execution status mismatch: timeout vs success`).
-  3. **Đầu vào Stdin 3 dạng**:
-     - `stdin_text`: Dạng chuỗi UTF-8.
-     - `stdin_base64`: Dạng mã hóa Base64.
-     - `stdin_hex`: Dạng chuỗi Hexadecimal.
-  4. **Đối sánh thực thi (Candidate C vs Reference Original)**:
-     - `candidate`: `status`, `returncode`, `stdout`, `stderr`, `elapsed_ms`.
-     - `reference`: `status`, `returncode`, `stdout`, `stderr`, `elapsed_ms`.
-  5. **Diff từng byte (Byte-level Diff)**:
-     - `stream`: stdout / stderr
-     - `first_differing_byte`: Vị trí offset byte đầu tiên bị sai lệch.
-     - `candidate_byte` vs `reference_byte` (dạng Hex).
-     - `window_hex`: Cửa sổ hex xung quanh vị trí byte lệch để LLM soi chi tiết.
+Compile repair và behavioral repair được log thành hai loại case/round riêng.
+Behavioral feedback chỉ dùng counterexample đã replay tái hiện được. Original C
+không bao giờ được đưa vào recovery prompt.
 
 ---
 
@@ -201,33 +156,29 @@ Bộ xác minh tương đương ngữ nghĩa nằm tại [`src/fuzzing_equi_chec
    - Thu thập toàn bộ các file đầu vào từ các thư mục `queue/`, `crashes/`, `hangs/` của AFL++.
    - Biên dịch file C khôi phục (`clean_bin`) và file gốc đối chứng (`ref_bin`).
    - Cho cả 2 binary thực thi trên 1,000 đầu vào đột biến và so sánh `returncode`, `stdout`, `stderr`.
-3. **Quy tắc xử lý Tương đương Ngữ nghĩa (Equivalence Rules)**:
-   - **Match**: `stdout` và `returncode` trùng khớp hoàn toàn.
-   - **Shared Timeout**: Cả 2 binary cùng bị timeout do input quá lớn của AFL++ $\rightarrow$ **Tính là PASS** (không coi là lỗi của code tái tạo).
-   - **Shared Crash**: Cả 2 binary cùng crash do input bị lỗi định dạng $\rightarrow$ **Tính là PASS**.
-   - **Mismatch**: Binary tái tạo cho kết quả khác binary gốc $\rightarrow$ Báo lỗi và kích hoạt vòng lặp sửa lỗi (Repair Loop).
+3. **Behavioral oracle**:
+   - Reference là Obfuscated Binary; candidate là binary compile từ Candidate C.
+   - Cả hai nhận đúng cùng một input.
+   - Observation là `(stdout_bytes, stderr_bytes, exit_code,
+     terminating_signal, timeout_status)`.
+   - Chỉ match khi toàn bộ tuple giống nhau. Shared timeout hoặc shared crash
+     không tự động match nếu các thành phần còn lại khác nhau.
+   - Mismatch chỉ trở thành final behavioral failure sau khi counterexample
+     replay tái hiện được.
 
 ---
 
-### Phase 6: Metrics Evaluation & CSV Exporter
+### Phase 6: Evaluation Framework & Report Exporter
 
-Bộ thu thập chỉ số tự động đặt tại [`src/evaluation/collect_metrics.py`](src/evaluation/collect_metrics.py) và [`src/evaluation/metrics_evaluator.py`](src/evaluation/metrics_evaluator.py):
+Framework trong `src/evaluation/` lưu raw record cho từng LLM attempt,
+compilation attempt, fuzzing campaign, counterexample và repair case. Trước khi
+aggregate, nó kiểm tra flow invariants, compile/fuzz relationships, status
+semantics và xuất `data_validation_errors.csv`; dữ liệu sai không bị tự sửa.
 
-Tự động tổng hợp **38 chỉ số đo lường** sau khi chạy xong pipeline và xuất file `metrics.csv`:
-
-- **Nóm 1: IR Deobfuscation Metrics**:
-  - `raw_loc` vs `clean_loc` & `loc_reduction_pct` (Tỷ lệ thu gọn dòng mã IR).
-  - `raw_bb` vs `clean_bb` & `bb_reduction_pct` (Tỷ lệ giảm số lượng Basic Blocks).
-  - `raw_cyclomatic` vs `clean_cyclomatic` & `cyclomatic_reduction_pct` (Tỷ lệ giảm độ phức tạp Cyclomatic Complexity của McCabe).
-  - `raw_switches` vs `clean_switches` & `switch_elim_pct` (Số lượng switch CFF bị triệt hạ).
-  - `raw_instructions` vs `clean_instructions` & `inst_reduction_pct` (Tỷ lệ giảm câu lệnh IR).
-- **Nhóm 2: Semantic Pipeline Metrics**:
-  - `semantic_pass` (`PASS` / `FAIL`).
-  - `semantic_fail_reason` (Lý do thất bại nếu có).
-  - `fuzz_total`, `fuzz_matches`, `fuzz_mismatches`, `fuzz_match_pct`.
-- **Nhóm 3: LLM Recovery Metrics (Cho cả 4 Mode)**:
-  - `m1_raw_ir_c_loc`, `m1_raw_ir_compile_ok`, `m1_raw_ir_semantic`, `m1_raw_ir_fail_reason`
-  - `m2_clean_pseudo_...`, `m3_clean_ir_...`, `m4_dual_...`
+Output gồm per-sample/per-attempt CSV, raw JSONL, metric tables, paired
+ablation, statistical tests, Markdown, LaTeX, HTML/dashboard và 17 figure ở cả
+PNG/SVG/PDF. `export_existing_metrics.py` có thể regenerate toàn bộ report từ
+artifact cũ mà không gọi lại LLM hoặc fuzzing.
 
 ---
 
@@ -300,12 +251,17 @@ pip install -r requirements.txt
 python3 src/main.py data/custom_dataset.csv llm-recovery
 ```
 
-### 2. Chạy Chiến Dịch Đánh Giá Song Song — 5 Flows (`run_experiment.py`) ⭐ Khuyên Dùng
+### 2. Chạy Chiến Dịch Đánh Giá Song Song — 6 Flows (`run_experiment.py`) ⭐ Khuyên Dùng
 
-Đây là kịch bản thực nghiệm chính, chạy song song đồng thời **5 luồng phục hồi LLM (Flow F1 → F5)** cho toàn bộ tập dữ liệu, hỗ trợ resume và tự động xoay vùng Vertex AI:
+Đây là kịch bản thực nghiệm chính. Runner thực thi **5 flow độc lập
+(F1 → F5)** cho toàn bộ tập dữ liệu; framework báo cáo bổ sung **F6** bằng
+cách lấy checkpoint ở lần gọi provider đầu tiên của F5. Vì vậy, một chiến
+dịch 40 mẫu thực hiện 200 flow-run độc lập và tạo 40 record F6 derived, không
+phải 240 lần gọi pipeline độc lập. Runner hỗ trợ resume và tự động xoay vùng
+Vertex AI:
 
 ```bash
-# Chạy chiến dịch đầy đủ (40 cases × 5 flows = 200 tasks)
+# Chạy chiến dịch đầy đủ (40 cases × 5 independent flows = 200 tasks)
 python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3
 
 # Nếu bị gián đoạn, tiếp tục từ vị trí bị dừng:
@@ -315,49 +271,66 @@ python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3
 python3 src/evaluation/run_experiment.py data/custom_dataset.csv --pilot=3 --max-workers=3
 ```
 
-#### Định Nghĩa 5 Flows (F1 → F5)
+#### Định Nghĩa 6 Flows (F1 → F6)
 
-| Flow | Evidence gửi vào LLM | Iterations | Tương đương `--mode` (main.py) | Mục đích |
-|:---:|:---|:---:|:---|:---|
-| **F1** | LLVM-to-C Pseudocode (Clean IR transpiled) | 5 | `--mode=clean_pseudocode` | Baseline: pseudocode thuần |
-| **F2** | LLVM-to-C Pseudocode + Clean IR (đính kèm) | 5 | `--mode=clean_ir_and_pseudocode` | Dual evidence: pseudo + IR |
-| **F3** | Raw LLVM IR (thô, chưa qua brightening) | 5 | `--mode=raw_ir` | Raw IR trực tiếp vào LLM |
-| **F4** | Clean LLVM IR (sau brightening, không pseudo) | 5 | `--mode=clean_ir` | Clean IR trực tiếp vào LLM |
-| **F5** | LLVM-to-C Pseudocode + Clean IR (đính kèm) | **1** | `--mode=clean_ir_and_pseudocode` | Ablation: tắt vòng lặp CEGIS |
+`Error context` là toàn bộ compiler feedback và behavioral
+counterexample feedback dùng cho các vòng sửa tiếp theo.
 
-> **Lưu ý về F5**: F5 dùng cùng input với F2 nhưng chỉ cho LLM **1 lần thử duy nhất** (không có vòng lặp sửa lỗi CEGIS). So sánh F2 vs F5 chứng minh đóng góp của cơ chế lặp phản hồi fuzzer (+~20% pass rate).
+| Flow | Evidence ban đầu gửi vào LLM | Error context / repair | Nguồn record | Mục đích |
+|:---:|:---|:---:|:---:|:---|
+| **F1 — FULL** | Clean IR + LLVM2C pseudocode | Có, iterative | Chạy độc lập | Cấu hình đầy đủ |
+| **F2 — NO_ERROR_CONTEXT** | Clean IR + LLVM2C pseudocode | Không, đúng 1 provider call | Chạy độc lập | Đo tác dụng của error context so với F1 |
+| **F3 — NO_PSEUDOCODE** | Clean IR | Có, iterative | Chạy độc lập | Đo tác dụng của LLVM2C pseudocode so với F1 |
+| **F4 — NO_DIRECT_CLEAN_IR** | LLVM2C pseudocode | Có, iterative | Chạy độc lập | Đo tác dụng của Clean IR trực tiếp so với F1 |
+| **F5 — RAW_IR_BASELINE** | Raw IR | Có, iterative | Chạy độc lập | Đo tác dụng của deobfuscation/representation |
+| **F6 — RAW_IR_NO_ERROR_CONTEXT_DERIVED** | Raw IR | Không, đúng 1 provider call | Derived từ lần gọi provider đầu tiên của F5 | Đo tác dụng của error context trên Raw IR |
 
-#### Kết Quả Thực Nghiệm (40 Cases × 5 Flows = 200 Tasks)
+F6 không tính retry do `MAX_TOKENS`, không lấy compiler/counterexample
+feedback và không lấy candidate ở vòng sau. Nếu artifact của checkpoint đầu
+không đủ, record được đánh dấu `CANCELLED`; framework không tự đoán dữ liệu.
+Do F6 dùng lại checkpoint của F5, F5–F6 là paired derived comparison, không
+được mô tả như hai chiến dịch độc lập.
 
-| Flow | PASS | Tỉ lệ |
+#### Kết Quả Canonical E2E Hiện Tại
+
+Canonical E2E dùng toàn bộ mẫu eligible trong mẫu số, nên generation fail,
+compile fail và `CANCELLED` không bị loại khỏi denominator.
+
+| Flow | Accepted behavioral PASS / eligible | Canonical E2E |
 |:---:|:---:|:---:|
-| F1 (Pseudocode) | 32/40 | **80.0%** |
-| F2 (Pseudocode + Clean IR) | 31/40 | **77.5%** |
-| F3 (Raw IR) | 25/40 | 62.5% |
-| F4 (Clean IR) | 32/40 | **80.0%** |
-| F5 (Pseudocode + Clean IR, 1 iter) | 23/40 | 57.5% |
-| **Tổng** | **143/200** | **71.5%** |
+| F1 (Full) | 31/40 | **77.5%** |
+| F2 (No error context) | 21/31 | 67.7% |
+| F3 (No pseudocode) | 32/40 | **80.0%** |
+| F4 (No direct Clean IR) | 32/40 | **80.0%** |
+| F5 (Raw IR iterative) | 25/40 | 62.5% |
+| F6 (Raw IR one-call, derived) | 7/40 | 17.5% |
+
+Không cộng sáu hàng thành một “overall pass rate”: chúng là các cấu hình
+paired trên cùng dataset, và F6 còn là checkpoint derived từ F5.
 
 ### 3. Chạy Pipeline Đơn Tuần Tự theo Mode (`src/main.py`)
 
 Dùng khi muốn chạy tuần tự từng binary với một mode cụ thể (không có parallel workers, không sinh HTML report):
 
 ```bash
-# Chạy toàn bộ dataset với mode mặc định (Dual Evidence - tương đương F2/F5)
+# Chạy toàn bộ dataset với mode mặc định (Clean IR + LLVM2C pseudocode)
 python3 src/main.py data/custom_dataset.csv llm-recovery
 
-# F1 — LLVM-to-C Pseudocode (không kèm Clean IR)
+# Representation của F4 — LLVM2C pseudocode (không kèm Clean IR)
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_pseudocode
 
-# F2/F5 — Dual Evidence: Pseudocode + Clean IR
+# Representation của F1/F2 — LLVM2C pseudocode + Clean IR
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir_and_pseudocode
 
-# F3 — Raw IR trực tiếp vào LLM
+# Representation của F5/F6 — Raw IR trực tiếp vào LLM
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=raw_ir
 
-# F4 — Clean IR trực tiếp vào LLM
+# Representation của F3 — Clean IR trực tiếp vào LLM
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir
 ```
+
+`--mode` chỉ chọn representation; nó không tự biến một lần chạy đơn thành
+flow ablation đầy đủ với đúng repair policy và provenance của F1–F6.
 
 ### 4. Chạy Độc Lập Bộ Thu Thập Metrics CSV (`collect_metrics.py`)
 
@@ -375,11 +348,14 @@ python3 src/evaluation/collect_metrics.py \
 
 ### 5. Vẽ Biểu Đồ & Trực Quan Hóa Thực Nghiệm (`visualize_experiment.py`)
 
-Sau khi chạy chiến dịch hoàn tất, hệ thống tự động xuất 24 biểu đồ so sánh, bảng biểu LaTeX, markdown và trang Dashboard HTML tổng quan trong thư mục báo cáo tương ứng tại `reports/experiment_YYYYMMDD_HHMMSS/`:
+Sau khi chạy chiến dịch hoàn tất, framework xuất 17 figure
+publication-ready ở cả PNG, SVG và PDF, cùng CSV/JSON, LaTeX, Markdown,
+HTML và dashboard trong `reports/experiment_YYYYMMDD_HHMMSS/`. Có thể
+regenerate hoàn toàn offline từ artifact đã có, không gọi lại LLM hay fuzzing:
 
 ```bash
-# Tự vẽ lại biểu đồ thủ công từ thư mục báo cáo cũ:
-python3 src/evaluation/visualize_experiment.py reports/experiment_20260728_124405/
+python3 src/evaluation/export_existing_metrics.py \
+    result/eval_20260728_124405
 ```
 
 **Các tham số bổ sung hữu ích cho `run_experiment.py`:**
@@ -428,10 +404,14 @@ capstone_project/
 ├── tools/
 │   └── llvm_to_c.py               # Công cụ dịch chuyển LLVM IR sạch sang C pseudocode
 ├── result/                        # Thư mục chứa kết quả đầu ra (tự động khởi tạo)
-│   └── pipeline_YYYYMMDD_HHMMSS/
-│       ├── p00001/                # Kết quả từng case (IR sạch, binary, report JSON)
-│       ├── ...
-│       └── metrics.csv            # File báo cáo CSV tổng hợp toàn bộ dataset
+│   └── eval_YYYYMMDD_HHMMSS/      # Artifact gốc theo sample/flow/attempt
+├── reports/
+│   └── experiment_YYYYMMDD_HHMMSS/
+│       ├── dashboard.html
+│       ├── report.{md,tex,html}
+│       ├── raw_results.jsonl
+│       ├── *.csv
+│       └── figures/               # 17 figure × PNG/SVG/PDF
 └── README.md                      # Tài liệu hướng dẫn chi tiết dự án
 ```
 
@@ -439,15 +419,22 @@ capstone_project/
 
 ## 6. KẾT QUẢ ĐÁNH GIÁ THỰC NGHIỆM (BENCHMARK RESULTS)
 
-Kết quả thực nghiệm thu thập tự động trên tập dataset **40 bài toán ELF x86_64 obfuscated bằng OLLVM**:
+Report `experiment_20260728_124405` được regenerate từ artifact của 40 bài
+toán ELF x86_64 obfuscated. Metric correctness chính được phát biểu là “không
+phát hiện reproducible behavioral divergence trong valid inputs và fuzzing
+budget đã dùng”, không phải tương đương với mọi input.
 
-| Chỉ Số Đo Lường (Metric) | Kết Quả Đạt Được |
-|---|---|
-| **Semantic PASS Rate (AFL++ 1,000 mutations)** | **40 / 40 Cases (100.0%)** |
-| **Mismatches thực tế** | **0 Cases (0.0%)** |
-| **Tỷ lệ giảm dòng mã IR (LOC Reduction)** | **↓ 81.52%** |
-| **Tỷ lệ giảm khối cơ bản (Basic Block Reduction)** | **↓ 80.53%** |
-| **Tỷ lệ giảm độ phức tạp Cyclomatic (CC Reduction)** | **↓ 77.32%** |
-| **Mã C Pseudocode tạo ra (LLVM-to-C Transpiler)** | Giảm **54.6%** dòng mã so với Ghidra Pseudocode |
+| Flow | Program Behavioral Pass | Canonical E2E |
+|---|---:|---:|
+| F1 Full | 31/38 (81.6%) | 31/40 (77.5%) |
+| F2 No error context | 21/30 (70.0%) | 21/31 (67.7%) |
+| F3 No pseudocode | 32/40 (80.0%) | 32/40 (80.0%) |
+| F4 No direct Clean IR | 32/40 (80.0%) | 32/40 (80.0%) |
+| F5 Raw IR iterative | 25/37 (67.6%) | 25/40 (62.5%) |
+| F6 Raw IR one-call, derived | 7/21 (33.3%) | 7/40 (17.5%) |
+
+Program Behavioral Pass loại generation/compile failure khỏi mẫu số và chỉ
+dùng run hoàn thành behavioral validation. Canonical E2E dùng toàn bộ eligible
+samples. F6 là checkpoint derived từ F5, không phải run độc lập.
 
 ---

@@ -274,7 +274,8 @@ fi
 rm -f "$VARARG_EXTERNAL_PTR_OUT"
 
 NATIVE_DISPATCH_OUT="$(mktemp)"
-trap 'rm -f "$NATIVE_DISPATCH_OUT"' EXIT
+NATIVE_DISPATCH_POST_FRAME_OUT="$(mktemp)"
+trap 'rm -f "$NATIVE_DISPATCH_OUT" "$NATIVE_DISPATCH_POST_FRAME_OUT"' EXIT
 "$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,verify' -S \
   "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
@@ -282,7 +283,91 @@ trap 'rm -f "$NATIVE_DISPATCH_OUT"' EXIT
 "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
   "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
   < "$NATIVE_DISPATCH_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
+  -o "$NATIVE_DISPATCH_POST_FRAME_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  --check-prefix=POST-FRAME \
+  "$ROOT/tests/native_pointer_dispatch_collapse.ll" \
+  < "$NATIVE_DISPATCH_POST_FRAME_OUT"
 rm -f "$NATIVE_DISPATCH_OUT"
+rm -f "$NATIVE_DISPATCH_POST_FRAME_OUT"
+
+WRITE_ONLY_FRAME_OUT="$(mktemp)"
+trap 'rm -f "$WRITE_ONLY_FRAME_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/write_only_local_frame_cleanup.ll" \
+  -o "$WRITE_ONLY_FRAME_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/write_only_local_frame_cleanup.ll" \
+  < "$WRITE_ONLY_FRAME_OUT"
+rm -f "$WRITE_ONLY_FRAME_OUT"
+
+FINITE_FRAME_SPLIT_OUT="$(mktemp)"
+trap 'rm -f "$FINITE_FRAME_SPLIT_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/finite_local_frame_split.ll" \
+  -o "$FINITE_FRAME_SPLIT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/finite_local_frame_split.ll" \
+  < "$FINITE_FRAME_SPLIT_OUT"
+rm -f "$FINITE_FRAME_SPLIT_OUT"
+
+SHARED_STATE_SCALAR_OUT="$(mktemp)"
+SHARED_STATE_SCALAR_BEFORE="$(mktemp)"
+SHARED_STATE_SCALAR_AFTER="$(mktemp)"
+trap 'rm -f "$SHARED_STATE_SCALAR_OUT" "$SHARED_STATE_SCALAR_BEFORE" "$SHARED_STATE_SCALAR_AFTER"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/shared_state_scalarization.ll" \
+  -o "$SHARED_STATE_SCALAR_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/shared_state_scalarization.ll" \
+  < "$SHARED_STATE_SCALAR_OUT"
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -O2 \
+  "$ROOT/tests/shared_state_scalarization.ll" -o "$SHARED_STATE_SCALAR_BEFORE"
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -O2 \
+  -x ir "$SHARED_STATE_SCALAR_OUT" -o "$SHARED_STATE_SCALAR_AFTER"
+"$SHARED_STATE_SCALAR_BEFORE"
+"$SHARED_STATE_SCALAR_AFTER"
+rm -f "$SHARED_STATE_SCALAR_OUT" "$SHARED_STATE_SCALAR_BEFORE" \
+  "$SHARED_STATE_SCALAR_AFTER"
+
+SHARED_STATE_DYNAMIC_OUT="$(mktemp)"
+trap 'rm -f "$SHARED_STATE_DYNAMIC_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/shared_state_scalarization_dynamic.ll" \
+  -o "$SHARED_STATE_DYNAMIC_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/shared_state_scalarization_dynamic.ll" \
+  < "$SHARED_STATE_DYNAMIC_OUT"
+rm -f "$SHARED_STATE_DYNAMIC_OUT"
+
+UNINITIALIZED_SEED_OUT="$(mktemp)"
+trap 'rm -f "$UNINITIALIZED_SEED_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/uninitialized_local_seed_phi.ll" \
+  -o "$UNINITIALIZED_SEED_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/uninitialized_local_seed_phi.ll" \
+  < "$UNINITIALIZED_SEED_OUT"
+rm -f "$UNINITIALIZED_SEED_OUT"
+
+NATIVE_STORAGE_OUT="$(mktemp)"
+trap 'rm -f "$NATIVE_STORAGE_OUT"' EXIT
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/native_residual_storage_classification.ll" \
+  -o "$NATIVE_STORAGE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/native_residual_storage_classification.ll" \
+  < "$NATIVE_STORAGE_OUT"
+rm -f "$NATIVE_STORAGE_OUT"
 
 SHARED_STATE_FRAME_OUT="$(mktemp)"
 trap 'rm -f "$SHARED_STATE_FRAME_OUT"' EXIT
@@ -543,7 +628,28 @@ fi
 rm -f "$THREAD_POINTER_CONTROL" "$THREAD_POINTER_FINAL"
 
 "$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,verify' -S \
+  "$ROOT/tests/thread_pointer_inline_asm.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/thread_pointer_inline_asm.ll"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-pass,default<O3>,verify' -S \
+  "$ROOT/tests/unique_local_frame_boundary.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/unique_local_frame_boundary.ll"
+
+"$OPT" -load-pass-plugin="$PLUGIN" \
   -passes='brighten-native-cleanup-pass,brighten-native-cleanup-final-pass,verify' \
+  -brighten-native-strict -S \
+  "$ROOT/tests/direct_overwritten_undefined_scaffold.ll" -o - |
+  "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+    "$ROOT/tests/direct_overwritten_undefined_scaffold.ll"
+
+# The same exact scaffold proof must run after late O3/095, where aggregate
+# return builders can first become visible at the post-frame boundary.
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,brighten-native-cleanup-final-pass,verify' \
   -brighten-native-strict -S \
   "$ROOT/tests/direct_overwritten_undefined_scaffold.ll" -o - |
   "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
@@ -1048,5 +1154,140 @@ SHARED_STATE_CONTEXT_OUT="$(mktemp)"
 "${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
   "$ROOT/tests/shared_state_context.ll" < "$SHARED_STATE_CONTEXT_OUT"
 rm -f "$SHARED_STATE_CONTEXT_OUT"
+
+RESOLVER_OUTLINE_OUT="$(mktemp)"
+RESOLVER_OUTLINE_TWICE="$(mktemp)"
+RESOLVER_CONTRACT_REPORT="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/recovered_resolver_outlining.ll" \
+  -o "$RESOLVER_OUTLINE_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/recovered_resolver_outlining.ll" < "$RESOLVER_OUTLINE_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$RESOLVER_OUTLINE_OUT" -o "$RESOLVER_OUTLINE_TWICE"
+cmp <(sed '1{/^; ModuleID = /d;}' "$RESOLVER_OUTLINE_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$RESOLVER_OUTLINE_TWICE")
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-final-pass,verify' -disable-output \
+  "$RESOLVER_OUTLINE_OUT" 2>"$RESOLVER_CONTRACT_REPORT"
+grep -Fq 'native contract finding: generated raw pointer fallback: mismatched_resolver' \
+  "$RESOLVER_CONTRACT_REPORT"
+grep -Fq 'native contract finding: surviving mapper/select fallback chain: mismatched_resolver' \
+  "$RESOLVER_CONTRACT_REPORT"
+if grep -Fq 'native contract finding: generated raw pointer fallback: __brighten_resolve_recovered_address' \
+    "$RESOLVER_CONTRACT_REPORT" || \
+   grep -Fq 'native contract finding: surviving mapper/select fallback chain: __brighten_resolve_recovered_address' \
+    "$RESOLVER_CONTRACT_REPORT"; then
+  echo "FAIL: exact recovered-address resolver boundary was reported as an inline mapper" >&2
+  exit 1
+fi
+rm -f "$RESOLVER_OUTLINE_OUT" "$RESOLVER_OUTLINE_TWICE" \
+  "$RESOLVER_CONTRACT_REPORT"
+
+NATIVE_RESOLVER_CALL_OUT="$(mktemp)"
+NATIVE_RESOLVER_CALL_TWICE="$(mktemp)"
+NATIVE_RESOLVER_CALL_BEFORE="$(mktemp)"
+NATIVE_RESOLVER_CALL_AFTER="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/native_outlined_resolver_call.ll" \
+  -o "$NATIVE_RESOLVER_CALL_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/native_outlined_resolver_call.ll" \
+  < "$NATIVE_RESOLVER_CALL_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$NATIVE_RESOLVER_CALL_OUT" -o "$NATIVE_RESOLVER_CALL_TWICE"
+cmp <(sed '1{/^; ModuleID = /d;}' "$NATIVE_RESOLVER_CALL_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$NATIVE_RESOLVER_CALL_TWICE")
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$ROOT/tests/native_outlined_resolver_call.ll" \
+  -o "$NATIVE_RESOLVER_CALL_BEFORE"
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$NATIVE_RESOLVER_CALL_OUT" -o "$NATIVE_RESOLVER_CALL_AFTER"
+"$NATIVE_RESOLVER_CALL_BEFORE"
+"$NATIVE_RESOLVER_CALL_AFTER"
+rm -f "$NATIVE_RESOLVER_CALL_OUT" "$NATIVE_RESOLVER_CALL_TWICE" \
+  "$NATIVE_RESOLVER_CALL_BEFORE" "$NATIVE_RESOLVER_CALL_AFTER"
+
+RESIDUAL_VIEWS_OUT="$(mktemp)"
+RESIDUAL_VIEWS_TWICE="$(mktemp)"
+RESIDUAL_VIEWS_BEFORE="$(mktemp)"
+RESIDUAL_VIEWS_AFTER="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/residual_constant_offset_views.ll" \
+  -o "$RESIDUAL_VIEWS_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/residual_constant_offset_views.ll" \
+  < "$RESIDUAL_VIEWS_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$RESIDUAL_VIEWS_OUT" -o "$RESIDUAL_VIEWS_TWICE"
+cmp <(sed '1{/^; ModuleID = /d;}' "$RESIDUAL_VIEWS_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$RESIDUAL_VIEWS_TWICE")
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$ROOT/tests/residual_constant_offset_views.ll" \
+  -o "$RESIDUAL_VIEWS_BEFORE"
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$RESIDUAL_VIEWS_OUT" -o "$RESIDUAL_VIEWS_AFTER"
+"$RESIDUAL_VIEWS_BEFORE"
+"$RESIDUAL_VIEWS_AFTER"
+rm -f "$RESIDUAL_VIEWS_OUT" "$RESIDUAL_VIEWS_TWICE" \
+  "$RESIDUAL_VIEWS_BEFORE" "$RESIDUAL_VIEWS_AFTER"
+
+CALL_FOOTPRINT_OUT="$(mktemp)"
+CALL_FOOTPRINT_TWICE="$(mktemp)"
+CALL_FOOTPRINT_BEFORE="$(mktemp)"
+CALL_FOOTPRINT_AFTER="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/disjoint_internal_call_frame_forwarding.ll" \
+  -o "$CALL_FOOTPRINT_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/disjoint_internal_call_frame_forwarding.ll" \
+  < "$CALL_FOOTPRINT_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$CALL_FOOTPRINT_OUT" -o "$CALL_FOOTPRINT_TWICE"
+cmp <(sed '1{/^; ModuleID = /d;}' "$CALL_FOOTPRINT_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$CALL_FOOTPRINT_TWICE")
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$ROOT/tests/disjoint_internal_call_frame_forwarding.ll" \
+  -o "$CALL_FOOTPRINT_BEFORE"
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$CALL_FOOTPRINT_OUT" -o "$CALL_FOOTPRINT_AFTER"
+"$CALL_FOOTPRINT_BEFORE"
+"$CALL_FOOTPRINT_AFTER"
+rm -f "$CALL_FOOTPRINT_OUT" "$CALL_FOOTPRINT_TWICE" \
+  "$CALL_FOOTPRINT_BEFORE" "$CALL_FOOTPRINT_AFTER"
+
+GUEST_FRAME_ABI_OUT="$(mktemp)"
+GUEST_FRAME_ABI_TWICE="$(mktemp)"
+GUEST_FRAME_ABI_BEFORE="$(mktemp)"
+GUEST_FRAME_ABI_AFTER="$(mktemp)"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$ROOT/tests/translation_invariant_guest_frame_abi.ll" \
+  -o "$GUEST_FRAME_ABI_OUT"
+"${FILECHECK:-$(command -v FileCheck-21 || command -v FileCheck)}" \
+  "$ROOT/tests/translation_invariant_guest_frame_abi.ll" \
+  < "$GUEST_FRAME_ABI_OUT"
+"$OPT" -load-pass-plugin="$PLUGIN" \
+  -passes='brighten-native-cleanup-post-frame-pass,verify' -S \
+  "$GUEST_FRAME_ABI_OUT" -o "$GUEST_FRAME_ABI_TWICE"
+cmp <(sed '1{/^; ModuleID = /d;}' "$GUEST_FRAME_ABI_OUT") \
+    <(sed '1{/^; ModuleID = /d;}' "$GUEST_FRAME_ABI_TWICE")
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$ROOT/tests/translation_invariant_guest_frame_abi.ll" \
+  -o "$GUEST_FRAME_ABI_BEFORE"
+"${CLANG:-$(command -v clang-21 || command -v clang)}" -x ir \
+  "$GUEST_FRAME_ABI_OUT" -o "$GUEST_FRAME_ABI_AFTER"
+"$GUEST_FRAME_ABI_BEFORE"
+"$GUEST_FRAME_ABI_AFTER"
+rm -f "$GUEST_FRAME_ABI_OUT" "$GUEST_FRAME_ABI_TWICE" "$GUEST_FRAME_ABI_BEFORE" \
+  "$GUEST_FRAME_ABI_AFTER"
 
 echo "Native State SSA tests: PASS"

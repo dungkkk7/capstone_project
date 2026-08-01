@@ -1,80 +1,105 @@
-# Hướng dẫn dùng LLM Recovery
+# Hướng dẫn LLM Recovery
 
-Folder này là nơi chạy luồng `llm-recovery` để tạo lại mã C từ LLVM IR.
+Module này khôi phục Candidate C từ LLVM evidence và hỗ trợ compiler/behavioral
+feedback cho các flow iterative. Backend pseudocode production là **LLVM2C**;
+Ghidra không còn là một recovery backend.
 
-Thiết kế prompt và flow chi tiết nằm trong [PROMPT_FLOW.md](PROMPT_FLOW.md).
+## Chạy nhanh
 
-## 1) Chạy nhanh
-
-- Chế độ mặc định: two-stage (Ghidra pseudo -> LLM).
-- Chạy từ root repo:
-
-```bash
-cd /home/dungbv/capstone_project
-rtk python3 src/main.py data/llm_test.csv llm-recovery
-```
-
-Hoặc có thể dùng trực tiếp biến môi trường:
+Chạy từ root repository:
 
 ```bash
-rtk LLM_RECOVERY_PSEUDO_BACKEND=1 python3 src/main.py data/llm_test.csv llm-recovery
+python3 src/main.py data/custom_dataset.csv llm-recovery
 ```
 
-## 2) Chọn luồng mode
-
-- `Mode 1` (two-stage, khuyến nghị):
-  - Ghidra headless decompile binary tham chiếu sang pseudo C.
-  - Rồi gửi pseudo C cho LLM.
-  - Thiết lập:
+Chọn representation:
 
 ```bash
-LLM_RECOVERY_PSEUDO_BACKEND=1
+# Clean IR + LLVM2C pseudocode
+python3 src/main.py data/custom_dataset.csv llm-recovery \
+    --mode=clean_ir_and_pseudocode
+
+# Chỉ LLVM2C pseudocode sinh từ Clean IR
+python3 src/main.py data/custom_dataset.csv llm-recovery \
+    --mode=clean_pseudocode
+
+# Chỉ Clean IR
+python3 src/main.py data/custom_dataset.csv llm-recovery \
+    --mode=clean_ir
+
+# Chỉ Raw IR chưa deobfuscate
+python3 src/main.py data/custom_dataset.csv llm-recovery \
+    --mode=raw_ir
 ```
 
-- `Mode 2` (direct IR):
-  - Bỏ qua Ghidra, gửi trực tiếp IR cho LLM.
-  - Thiết lập:
+`--mode` chỉ chọn representation. Muốn chạy đúng ablation contract, repair
+policy và artifact logging của evaluation framework thì dùng
+`src/evaluation/run_experiment.py`.
+
+## Evidence routing
+
+| Representation | Raw IR | Clean IR trực tiếp | LLVM2C pseudocode |
+|---|:---:|:---:|:---:|
+| `clean_ir_and_pseudocode` | Không | Có | Có |
+| `clean_pseudocode` | Không | Không | Có |
+| `clean_ir` | Không | Có | Không |
+| `raw_ir` | Có | Không | Không |
+
+Original C chỉ được dùng cho đánh giá hậu nghiệm; tuyệt đối không được đưa vào
+recovery prompt. Obfuscated Binary là behavioral reference khi differential
+execution.
+
+## Sáu evaluation flow
+
+| Flow | Cấu hình |
+|---|---|
+| F1 `FULL` | Clean IR + LLVM2C pseudocode + error context, iterative |
+| F2 `NO_ERROR_CONTEXT` | Clean IR + LLVM2C pseudocode, đúng một provider call |
+| F3 `NO_PSEUDOCODE` | Clean IR + error context, iterative |
+| F4 `NO_DIRECT_CLEAN_IR` | LLVM2C pseudocode + error context, iterative |
+| F5 `RAW_IR_BASELINE` | Raw IR + error context, iterative |
+| F6 `RAW_IR_NO_ERROR_CONTEXT_DERIVED` | Raw IR, checkpoint provider call đầu tiên của F5 |
+
+F1–F5 là flow chạy độc lập. F6 được report generator suy ra từ lần gọi
+provider thực tế đầu tiên của F5, bỏ retry `MAX_TOKENS` và mọi candidate/feedback
+về sau. Vì thế F6 là paired derived checkpoint, không phải một pipeline run độc
+lập. Artifact thiếu được ghi `CANCELLED`, không nội suy.
+
+## Repair và behavioral oracle
+
+Flow iterative tách riêng:
+
+- compile repair: dùng diagnostics của compiler;
+- behavioral repair: dùng reproducible counterexample;
+- repair case count: số candidate fail được đưa vào repair;
+- repair round count: số vòng sửa đã thực hiện.
+
+Behavior của mỗi executable trên input `x` là:
+
+```text
+(stdout_bytes, stderr_bytes, exit_code, terminating_signal, timeout_status)
+```
+
+Chỉ match khi toàn bộ tuple giống nhau. Counterexample phải replay thành công
+theo policy mới được kết luận `FAIL_BEHAVIORAL` hoặc dùng cho repair.
+
+## Biến cấu hình thường dùng
+
+- `LLM_RECOVERY_MAX_ITERS`: ngân sách vòng generation/repair.
+- `LLM_RECOVERY_FUZZ_ITERS`: input budget cho behavioral validation.
+- `LLM_RECOVERY_FUZZ_TIMEOUT`: timeout cho mỗi binary execution.
+- `LLM_RECOVERY_TIMEOUT`: timeout request tới provider.
+- `LLM_RECOVERY_MODEL`: model/provider model ID.
+
+Token, cost hoặc resource metric mà provider/runtime không cung cấp phải được
+lưu `null`; không tự ước lượng.
+
+## Regenerate report offline
 
 ```bash
-LLM_RECOVERY_TWO_STAGE=0
-LLM_RECOVERY_PSEUDO_BACKEND=2
+python3 src/evaluation/export_existing_metrics.py \
+    result/eval_20260728_124405
 ```
 
-## 3) Chọn file cho Ghidra (quan trọng)
-
-Mode 1 **không fallback về `original_binary` nữa**. Nó chỉ nhận:
-
-`metadata["recovery_reference_binary"]`
-
-Nội bộ pipeline sẽ truyền:
-
-- Nếu delifted IR compile được sang binary tham chiếu: `.../<base>_delifted_ref.bin`
-- Ngược lại, trong luồng hiện tại sẽ truyền `original_binary` như fallback từ `main.py` (khi metadata được set).
-
-Nếu `recovery_reference_binary` thiếu -> mode 1 dừng, không tự chuyển sang mode 2.
-
-Ghidra executable mặc định:
-
-`/opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless`
-
-Có thể ghi đè bằng `LLM_RECOVERY_GHIDRA_ANALYZE_HEADLESS`.
-
-## 4) Khác biệt với AFL binary
-
-- `bin1_afl.bin` chỉ là binary có instrumentation để sinh input trong fuzzing.
-- Ghidra decompile **không** lấy `bin1_afl.bin`.
-
-## 5) Ý nghĩa các flag thường dùng
-
-- `LLM_RECOVERY_MAX_ITERS`: số vòng lặp fix lỗi + retry.
-- `LLM_RECOVERY_FUZZ_ITERS`: số test cho mỗi lần fuzz trong recovery.
-- `LLM_RECOVERY_FUZZ_TIMEOUT`: hard timeout mỗi binary execution (mặc định `0.1` giây).
-- `LLM_RECOVERY_TIMEOUT`: timeout request tới LLM.
-
-## 6) Gợi ý đọc log
-
-Trong log bạn sẽ thấy:
-
-  - `[LLM] Mode 1: decompile bằng Ghidra rồi gửi C-like pseudocode cho LLM.`
-  - `[LLM] Ghidra analyzeHeadless: <path>`: executable Ghidra được dùng.
-  - `Dừng mode 1`: Ghidra stage không chạy được; mode 2 phải được chọn rõ ràng.
+Lệnh này chỉ đọc artifact đã lưu và tạo lại CSV, JSONL, Markdown, LaTeX, HTML
+và figure PNG/SVG/PDF; không gọi lại LLM, compiler repair hay fuzzing.

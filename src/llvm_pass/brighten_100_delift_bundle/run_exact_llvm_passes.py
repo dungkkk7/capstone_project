@@ -36,7 +36,14 @@ def main():
     input_text = args.input.read_text()
     before = count_ir(input_text)
     subprocess.run(
-        [opt, "-S", "-passes=sccp,instcombine,dce,simplifycfg,verify", str(args.input), "-o", str(args.output)],
+        [
+            opt,
+            "-S",
+            "-passes=sccp,instcombine<no-verify-fixpoint>,dce,simplifycfg,verify",
+            str(args.input),
+            "-o",
+            str(args.output),
+        ],
         check=True,
     )
     after = count_ir(args.output.read_text())

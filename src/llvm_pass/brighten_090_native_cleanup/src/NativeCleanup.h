@@ -23,6 +23,16 @@ private:
   bool EnforceStrict;
 };
 
+// Narrow mutation boundary after the final 040/heap-owner sweep. Late frame
+// promotion can expose pointer PHIs and native affine round-trips that did not
+// exist at either broad cleanup boundary.
+class NativeCleanupPostFramePass
+    : public llvm::PassInfoMixin<NativeCleanupPostFramePass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM);
+};
+
 } // namespace brighten_native_cleanup
 
 #endif

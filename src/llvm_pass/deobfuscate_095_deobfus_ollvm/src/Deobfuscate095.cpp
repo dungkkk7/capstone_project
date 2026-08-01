@@ -29,6 +29,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
@@ -895,8 +896,616 @@ static bool hasOnlyOwnedParityComparisons(const Instruction &I) {
   return true;
 }
 
+static Value *matchZeroComparison(Value *V, ICmpInst::Predicate Predicate) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp || Cmp->getPredicate() != Predicate) return nullptr;
+  if (PatternMatch::match(Cmp->getOperand(1), PatternMatch::m_Zero()))
+    return Cmp->getOperand(0);
+  if (PatternMatch::match(Cmp->getOperand(0), PatternMatch::m_Zero())) {
+    ICmpInst::Predicate Swapped = CmpInst::getSwappedPredicate(Predicate);
+    return Swapped == Predicate ? Cmp->getOperand(1) : nullptr;
+  }
+  return nullptr;
+}
+
+static bool matchSignBit(Value *V, Value *X) {
+  auto *Shift = dyn_cast<BinaryOperator>(V);
+  auto *Amount = Shift ? dyn_cast<ConstantInt>(Shift->getOperand(1)) : nullptr;
+  return Shift && Shift->getOpcode() == Instruction::LShr &&
+         Shift->getOperand(0) == X && X->getType()->isIntegerTy() &&
+         X->getType()->getIntegerBitWidth() >= 2 && Amount &&
+         Amount->getZExtValue() == X->getType()->getIntegerBitWidth() - 1;
+}
+
+// McSema materializes a signed `x >= 0` test through the x86 SF/OF/ZF flag
+// equations. Match the complete dataflow rather than names or constants from
+// one sample:
+//
+//   x == 0 || ((-x < 0) ^ ((signbit(x) + signbit(-x)) == 2))
+//
+// The overflow term is essential for INT_MIN. All arithmetic in the matched
+// form is modular (the add may carry flags, but its operands are single bits).
+static Value *matchExactSignedNonnegativeFlags(Value *V) {
+  auto *Root = dyn_cast<BinaryOperator>(V);
+  if (!Root || Root->getOpcode() != Instruction::Or ||
+      !Root->getType()->isIntegerTy(1))
+    return nullptr;
+
+  for (unsigned RootSide = 0; RootSide != 2; ++RootSide) {
+    Value *X = matchZeroComparison(Root->getOperand(RootSide),
+                                   ICmpInst::ICMP_EQ);
+    auto *Xor = dyn_cast<BinaryOperator>(Root->getOperand(1 - RootSide));
+    if (!X || !Xor || Xor->getOpcode() != Instruction::Xor ||
+        !X->getType()->isIntegerTy())
+      continue;
+
+    for (unsigned XorSide = 0; XorSide != 2; ++XorSide) {
+      Value *Neg = matchZeroComparison(Xor->getOperand(XorSide),
+                                       ICmpInst::ICMP_SLT);
+      auto *NegOp = dyn_cast_or_null<BinaryOperator>(Neg);
+      if (!NegOp || NegOp->getOpcode() != Instruction::Sub ||
+          !PatternMatch::match(NegOp->getOperand(0),
+                               PatternMatch::m_Zero()) ||
+          NegOp->getOperand(1) != X || hasPoisonGeneratingBinaryFlags(NegOp))
+        continue;
+
+      auto *Overflow = dyn_cast<ICmpInst>(Xor->getOperand(1 - XorSide));
+      if (!Overflow || Overflow->getPredicate() != ICmpInst::ICMP_EQ)
+        continue;
+      Value *SumValue = nullptr;
+      ConstantInt *Two = nullptr;
+      if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(1))))
+        SumValue = Overflow->getOperand(0);
+      else if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(0))))
+        SumValue = Overflow->getOperand(1);
+      if (!Two || !Two->equalsInt(2)) continue;
+      auto *Sum = dyn_cast<BinaryOperator>(SumValue);
+      if (!Sum || Sum->getOpcode() != Instruction::Add ||
+          Sum->getType() != X->getType())
+        continue;
+      bool ExactSigns =
+          (matchSignBit(Sum->getOperand(0), X) &&
+           matchSignBit(Sum->getOperand(1), Neg)) ||
+          (matchSignBit(Sum->getOperand(1), X) &&
+           matchSignBit(Sum->getOperand(0), Neg));
+      if (ExactSigns)
+        return X;
+    }
+  }
+
+  // Reassociation can express the same x/-x pair around a shared affine
+  // origin: x = A - C, -x = C - A, and x == 0 as A == C. Keep the proof
+  // syntactic and modular; flagged arithmetic is refused.
+  for (unsigned RootSide = 0; RootSide != 2; ++RootSide) {
+    auto *Equal = dyn_cast<ICmpInst>(Root->getOperand(RootSide));
+    auto *Xor = dyn_cast<BinaryOperator>(Root->getOperand(1 - RootSide));
+    if (!Equal || Equal->getPredicate() != ICmpInst::ICMP_EQ || !Xor ||
+        Xor->getOpcode() != Instruction::Xor)
+      continue;
+    for (unsigned Order = 0; Order != 2; ++Order) {
+      Value *A = Equal->getOperand(Order);
+      auto *C = dyn_cast<ConstantInt>(Equal->getOperand(1 - Order));
+      if (!C || !A->getType()->isIntegerTy() || A->getType() != C->getType())
+        continue;
+      for (unsigned XorSide = 0; XorSide != 2; ++XorSide) {
+        Value *Neg = matchZeroComparison(Xor->getOperand(XorSide),
+                                         ICmpInst::ICMP_SLT);
+        auto *NegOp = dyn_cast_or_null<BinaryOperator>(Neg);
+        if (!NegOp || NegOp->getOpcode() != Instruction::Sub ||
+            NegOp->getOperand(0) != C || NegOp->getOperand(1) != A ||
+            hasPoisonGeneratingBinaryFlags(NegOp))
+          continue;
+        auto *Overflow = dyn_cast<ICmpInst>(Xor->getOperand(1 - XorSide));
+        if (!Overflow || Overflow->getPredicate() != ICmpInst::ICMP_EQ)
+          continue;
+        Value *SumValue = nullptr;
+        ConstantInt *Two = nullptr;
+        if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(1))))
+          SumValue = Overflow->getOperand(0);
+        else if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(0))))
+          SumValue = Overflow->getOperand(1);
+        if (!Two || !Two->equalsInt(2)) continue;
+        auto *Sum = dyn_cast<BinaryOperator>(SumValue);
+        if (!Sum || Sum->getOpcode() != Instruction::Add) continue;
+        for (unsigned SignSide = 0; SignSide != 2; ++SignSide) {
+          Value *Positive = nullptr;
+          auto *PositiveSign = dyn_cast<BinaryOperator>(
+              Sum->getOperand(SignSide));
+          if (PositiveSign &&
+              PositiveSign->getOpcode() == Instruction::LShr)
+            Positive = PositiveSign->getOperand(0);
+          auto *PositiveOp = dyn_cast_or_null<BinaryOperator>(Positive);
+          bool IsDifference =
+              PositiveOp && !hasPoisonGeneratingBinaryFlags(PositiveOp) &&
+              ((PositiveOp->getOpcode() == Instruction::Sub &&
+                PositiveOp->getOperand(0) == A &&
+                PositiveOp->getOperand(1) == C) ||
+               (PositiveOp->getOpcode() == Instruction::Add &&
+                PositiveOp->getOperand(0) == A &&
+                isa<ConstantInt>(PositiveOp->getOperand(1)) &&
+                cast<ConstantInt>(PositiveOp->getOperand(1))->getValue() ==
+                    -C->getValue()));
+          if (!IsDifference || !matchSignBit(PositiveSign, Positive) ||
+              !matchSignBit(Sum->getOperand(1 - SignSide), Neg))
+            continue;
+          return Positive;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+static bool isKnownNonnegativeAt(Value *V, Instruction *At,
+                                 DominatorTree &DT) {
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return !C->isNegative();
+  Function *F = At ? At->getFunction() : nullptr;
+  if (!F) return false;
+  for (BasicBlock &BB : *F) {
+    auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
+    auto *Cmp = Branch && Branch->isConditional()
+                    ? dyn_cast<ICmpInst>(Branch->getCondition())
+                    : nullptr;
+    if (!Cmp) continue;
+    bool ProvesOnTrue =
+        (Cmp->getPredicate() == ICmpInst::ICMP_SGE &&
+         Cmp->getOperand(0) == V &&
+         PatternMatch::match(Cmp->getOperand(1), PatternMatch::m_Zero())) ||
+        (Cmp->getPredicate() == ICmpInst::ICMP_SGT &&
+         Cmp->getOperand(0) == V &&
+         isa<ConstantInt>(Cmp->getOperand(1)) &&
+         cast<ConstantInt>(Cmp->getOperand(1))->isMinusOne());
+    if (ProvesOnTrue && DT.dominates(Branch->getSuccessor(0), At->getParent()))
+      return true;
+  }
+  return false;
+}
+
+static Value *matchSignedNonnegativeTest(Value *V) {
+  auto *Cmp = dyn_cast<ICmpInst>(V);
+  if (!Cmp)
+    return nullptr;
+  for (unsigned Side = 0; Side != 2; ++Side) {
+    Value *X = Cmp->getOperand(Side);
+    auto *Bound = dyn_cast<ConstantInt>(Cmp->getOperand(1 - Side));
+    if (!Bound || !X->getType()->isIntegerTy() ||
+        X->getType() != Bound->getType())
+      continue;
+    ICmpInst::Predicate Predicate =
+        Side == 0 ? Cmp->getPredicate()
+                  : CmpInst::getSwappedPredicate(Cmp->getPredicate());
+    if ((Predicate == ICmpInst::ICMP_SGE && Bound->isZero()) ||
+        (Predicate == ICmpInst::ICMP_SGT && Bound->isMinusOne()))
+      return X;
+  }
+  return nullptr;
+}
+
+struct SignedLessEqualOperands {
+  Value *LHS = nullptr;
+  Value *RHS = nullptr;
+};
+
+struct SubtractionFlagOperands {
+  Value *LHS = nullptr;
+  Value *RHS = nullptr;
+  Value *Difference = nullptr;
+  bool HasCompleteOverflow = false;
+};
+
+struct AffineConstant {
+  Value *Base = nullptr;
+  APInt Offset;
+};
+
+static std::optional<AffineConstant> matchAffineConstant(Value *V) {
+  if (!V->getType()->isIntegerTy())
+    return std::nullopt;
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO || hasPoisonGeneratingBinaryFlags(BO))
+    return AffineConstant{V, APInt(V->getType()->getIntegerBitWidth(), 0)};
+  if (BO->getOpcode() == Instruction::Add) {
+    for (unsigned I = 0; I != 2; ++I)
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(I)))
+        return AffineConstant{BO->getOperand(1 - I), C->getValue()};
+  }
+  if (BO->getOpcode() == Instruction::Sub)
+    if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1)))
+      return AffineConstant{BO->getOperand(0), -C->getValue()};
+  return AffineConstant{V, APInt(V->getType()->getIntegerBitWidth(), 0)};
+}
+
+static std::optional<SubtractionFlagOperands>
+matchSubtractionSignOverflow(Value *V, ICmpInst::Predicate OverflowPredicate,
+                             bool UsesNonnegativeDifference = false) {
+  auto *Xor = dyn_cast<BinaryOperator>(V);
+  if (!Xor || Xor->getOpcode() != Instruction::Xor ||
+      !Xor->getType()->isIntegerTy(1))
+    return std::nullopt;
+
+  auto DeriveRHS = [&](Value *Difference, Value *A) -> Value * {
+    auto *Sub = dyn_cast<BinaryOperator>(Difference);
+    if (!Sub)
+      return nullptr;
+    Value *B = nullptr;
+    if (Sub->getOpcode() == Instruction::Sub && Sub->getOperand(0) == A) {
+      B = Sub->getOperand(1);
+    } else if (Sub->getOpcode() == Instruction::Add) {
+      for (unsigned Operand = 0; Operand != 2; ++Operand)
+        if (Sub->getOperand(1 - Operand) == A)
+          if (auto *C = dyn_cast<ConstantInt>(Sub->getOperand(Operand)))
+            B = ConstantInt::get(C->getType(), -C->getValue());
+    }
+    if (!B) {
+      auto DifferenceAffine = matchAffineConstant(Difference);
+      auto AAffine = matchAffineConstant(A);
+      if (!DifferenceAffine || !AAffine ||
+          DifferenceAffine->Base != AAffine->Base ||
+          DifferenceAffine->Offset.getBitWidth() !=
+              AAffine->Offset.getBitWidth())
+        return nullptr;
+      APInt BOffset = AAffine->Offset - DifferenceAffine->Offset;
+      B = ConstantInt::get(A->getType(), BOffset);
+    }
+    if (!hasPoisonGeneratingBinaryFlags(Sub) ||
+        isGuaranteedNotToBeUndefOrPoison(Sub))
+      return B;
+
+    // A flagged wide subtraction of a sign-extended narrow integer is still
+    // poison-free when both extrema minus the constant fit in the wide type.
+    // Prove that interval directly instead of discarding useful `nsw`
+    // information or assuming it away.
+    auto *Extend = dyn_cast<SExtInst>(A);
+    auto *ConstantB = dyn_cast<ConstantInt>(B);
+    if (!Extend || !ConstantB || !A->getType()->isIntegerTy())
+      return nullptr;
+    unsigned WideBits = A->getType()->getIntegerBitWidth();
+    unsigned NarrowBits =
+        Extend->getOperand(0)->getType()->getIntegerBitWidth();
+    if (NarrowBits >= WideBits)
+      return nullptr;
+    APInt Minimum = APInt::getSignedMinValue(NarrowBits).sext(WideBits);
+    APInt Maximum = APInt::getSignedMaxValue(NarrowBits).sext(WideBits);
+    bool MinimumOverflow = false;
+    bool MaximumOverflow = false;
+    (void)Minimum.ssub_ov(ConstantB->getValue(), MinimumOverflow);
+    (void)Maximum.ssub_ov(ConstantB->getValue(), MaximumOverflow);
+    return !MinimumOverflow && !MaximumOverflow ? B : nullptr;
+  };
+
+  auto MatchesDifferenceSign = [&](Value *Test, Value *Difference, Value *A,
+                                   Value *B) {
+    Value *Direct = UsesNonnegativeDifference
+                        ? matchSignedNonnegativeTest(Test)
+                        : matchZeroComparison(Test, ICmpInst::ICMP_SLT);
+    if (Direct == Difference)
+      return true;
+
+    // InstCombine can sink a sign extension out of the flag graph while
+    // retaining the original narrow comparison.  For a mathematical
+    // subtraction in a wider type, `sext(x) - C < 0` is exactly `x < C`
+    // (and likewise for >=) when C is representable in x's signed type.
+    auto *Extend = dyn_cast<SExtInst>(A);
+    auto *Bound = dyn_cast<ConstantInt>(B);
+    auto *Cmp = dyn_cast<ICmpInst>(Test);
+    if (!Extend || !Bound || !Cmp ||
+        !Difference->getType()->isIntegerTy() ||
+        Difference->getType() != A->getType())
+      return false;
+    Value *Narrow = Extend->getOperand(0);
+    unsigned NarrowBits = Narrow->getType()->getIntegerBitWidth();
+    if (!Bound->getValue().isSignedIntN(NarrowBits))
+      return false;
+    APInt WideBound = Bound->getValue();
+    for (unsigned Side = 0; Side != 2; ++Side) {
+      if (Cmp->getOperand(Side) != Narrow)
+        continue;
+      auto *CmpBound = dyn_cast<ConstantInt>(Cmp->getOperand(1 - Side));
+      if (!CmpBound)
+        continue;
+      ICmpInst::Predicate Predicate =
+          Side == 0 ? Cmp->getPredicate()
+                    : CmpInst::getSwappedPredicate(Cmp->getPredicate());
+      APInt ExtendedCmpBound = CmpBound->getValue().sext(WideBound.getBitWidth());
+      if (!UsesNonnegativeDifference)
+        return Predicate == ICmpInst::ICMP_SLT &&
+               ExtendedCmpBound == WideBound;
+      if (Predicate == ICmpInst::ICMP_SGE)
+        return ExtendedCmpBound == WideBound;
+      if (Predicate == ICmpInst::ICMP_SGT && !CmpBound->isMaxValue(true))
+        return ExtendedCmpBound + 1 == WideBound;
+    }
+    return false;
+  };
+
+  for (unsigned XorSide = 0; XorSide != 2; ++XorSide) {
+    Value *SignTest = Xor->getOperand(XorSide);
+    auto *Overflow = dyn_cast<ICmpInst>(Xor->getOperand(1 - XorSide));
+    if (!Overflow || Overflow->getPredicate() != OverflowPredicate)
+      continue;
+    Value *SumValue = nullptr;
+    ConstantInt *Two = nullptr;
+    if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(1))))
+      SumValue = Overflow->getOperand(0);
+    else if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(0))))
+      SumValue = Overflow->getOperand(1);
+    if (!Two || !Two->equalsInt(2)) continue;
+    auto *Sum = dyn_cast<BinaryOperator>(SumValue);
+    if (!Sum || Sum->getOpcode() != Instruction::Add ||
+        !Sum->getType()->isIntegerTy())
+      continue;
+    for (unsigned I = 0; I != 2; ++I) {
+      auto *OverflowSign = dyn_cast<BinaryOperator>(Sum->getOperand(I));
+      if (!OverflowSign || OverflowSign->getOpcode() != Instruction::LShr)
+        continue;
+      auto *DifferenceXorA =
+          dyn_cast<BinaryOperator>(OverflowSign->getOperand(0));
+      if (!DifferenceXorA ||
+          DifferenceXorA->getOpcode() != Instruction::Xor ||
+          !matchSignBit(OverflowSign, DifferenceXorA))
+        continue;
+      for (unsigned DifferenceSide = 0; DifferenceSide != 2;
+           ++DifferenceSide) {
+        Value *Difference = DifferenceXorA->getOperand(DifferenceSide);
+        Value *A = DifferenceXorA->getOperand(1 - DifferenceSide);
+        Value *B = DeriveRHS(Difference, A);
+        if (!B || !MatchesDifferenceSign(SignTest, Difference, A, B))
+          continue;
+
+        Value *OtherSign = Sum->getOperand(1 - I);
+        bool HasCompleteOverflow = false;
+        if (!matchSignBit(OtherSign, A)) {
+          auto *Shift = dyn_cast<BinaryOperator>(OtherSign);
+          auto *AXorB = Shift
+                            ? dyn_cast<BinaryOperator>(Shift->getOperand(0))
+                            : nullptr;
+          HasCompleteOverflow =
+              AXorB && AXorB->getOpcode() == Instruction::Xor &&
+              ((AXorB->getOperand(0) == A && AXorB->getOperand(1) == B) ||
+               (AXorB->getOperand(1) == A && AXorB->getOperand(0) == B)) &&
+              matchSignBit(Shift, AXorB);
+          if (!HasCompleteOverflow)
+            continue;
+        }
+        return SubtractionFlagOperands{A, B, Difference,
+                                       HasCompleteOverflow};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+static std::optional<SignedLessEqualOperands>
+matchExactSignedLessEqualDifferenceZero(Value *V, DominatorTree &DT) {
+  auto *Root = dyn_cast<BinaryOperator>(V);
+  if (!Root || Root->getOpcode() != Instruction::Or ||
+      !Root->getType()->isIntegerTy(1))
+    return std::nullopt;
+  for (unsigned Side = 0; Side != 2; ++Side) {
+    Value *Difference = matchZeroComparison(Root->getOperand(Side),
+                                            ICmpInst::ICMP_EQ);
+    auto Flags = matchSubtractionSignOverflow(Root->getOperand(1 - Side),
+                                              ICmpInst::ICMP_EQ);
+    if (!Flags || Difference != Flags->Difference ||
+        (!Flags->HasCompleteOverflow &&
+         !isKnownNonnegativeAt(Flags->RHS, Root, DT)))
+      continue;
+    return SignedLessEqualOperands{Flags->LHS, Flags->RHS};
+  }
+  return std::nullopt;
+}
+
+static std::optional<SignedLessEqualOperands>
+matchExactSignedGreaterThanFlags(Value *V, DominatorTree &DT) {
+  auto *Root = dyn_cast<BinaryOperator>(V);
+  if (!Root || Root->getOpcode() != Instruction::And ||
+      !Root->getType()->isIntegerTy(1))
+    return std::nullopt;
+  for (unsigned Side = 0; Side != 2; ++Side) {
+    auto Flags = matchSubtractionSignOverflow(Root->getOperand(1 - Side),
+                                              ICmpInst::ICMP_NE);
+    // Some lifts complement SF instead of OF:
+    //   (difference >= 0) xor OF == !(SF xor OF).
+    // This is the same strict-greater flag condition as
+    //   SF xor !OF,
+    // and the complete sign(A xor B) term keeps it exact for arbitrary RHS.
+    if (!Flags)
+      Flags = matchSubtractionSignOverflow(Root->getOperand(1 - Side),
+                                           ICmpInst::ICMP_EQ, true);
+    if (!Flags ||
+        (!Flags->HasCompleteOverflow &&
+         !isKnownNonnegativeAt(Flags->RHS, Root, DT)))
+      continue;
+
+    // InstCombine, and the normalize stage above this matcher, may replace
+    // `(A - B) != 0` with the exactly equivalent `A != B`.  Accept both
+    // spellings, but tie the latter directly to the operands reconstructed
+    // from the complete SF/OF dataflow.
+    Value *Different = Root->getOperand(Side);
+    bool ExactNonzero =
+        matchZeroComparison(Different, ICmpInst::ICMP_NE) ==
+        Flags->Difference;
+    auto *NotEqual = dyn_cast<ICmpInst>(Different);
+    bool ExactOperands =
+        NotEqual && NotEqual->getPredicate() == ICmpInst::ICMP_NE &&
+        ((NotEqual->getOperand(0) == Flags->LHS &&
+          NotEqual->getOperand(1) == Flags->RHS) ||
+         (NotEqual->getOperand(1) == Flags->LHS &&
+          NotEqual->getOperand(0) == Flags->RHS));
+    if (!ExactNonzero && !ExactOperands)
+      continue;
+    return SignedLessEqualOperands{Flags->LHS, Flags->RHS};
+  }
+  return std::nullopt;
+}
+
+// x86 lowers signed `A < B` to SF xor OF. Accept the complete overflow graph
+// containing sign(A xor B) for arbitrary operands. The older shortened graph
+// uses sign(A) instead and remains valid only when B is known nonnegative.
+static std::optional<SignedLessEqualOperands>
+matchExactSignedLessThanFlags(Value *V, DominatorTree &DT) {
+  auto Flags = matchSubtractionSignOverflow(V, ICmpInst::ICMP_EQ);
+  if (!Flags ||
+      (!Flags->HasCompleteOverflow &&
+       !isKnownNonnegativeAt(Flags->RHS, cast<Instruction>(V), DT)))
+    return std::nullopt;
+  return SignedLessEqualOperands{Flags->LHS, Flags->RHS};
+}
+
+static std::optional<SignedLessEqualOperands>
+matchExactSignedLessEqualFlags(Value *V, DominatorTree &DT) {
+  auto *Root = dyn_cast<BinaryOperator>(V);
+  if (!Root || Root->getOpcode() != Instruction::Or ||
+      !Root->getType()->isIntegerTy(1))
+    return std::nullopt;
+
+  for (unsigned RootSide = 0; RootSide != 2; ++RootSide) {
+    auto *Equal = dyn_cast<ICmpInst>(Root->getOperand(RootSide));
+    auto *Xor = dyn_cast<BinaryOperator>(Root->getOperand(1 - RootSide));
+    if (!Equal || Equal->getPredicate() != ICmpInst::ICMP_EQ || !Xor ||
+        Xor->getOpcode() != Instruction::Xor)
+      continue;
+    for (unsigned Order = 0; Order != 2; ++Order) {
+      Value *A = Equal->getOperand(Order);
+      Value *B = Equal->getOperand(1 - Order);
+      if (!A->getType()->isIntegerTy() || A->getType() != B->getType())
+        continue;
+      for (unsigned XorSide = 0; XorSide != 2; ++XorSide) {
+        Value *Difference = matchZeroComparison(Xor->getOperand(XorSide),
+                                                ICmpInst::ICMP_SLT);
+        auto *Sub = dyn_cast_or_null<BinaryOperator>(Difference);
+        if (!Sub || Sub->getOpcode() != Instruction::Sub ||
+            Sub->getOperand(0) != A || Sub->getOperand(1) != B ||
+            hasPoisonGeneratingBinaryFlags(Sub))
+          continue;
+
+        auto *Overflow = dyn_cast<ICmpInst>(Xor->getOperand(1 - XorSide));
+        if (!Overflow || Overflow->getPredicate() != ICmpInst::ICMP_EQ)
+          continue;
+        Value *SumValue = nullptr;
+        ConstantInt *Two = nullptr;
+        if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(1))))
+          SumValue = Overflow->getOperand(0);
+        else if ((Two = dyn_cast<ConstantInt>(Overflow->getOperand(0))))
+          SumValue = Overflow->getOperand(1);
+        if (!Two || !Two->equalsInt(2)) continue;
+        auto *Sum = dyn_cast<BinaryOperator>(SumValue);
+        if (!Sum || Sum->getOpcode() != Instruction::Add ||
+            Sum->getType() != A->getType())
+          continue;
+        Value *DifferenceXorA = nullptr;
+        for (unsigned I = 0; I != 2; ++I)
+          if (auto *Candidate = dyn_cast<BinaryOperator>(Sum->getOperand(I));
+              Candidate && Candidate->getOpcode() == Instruction::LShr) {
+            auto *Inner = dyn_cast<BinaryOperator>(Candidate->getOperand(0));
+            if (Inner && Inner->getOpcode() == Instruction::Xor &&
+                ((Inner->getOperand(0) == Difference &&
+                  Inner->getOperand(1) == A) ||
+                 (Inner->getOperand(1) == Difference &&
+                  Inner->getOperand(0) == A)) &&
+                matchSignBit(Candidate, Inner))
+              DifferenceXorA = Candidate;
+          }
+        if (!DifferenceXorA) continue;
+        Value *OtherSign = Sum->getOperand(
+            Sum->getOperand(0) == DifferenceXorA ? 1 : 0);
+        if (!matchSignBit(OtherSign, A) ||
+            !isKnownNonnegativeAt(B, Root, DT))
+          continue;
+        return SignedLessEqualOperands{A, B};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 static bool simplifyKnownMBA(Function &F, Report &R) {
   bool Changed = false;
+  SmallVector<BinaryOperator *, 32> SignedNonnegative;
+  for (Instruction &I : instructions(F))
+    if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (!BO->use_empty() && matchExactSignedNonnegativeFlags(BO))
+        SignedNonnegative.push_back(BO);
+  R.Stages["mba"].Candidates += SignedNonnegative.size();
+  for (BinaryOperator *Root : reverse(SignedNonnegative)) {
+    if (!Root->getParent() || Root->use_empty()) continue;
+    Value *X = matchExactSignedNonnegativeFlags(Root);
+    if (!X) continue;
+    IRBuilder<> B(Root);
+    Value *Clean = B.CreateICmpSGE(
+        X, ConstantInt::get(X->getType(), 0), "deobf.sge.zero");
+    Root->replaceAllUsesWith(Clean);
+    ++R.Stages["mba"].Changes;
+    noteRule(R, "mba.SignedNonnegativeFlagsRule");
+    Changed = true;
+  }
+
+  DominatorTree DT(F);
+  SmallVector<BinaryOperator *, 32> SignedLessEqual;
+  for (Instruction &I : instructions(F))
+    if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (!BO->use_empty() &&
+          (matchExactSignedLessEqualFlags(BO, DT) ||
+           matchExactSignedLessEqualDifferenceZero(BO, DT)))
+        SignedLessEqual.push_back(BO);
+  R.Stages["mba"].Candidates += SignedLessEqual.size();
+  for (BinaryOperator *Root : reverse(SignedLessEqual)) {
+    if (!Root->getParent() || Root->use_empty()) continue;
+    auto Operands = matchExactSignedLessEqualFlags(Root, DT);
+    if (!Operands)
+      Operands = matchExactSignedLessEqualDifferenceZero(Root, DT);
+    if (!Operands) continue;
+    IRBuilder<> B(Root);
+    Value *Clean = B.CreateICmpSLE(
+        Operands->LHS, Operands->RHS, "deobf.sle");
+    Root->replaceAllUsesWith(Clean);
+    ++R.Stages["mba"].Changes;
+    noteRule(R, "mba.SignedLessEqualFlagsRule");
+    Changed = true;
+  }
+
+  SmallVector<BinaryOperator *, 32> SignedGreaterThan;
+  for (Instruction &I : instructions(F))
+    if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (!BO->use_empty() && matchExactSignedGreaterThanFlags(BO, DT))
+        SignedGreaterThan.push_back(BO);
+  R.Stages["mba"].Candidates += SignedGreaterThan.size();
+  for (BinaryOperator *Root : reverse(SignedGreaterThan)) {
+    if (!Root->getParent() || Root->use_empty()) continue;
+    auto Operands = matchExactSignedGreaterThanFlags(Root, DT);
+    if (!Operands) continue;
+    IRBuilder<> B(Root);
+    Value *Clean = B.CreateICmpSGT(
+        Operands->LHS, Operands->RHS, "deobf.sgt");
+    Root->replaceAllUsesWith(Clean);
+    ++R.Stages["mba"].Changes;
+    noteRule(R, "mba.SignedGreaterThanFlagsRule");
+    Changed = true;
+  }
+
+  // Match the bare SF xor OF form after the composite <= and > roots.  Doing
+  // so preserves the larger exact patterns instead of rewriting their inner
+  // flag node first.
+  SmallVector<BinaryOperator *, 32> SignedLessThan;
+  for (Instruction &I : instructions(F))
+    if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (!BO->use_empty() && matchExactSignedLessThanFlags(BO, DT))
+        SignedLessThan.push_back(BO);
+  R.Stages["mba"].Candidates += SignedLessThan.size();
+  for (BinaryOperator *Root : reverse(SignedLessThan)) {
+    if (!Root->getParent() || Root->use_empty()) continue;
+    auto Operands = matchExactSignedLessThanFlags(Root, DT);
+    if (!Operands) continue;
+    IRBuilder<> B(Root);
+    Value *Clean = B.CreateICmpSLT(
+        Operands->LHS, Operands->RHS, "deobf.slt");
+    Root->replaceAllUsesWith(Clean);
+    ++R.Stages["mba"].Changes;
+    noteRule(R, "mba.SignedLessThanFlagsRule");
+    Changed = true;
+  }
+
   // This pass used to fold a broad "known even" family purely from modular
   // algebra.  Restrict it to the exact, poison-aware BCF/InstSub family; all
   // other MBA identities remain owned by LLVM's simplifier or the bounded SMT
@@ -2008,6 +2617,7 @@ static std::optional<StateChoice> decodeStateChoice(Value *V) {
 struct DispatchMap {
   DenseMap<APInt, BasicBlock *> Targets;
   DenseMap<BasicBlock *, BasicBlock *> DispatchPredecessor;
+  DenseMap<BasicBlock *, BasicBlock *> DispatchParent;
   SmallPtrSet<BasicBlock *, 8> Blocks;
 };
 
@@ -2026,8 +2636,10 @@ static DispatchMap collectDispatchMap(SwitchInst *Root, Value *State) {
     }
     BasicBlock *Default = SI->getDefaultDest();
     auto *Next = dyn_cast<SwitchInst>(Default->getTerminator());
-    if (Next && stripIntegerCasts(Next->getCondition()) == State)
+    if (Next && stripIntegerCasts(Next->getCondition()) == State) {
+      Map.DispatchParent.try_emplace(Default, Dispatch);
       Worklist.push_back(Next);
+    }
   }
   return Map;
 }
@@ -2122,6 +2734,30 @@ static bool dispatcherPayloadIsCloneable(BasicBlock *Latch,
   return true;
 }
 
+static bool dispatcherPathPayloadIsCloneable(ArrayRef<BasicBlock *> Path) {
+  unsigned PayloadInstructions = 0;
+  for (BasicBlock *BB : Path) {
+    if (!BB)
+      return false;
+    for (PHINode &PN : BB->phis())
+      if (++PayloadInstructions > 64 || PN.getType()->isTokenTy() ||
+          PN.getType()->isMetadataTy())
+        return false;
+    for (Instruction &I : *BB) {
+      if (isa<PHINode>(I) || I.isTerminator())
+        continue;
+      if (++PayloadInstructions > 64 || I.getType()->isTokenTy() ||
+          I.getType()->isMetadataTy() || isa<AllocaInst>(I) ||
+          isa<InvokeInst>(I) || isa<CallBrInst>(I) || I.isEHPad())
+        return false;
+      if (auto *CB = dyn_cast<CallBase>(&I);
+          CB && (CB->cannotDuplicate() || CB->isConvergent()))
+        return false;
+    }
+  }
+  return true;
+}
+
 static bool buildDispatcherValueMap(BasicBlock *Source, BasicBlock *Latch,
                                     BasicBlock *Header,
                                     DominatorTree &DT,
@@ -2210,6 +2846,105 @@ static void cloneHeaderPayload(BasicBlock *InsertBlock, BasicBlock *Header,
   }
 }
 
+static bool extendDispatcherPathValueMap(ArrayRef<BasicBlock *> Path,
+                                         BasicBlock *Header,
+                                         ValueToValueMapTy &VMap) {
+  BasicBlock *Predecessor = Header;
+  for (BasicBlock *BB : Path) {
+    for (PHINode &PN : BB->phis()) {
+      int Index = PN.getBasicBlockIndex(Predecessor);
+      if (Index < 0)
+        return false;
+      // Keep the original value here. MapValue will follow it through the
+      // header/path clones after those placeholders have been replaced.
+      VMap[&PN] = PN.getIncomingValue(Index);
+    }
+    Predecessor = BB;
+  }
+  return true;
+}
+
+static void seedDispatcherClonePlaceholders(BasicBlock *Latch,
+                                            BasicBlock *Header,
+                                            ArrayRef<BasicBlock *> Path,
+                                            ValueToValueMapTy &VMap) {
+  auto SeedBlock = [&](BasicBlock *BB) {
+    for (Instruction &I : *BB) {
+      if (isa<PHINode>(I) || I.isTerminator() || I.getType()->isVoidTy())
+        continue;
+      VMap[&I] = PoisonValue::get(I.getType());
+    }
+  };
+  if (Latch)
+    SeedBlock(Latch);
+  SeedBlock(Header);
+  for (BasicBlock *BB : Path)
+    SeedBlock(BB);
+}
+
+// Carrier mappings can legitimately resolve to a value produced by the
+// previous visit to the child dispatcher.  The same original instruction is
+// about to become the key for the freshly cloned visit, so letting MapValue
+// recursively follow that key would confuse the old reaching value with the
+// new definition.  A one-predecessor bridge PHI gives the old value its own SSA
+// identity.  Later payload SSA repair updates its incoming edge if an earlier
+// rewritten transition supplies the reaching definition.
+static void pinDispatcherPathInputs(BasicBlock *InsertBlock,
+                                    BasicBlock *Source,
+                                    ArrayRef<BasicBlock *> Path,
+                                    ValueToValueMapTy &VMap) {
+  SmallPtrSet<Instruction *, 32> PathDefinitions;
+  for (BasicBlock *BB : Path)
+    for (Instruction &I : *BB)
+      PathDefinitions.insert(&I);
+
+  SmallVector<std::pair<const Value *, Value *>, 16> InputsToPin;
+  for (auto Mapping : VMap) {
+    const Value *Key = Mapping.first;
+    Value *Resolved = Mapping.second;
+    if (Value *Mapped = MapValue(Resolved, VMap, RF_IgnoreMissingLocals))
+      Resolved = Mapped;
+    auto *ResolvedI = dyn_cast<Instruction>(Resolved);
+    if (ResolvedI && PathDefinitions.contains(ResolvedI))
+      InputsToPin.emplace_back(Key, Resolved);
+  }
+
+  DenseMap<Value *, PHINode *> Pins;
+  for (auto [Key, Resolved] : InputsToPin) {
+    PHINode *&Pin = Pins[Resolved];
+    if (!Pin) {
+      std::string Name = (Resolved->getName() + ".dispatch.in").str();
+      Pin = PHINode::Create(Resolved->getType(), 1, Name,
+                            InsertBlock->begin());
+      Pin->addIncoming(Resolved, Source);
+    }
+    VMap[Key] = Pin;
+  }
+}
+
+static void cloneDispatcherPathPayload(BasicBlock *InsertBlock,
+                                       ArrayRef<BasicBlock *> Path,
+                                       ValueToValueMapTy &VMap) {
+  Instruction *InsertBefore = InsertBlock->getTerminator();
+  for (BasicBlock *BB : Path) {
+    for (PHINode &PN : BB->phis()) {
+      auto It = VMap.find(&PN);
+      if (It != VMap.end())
+        if (Value *Mapped =
+                MapValue(It->second, VMap, RF_IgnoreMissingLocals))
+          It->second = Mapped;
+    }
+    for (Instruction &I : *BB) {
+      if (isa<PHINode>(I) || I.isTerminator())
+        continue;
+      Instruction *Clone = I.clone();
+      Clone->insertBefore(InsertBefore->getIterator());
+      VMap[&I] = Clone;
+      RemapInstruction(Clone, VMap, RF_IgnoreMissingLocals);
+    }
+  }
+}
+
 static void finalizeDispatcherCarrierMap(BasicBlock *Header,
                                          ValueToValueMapTy &VMap) {
   for (PHINode &Carrier : Header->phis()) {
@@ -2264,6 +2999,66 @@ static void repairCarrierSSA(
       if (DeflattenDebug && U->get() != Before) {
         auto *UserI = cast<Instruction>(U->getUser());
         errs() << "  carrier-rewrite=" << Carrier->getName()
+               << " user=" << UserI->getParent()->getName() << " before=";
+        Before->printAsOperand(errs(), false);
+        errs() << " after=";
+        U->get()->printAsOperand(errs(), false);
+        errs() << "\n";
+      }
+    }
+  }
+}
+
+// A split dispatcher is allowed to compute ordinary SSA values before its
+// child switch.  When a proven state transition bypasses that child, the
+// payload is cloned onto the new bridge, but uses in later application cases
+// must also select the clone associated with the edge that reached them.
+// Preserve the original definition for paths which still traverse the
+// dispatcher and make each bridge-local clone an alternative reaching
+// definition.  SSAUpdater then creates only the PHIs required by the rewritten
+// CFG (including edge-sensitive incoming values for existing PHIs).
+static void repairClonedDispatcherPayloadSSA(
+    const SmallPtrSetImpl<BasicBlock *> &DispatchBlocks,
+    ArrayRef<BasicBlock *> Bridges,
+    ArrayRef<std::unique_ptr<ValueToValueMapTy>> Maps,
+    ArrayRef<Instruction *> PayloadDefinitions) {
+  for (Instruction *Original : PayloadDefinitions) {
+    if (!Original || !Original->getParent() || Original->getType()->isVoidTy())
+      continue;
+
+    SSAUpdater Updater;
+    std::string UpdatedName =
+        (Original->getName() + ".dispatch.deobf").str();
+    Updater.Initialize(Original->getType(), UpdatedName);
+    Updater.AddAvailableValue(Original->getParent(), Original);
+
+    bool HasBridgeClone = false;
+    for (unsigned I = 0; I < Bridges.size(); ++I) {
+      auto It = Maps[I]->find(Original);
+      if (It == Maps[I]->end())
+        continue;
+      auto *Clone = dyn_cast<Instruction>(It->second);
+      if (!Clone || Clone == Original || Clone->getParent() != Bridges[I])
+        continue;
+      Updater.AddAvailableValue(Bridges[I], Clone);
+      HasBridgeClone = true;
+    }
+    if (!HasBridgeClone)
+      continue;
+
+    SmallVector<Use *, 32> Uses;
+    for (Use &U : Original->uses()) {
+      auto *UserI = dyn_cast<Instruction>(U.getUser());
+      if (!UserI || DispatchBlocks.contains(UserI->getParent()))
+        continue;
+      Uses.push_back(&U);
+    }
+    for (Use *U : Uses) {
+      Value *Before = U->get();
+      Updater.RewriteUse(*U);
+      if (DeflattenDebug && U->get() != Before) {
+        auto *UserI = cast<Instruction>(U->getUser());
+        errs() << "  payload-rewrite=" << Original->getName()
                << " user=" << UserI->getParent()->getName() << " before=";
         Before->printAsOperand(errs(), false);
         errs() << " after=";
@@ -3193,7 +3988,16 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
                          Report &R) {
   if (Root->getNumCases() < 3)
     return false;
-  Value *State = stripIntegerCasts(Root->getCondition());
+  Value *DispatchState = stripIntegerCasts(Root->getCondition());
+  Value *State = DispatchState;
+  bool StateWasFrozen = false;
+  if (auto *Freeze = dyn_cast<FreezeInst>(State)) {
+    Value *Candidate = stripIntegerCasts(Freeze->getOperand(0));
+    if (isa<PHINode>(Candidate)) {
+      State = Candidate;
+      StateWasFrozen = true;
+    }
+  }
   if (auto *StateLoad = dyn_cast<LoadInst>(State)) {
     if (deflattenMemoryState(F, Root, StateLoad, DT, AA, Prover, R))
       return true;
@@ -3206,6 +4010,10 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     return false;
 
   BasicBlock *Header = Root->getParent();
+  auto FrozenEdgeIsDefined = [&](Value *EdgeState) {
+    return !StateWasFrozen ||
+           isGuaranteedNotToBeUndefOrPoison(EdgeState);
+  };
 
   // Split a mixed entry/return forwarder before classifying recurrent edges.
   // Unlike the canonical latch, such a block is not dominated by the header
@@ -3248,9 +4056,11 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
       return true;
   }
 
-  if (deflattenDirectPhiReturns(F, Root, HeaderPhi, DT, Prover, R))
+  if (!StateWasFrozen &&
+      deflattenDirectPhiReturns(F, Root, HeaderPhi, DT, Prover, R))
     return true;
-  if (deflattenPhiEntry(F, Root, HeaderPhi, DT, Prover, R))
+  if (!StateWasFrozen &&
+      deflattenPhiEntry(F, Root, HeaderPhi, DT, Prover, R))
     return true;
 
   PHINode *LatchPhi = nullptr;
@@ -3293,9 +4103,149 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     return false;
   }
 
-  DispatchMap Map = collectDispatchMap(Root, State);
+  DispatchMap Map = collectDispatchMap(Root, DispatchState);
   if (Map.Targets.size() < 3)
     return false;
+
+  // A target in a split dispatcher may be reached through several default-arm
+  // switch blocks. The immediate owner is not enough: bypassing it also
+  // bypasses every ancestor on that path. Require the complete root-to-owner
+  // chain to consist solely of PHI-free switch terminators, so no payload or
+  // carrier definition can lose dominance.
+  auto DispatchMayBeBypassed = [&](BasicBlock *Dispatch) {
+    SmallPtrSet<BasicBlock *, 8> Seen;
+    while (Dispatch && Dispatch != Header && Seen.insert(Dispatch).second) {
+      if (!Map.Blocks.contains(Dispatch) || !Dispatch->phis().empty() ||
+          Dispatch->size() != 1 ||
+          !isa<SwitchInst>(Dispatch->getTerminator()))
+        return false;
+      Dispatch = Map.DispatchParent.lookup(Dispatch);
+    }
+    return Dispatch == Header;
+  };
+  auto GetDispatchPayloadPath = [&](BasicBlock *Dispatch)
+      -> std::optional<SmallVector<BasicBlock *, 4>> {
+    SmallVector<BasicBlock *, 4> ReversePath;
+    SmallPtrSet<BasicBlock *, 8> Seen;
+    while (Dispatch && Dispatch != Header && Seen.insert(Dispatch).second) {
+      if (!Map.Blocks.contains(Dispatch) || ReversePath.size() == 8)
+        return std::nullopt;
+      ReversePath.push_back(Dispatch);
+      Dispatch = Map.DispatchParent.lookup(Dispatch);
+    }
+    if (Dispatch != Header)
+      return std::nullopt;
+    std::reverse(ReversePath.begin(), ReversePath.end());
+    if (!dispatcherPathPayloadIsCloneable(ReversePath))
+      return std::nullopt;
+    return ReversePath;
+  };
+
+  // A child switch can reserve a state whose edge re-enters the latch.  The
+  // latch installs a second constant state, so this is one more dispatcher
+  // iteration rather than an application transition.  Materialize that exact
+  // iteration on the child edge first.  A later deflatten round can then see
+  // the original application source as an ordinary state-to-case transition.
+  //
+  // Restrict this composition to a constant second state and identical PHI
+  // values on every duplicate child-to-latch edge.  This keeps the rewrite
+  // edge-exact while still covering nested switch trees; conditional second
+  // states continue through the older root-edge path below.
+  for (BasicBlock &Candidate : F) {
+    BasicBlock *InternalDispatch = &Candidate;
+    if (!Map.Blocks.contains(InternalDispatch))
+      continue;
+    auto *InternalSwitch =
+        dyn_cast<SwitchInst>(InternalDispatch->getTerminator());
+    if (!InternalSwitch)
+      continue;
+    bool EntersLatch = false;
+    for (BasicBlock *Successor : successors(InternalDispatch))
+      EntersLatch |= Successor == Latch;
+    if (!EntersLatch || LatchPhi->getBasicBlockIndex(InternalDispatch) < 0)
+      continue;
+
+    bool EdgeValuesAreUniform = true;
+    for (PHINode &PN : Latch->phis()) {
+      Value *First = nullptr;
+      for (unsigned I = 0; I < PN.getNumIncomingValues(); ++I) {
+        if (PN.getIncomingBlock(I) != InternalDispatch)
+          continue;
+        Value *Incoming = PN.getIncomingValue(I);
+        if (First && Incoming != First) {
+          EdgeValuesAreUniform = false;
+          break;
+        }
+        First = Incoming;
+      }
+      if (!EdgeValuesAreUniform)
+        break;
+    }
+    if (!EdgeValuesAreUniform)
+      continue;
+
+    Value *EdgeState = LatchPhi->getIncomingValueForBlock(InternalDispatch);
+    auto Choice = decodeStateChoice(EdgeState);
+    if (!Choice || Choice->Condition || !FrozenEdgeIsDefined(EdgeState))
+      continue;
+    BasicBlock *Target =
+        lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
+    if (!Target || Target == Latch || Map.Blocks.contains(Target))
+      continue;
+    BasicBlock *TargetDispatch = Map.DispatchPredecessor.lookup(Target);
+    auto TargetPath = GetDispatchPayloadPath(TargetDispatch);
+    if (!TargetPath)
+      continue;
+
+    auto VMap = std::make_unique<ValueToValueMapTy>();
+    if (!buildDispatcherValueMap(InternalDispatch, Latch, Header, DT, *VMap) ||
+        !extendDispatcherPathValueMap(*TargetPath, Header, *VMap))
+      continue;
+    ValueToValueMapTy PreflightMap;
+    for (auto Mapping : *VMap)
+      PreflightMap[Mapping.first] = Mapping.second;
+    seedDispatcherClonePlaceholders(Latch, Header, *TargetPath,
+                                    PreflightMap);
+    if (!prepareTargetPHIs(Target, InternalDispatch, TargetDispatch, DT,
+                           &PreflightMap, false))
+      continue;
+
+    BasicBlock *Bridge = BasicBlock::Create(
+        F.getContext(), "deobf.dispatch.internal", &F, Latch);
+    IRBuilder<>(Bridge).CreateBr(Target);
+    cloneDispatcherPayload(Bridge, Latch, Header, *VMap);
+    pinDispatcherPathInputs(Bridge, InternalDispatch, *TargetPath, *VMap);
+    cloneDispatcherPathPayload(Bridge, *TargetPath, *VMap);
+    finalizeDispatcherCarrierMap(Header, *VMap);
+    if (!prepareTargetPHIs(Target, Bridge, TargetDispatch, DT, VMap.get(),
+                           true, InternalDispatch))
+      report_fatal_error(
+          "095 internal error: nested dispatcher PHI mapping became invalid");
+
+    for (unsigned I = 0; I < InternalSwitch->getNumSuccessors(); ++I)
+      if (InternalSwitch->getSuccessor(I) == Latch)
+        InternalSwitch->setSuccessor(I, Bridge);
+    removeAllPredecessorPHIEntries(Latch, InternalDispatch);
+
+    SmallVector<Instruction *, 32> PayloadDefinitions;
+    for (BasicBlock *BB : *TargetPath)
+      for (Instruction &I : *BB)
+        if (!isa<PHINode>(I) && !I.isTerminator() &&
+            !I.getType()->isVoidTy())
+          PayloadDefinitions.push_back(&I);
+    SmallVector<BasicBlock *, 1> Bridges{Bridge};
+    SmallVector<std::unique_ptr<ValueToValueMapTy>, 1> Maps;
+    Maps.push_back(std::move(VMap));
+    repairCarrierSSA(Header, Bridges, Maps);
+    repairClonedDispatcherPayloadSSA(Map.Blocks, Bridges, Maps,
+                                     PayloadDefinitions);
+    ++R.Stages["deflatten"].Changes;
+    if (DeflattenDebug)
+      errs() << "  dispatcher-internal source="
+             << InternalDispatch->getName() << " target=" << Target->getName()
+             << " result=rewrite\n";
+    return true;
+  }
 
   // Some flatteners reserve a state whose switch edge enters the latch
   // itself.  The latch then installs another constant/select state and the
@@ -3308,7 +4258,10 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
   for (BasicBlock *Successor : successors(Header))
     SwitchEntersLatch |= Successor == Latch;
   if (HeaderToLatch >= 0 && SwitchEntersLatch) {
-    auto Choice = decodeStateChoice(LatchPhi->getIncomingValue(HeaderToLatch));
+    Value *EdgeState = LatchPhi->getIncomingValue(HeaderToLatch);
+    auto Choice = FrozenEdgeIsDefined(EdgeState)
+                      ? decodeStateChoice(EdgeState)
+                      : std::nullopt;
     if (Choice && Choice->Condition) {
       if (std::optional<bool> Proven =
               Prover.proveBooleanConstant(Choice->Condition)) {
@@ -3327,18 +4280,12 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
             Map.DispatchPredecessor.lookup(TrueTarget);
         BasicBlock *FalseDispatch =
             Map.DispatchPredecessor.lookup(FalseTarget);
-        auto TransparentDispatch = [&](BasicBlock *Dispatch) {
-          return Dispatch == Header ||
-                 (Dispatch && Dispatch->phis().empty() &&
-                  Dispatch->size() == 1 &&
-                  isa<SwitchInst>(Dispatch->getTerminator()));
-        };
         auto VMap = std::make_unique<ValueToValueMapTy>();
         if (TrueTarget != Latch && FalseTarget != Latch &&
             !Map.Blocks.contains(TrueTarget) &&
             !Map.Blocks.contains(FalseTarget) &&
-            TransparentDispatch(TrueDispatch) &&
-            TransparentDispatch(FalseDispatch) &&
+            DispatchMayBeBypassed(TrueDispatch) &&
+            DispatchMayBeBypassed(FalseDispatch) &&
             (!Choice->Condition ||
              valueDominatesEdge(Choice->Condition, Root, DT)) &&
             buildDispatcherValueMap(Header, Latch, Header, DT, *VMap) &&
@@ -3399,15 +4346,28 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
   struct Rewrite {
     BasicBlock *Source;
     Value *Condition;
+    bool FreezeCondition;
     BasicBlock *TrueTarget;
     BasicBlock *FalseTarget;
     BasicBlock *TrueDispatch;
     BasicBlock *FalseDispatch;
     bool ViaLatch;
+    SmallVector<BasicBlock *, 4> DispatchPayloadPath;
+    SmallVector<BasicBlock *, 4> FalseDispatchPayloadPath;
     std::unique_ptr<ValueToValueMapTy> VMap;
+    std::unique_ptr<ValueToValueMapTy> FalseVMap;
   };
   SmallVector<Rewrite, 32> Rewrites;
   uint64_t UnresolvedStates = 0;
+  std::map<std::string, uint64_t> RejectionReasons;
+  bool OnlyDispatcherInternalRejections = true;
+  auto RejectState = [&](StringRef Reason) {
+    ++UnresolvedStates;
+    if (Reason != "target-is-dispatcher")
+      OnlyDispatcherInternalRejections = false;
+    if (DeflattenDebug)
+      ++RejectionReasons[Reason.str()];
+  };
   Loop *HeaderLoop = LI.getLoopFor(Header);
 
   for (unsigned I = 0; I < LatchPhi->getNumIncomingValues(); ++I) {
@@ -3417,12 +4377,16 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     auto *Br = dyn_cast<BranchInst>(Source->getTerminator());
     if (!Br || !Br->isUnconditional() || Br->getSuccessor(0) != Latch)
       continue;
-    auto Choice = decodeStateChoice(LatchPhi->getIncomingValue(I));
+    Value *EdgeState = LatchPhi->getIncomingValue(I);
+    bool EdgeStateIsDefined = FrozenEdgeIsDefined(EdgeState);
+    auto Choice = decodeStateChoice(EdgeState);
     if (!Choice) {
-      ++UnresolvedStates;
+      RejectState(EdgeStateIsDefined ? "state-decode-failed"
+                                     : "edge-state-not-defined");
       continue;
     }
-    if (Choice->Condition) {
+    bool FreezeCondition = !EdgeStateIsDefined && Choice->Condition;
+    if (Choice->Condition && EdgeStateIsDefined) {
       if (std::optional<bool> Proven =
               Prover.proveBooleanConstant(Choice->Condition)) {
         ConstantInt *Chosen =
@@ -3430,18 +4394,28 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
         *Choice = StateChoice{nullptr, Chosen, Chosen};
       }
     }
+    // The dispatcher observes freeze(select Cond, T, F). If Cond may be
+    // poison, branching on it directly would introduce UB. Branching on
+    // freeze(Cond) is a valid refinement: the poison case chooses T or F,
+    // both of which were among the arbitrary i32 values permitted by the
+    // original freeze, while defined and undef conditions retain their
+    // original two-way choice.
+    if (!EdgeStateIsDefined && !FreezeCondition) {
+      RejectState("edge-state-not-defined");
+      continue;
+    }
     BasicBlock *TrueTarget =
         lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
     BasicBlock *FalseTarget =
         lookupDispatchTarget(Map, Root, Choice->FalseState->getValue());
     if (!TrueTarget || !FalseTarget) {
-      ++UnresolvedStates;
+      RejectState("state-target-missing");
       continue;
     }
     if (DeflattenInLoopOnly &&
         (!HeaderLoop || !HeaderLoop->contains(TrueTarget) ||
          !HeaderLoop->contains(FalseTarget))) {
-      ++UnresolvedStates;
+      RejectState("target-outside-root-loop");
       continue;
     }
     // A state that routes back into the dispatcher/latch is recurrent switch
@@ -3449,43 +4423,82 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     // would remove a required PHI incoming while retaining the CFG edge.
     if (TrueTarget == Latch || FalseTarget == Latch ||
         Map.Blocks.contains(TrueTarget) || Map.Blocks.contains(FalseTarget)) {
-      ++UnresolvedStates;
+      if (DeflattenDebug) {
+        errs() << "    reject source=" << Source->getName()
+               << " reason=target-is-dispatcher true="
+               << TrueTarget->getName() << " false="
+               << FalseTarget->getName() << "\n";
+      }
+      RejectState("target-is-dispatcher");
       continue;
     }
     BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
     BasicBlock *FalseDispatch = Map.DispatchPredecessor.lookup(FalseTarget);
-    // A recurrent switch chain may route through a child block.  It is safe to
-    // bypass that child only when it is a transparent, PHI-free switch node;
-    // otherwise its payload would need a path-specific clone.
-    auto TransparentDispatch = [&](BasicBlock *Dispatch) {
-      return Dispatch == Header ||
-             (Dispatch && Dispatch->phis().empty() && Dispatch->size() == 1 &&
-              isa<SwitchInst>(Dispatch->getTerminator()));
-    };
-    if (!TransparentDispatch(TrueDispatch) ||
-        !TransparentDispatch(FalseDispatch)) {
-      ++UnresolvedStates;
+    auto TruePath = GetDispatchPayloadPath(TrueDispatch);
+    auto FalsePath = GetDispatchPayloadPath(FalseDispatch);
+    if (!TruePath || !FalsePath) {
+      RejectState("dispatch-payload-path-mismatch");
+      continue;
+    }
+    bool SplitPayloadPaths =
+        TruePath->size() != FalsePath->size() ||
+        !std::equal(TruePath->begin(), TruePath->end(), FalsePath->begin());
+    if (SplitPayloadPaths &&
+        (!Choice->Condition || TrueTarget == FalseTarget)) {
+      RejectState("dispatch-payload-path-mismatch");
       continue;
     }
     auto VMap = std::make_unique<ValueToValueMapTy>();
     if (!buildDispatcherValueMap(Source, Latch, Header, DT, *VMap) ||
-        !prepareTargetPHIs(TrueTarget, Source, TrueDispatch, DT, nullptr, false) ||
+        !extendDispatcherPathValueMap(*TruePath, Header, *VMap)) {
+      RejectState("dispatcher-value-map-failed");
+      continue;
+    }
+    std::unique_ptr<ValueToValueMapTy> FalseVMap;
+    if (SplitPayloadPaths) {
+      FalseVMap = std::make_unique<ValueToValueMapTy>();
+      if (!buildDispatcherValueMap(Source, Latch, Header, DT, *FalseVMap) ||
+          !extendDispatcherPathValueMap(*FalsePath, Header, *FalseVMap)) {
+        RejectState("dispatcher-value-map-failed");
+        continue;
+      }
+    }
+    ValueToValueMapTy PreflightMap;
+    for (auto Mapping : *VMap)
+      PreflightMap[Mapping.first] = Mapping.second;
+    seedDispatcherClonePlaceholders(Latch, Header, *TruePath, PreflightMap);
+    ValueToValueMapTy FalsePreflightMap;
+    if (FalseVMap) {
+      for (auto Mapping : *FalseVMap)
+        FalsePreflightMap[Mapping.first] = Mapping.second;
+      seedDispatcherClonePlaceholders(Latch, Header, *FalsePath,
+                                      FalsePreflightMap);
+    }
+    if (!prepareTargetPHIs(TrueTarget, Source, TrueDispatch, DT,
+                           &PreflightMap,
+                           false) ||
         (FalseTarget != TrueTarget &&
-         !prepareTargetPHIs(FalseTarget, Source, FalseDispatch, DT, nullptr,
+         !prepareTargetPHIs(FalseTarget, Source, FalseDispatch, DT,
+                            FalseVMap ? &FalsePreflightMap : &PreflightMap,
                             false))) {
-      ++UnresolvedStates;
+      RejectState("target-phi-proof-failed");
       continue;
     }
     if (Choice->Condition && !valueDominatesEdge(Choice->Condition, Br, DT)) {
-      ++UnresolvedStates;
+      RejectState("condition-does-not-dominate-edge");
       continue;
     }
     if (MaxPhiDeflattenEdges && Rewrites.size() >= MaxPhiDeflattenEdges) {
-      ++UnresolvedStates;
+      RejectState("edge-budget-exhausted");
       continue;
     }
-    Rewrites.push_back({Source, Choice->Condition, TrueTarget, FalseTarget,
-                        TrueDispatch, FalseDispatch, true, std::move(VMap)});
+    Rewrites.push_back({Source, Choice->Condition, FreezeCondition,
+                        TrueTarget, FalseTarget,
+                        TrueDispatch, FalseDispatch, true,
+                        std::move(*TruePath),
+                        SplitPayloadPaths ? std::move(*FalsePath)
+                                          : SmallVector<BasicBlock *, 4>{},
+                        std::move(VMap), std::move(FalseVMap)});
   }
 
   // Bypass the dispatcher on its entry edge in the same transaction as the
@@ -3511,19 +4524,29 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
         EntryDebug("not-direct");
         continue;
       }
-      auto Choice = decodeStateChoice(HeaderPhi->getIncomingValue(I));
+      Value *EdgeState = HeaderPhi->getIncomingValue(I);
+      bool EdgeStateIsDefined = FrozenEdgeIsDefined(EdgeState);
+      auto Choice = decodeStateChoice(EdgeState);
       if (!Choice) {
-        EntryDebug("state-decode-failed");
+        EntryDebug(EdgeStateIsDefined
+                       ? "state-decode-failed"
+                       : "frozen-state-may-be-undef-or-poison");
         ++UnresolvedStates;
         continue;
       }
-      if (Choice->Condition) {
+      bool FreezeCondition = !EdgeStateIsDefined && Choice->Condition;
+      if (Choice->Condition && EdgeStateIsDefined) {
         if (std::optional<bool> Proven =
                 Prover.proveBooleanConstant(Choice->Condition)) {
           ConstantInt *Chosen =
               *Proven ? Choice->TrueState : Choice->FalseState;
           *Choice = StateChoice{nullptr, Chosen, Chosen};
         }
+      }
+      if (!EdgeStateIsDefined && !FreezeCondition) {
+        EntryDebug("frozen-state-may-be-undef-or-poison");
+        ++UnresolvedStates;
+        continue;
       }
       BasicBlock *TrueTarget =
           lookupDispatchTarget(Map, Root, Choice->TrueState->getValue());
@@ -3542,14 +4565,8 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
       }
       BasicBlock *TrueDispatch = Map.DispatchPredecessor.lookup(TrueTarget);
       BasicBlock *FalseDispatch = Map.DispatchPredecessor.lookup(FalseTarget);
-      auto TransparentDispatch = [&](BasicBlock *Dispatch) {
-        return Dispatch == Header ||
-               (Dispatch && Dispatch->phis().empty() &&
-                Dispatch->size() == 1 &&
-                isa<SwitchInst>(Dispatch->getTerminator()));
-      };
-      if (!TransparentDispatch(TrueDispatch) ||
-          !TransparentDispatch(FalseDispatch)) {
+      if (!DispatchMayBeBypassed(TrueDispatch) ||
+          !DispatchMayBeBypassed(FalseDispatch)) {
         EntryDebug("target-dispatch-not-transparent");
         ++UnresolvedStates;
         continue;
@@ -3568,13 +4585,36 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
         continue;
       }
       EntryDebug("rewrite");
-      Rewrites.push_back({Source, Choice->Condition, TrueTarget, FalseTarget,
+      Rewrites.push_back({Source, Choice->Condition, FreezeCondition,
+                          TrueTarget, FalseTarget,
                           TrueDispatch, FalseDispatch, false,
-                          std::move(VMap)});
+                          {}, {}, std::move(VMap), nullptr});
     }
   }
 
+  // Cloning a child-dispatch payload is valuable when it removes that
+  // dispatcher frontier.  If any recurrent transition is still unproved, the
+  // child must remain executable and cloning its state onto only a subset of
+  // edges merely duplicates loop-carried SSA (often making the recovered CFG
+  // less readable).  Keep payload-bearing paths atomic in that situation,
+  // while retaining independently useful root/transparent-path rewrites.
+  if (UnresolvedStates != 0 && !OnlyDispatcherInternalRejections) {
+    SmallVector<Rewrite, 32> TransparentRewrites;
+    uint64_t RetainedPayloadTransitions = 0;
+    for (Rewrite &RW : Rewrites) {
+      if (RW.DispatchPayloadPath.empty())
+        TransparentRewrites.push_back(std::move(RW));
+      else
+        ++RetainedPayloadTransitions;
+    }
+    Rewrites = std::move(TransparentRewrites);
+    UnresolvedStates += RetainedPayloadTransitions;
+  }
+
   if (Rewrites.empty()) {
+    if (DeflattenDebug)
+      for (const auto &[Reason, Count] : RejectionReasons)
+        errs() << "    rejected=" << Reason << " count=" << Count << "\n";
     addUnresolved(R, "deflatten", UnresolvedStates,
                   "dispatcher state updates retained because target/SSA proof failed");
     return false;
@@ -3584,6 +4624,8 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     errs() << "  rewrites=" << Rewrites.size()
            << " loop-depth=" << (HeaderLoop ? HeaderLoop->getLoopDepth() : 0)
            << " unresolved=" << UnresolvedStates << "\n";
+    for (const auto &[Reason, Count] : RejectionReasons)
+      errs() << "    rejected=" << Reason << " count=" << Count << "\n";
     for (const Rewrite &RW : Rewrites) {
       errs() << "    source=" << RW.Source->getName()
              << " true=" << RW.TrueTarget->getName()
@@ -3597,8 +4639,70 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
 
   SmallVector<BasicBlock *, 32> Bridges;
   SmallVector<std::unique_ptr<ValueToValueMapTy>, 32> AppliedMaps;
+  SmallVector<Instruction *, 32> DispatchPayloadDefinitions;
+  SmallPtrSet<Instruction *, 32> SeenDispatchPayloadDefinitions;
+  for (const Rewrite &RW : Rewrites) {
+    for (BasicBlock *BB : RW.DispatchPayloadPath)
+      for (Instruction &I : *BB)
+        if (!isa<PHINode>(I) && !I.isTerminator() &&
+            !I.getType()->isVoidTy() &&
+            SeenDispatchPayloadDefinitions.insert(&I).second)
+          DispatchPayloadDefinitions.push_back(&I);
+    for (BasicBlock *BB : RW.FalseDispatchPayloadPath)
+      for (Instruction &I : *BB)
+        if (!isa<PHINode>(I) && !I.isTerminator() &&
+            !I.getType()->isVoidTy() &&
+            SeenDispatchPayloadDefinitions.insert(&I).second)
+          DispatchPayloadDefinitions.push_back(&I);
+  }
   for (Rewrite &RW : Rewrites) {
     auto *Old = cast<BranchInst>(RW.Source->getTerminator());
+    if (RW.FalseVMap) {
+      BasicBlock *TrueBridge = BasicBlock::Create(
+          F.getContext(), "deobf.dispatch.true", &F, Latch);
+      BasicBlock *FalseBridge = BasicBlock::Create(
+          F.getContext(), "deobf.dispatch.false", &F, Latch);
+      IRBuilder<>(TrueBridge).CreateBr(RW.TrueTarget);
+      IRBuilder<>(FalseBridge).CreateBr(RW.FalseTarget);
+      if (RW.ViaLatch) {
+        cloneDispatcherPayload(TrueBridge, Latch, Header, *RW.VMap);
+        cloneDispatcherPayload(FalseBridge, Latch, Header, *RW.FalseVMap);
+      } else {
+        cloneHeaderPayload(TrueBridge, Header, *RW.VMap);
+        cloneHeaderPayload(FalseBridge, Header, *RW.FalseVMap);
+      }
+      pinDispatcherPathInputs(TrueBridge, RW.Source,
+                              RW.DispatchPayloadPath, *RW.VMap);
+      pinDispatcherPathInputs(FalseBridge, RW.Source,
+                              RW.FalseDispatchPayloadPath, *RW.FalseVMap);
+      cloneDispatcherPathPayload(TrueBridge, RW.DispatchPayloadPath,
+                                 *RW.VMap);
+      cloneDispatcherPathPayload(FalseBridge, RW.FalseDispatchPayloadPath,
+                                 *RW.FalseVMap);
+      finalizeDispatcherCarrierMap(Header, *RW.VMap);
+      finalizeDispatcherCarrierMap(Header, *RW.FalseVMap);
+      if (!prepareTargetPHIs(RW.TrueTarget, TrueBridge, RW.TrueDispatch, DT,
+                             RW.VMap.get(), true, RW.Source) ||
+          !prepareTargetPHIs(RW.FalseTarget, FalseBridge, RW.FalseDispatch,
+                             DT, RW.FalseVMap.get(), true, RW.Source))
+        report_fatal_error(
+            "095 internal error: split dispatcher PHI mapping became invalid");
+      if (RW.ViaLatch)
+        Latch->removePredecessor(RW.Source, true);
+      else
+        Header->removePredecessor(RW.Source, true);
+      Value *BranchCondition = RW.Condition;
+      if (RW.FreezeCondition)
+        BranchCondition = IRBuilder<>(Old).CreateFreeze(
+            BranchCondition, "deobf.frozen.condition");
+      IRBuilder<>(Old).CreateCondBr(BranchCondition, TrueBridge, FalseBridge);
+      Old->eraseFromParent();
+      Bridges.push_back(TrueBridge);
+      AppliedMaps.push_back(std::move(RW.VMap));
+      Bridges.push_back(FalseBridge);
+      AppliedMaps.push_back(std::move(RW.FalseVMap));
+      continue;
+    }
     BasicBlock *Bridge = BasicBlock::Create(
         F.getContext(), "deobf.dispatch", &F, Latch);
     IRBuilder<>(Bridge).CreateBr(RW.TrueTarget);
@@ -3606,6 +4710,9 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
       cloneDispatcherPayload(Bridge, Latch, Header, *RW.VMap);
     else
       cloneHeaderPayload(Bridge, Header, *RW.VMap);
+    pinDispatcherPathInputs(Bridge, RW.Source, RW.DispatchPayloadPath,
+                            *RW.VMap);
+    cloneDispatcherPathPayload(Bridge, RW.DispatchPayloadPath, *RW.VMap);
     finalizeDispatcherCarrierMap(Header, *RW.VMap);
     if (!prepareTargetPHIs(RW.TrueTarget, Bridge, RW.TrueDispatch, DT,
                            RW.VMap.get(), true, RW.Source) ||
@@ -3621,14 +4728,20 @@ static bool deflattenOne(Function &F, SwitchInst *Root, DominatorTree &DT,
     Old->eraseFromParent();
     if (RW.Condition && RW.TrueTarget != RW.FalseTarget) {
       Instruction *BridgeTerm = Bridge->getTerminator();
+      Value *BranchCondition = RW.Condition;
+      if (RW.FreezeCondition)
+        BranchCondition = IRBuilder<>(BridgeTerm).CreateFreeze(
+            BranchCondition, "deobf.frozen.condition");
       IRBuilder<>(BridgeTerm)
-          .CreateCondBr(RW.Condition, RW.TrueTarget, RW.FalseTarget);
+          .CreateCondBr(BranchCondition, RW.TrueTarget, RW.FalseTarget);
       BridgeTerm->eraseFromParent();
     }
     Bridges.push_back(Bridge);
     AppliedMaps.push_back(std::move(RW.VMap));
   }
   repairCarrierSSA(Header, Bridges, AppliedMaps);
+  repairClonedDispatcherPayloadSSA(Map.Blocks, Bridges, AppliedMaps,
+                                   DispatchPayloadDefinitions);
   R.Stages["deflatten"].Changes += Rewrites.size();
   addUnresolved(R, "deflatten", UnresolvedStates,
                 "dispatcher state updates retained because target/SSA proof failed");
@@ -3754,6 +4867,21 @@ static bool cleanupRegisterState(Function &F, FunctionAnalysisManager &FAM,
   return Changed;
 }
 
+// Rewiring a dispatcher changes how often and where its carrier values are
+// used.  LLVM permits each use of `undef` to choose a different value, so even
+// a verifier-clean CFG rewrite can change the concrete native behaviour of a
+// lifted program (for example, choose zero as a later division operand).
+// Until an earlier owner freezes or defines these carriers, retain the whole
+// dispatcher rather than relying on ordinary LLVM refinement semantics.
+static bool hasUndefinedPhiCarrier(const Function &F) {
+  for (const BasicBlock &BB : F)
+    for (const PHINode &PN : BB.phis())
+      for (const Value *Incoming : PN.incoming_values())
+        if (isa<UndefValue>(Incoming) || isa<PoisonValue>(Incoming))
+          return true;
+  return false;
+}
+
 static bool runTransactionalDeflatten(Module &M, FunctionAnalysisManager &FAM,
                                       Z3Prover &Prover, Report &R,
                                       bool RecordResiduals) {
@@ -3763,6 +4891,12 @@ static bool runTransactionalDeflatten(Module &M, FunctionAnalysisManager &FAM,
   for (Function &F : M) {
     if (F.isDeclaration() || DisableDeflatten)
       continue;
+    if (hasUndefinedPhiCarrier(F)) {
+      addUnresolved(
+          R, "deflatten", 1,
+          "dispatcher retained because undef/poison PHI carriers make CFG rewiring concretely unstable");
+      continue;
+    }
     if (instructionCount(F) > MaxDeflattenInstructions) {
       addUnresolved(
           R, "deflatten", 1,

@@ -14,3 +14,13 @@ entry:
   %result = zext i1 %present to i32
   ret i32 %result
 }
+
+; CHECK-LABEL: define i32 @unused_tls_read(
+; CHECK-NOT: asm
+; CHECK-NOT: llvm.thread.pointer
+; CHECK: ret i32 7
+define i32 @unused_tls_read() {
+entry:
+  %tls = call i64 asm "movq %fs:0, $0", "=r"()
+  ret i32 7
+}

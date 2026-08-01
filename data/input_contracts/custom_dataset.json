@@ -13,11 +13,13 @@
       "submission_id": "s626776881",
       "kind": "encoded_line_stream",
       "transport": "stdin",
-      "format": "L followed by string of length L",
+      "format": "N followed by one non-whitespace string whose length is at most N",
       "termination": "eof",
       "constraints": {
         "newline_required": true,
-        "max_line_length": 100000
+        "max_line_length": 512,
+        "n_min": 1,
+        "n_max": 512
       },
       "mutation": "alphabet_only"
     },
@@ -96,7 +98,10 @@
       "termination": "eof",
       "constraints": {
         "newline_required": true,
-        "max_line_length": 1000
+        "max_line_length": 64,
+        "string_max_length": 64,
+        "k_min": 0,
+        "k_max": 8
       },
       "mutation": "alphabet_only"
     },
@@ -324,7 +329,9 @@
       "termination": "eof",
       "constraints": {
         "records": 1,
-        "fields": 2
+        "fields": 2,
+        "k_min": 0,
+        "k_max": 2500
       },
       "mutation": "values_only"
     },
@@ -432,9 +439,13 @@
       "termination": "eof",
       "constraints": {
         "newline_required": true,
-        "max_line_length": 1000
+        "max_line_length": 1000,
+        "n_min": 3,
+        "n_max": 256,
+        "m_min": 0,
+        "m_max": 512
       },
-      "mutation": "alphabet_only"
+      "mutation": "values_only_preserve_count"
     },
     {
       "case_id": "p02788",
@@ -573,7 +584,10 @@
       "termination": "eof",
       "constraints": {
         "newline_required": true,
-        "max_line_length": 1000
+        "max_line_length": 10,
+        "n_min": 1,
+        "n_max": 100,
+        "word_max_length": 10
       },
       "mutation": "alphabet_only"
     },
@@ -586,9 +600,11 @@
       "termination": "eof",
       "constraints": {
         "n_min": 1,
-        "n_max": 100000,
+        "n_max": 50,
         "values_per_count": 1,
-        "count_offset": 2
+        "count_offset": 2,
+        "value_min": 1,
+        "value_max": 1000000000000000
       },
       "mutation": "values_only_preserve_count"
     },

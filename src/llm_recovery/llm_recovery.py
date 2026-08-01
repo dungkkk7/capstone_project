@@ -139,17 +139,12 @@ class RecoveryConfig:
         default_factory=lambda: _text(os.environ.get("LLM_RECOVERY_USE_FILE_API", "1")).lower()
         not in {"", "0", "false", "no", "off"}
     )
-    # In P0 mode, Ghidra pseudocode is the default model evidence. The clean
-    # brightened LLVM IR remains local unless this switch is explicitly enabled.
+    # In pseudocode mode, LLVM2C output is the default model evidence. The
+    # cleaned LLVM IR remains local unless this switch is explicitly enabled.
     attach_clean_ir: bool = False
-    # Remove import thunks/CRT startup noise before sending Ghidra pseudocode.
-    # The unmodified export is still persisted for debugging.
-    focus_ghidra_pseudocode: bool = field(
-        default_factory=lambda: _text(
-            os.environ.get("LLM_RECOVERY_FOCUS_GHIDRA", "1")
-        ).lower()
-        not in {"", "0", "false", "no", "off"}
-    )
+    # Direct-IR flows must distinguish Raw IR from Clean IR in the prompt and
+    # persisted evidence manifest. This does not alter the IR content.
+    ir_representation: str = "clean"
     file_api_inline_max_bytes: Optional[int] = None
     request_timeout: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_REQUEST_TIMEOUT", "900"))
@@ -163,19 +158,6 @@ class RecoveryConfig:
         default_factory=lambda: _text(
             os.environ.get("LLM_RECOVERY_PSEUDO_BACKEND", "")
         ).lower().strip()
-    )
-    ghidra_binary_path: Optional[str] = field(
-        default_factory=lambda: _text(
-            os.environ.get("LLM_RECOVERY_GHIDRA_ANALYZE_HEADLESS")
-            or os.environ.get("GHIDRA_ANALYZE_HEADLESS")
-        )
-    )
-    ghidra_timeout: float = field(
-        default_factory=lambda: float(os.environ.get("LLM_RECOVERY_GHIDRA_TIMEOUT", "300"))
-    )
-    two_stage_recovery: bool = field(
-        default_factory=lambda: _text(os.environ.get("LLM_RECOVERY_TWO_STAGE", "1")).strip().lower()
-        in {"1", "true", "yes", "on"}
     )
     require_json: bool = field(
         default_factory=lambda: _text(os.environ.get("LLM_RECOVERY_REQUIRE_JSON", "0")).lower()
@@ -315,7 +297,7 @@ def _is_ida_pseudo_valid(pseudo: str) -> bool:
 
 
 def _decompiler_function_blocks(pseudo: str) -> tuple[str, List[tuple[str, str]]]:
-    """Split an IDA/Ghidra text export into a preamble and named function blocks."""
+    """Split a decompiler text export into a preamble and function blocks."""
     text = _text(pseudo).replace("\r\n", "\n")
     matches = list(re.finditer(r"(?m)^// Function:\s*([^\n]+)\s*$", text))
     if not matches:
@@ -348,8 +330,8 @@ def _looks_like_import_thunk(name: str, block: str) -> bool:
     return False
 
 
-def _focus_ghidra_pseudocode(pseudo: str) -> str:
-    """Keep semantic program functions while removing deterministic Ghidra/CRT noise.
+def _focus_decompiler_pseudocode(pseudo: str) -> str:
+    """Keep semantic functions while removing deterministic runtime noise.
 
     This is intentionally conservative: unknown/custom helpers are retained.  Only
     well-known runtime functions and blocks that structurally look like import thunks
@@ -416,7 +398,7 @@ def _focus_ghidra_pseudocode(pseudo: str) -> str:
     if include_lines:
         focused_parts.append("\n".join(dict.fromkeys(include_lines)))
     focused_parts.append(
-        "/* Deterministically focused Ghidra evidence. Import thunks and CRT startup "
+        "/* Deterministically focused decompiler evidence. Import thunks and CRT startup "
         "boilerplate were removed; unknown/custom functions were retained. */"
     )
     focused_parts.extend(kept)
@@ -431,10 +413,10 @@ def _focus_ghidra_pseudocode(pseudo: str) -> str:
 
 def _focus_ida_pseudocode(pseudo: str) -> str:
     """Backward-compatible alias; the same conservative cleanup works for IDA exports."""
-    return _focus_ghidra_pseudocode(pseudo)
+    return _focus_decompiler_pseudocode(pseudo)
 
 
-def _summarize_ghidra_evidence(pseudo: str) -> str:
+def _summarize_pseudocode_evidence(pseudo: str) -> str:
     """Create a literal, non-semantic inventory to orient the model before reconstruction."""
     text = _text(pseudo)
     _, blocks = _decompiler_function_blocks(text)
@@ -801,165 +783,6 @@ _main()
     return out_text.strip() + "\n"
 
 
-def _find_ghidra_analyze_headless(preferred: Optional[str] = None) -> Optional[str]:
-    candidates: List[str] = []
-    if preferred:
-        candidates.append(preferred)
-    candidates.extend(
-        [
-            os.environ.get("GHIDRA_ANALYZE_HEADLESS", ""),
-            "/opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless",
-            "/opt/ghidra/support/analyzeHeadless",
-            "/usr/local/bin/analyzeHeadless",
-            "analyzeHeadless",
-        ]
-    )
-    seen: set[str] = set()
-    for candidate in candidates:
-        candidate = _text(candidate)
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-        found = shutil.which(candidate)
-        if found:
-            return found
-    return None
-
-
-def _decompile_binary_with_ghidra(
-    binary_path: str,
-    output_path: str,
-    ghidra_binary: str,
-    timeout: float,
-) -> Optional[str]:
-    """Export all Ghidra decompiler C output for a binary."""
-    binary_path = os.path.abspath(_text(binary_path))
-    output_path = os.path.abspath(_text(output_path))
-    ghidra_binary = _text(ghidra_binary)
-    if not os.path.isfile(binary_path):
-        raise RecoveryError(f"Ghidra input binary không tồn tại: {binary_path}")
-    if not ghidra_binary:
-        raise RecoveryError("Không tìm thấy Ghidra analyzeHeadless.")
-
-    output_dir = os.path.dirname(output_path)
-    os.makedirs(output_dir, exist_ok=True)
-    project_dir = os.path.join(output_dir, "ghidra_project")
-    shutil.rmtree(project_dir, ignore_errors=True)
-    os.makedirs(project_dir, exist_ok=True)
-    script_dir = tempfile.mkdtemp(prefix="ghidra_export_script_")
-    script_path = os.path.join(script_dir, "ExportDecomp.java")
-    script_log = os.path.join(output_dir, "ghidra_script.log")
-    analyze_log = os.path.join(output_dir, "ghidra_analyze.log")
-    project_name = "recovery_project"
-    java_script = r'''// ExportDecomp.java
-import ghidra.app.decompiler.DecompInterface;
-import ghidra.app.decompiler.DecompileResults;
-import ghidra.app.script.GhidraScript;
-import ghidra.program.model.listing.Function;
-import ghidra.program.model.listing.FunctionIterator;
-import java.io.File;
-import java.io.PrintWriter;
-
-public class ExportDecomp extends GhidraScript {
-    @Override
-    public void run() throws Exception {
-        String[] args = getScriptArgs();
-        if (args.length < 1) {
-            throw new Exception("missing output path");
-        }
-        PrintWriter out = new PrintWriter(new File(args[0]), "UTF-8");
-        out.println("#include <stdint.h>");
-        out.println("#include <stdbool.h>");
-        out.println("#include <stdio.h>");
-        out.println();
-        DecompInterface decompiler = new DecompInterface();
-        decompiler.openProgram(currentProgram);
-        FunctionIterator functions = currentProgram.getFunctionManager().getFunctions(true);
-        while (functions.hasNext() && !monitor.isCancelled()) {
-            Function function = functions.next();
-            DecompileResults result = decompiler.decompileFunction(function, 120, monitor);
-            if (!result.decompileCompleted() || result.getDecompiledFunction() == null) {
-                continue;
-            }
-            out.println("// Function: " + function.getName());
-            out.println(result.getDecompiledFunction().getC());
-            out.println();
-        }
-        decompiler.dispose();
-        out.flush();
-        out.close();
-    }
-}
-'''
-    Path(script_path).write_text(java_script, encoding="utf-8")
-    try:
-        process = subprocess.run(
-            [
-                ghidra_binary,
-                project_dir,
-                project_name,
-                "-import",
-                binary_path,
-                "-overwrite",
-                "-scriptPath",
-                script_dir,
-                "-postScript",
-                "ExportDecomp.java",
-                output_path,
-                "-scriptlog",
-                script_log,
-                "-log",
-                analyze_log,
-                "-deleteProject",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RecoveryError(f"Ghidra export timed out after {timeout}s: {exc}") from exc
-    except Exception as exc:
-        raise RecoveryError(f"Không thể chạy Ghidra analyzeHeadless: {exc}") from exc
-    finally:
-        shutil.rmtree(script_dir, ignore_errors=True)
-        shutil.rmtree(project_dir, ignore_errors=True)
-
-    if not os.path.isfile(output_path) or not os.path.getsize(output_path):
-        details = (process.stderr or process.stdout or "No Ghidra output").strip()
-        if os.path.isfile(script_log):
-            details = f"{details} | script_log={Path(script_log).read_text(errors='replace')[:2000]}"
-        raise RecoveryError(
-            f"Ghidra không tạo được pseudocode: {output_path}. {details}"
-        )
-    return Path(output_path).read_text(encoding="utf-8", errors="replace")
-
-
-def export_ghidra_pseudocode(
-    binary_path: str,
-    output_path: str,
-    *,
-    ghidra_binary_path: Optional[str] = None,
-    timeout: float = 900.0,
-) -> str:
-    """Create a reusable Ghidra artifact without starting an LLM request."""
-
-    ghidra_binary = _find_ghidra_analyze_headless(ghidra_binary_path)
-    if not ghidra_binary:
-        raise RecoveryError("Không tìm thấy Ghidra analyzeHeadless.")
-    source = _decompile_binary_with_ghidra(
-        binary_path,
-        output_path,
-        ghidra_binary=ghidra_binary,
-        timeout=timeout,
-    )
-    if not source or not source.strip():
-        raise RecoveryError("Ghidra không trả về pseudocode.")
-    return source
-
-
 def read_recovery_csv(csv_path: str, project_root: str) -> List[RecoveryInput]:
     """Read both the current one-column CSV and explicit IR/binary columns.
 
@@ -1033,21 +856,25 @@ def build_system_prompt(
     )
     if selected_mode == "dual":
         mode_evidence = (
-            "Focused Ghidra pseudocode and final cleaned/delifted LLVM IR are "
-            "attached as two readable files. Treat both as first-class evidence "
+            "LLVM2C pseudocode and final cleaned/delifted LLVM IR are "
+            "supplied as two representations. Treat both as first-class evidence "
             "and cross-check them before reconstructing source."
         )
     elif selected_mode == "pseudocode":
         mode_evidence = (
-            "This request carries the focused Ghidra pseudocode evidence. The "
-            "same recovery loop audits the candidate against cleaned/delifted "
-            "LLVM IR in a separate context-safe round; do not invent absent IR."
+            "This request carries LLVM2C pseudocode generated from cleaned LLVM "
+            "IR. No LLVM IR is supplied in this flow; do not invent absent IR."
         )
     elif selected_mode == "llvm_ir":
         mode_evidence = (
-            "This request carries the cleaned/delifted LLVM IR evidence plus "
-            "the candidate and validation history derived from the pseudocode "
-            "round. Re-audit the candidate against exact IR semantics."
+            "This request carries LLVM IR evidence directly. It does not carry "
+            "pseudocode; reconstruct and repair from exact IR semantics."
+        )
+    elif selected_mode == "raw_ir":
+        mode_evidence = (
+            "This request carries raw, non-deobfuscated LLVM IR directly. It "
+            "does not carry Clean LLVM IR or pseudocode; reconstruct and repair "
+            "from the supplied raw IR only."
         )
     else:
         mode_evidence = (
@@ -1092,7 +919,7 @@ def _clip_ir(ir_text: str, max_chars: Optional[int] = None) -> str:
 def _build_synthetic_icl_example(use_pseudo: bool) -> str:
     """Return one fixed, non-dataset semantic demonstration for the initial prompt."""
     if use_pseudo:
-        return r"""<IN_CONTEXT_DEMO type="synthetic_lifted_ghidra_to_c">
+        return r"""<IN_CONTEXT_DEMO type="synthetic_llvm2c_pseudocode_to_c">
 This demonstration is synthetic and is not evidence about the current case.
 
 <DEMO_INPUT>
@@ -1190,6 +1017,8 @@ def build_initial_prompt(
     attached_evidence_label: str = (
         "COMPLETE MODEL INPUT ARTIFACT ATTACHED IN THIS REQUEST"
     ),
+    dual_ir_text: Optional[str] = None,
+    ir_representation: str = "clean",
 ) -> str:
     context_lines = []
     for key, value in metadata.items():
@@ -1204,9 +1033,50 @@ def build_initial_prompt(
         context_lines.append(f"- {key}: {value}")
     context = "\n".join(context_lines)
 
+    if use_pseudo and dual_ir_text is not None:
+        if seed_attached_file:
+            pseudo_evidence = (
+                "/* COMPLETE LLVM2C PSEUDOCODE ATTACHED IN THIS REQUEST */"
+            )
+            clean_ir_evidence = (
+                "/* COMPLETE CLEANED LLVM IR ATTACHED IN THIS REQUEST */"
+            )
+        else:
+            pseudo_evidence = ir_text
+            clean_ir_evidence = _clip_ir(dual_ir_text, max_ir_chars)
+        if _prompts_cfg and hasattr(
+            _prompts_cfg,
+            "PROMPT_CLEAN_IR_AND_PSEUDOCODE",
+        ):
+            return (
+                _prompts_cfg.PROMPT_CLEAN_IR_AND_PSEUDOCODE.replace(
+                    "{CLEAN_PSEUDOCODE}",
+                    pseudo_evidence,
+                ).replace(
+                    "{CLEAN_IR}",
+                    clean_ir_evidence,
+                )
+            )
+        return f"""Recover one behavior-preserving standalone C11 program from
+the following two representations of the same cleaned program.
+
+<MODEL_INPUT_ARTIFACT type="LLVM2C transpiled pseudocode">
+{pseudo_evidence}
+</MODEL_INPUT_ARTIFACT>
+
+<MODEL_INPUT_ARTIFACT type="cleaned LLVM IR">
+{clean_ir_evidence}
+</MODEL_INPUT_ARTIFACT>
+
+Cross-check both representations and return the complete raw C11 source only.
+"""
+
+    raw_ir = not use_pseudo and _text(ir_representation).lower() == "raw"
     artifact_label = (
-        "Ghidra decompiler C-like pseudocode"
+        "LLVM2C-transpiled C pseudocode"
         if use_pseudo
+        else "raw non-deobfuscated LLVM IR"
+        if raw_ir
         else "brightened LLVM IR"
     )
     evidence = (
@@ -1219,14 +1089,14 @@ def build_initial_prompt(
         )
     )
     inventory = (
-        _summarize_ghidra_evidence(ir_text)
+        _summarize_pseudocode_evidence(ir_text)
         if use_pseudo
         else "LLVM mode: reconstruct from exact IR control/data flow and calls."
     )
     mode_rules = (
         r"""- Start at the executable entry path and recover the reachable
-  custom-function call graph; ignore disconnected runtime/decompiler noise.
-- Trust literal format strings and imported ABIs over guessed Ghidra types.
+  custom-function call graph; ignore disconnected runtime/transpiler noise.
+- Trust literal format strings and imported ABIs over guessed transpiler types.
 - Map frame storage and translated addresses from complete def-use evidence.
 - Trace every dispatcher transition before collapsing flattened control flow.
 - Infer loop bounds from initialization, update and exit together.
@@ -1244,6 +1114,8 @@ def build_initial_prompt(
     if _prompts_cfg:
         if use_pseudo and hasattr(_prompts_cfg, "PROMPT_CLEAN_PSEUDOCODE"):
             return _prompts_cfg.PROMPT_CLEAN_PSEUDOCODE.replace("{CLEAN_PSEUDOCODE}", evidence)
+        elif raw_ir and hasattr(_prompts_cfg, "PROMPT_RAW_IR"):
+            return _prompts_cfg.PROMPT_RAW_IR.replace("{RAW_IR}", evidence)
         elif not use_pseudo and hasattr(_prompts_cfg, "PROMPT_CLEAN_IR"):
             return _prompts_cfg.PROMPT_CLEAN_IR.replace("{CLEAN_IR}", evidence)
 
@@ -1711,31 +1583,44 @@ def build_repair_prompt(
         bounded_candidate,
         bounded_feedback,
     )
-    is_ghidra = (
-        "ghidra" in source_label.lower()
-        or "pseudo" in source_label.lower()
-    )
+    normalized_source_label = source_label.lower()
+    is_pseudocode = "pseudo" in normalized_source_label
+    is_dual = is_pseudocode and "llvm ir" in normalized_source_label
     inventory = (
-        _summarize_ghidra_evidence(ir_text)
-        if is_ghidra
+        _summarize_pseudocode_evidence(ir_text)
+        if is_pseudocode
         else "LLVM mode."
     )
     mode_rule = (
-        r"""For this Ghidra repair, re-derive behavior from literal call sites,
-def-use, loop transitions and memory accesses. Do not reintroduce `frame_storage_backing_*`,
-`__brighten_native_data_pointer`, import thunks,
+        r"""For this LLVM2C pseudocode repair, re-derive behavior from literal
+call sites, def-use, loop transitions and memory accesses. Do not reintroduce
+`frame_storage_backing_*`, `__brighten_native_data_pointer`, import thunks,
 dispatcher constants or guessed source logic."""
-        if is_ghidra
+        if is_pseudocode
         else
         "For this LLVM repair, re-derive behavior from exact IR control/data flow."
     )
 
     # Read repair prompt from configs/prompts_config.py if available
     if _prompts_cfg and hasattr(_prompts_cfg, "REPAIR_PROMPT"):
-        repair_rule = (
-            getattr(_prompts_cfg, "REPAIR_RULE_PSEUDOCODE", mode_rule) if is_ghidra
-            else getattr(_prompts_cfg, "REPAIR_RULE_IR", mode_rule)
-        )
+        if is_dual:
+            repair_rule = getattr(
+                _prompts_cfg,
+                "REPAIR_RULE_CLEAN_IR_AND_PSEUDOCODE",
+                mode_rule,
+            )
+        elif is_pseudocode:
+            repair_rule = getattr(
+                _prompts_cfg,
+                "REPAIR_RULE_PSEUDOCODE",
+                mode_rule,
+            )
+        else:
+            repair_rule = getattr(
+                _prompts_cfg,
+                "REPAIR_RULE_IR",
+                mode_rule,
+            )
         return (
             _prompts_cfg.REPAIR_PROMPT
             .replace("{FEEDBACK}", bounded_feedback)
@@ -2076,15 +1961,15 @@ def _validate_recovered_candidate(source: str) -> None:
         )
 
     forbidden_patterns = (
-        (r"\bundefined(?:1|2|4|8|16)\b", "Ghidra undefined-width type"),
-        (r"\bprocessEntry\b", "Ghidra processEntry type"),
+        (r"\bundefined(?:1|2|4|8|16)\b", "decompiler undefined-width type"),
+        (r"\bprocessEntry\b", "decompiler processEntry type"),
         (r"\bframe_storage_backing_[A-Za-z0-9_]*", "lifted frame storage"),
         (r"\b__brighten_native_data_pointer\b", "lifted pointer translator"),
-        (r"\bhalt_baddata\b", "Ghidra bad-data stub"),
-        (r"\bCONCAT\d+\b", "Ghidra CONCAT helper"),
+        (r"\bhalt_baddata\b", "decompiler bad-data stub"),
+        (r"\bCONCAT\d+\b", "decompiler CONCAT helper"),
         (r"\bPTR_[A-Za-z0-9_]+", "import-thunk pointer"),
-        (r"\._\d+_\d+_", "Ghidra synthetic field selector"),
-        (r"\(code\s*\*\)", "Ghidra code-pointer type"),
+        (r"\._\d+_\d+_", "decompiler synthetic field selector"),
+        (r"\(code\s*\*\)", "decompiler code-pointer type"),
     )
     for pattern, description in forbidden_patterns:
         if re.search(pattern, text):
@@ -2996,126 +2881,55 @@ def run_recovery_loop(
     )
 
     backend = _text(config.pseudo_backend).strip().lower()
-    if backend in {"llvm2c", "clean_pseudocode", "llvm-to-c", "llvm_to_c"}:
+    if not backend or backend in {
+        "llvm2c",
+        "clean_pseudocode",
+        "llvm-to-c",
+        "llvm_to_c",
+    }:
         backend_mode = "llvm2c"
-    elif backend in {"1", "ghidra", "ghidra-only", "analyzeheadless"}:
-        backend_mode = "ghidra"
     elif backend in {"2", "ir", "llvm", "raw_ir", "raw"}:
         backend_mode = "ir"
     else:
-        backend_mode = "llvm2c"
+        raise RecoveryError(
+            f"Unsupported pseudocode backend {backend!r}; use 'llvm2c' or 'ir'."
+        )
 
+    use_pseudocode = backend_mode == "llvm2c"
     if backend_mode == "llvm2c":
-        print("[LLM] Mode 2: Transpile LLVM IR sang C Pseudocode (LLVM-to-C Transpiler) cho LLM.")
+        print(
+            "[LLM] LLVM2C mode: transpile Clean LLVM IR thành C pseudocode "
+            "làm model evidence."
+        )
         pseudo_path = os.path.join(output_dir, "clean_pseudocode.c")
-        input_ir = _text(metadata.get("input_ir")) if isinstance(metadata, Mapping) else ""
-        if input_ir and os.path.isfile(input_ir):
-            try:
-                from tools.llvm_to_c import transpile_llvm_ir_to_c
-                transpile_llvm_ir_to_c(input_ir, pseudo_path)
-                pseudo_source = Path(pseudo_path).read_text(encoding="utf-8", errors="replace")
-                print(f"[LLM] [✓] Đã transpile LLVM IR sang C pseudocode thành công: {pseudo_path}")
-            except Exception as e:
-                print(f"[LLM] [!] Lỗi transpile LLVM-to-C: {e}")
-        pseudo_path_for_api = pseudo_path
+        input_ir = (
+            _text(metadata.get("input_ir"))
+            if isinstance(metadata, Mapping)
+            else ""
+        )
+        if not input_ir or not os.path.isfile(input_ir):
+            raise RecoveryError(
+                "LLVM2C mode requires metadata.input_ir pointing to Clean LLVM IR."
+            )
+        try:
+            from tools.llvm_to_c import transpile_llvm_ir_to_c
 
-    use_two_stage = backend_mode == "ghidra"
-    if use_two_stage:
-        print("[LLM] Mode 1: decompile bằng Ghidra rồi gửi C-like pseudocode cho LLM.")
-        pseudo_path = os.path.join(output_dir, "ghidra_recovery_input.c")
-        binary_path = ""
-        prepared_pseudo_path = ""
-        prepared_pseudo_sha256 = ""
-        if isinstance(metadata, Mapping):
-            binary_path = _text(
-                metadata.get("recovery_reference_binary")
-            )
-            prepared_pseudo_path = _text(
-                metadata.get("precomputed_ghidra_pseudocode_path")
-            )
-            prepared_pseudo_sha256 = _text(
-                metadata.get("precomputed_ghidra_pseudocode_sha256")
-            )
-        print(f"[LLM] Mục tiêu decompile: {binary_path or '<missing>'}")
-        ghidra_failed: Optional[str] = None
-        persisted_pseudo = os.path.join(output_dir, "ghidra_pseudocode.c")
-        if prepared_pseudo_path:
-            print(
-                "[LLM] Dùng Ghidra pseudocode đã freeze từ preparation: "
-                f"{prepared_pseudo_path}"
-            )
-            if not os.path.isfile(prepared_pseudo_path):
-                ghidra_failed = (
-                    "Không tìm thấy Ghidra pseudocode đã chuẩn bị: "
-                    f"{prepared_pseudo_path}"
-                )
-            elif prepared_pseudo_sha256 and hashlib.sha256(
-                Path(prepared_pseudo_path).read_bytes()
-            ).hexdigest() != prepared_pseudo_sha256:
-                ghidra_failed = "Ghidra pseudocode đã chuẩn bị bị thay đổi hash."
-            else:
-                pseudo_source = Path(prepared_pseudo_path).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-                Path(persisted_pseudo).write_text(
-                    pseudo_source, encoding="utf-8"
-                )
-        else:
-            ghidra_binary = _find_ghidra_analyze_headless(
-                config.ghidra_binary_path
-            )
-            print(
-                f"[LLM] Ghidra analyzeHeadless: {ghidra_binary or '<missing>'}"
-            )
-            if not binary_path:
-                ghidra_failed = (
-                    "Mode 1 yêu cầu recovery_reference_binary nhưng không có metadata."
-                )
-            elif not ghidra_binary:
-                ghidra_failed = "Không tìm thấy Ghidra analyzeHeadless."
-            elif not os.path.isfile(binary_path):
-                ghidra_failed = f"Không tìm thấy binary cho Ghidra: {binary_path}"
-        if not prepared_pseudo_path and ghidra_failed is None:
-            try:
-                pseudo_source = _decompile_binary_with_ghidra(
-                    binary_path,
-                    persisted_pseudo,
-                    ghidra_binary=ghidra_binary,
-                    timeout=config.ghidra_timeout,
-                )
-                if not pseudo_source or not pseudo_source.strip():
-                    ghidra_failed = "Ghidra không trả về pseudocode."
-            except Exception as exc:
-                ghidra_failed = f"Ghidra decompile lỗi: {exc}"
-
-        if ghidra_failed:
-            Path(os.path.join(output_dir, "recovery_iter0.parse.txt")).write_text(
-                ghidra_failed,
+            transpile_llvm_ir_to_c(input_ir, pseudo_path)
+            pseudo_source = Path(pseudo_path).read_text(
                 encoding="utf-8",
+                errors="replace",
             )
-            print(f"[LLM] {ghidra_failed}. Dừng mode 1; không tự chuyển sang mode 2.")
-            raise RecoveryError(ghidra_failed)
-        else:
-            raw_pseudo_source = pseudo_source or ""
-            if config.focus_ghidra_pseudocode:
-                focused_pseudo = _focus_ghidra_pseudocode(raw_pseudo_source)
-                if focused_pseudo.strip():
-                    pseudo_source = focused_pseudo
-                print(
-                    "[LLM] Đã lọc Ghidra noise | "
-                    f"raw_chars={len(raw_pseudo_source)} | focused_chars={len(pseudo_source or '')}"
-                )
-            else:
-                pseudo_source = raw_pseudo_source
-                print("[LLM] Tắt bước lọc Ghidra noise theo cấu hình.")
-
-            Path(pseudo_path).write_text(pseudo_source or "", encoding="utf-8")
-            pseudo_path_for_api = pseudo_path
-            print(
-                f"[LLM] Ghidra model evidence đã lưu: {os.path.relpath(pseudo_path, output_dir)}"
-            )
+        except Exception as exc:
+            raise RecoveryError(f"LLVM2C transpilation failed: {exc}") from exc
+        if not pseudo_source.strip():
+            raise RecoveryError("LLVM2C produced an empty pseudocode artifact.")
+        pseudo_path_for_api = pseudo_path
+        print(
+            "[LLM] [✓] LLVM2C pseudocode ready: "
+            f"{os.path.relpath(pseudo_path, output_dir)}"
+        )
     else:
-        print("[LLM] Mode 2: gửi trực tiếp LLVM IR cho LLM.")
+        print("[LLM] Direct IR mode: send LLVM IR as model evidence.")
         pseudo_path_for_api = None
 
     start_iteration = 1
@@ -3201,7 +3015,10 @@ def run_recovery_loop(
         os.replace(temporary, recovery_state_path)
 
     total_model_calls = len(list(Path(output_dir).glob("recovery_iter*.response.txt")))
-    max_allowed_calls = 5
+    # The flow contract owns the provider-call budget. A one-shot flow sets
+    # max_iterations=1 and must remain a literal one-call flow even when the
+    # provider returns MAX_TOKENS.
+    max_allowed_calls = config.max_iterations
 
     for iteration in range(start_iteration, config.max_iterations + 1):
         if total_model_calls >= max_allowed_calls:
@@ -3216,30 +3033,35 @@ def run_recovery_loop(
             max_chars: Optional[int],
             evidence_mode: str,
         ) -> str:
+            direct_ir_modes = {"llvm_ir", "raw_ir"}
             attached_label = {
                 "dual": (
-                    "COMPLETE FOCUSED GHIDRA PSEUDOCODE AND CLEANED/DELIFTED "
+                    "COMPLETE LLVM2C PSEUDOCODE AND CLEANED/DELIFTED "
                     "LLVM IR ATTACHED IN THIS REQUEST"
                 ),
                 "pseudocode": (
-                    "COMPLETE FOCUSED GHIDRA PSEUDOCODE ATTACHED IN THIS REQUEST"
+                    "COMPLETE LLVM2C PSEUDOCODE ATTACHED IN THIS REQUEST"
                 ),
                 "llvm_ir": (
                     "COMPLETE CLEANED/DELIFTED LLVM IR ATTACHED IN THIS REQUEST"
+                ),
+                "raw_ir": (
+                    "COMPLETE RAW NON-DEOBFUSCATED LLVM IR ATTACHED IN THIS REQUEST"
                 ),
             }.get(
                 evidence_mode,
                 "COMPLETE MODEL INPUT ARTIFACT ATTACHED IN THIS REQUEST",
             )
             if iteration == 1:
-                if use_two_stage and pseudo_source is None:
-                    raise RecoveryError("Pseudo stage output missing while mode 1 is enabled.")
-                use_pseudo = use_two_stage and evidence_mode != "llvm_ir"
-                seed_text = pseudo_source if use_pseudo else ir_text
-                seed_attached = (
-                    bool(config.use_file_api)
-                    and evidence_mode in {"dual", "pseudocode", "llvm_ir"}
+                if use_pseudocode and pseudo_source is None:
+                    raise RecoveryError(
+                        "LLVM2C pseudocode is missing from pseudocode mode."
+                    )
+                use_pseudo = (
+                    use_pseudocode and evidence_mode not in direct_ir_modes
                 )
+                seed_text = pseudo_source if use_pseudo else ir_text
+                seed_attached = bool(attachment_paths)
                 return build_initial_prompt(
                     seed_text,
                     {},
@@ -3247,20 +3069,39 @@ def run_recovery_loop(
                     use_pseudo=use_pseudo,
                     seed_attached_file=seed_attached,
                     attached_evidence_label=attached_label,
+                    dual_ir_text=(
+                        ir_text if evidence_mode == "dual" else None
+                    ),
+                    ir_representation=config.ir_representation,
                 )
             use_pseudo = (
-                use_two_stage
+                use_pseudocode
                 and pseudo_source is not None
-                and evidence_mode != "llvm_ir"
+                and evidence_mode not in direct_ir_modes
             )
-            repair_input = pseudo_source if use_pseudo else ir_text
+            if (
+                evidence_mode == "dual"
+                and pseudo_source is not None
+                and not attachment_paths
+            ):
+                repair_input = (
+                    "<LLVM2C_PSEUDOCODE>\n"
+                    f"{pseudo_source}\n"
+                    "</LLVM2C_PSEUDOCODE>\n"
+                    "<CLEANED_LLVM_IR>\n"
+                    f"{ir_text}\n"
+                    "</CLEANED_LLVM_IR>"
+                )
+            else:
+                repair_input = pseudo_source if use_pseudo else ir_text
             source_label = {
-                "dual": "focused Ghidra pseudocode plus cleaned/delifted LLVM IR",
-                "pseudocode": "focused Ghidra decompiler pseudocode",
+                "dual": "LLVM2C pseudocode plus cleaned/delifted LLVM IR",
+                "pseudocode": "LLVM2C transpiled pseudocode",
                 "llvm_ir": "cleaned/delifted LLVM IR",
+                "raw_ir": "raw non-deobfuscated LLVM IR",
             }.get(
                 evidence_mode,
-                "Ghidra decompiler pseudocode"
+                "LLVM2C transpiled pseudocode"
                 if use_pseudo
                 else "cleaned/delifted LLVM IR",
             )
@@ -3270,10 +3111,7 @@ def run_recovery_loop(
                 last_error or _format_fuzz_feedback(last_report or {}),
                 max_chars,
                 source_label=source_label,
-                evidence_attached=(
-                    bool(config.use_file_api)
-                    and evidence_mode in {"dual", "pseudocode", "llvm_ir"}
-                ),
+                evidence_attached=bool(attachment_paths),
                 attached_evidence_label=attached_label,
             )
 
@@ -3290,28 +3128,46 @@ def run_recovery_loop(
             attachment_paths: List[str] = []
             pseudo_attachment: Optional[str] = None
             ir_attachment: Optional[str] = None
-            if use_two_stage and config.use_file_api:
-                if not pseudo_path_for_api or not os.path.isfile(pseudo_path_for_api):
-                    raise RecoveryError("File-API recovery enabled but Ghidra artifact is unavailable.")
-                pseudo_attachment = pseudo_path_for_api
-                attachment_paths = [pseudo_attachment]
-                if config.attach_clean_ir:
-                    brightened_ir_path = _text(metadata.get("input_ir"))
-                    if brightened_ir_path:
-                        if not os.path.isfile(brightened_ir_path):
+            if config.use_file_api:
+                input_ir_path = (
+                    _text(metadata.get("input_ir"))
+                    if isinstance(metadata, Mapping)
+                    else ""
+                )
+                if use_pseudocode:
+                    if (
+                        not pseudo_path_for_api
+                        or not os.path.isfile(pseudo_path_for_api)
+                    ):
+                        raise RecoveryError(
+                            "File-API recovery enabled but LLVM2C pseudocode "
+                            "is unavailable."
+                        )
+                    pseudo_attachment = pseudo_path_for_api
+                    attachment_paths = [pseudo_attachment]
+                    if config.attach_clean_ir:
+                        if not input_ir_path or not os.path.isfile(
+                            input_ir_path
+                        ):
                             raise RecoveryError(
-                                f"File-API recovery enabled but brightened LLVM IR is unavailable: "
-                                f"{brightened_ir_path}"
+                                "File-API recovery enabled but cleaned LLVM IR "
+                                f"is unavailable: {input_ir_path or '<missing>'}"
                             )
-                        ir_attachment = brightened_ir_path
+                        ir_attachment = input_ir_path
                         attachment_paths.append(ir_attachment)
+                else:
+                    if input_ir_path and os.path.isfile(input_ir_path):
+                        ir_attachment = input_ir_path
+                        attachment_paths = [ir_attachment]
 
             evidence_mode = (
                 "dual"
-                if pseudo_attachment and ir_attachment
+                if use_pseudocode and config.attach_clean_ir
                 else "pseudocode"
-                if pseudo_attachment
-                else "single"
+                if use_pseudocode
+                else "raw_ir"
+                if _text(config.ir_representation).lower() == "raw"
+                else "llvm_ir"
             )
             system_prompt = build_system_prompt(
                 config.attach_clean_ir,
@@ -3395,6 +3251,7 @@ def run_recovery_loop(
             current_request_uses_ir = evidence_mode in {
                 "dual",
                 "llvm_ir",
+                "raw_ir",
             }
             print(
                 "[LLM] Readable evidence attachments "
@@ -3447,6 +3304,15 @@ def run_recovery_loop(
                     attachment_paths=attachment_paths,
                     system_instruction=system_prompt,
                 )
+
+            # Persist the exact request material before the provider call. This
+            # is append-only evaluation evidence and does not alter prompting.
+            Path(
+                os.path.join(output_dir, f"recovery_iter{iteration}.prompt.txt")
+            ).write_text(model_prompt, encoding="utf-8")
+            Path(
+                os.path.join(output_dir, f"recovery_iter{iteration}.system.txt")
+            ).write_text(system_prompt, encoding="utf-8")
 
             request_context = {
                 "iteration": iteration,

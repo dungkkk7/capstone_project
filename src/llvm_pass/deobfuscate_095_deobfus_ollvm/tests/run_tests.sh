@@ -44,6 +44,8 @@ fi
 "${root_dir}/tests/test_opaque_select.sh"
 "${root_dir}/tests/test_opaque_semantic_proof.sh"
 "${root_dir}/tests/test_opaque_parity_semantic_proof.sh"
+"${root_dir}/tests/test_signed_compare_flags.sh"
+"${root_dir}/tests/test_frozen_dispatcher.sh"
 python3 "${root_dir}/tests/test_p00788_semantic_lifecycle.py"
 python3 "${root_dir}/tests/test_p03430_semantic_lifecycle.py"
 "${root_dir}/tests/test_chernobog_add_ollvm_rules.sh"

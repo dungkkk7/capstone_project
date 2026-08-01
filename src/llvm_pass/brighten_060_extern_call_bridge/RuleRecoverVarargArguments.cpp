@@ -1,7 +1,9 @@
 #include "BrightenExternCallBridgePass.h"
+#include <limits>
 #include <queue>
 #include <set>
 #include "llvm/IR/CFG.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/IR/InstIterator.h"
@@ -207,6 +209,7 @@ static Value *FindStoreToStackOffset(AllocaInst *AI, uint64_t Offset, Instructio
 
 static Value *FindSameBlockRegisterStore(LoadInst *LI);
 
+static bool IsNativeProvenance(PointerProvenance P);
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth = 0);
 static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
   if (!V || Depth > 8) return PointerProvenance::Unknown;
@@ -274,20 +277,45 @@ static PointerProvenance ClassifyPointerProvenance(Value *V, unsigned Depth) {
   }
   if (auto *PTI = dyn_cast<PtrToIntInst>(Stripped))
     return ClassifyPointerProvenance(PTI->getOperand(0), Depth + 1);
+  // Integer-preserved native pointers remain native through ordinary affine
+  // byte arithmetic.  Require exactly one native carrier; a guest-address
+  // carrier or subtraction of two pointers is not a pointer provenance proof.
+  if (auto *BO = dyn_cast<BinaryOperator>(Stripped)) {
+    PointerProvenance L =
+        ClassifyPointerProvenance(BO->getOperand(0), Depth + 1);
+    PointerProvenance R =
+        ClassifyPointerProvenance(BO->getOperand(1), Depth + 1);
+    // Stack-relative integer arithmetic is owned by the bounds-checked frame
+    // translator below.  The generic affine proof is intentionally limited
+    // to allocator returns, whose integer spelling is already a host address.
+    bool LNative = L == PointerProvenance::NativeHeapObject;
+    bool RNative = R == PointerProvenance::NativeHeapObject;
+    if (BO->getOpcode() == Instruction::Add && LNative != RNative &&
+        (LNative ? R : L) == PointerProvenance::Unknown)
+      return LNative ? L : R;
+    if (BO->getOpcode() == Instruction::Sub && LNative && !RNative &&
+        R == PointerProvenance::Unknown)
+      return L;
+  }
   if (auto *Phi = dyn_cast<PHINode>(Stripped)) {
     if (Phi->getNumIncomingValues() == 0) return PointerProvenance::Unknown;
     PointerProvenance First =
         ClassifyPointerProvenance(Phi->getIncomingValue(0), Depth + 1);
     if (First == PointerProvenance::Unknown) return First;
-    for (unsigned I = 1; I < Phi->getNumIncomingValues(); ++I)
-      if (ClassifyPointerProvenance(Phi->getIncomingValue(I), Depth + 1) != First)
+    for (unsigned I = 1; I < Phi->getNumIncomingValues(); ++I) {
+      PointerProvenance Incoming =
+          ClassifyPointerProvenance(Phi->getIncomingValue(I), Depth + 1);
+      if (Incoming != First &&
+          !(IsNativeProvenance(Incoming) && IsNativeProvenance(First)))
         return PointerProvenance::Unknown;
+    }
     return First;
   }
   if (auto *Sel = dyn_cast<SelectInst>(Stripped)) {
     PointerProvenance T = ClassifyPointerProvenance(Sel->getTrueValue(), Depth + 1);
     PointerProvenance F = ClassifyPointerProvenance(Sel->getFalseValue(), Depth + 1);
     if (T == F && T != PointerProvenance::Unknown) return T;
+    if (IsNativeProvenance(T) && IsNativeProvenance(F)) return T;
   }
   if (auto *Alias = dyn_cast<GlobalAlias>(Stripped))
     if (Constant *Aliasee = Alias->getAliasee())
@@ -995,18 +1023,31 @@ static Value *ResolveUniqueGuestConstant(IRBuilder<> &B, Module &M,
                      "extern.vararg.guest.object");
 }
 
+static bool HasScanfLengthModifier(StringRef Raw, StringRef Modifier) {
+  if (Raw.size() < 2 || Modifier.empty()) return false;
+  size_t Conversion = Raw.size() - 1;
+  return Raw.substr(0, Conversion).contains(Modifier);
+}
+
 static std::optional<uint64_t>
-ScanfDestinationWidth(const VarargSpecifier &Spec) {
+ScanfDestinationWidth(const VarargSpecifier &Spec, const DataLayout &DL) {
   switch (Spec.Ty) {
   case VarargType::CharI8:
+    // A field width makes %c write an array, and %lc writes wide characters.
+    // Keep those forms fail-closed until the parser exposes their exact count.
+    if (Spec.Raw != "%c") return std::nullopt;
     return 1;
   case VarargType::IntI32:
   case VarargType::UintI32:
+    if (HasScanfLengthModifier(Spec.Raw, "hh")) return 1;
+    if (HasScanfLengthModifier(Spec.Raw, "h")) return 2;
     return 4;
   case VarargType::IntI64:
   case VarargType::UintI64:
-  case VarargType::Double:
     return 8;
+  case VarargType::Double:
+    if (HasScanfLengthModifier(Spec.Raw, "L")) return 16;
+    return HasScanfLengthModifier(Spec.Raw, "l") ? 8 : 4;
   case VarargType::Pointer:
     // %s and %[ have an input-dependent write extent.  We cannot prove that
     // extent here, but a direct native call needs the guest address rebased
@@ -1015,7 +1056,7 @@ ScanfDestinationWidth(const VarargSpecifier &Spec) {
     // of manufacturing an unmapped inttoptr.  %p is fixed-width and retains
     // its stricter eight-byte proof.
     if (StringRef(Spec.Raw).ends_with("p"))
-      return 8;
+      return DL.getPointerSize(0);
     if (StringRef(Spec.Raw).ends_with("s") || StringRef(Spec.Raw).contains('['))
       return 1;
     return std::nullopt;
@@ -1046,6 +1087,13 @@ struct AffineValue {
   Value *Base = nullptr;
   int64_t Offset = 0;
 };
+
+static std::optional<int64_t> AddSignedOffset(int64_t LHS, int64_t RHS) {
+  if ((RHS > 0 && LHS > std::numeric_limits<int64_t>::max() - RHS) ||
+      (RHS < 0 && LHS < std::numeric_limits<int64_t>::min() - RHS))
+    return std::nullopt;
+  return LHS + RHS;
+}
 
 static Value *FindSameBlockRegisterStore(LoadInst *LI) {
   auto Wanted = IdentifyStateOffset(LI->getPointerOperand());
@@ -1079,17 +1127,25 @@ static std::optional<AffineValue> GetAffineValue(Value *V,
     if (BO->getOpcode() == Instruction::Add) {
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
         auto A = GetAffineValue(BO->getOperand(0), Depth + 1);
-        if (A) { A->Offset += C->getSExtValue(); return A; }
+        auto Offset = A ? AddSignedOffset(A->Offset, C->getSExtValue())
+                        : std::nullopt;
+        if (Offset) { A->Offset = *Offset; return A; }
       }
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(0))) {
         auto A = GetAffineValue(BO->getOperand(1), Depth + 1);
-        if (A) { A->Offset += C->getSExtValue(); return A; }
+        auto Offset = A ? AddSignedOffset(A->Offset, C->getSExtValue())
+                        : std::nullopt;
+        if (Offset) { A->Offset = *Offset; return A; }
       }
     }
     if (BO->getOpcode() == Instruction::Sub)
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
         auto A = GetAffineValue(BO->getOperand(0), Depth + 1);
-        if (A) { A->Offset -= C->getSExtValue(); return A; }
+        int64_t Delta = C->getSExtValue();
+        if (Delta == std::numeric_limits<int64_t>::min())
+          return std::nullopt;
+        auto Offset = A ? AddSignedOffset(A->Offset, -Delta) : std::nullopt;
+        if (Offset) { A->Offset = *Offset; return A; }
       }
   }
   return AffineValue{V, 0};
@@ -1283,14 +1339,69 @@ GetRecoveredFrameAnchor(Value *V, const DataLayout &DL, unsigned Depth = 0) {
   return std::nullopt;
 }
 
-static Value *TranslateProvenFrameOffset(IRBuilder<> &B, Value *V,
-                                         const RecoveredFrameAnchor &Anchor) {
-  if (!V || !V->getType()->isIntegerTy()) return nullptr;
-  if (auto *PTI = dyn_cast<PtrToIntInst>(V))
+static Value *PtrToIntPointerOperand(Value *V) {
+  if (auto *PTI = dyn_cast_or_null<PtrToIntInst>(V))
     return PTI->getPointerOperand();
-  if (auto *CE = dyn_cast<ConstantExpr>(V);
+  if (auto *CE = dyn_cast_or_null<ConstantExpr>(V);
       CE && CE->getOpcode() == Instruction::PtrToInt)
     return CE->getOperand(0);
+  return nullptr;
+}
+
+static bool HasSameConcreteFrameBacking(Value *LHS, Value *RHS,
+                                        const DataLayout &DL) {
+  if (!LHS || !RHS) return false;
+  APInt LHSOffset(DL.getPointerSizeInBits(0), 0, true);
+  APInt RHSOffset(DL.getPointerSizeInBits(0), 0, true);
+  Value *LHSBase = LHS->stripAndAccumulateConstantOffsets(
+      DL, LHSOffset, true);
+  Value *RHSBase = RHS->stripAndAccumulateConstantOffsets(
+      DL, RHSOffset, true);
+  return LHSBase && RHSBase &&
+         LHSBase->stripPointerCasts() == RHSBase->stripPointerCasts() &&
+         (isa<AllocaInst>(LHSBase) || isa<GlobalVariable>(LHSBase) ||
+          isa<Argument>(LHSBase));
+}
+
+static Value *TranslateAffineFrameAddress(IRBuilder<> &B, Value *V,
+                                          const RecoveredFrameAnchor &Anchor,
+                                          const DataLayout &DL,
+                                          uint64_t RequiredWidth) {
+  auto Affine = GetAffineValue(V);
+  if (!Affine || !Affine->Base) return nullptr;
+  Value *BasePointer = PtrToIntPointerOperand(Affine->Base);
+  if (!BasePointer ||
+      V->getType()->getIntegerBitWidth() != DL.getPointerSizeInBits(0) ||
+      !HasSameConcreteFrameBacking(BasePointer, Anchor.Ptr, DL))
+    return nullptr;
+
+  auto BaseAnchor = GetRecoveredFrameAnchor(BasePointer, DL);
+  if (!BaseAnchor) return nullptr;
+  __int128 Target = static_cast<__int128>(BaseAnchor->Offset) +
+                    static_cast<__int128>(Affine->Offset);
+  if (Target < 0 || Target > static_cast<__int128>(BaseAnchor->Size))
+    return nullptr;
+  uint64_t TargetOffset = static_cast<uint64_t>(Target);
+  if (RequiredWidth > BaseAnchor->Size - TargetOffset)
+    return nullptr;
+
+  if (Affine->Offset == 0)
+    return BasePointer;
+
+  return B.CreateGEP(B.getInt8Ty(), BasePointer,
+                     ConstantInt::getSigned(B.getInt64Ty(), Affine->Offset),
+                     "native.frame.affine.ptr");
+}
+
+static Value *TranslateProvenFrameOffset(IRBuilder<> &B, Value *V,
+                                         const RecoveredFrameAnchor &Anchor,
+                                         const DataLayout &DL,
+                                         uint64_t RequiredWidth = 1) {
+  if (!V || !V->getType()->isIntegerTy()) return nullptr;
+
+  if (Value *AffinePointer =
+          TranslateAffineFrameAddress(B, V, Anchor, DL, RequiredWidth))
+    return AffinePointer;
 
   if (IsExplicitFrameRelativeOffset(V, Anchor.Ptr)) {
     Value *Relative = V;
@@ -1345,6 +1456,186 @@ static Value *TranslateProvenFrameOffset(IRBuilder<> &B, Value *V,
                      "native.overflow.frame.ptr");
 }
 
+struct LocalFrameSlice {
+  AllocaInst *Root = nullptr;
+  uint64_t Offset = 0;
+  uint64_t Width = 0;
+};
+
+static std::optional<LocalFrameSlice>
+GetLocalFrameSlice(Value *Pointer, uint64_t Width, const DataLayout &DL) {
+  if (!Pointer || !Pointer->getType()->isPointerTy() || Width == 0)
+    return std::nullopt;
+  APInt Offset(DL.getPointerSizeInBits(0), 0, true);
+  Value *Base = Pointer->stripAndAccumulateConstantOffsets(DL, Offset, true);
+  auto *Root = dyn_cast_or_null<AllocaInst>(
+      Base ? Base->stripPointerCasts() : nullptr);
+  if (!Root || Offset.isNegative()) return std::nullopt;
+  auto *Count = dyn_cast<ConstantInt>(Root->getArraySize());
+  if (!Count) return std::nullopt;
+  TypeSize ElementSize = DL.getTypeAllocSize(Root->getAllocatedType());
+  if (ElementSize.isScalable()) return std::nullopt;
+  uint64_t CountValue = Count->getLimitedValue();
+  uint64_t StorageSize = 0;
+  if (__builtin_mul_overflow(ElementSize.getFixedValue(), CountValue,
+                             &StorageSize))
+    return std::nullopt;
+  uint64_t ByteOffset = Offset.getZExtValue();
+  if (ByteOffset > StorageSize || Width > StorageSize - ByteOffset)
+    return std::nullopt;
+  return LocalFrameSlice{Root, ByteOffset, Width};
+}
+
+static bool HasFixedScanfWriteExtent(const VarargSpecifier &Spec) {
+  if (Spec.Ty == VarargType::Pointer)
+    return StringRef(Spec.Raw).ends_with("p");
+  return Spec.Ty == VarargType::CharI8 ||
+         Spec.Ty == VarargType::IntI32 ||
+         Spec.Ty == VarargType::UintI32 ||
+         Spec.Ty == VarargType::IntI64 ||
+         Spec.Ty == VarargType::UintI64 ||
+         Spec.Ty == VarargType::Double;
+}
+
+static bool FrameSlicesOverlap(const LocalFrameSlice &LHS,
+                               const LocalFrameSlice &RHS) {
+  if (LHS.Root != RHS.Root) return false;
+  return LHS.Offset < RHS.Offset + RHS.Width &&
+         RHS.Offset < LHS.Offset + LHS.Width;
+}
+
+static Value *TranslateProvenLocalFrameInteger(IRBuilder<> &B, Value *V,
+                                               const DataLayout &DL,
+                                               uint64_t RequiredWidth) {
+  auto Affine = GetAffineValue(V);
+  if (!Affine || !Affine->Base ||
+      V->getType()->getIntegerBitWidth() != DL.getPointerSizeInBits(0))
+    return nullptr;
+  Value *BasePointer = PtrToIntPointerOperand(Affine->Base);
+  if (!BasePointer) return nullptr;
+  auto Anchor = GetRecoveredFrameAnchor(BasePointer, DL);
+  if (!Anchor) return nullptr;
+  Value *Object = getUnderlyingObject(BasePointer);
+  auto *Root = dyn_cast_or_null<AllocaInst>(Object);
+  if (!Root || Root->getFunction() != B.GetInsertBlock()->getParent())
+    return nullptr;
+
+  __int128 Target = static_cast<__int128>(Anchor->Offset) +
+                    static_cast<__int128>(Affine->Offset);
+  if (Target < 0 || Target > static_cast<__int128>(Anchor->Size))
+    return nullptr;
+  uint64_t TargetOffset = static_cast<uint64_t>(Target);
+  if (RequiredWidth > Anchor->Size - TargetOffset)
+    return nullptr;
+  if (Affine->Offset == 0)
+    return BasePointer;
+  return B.CreateGEP(B.getInt8Ty(), BasePointer,
+                     ConstantInt::getSigned(B.getInt64Ty(), Affine->Offset),
+                     "native.scanf.frame.ptr");
+}
+
+static bool IsSyntheticLocalFrame(const LocalFrameSlice &Slice) {
+  if (!Slice.Root) return false;
+  StringRef Name = Slice.Root->getName();
+  return Name.starts_with("frame_storage") ||
+         Name.starts_with("native_frame");
+}
+
+static bool CanonicalizeDirectScanfFrameDestinations(ExternCallContext &Ctx) {
+  SmallVector<CallInst *, 16> Calls;
+  for (Function &F : Ctx.M)
+    if (!F.isDeclaration())
+      for (Instruction &I : instructions(F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Callee = CI->getCalledFunction())
+            if (Callee->getName() == "scanf" ||
+                Callee->getName() == "__isoc99_scanf")
+              Calls.push_back(CI);
+
+  bool Changed = false;
+  for (CallInst *CI : Calls) {
+    if (CI->arg_empty()) continue;
+    std::string Format = ResolveFormatString(CI->getArgOperand(0));
+    if (Format.empty()) continue;
+    SmallVector<VarargSpecifier, 16> Specs;
+    if (!parseFormatString(Format, Specs, true)) continue;
+
+    struct PendingDirectLocal {
+      unsigned ArgumentIndex = 0;
+      Value *FramePointer = nullptr;
+      LocalFrameSlice Slice;
+      AllocaInst *Local = nullptr;
+    };
+    SmallVector<PendingDirectLocal, 8> Pending;
+    unsigned ArgumentIndex = 1;
+    IRBuilder<> B(CI);
+    for (const VarargSpecifier &Spec : Specs) {
+      if (!Spec.ConsumesArg || Spec.Ty == VarargType::Percent ||
+          Spec.Ty == VarargType::ScanfSuppressed)
+        continue;
+      if (ArgumentIndex >= CI->arg_size()) {
+        Pending.clear();
+        break;
+      }
+      auto Width = ScanfDestinationWidth(Spec, Ctx.DL);
+      if (!Width || !HasFixedScanfWriteExtent(Spec)) {
+        ++ArgumentIndex;
+        continue;
+      }
+      Value *Original = CI->getArgOperand(ArgumentIndex);
+      Value *FramePointer = Original;
+      Value *IntegerAddress = nullptr;
+      if (auto *ITP = dyn_cast<IntToPtrInst>(Original))
+        IntegerAddress = ITP->getOperand(0);
+      else if (auto *CE = dyn_cast<ConstantExpr>(Original);
+               CE && CE->getOpcode() == Instruction::IntToPtr)
+        IntegerAddress = CE->getOperand(0);
+      if (IntegerAddress)
+        FramePointer = TranslateProvenLocalFrameInteger(
+            B, IntegerAddress, Ctx.DL, *Width);
+      if (FramePointer)
+        if (auto Slice = GetLocalFrameSlice(FramePointer, *Width, Ctx.DL);
+            Slice && IsSyntheticLocalFrame(*Slice))
+          Pending.push_back(
+              {ArgumentIndex, FramePointer, *Slice, nullptr});
+      ++ArgumentIndex;
+    }
+    if (Pending.empty()) continue;
+
+    bool Disjoint = true;
+    for (size_t I = 0; I < Pending.size(); ++I)
+      for (size_t J = I + 1; J < Pending.size(); ++J)
+        if (FrameSlicesOverlap(Pending[I].Slice, Pending[J].Slice))
+          Disjoint = false;
+    if (!Disjoint) continue;
+
+    IRBuilder<> EntryBuilder(
+        &*CI->getFunction()->getEntryBlock().getFirstInsertionPt());
+    for (PendingDirectLocal &Item : Pending) {
+      ArrayType *Storage = ArrayType::get(B.getInt8Ty(), Item.Slice.Width);
+      Item.Local = EntryBuilder.CreateAlloca(
+          Storage, nullptr, "native.scanf.destination");
+      uint64_t AlignmentValue = Item.Slice.Width >= 16 ? 16 :
+                                Item.Slice.Width >= 8 ? 8 :
+                                Item.Slice.Width >= 4 ? 4 :
+                                Item.Slice.Width >= 2 ? 2 : 1;
+      Align Alignment(AlignmentValue);
+      Item.Local->setAlignment(Alignment);
+      B.CreateMemCpy(Item.Local, Alignment, Item.FramePointer, Align(1),
+                     Item.Slice.Width);
+      CI->setArgOperand(Item.ArgumentIndex, Item.Local);
+    }
+    Instruction *AfterCall = CI->getNextNode();
+    if (!AfterCall) continue;
+    IRBuilder<> CopyBack(AfterCall);
+    for (const PendingDirectLocal &Item : Pending)
+      CopyBack.CreateMemCpy(Item.FramePointer, Align(1), Item.Local,
+                           Item.Local->getAlign(), Item.Slice.Width);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static bool NormalizeScanfOverflowSlots(CallInst *Before, Value *OverflowArea,
                                         const RecoveredFrameAnchor &Anchor,
                                         const DataLayout &DL) {
@@ -1358,7 +1649,7 @@ static bool NormalizeScanfOverflowSlots(CallInst *Before, Value *OverflowArea,
     auto *Raw = dyn_cast<ConstantInt>(SI->getValueOperand());
     if (!Raw) continue;
     IRBuilder<> B(SI);
-    Value *HostPtr = TranslateProvenFrameOffset(B, Raw, Anchor);
+    Value *HostPtr = TranslateProvenFrameOffset(B, Raw, Anchor, DL);
     if (!HostPtr) continue;
     Value *HostInt = B.CreatePtrToInt(HostPtr, Raw->getType(),
                                       "native.overflow.frame.address");
@@ -1431,6 +1722,13 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
 
     IRBuilder<> B(CI);
     SmallVector<Value *, 8> Args;
+    struct PendingScanfLocal {
+      unsigned ArgumentIndex = 0;
+      Value *FramePointer = nullptr;
+      LocalFrameSlice Slice;
+      AllocaInst *Local = nullptr;
+    };
+    SmallVector<PendingScanfLocal, 8> PendingLocals;
     if (IsSscanf) Args.push_back(CI->getArgOperand(0));
     Args.push_back(CI->getArgOperand(FormatIndex));
     bool Safe = true;
@@ -1465,8 +1763,13 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       if (!Stored) { Safe = false; break; }
       Type *Ty = VarargLLVMType(Ctx.M.getContext(), Spec.Ty, IsScanf);
       Value *Arg = nullptr;
-      if (FromOverflow && IsScanf && Ty->isPointerTy())
-        Arg = TranslateProvenFrameOffset(B, Stored, *FrameAnchor);
+      std::optional<uint64_t> DestinationWidth;
+      if (IsScanf && Ty->isPointerTy()) {
+        DestinationWidth = ScanfDestinationWidth(Spec, Ctx.DL);
+        if (FrameAnchor && DestinationWidth)
+          Arg = TranslateProvenFrameOffset(B, Stored, *FrameAnchor, Ctx.DL,
+                                           *DestinationWidth);
+      }
       // scanf-family variadic operands are destination pointers.  A literal
       // from the materialized register-save area is still a guest coordinate,
       // not a host pointer: lowering it through CoerceToType would create a
@@ -1474,10 +1777,11 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       // the same unique guest-object proof for vscanf as for vsscanf.
       if (!Arg && IsScanf && Ty->isPointerTy()) {
         if (auto *Guest = dyn_cast<ConstantInt>(Stored)) {
-          auto Width = ScanfDestinationWidth(Spec);
-          if (!Width) { Trace("guest-width"); Safe = false; break; }
+          if (!DestinationWidth) {
+            Trace("guest-width"); Safe = false; break;
+          }
           StringRef GuestFailure;
-          Arg = ResolveUniqueGuestConstant(B, Ctx.M, Guest, *Width,
+          Arg = ResolveUniqueGuestConstant(B, Ctx.M, Guest, *DestinationWidth,
                                            &GuestFailure);
           // A literal guest coordinate is never a host pointer merely because
           // it has pointer width.  In particular, do not let CoerceToType
@@ -1486,6 +1790,12 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
         }
         else if (!Stored->getType()->isPointerTy() &&
                  !IsNativeProvenance(ClassifyPointerProvenance(Stored))) {
+          if (TraceMaterializedVAList) {
+            errs() << "[brighten-extern] materialized-va-list slot lacks "
+                      "native pointer provenance: ";
+            Stored->printAsOperand(errs(), false);
+            errs() << '\n';
+          }
           Safe = false;
           break;
         }
@@ -1493,9 +1803,43 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
       if (!Arg)
         Arg = CoerceToType(B, Stored, Ty);
       if (!Arg) { Safe = false; break; }
+      if (IsScanf && DestinationWidth &&
+          HasFixedScanfWriteExtent(Spec)) {
+        if (auto Slice = GetLocalFrameSlice(Arg, *DestinationWidth, Ctx.DL))
+          PendingLocals.push_back(
+              {static_cast<unsigned>(Args.size()), Arg, *Slice, nullptr});
+      }
       Args.push_back(Arg);
     }
     if (!Safe) { Trace("slot-or-provenance"); continue; }
+
+    bool DisjointLocals = true;
+    for (size_t I = 0; I < PendingLocals.size(); ++I)
+      for (size_t J = I + 1; J < PendingLocals.size(); ++J)
+        if (FrameSlicesOverlap(PendingLocals[I].Slice,
+                               PendingLocals[J].Slice))
+          DisjointLocals = false;
+    if (DisjointLocals) {
+      IRBuilder<> EntryBuilder(
+          &*CI->getFunction()->getEntryBlock().getFirstInsertionPt());
+      for (PendingScanfLocal &Pending : PendingLocals) {
+        ArrayType *Storage = ArrayType::get(B.getInt8Ty(),
+                                            Pending.Slice.Width);
+        Pending.Local = EntryBuilder.CreateAlloca(
+            Storage, nullptr, "native.scanf.destination");
+        uint64_t AlignmentValue = Pending.Slice.Width >= 16 ? 16 :
+                                  Pending.Slice.Width >= 8 ? 8 :
+                                  Pending.Slice.Width >= 4 ? 4 :
+                                  Pending.Slice.Width >= 2 ? 2 : 1;
+        Align Alignment(AlignmentValue);
+        Pending.Local->setAlignment(Alignment);
+        B.CreateMemCpy(Pending.Local, Alignment, Pending.FramePointer,
+                       Align(1), Pending.Slice.Width);
+        Args[Pending.ArgumentIndex] = Pending.Local;
+      }
+    } else {
+      PendingLocals.clear();
+    }
 
     SmallVector<Type *, 2> FixedArgs{B.getPtrTy()};
     if (IsSscanf) FixedArgs.push_back(B.getPtrTy());
@@ -1505,11 +1849,16 @@ bool BrightenExternCallBridgePass::LowerMaterializedVAListCalls(
     CallInst *NewCall = B.CreateCall(FT, Native.getCallee(), Args,
                                      "native.vararg.direct");
     NewCall->setCallingConv(CI->getCallingConv());
+    IRBuilder<> CopyBack(CI);
+    for (const PendingScanfLocal &Pending : PendingLocals)
+      CopyBack.CreateMemCpy(Pending.FramePointer, Align(1), Pending.Local,
+                           Pending.Local->getAlign(), Pending.Slice.Width);
     CI->replaceAllUsesWith(NewCall);
     CI->eraseFromParent();
     ++Ctx.Report.VarargRecovered;
     Changed = true;
   }
+  Changed |= CanonicalizeDirectScanfFrameDestinations(Ctx);
   return Changed;
 }
 

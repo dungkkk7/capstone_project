@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
 
+from evaluation.schema import FLOW_SPECS
+
 # Try importing scipy.stats for McNemar / Wilcoxon tests
 try:
     from scipy import stats
@@ -56,11 +58,11 @@ FLOW_HATCHES = {
 }
 
 FLOW_LABELS = {
-    'F1': 'F1: Pseudocode',
-    'F2': 'F2: Pseudo + Clean IR',
-    'F3': 'F3: Raw IR (Obfuscated)',
-    'F4': 'F4: Clean IR',
-    'F5': 'F5: Single-Iter (Ablation)',
+    'F1': 'F1: Full',
+    'F2': 'F2: No Error Context',
+    'F3': 'F3: No Pseudocode',
+    'F4': 'F4: No Direct Clean IR',
+    'F5': 'F5: Raw IR Baseline',
 }
 
 def compute_bootstrap_ci(data_series: np.ndarray, n_bootstraps: int = 2000, ci: float = 95.0) -> Tuple[float, float, float]:
@@ -126,8 +128,8 @@ def generate_visualizations(output_dir: str, trackers: List[Any], experiment_id:
             "compile_success_final": 1 if t.compile_success_final else 0,
             "any_compile_success_within_budget": 1 if getattr(t, "any_compile_success_within_budget", t.compile_success_final) else 0,
             "last_candidate_compile_success": 1 if getattr(t, "last_candidate_compile_success", t.compile_success_final) else 0,
-            "compile_repair_rounds": t.compile_repair_rounds if t.flow_id != "F5" else 0,
-            "behavioral_repair_rounds": t.behavioral_repair_rounds if t.flow_id != "F5" else 0,
+            "compile_repair_rounds": t.compile_repair_rounds if FLOW_SPECS[t.flow_id].iterative else 0,
+            "behavioral_repair_rounds": t.behavioral_repair_rounds if FLOW_SPECS[t.flow_id].iterative else 0,
             "fuzz_total": t.fuzz_total,
             "fuzz_valid": t.fuzz_valid,
             "fuzz_matches": t.fuzz_matches,
@@ -258,10 +260,10 @@ def _plot_ablation_forest_plot(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(6.0, 3.2))
     
     contrasts = [
-        ("F2", "F4", "F2 vs F4: Pseudocode Effect"),
-        ("F2", "F1", "F2 vs F1: Clean IR Effect"),
-        ("F4", "F3", "F4 vs F3: Deobfuscation Effect"),
-        ("F2", "F5", "F2 vs F5: Feedback Repair Effect")
+        ("F1", "F2", "F1 vs F2: Error Context Effect"),
+        ("F1", "F3", "F1 vs F3: Pseudocode Effect"),
+        ("F1", "F4", "F1 vs F4: Direct Clean IR Effect"),
+        ("F3", "F5", "F3 vs F5: Deobfuscation Effect"),
     ]
     
     labels = []
@@ -508,11 +510,11 @@ def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
     # Paired Ablation Table with p-values
     ablation_data = []
     contrasts = [
-        ("F2", "F4", "Pseudocode Benefit"),
-        ("F2", "F1", "Clean IR Benefit"),
-        ("F4", "F3", "Deobfuscation Benefit"),
-        ("F2", "F5", "Feedback/Repair Benefit"),
-        ("F2", "F3", "Full Configuration vs Raw")
+        ("F1", "F2", "Error Context Benefit"),
+        ("F1", "F3", "Pseudocode Benefit"),
+        ("F1", "F4", "Direct Clean IR Benefit"),
+        ("F3", "F5", "Deobfuscation Benefit"),
+        ("F1", "F5", "Full Configuration vs Raw"),
     ]
     all_samples = set(df["sample_id"].unique())
     for fa, fb, desc in contrasts:
@@ -719,7 +721,8 @@ def _generate_report_markdown(df: pd.DataFrame, output_dir: str, experiment_id: 
     report_content += """
 ## 🔍 Paired Ablation Win/Tie/Loss Results
 
-See `ablation_comparisons.csv` for raw details. The analysis demonstrates a strong behavioral validation gain from iterative feedback loop on F2 vs F5.
+See `ablation_comparisons.csv` for raw details. F1 vs F2 isolates the
+contribution of error context; F1 vs F5 is a multi-factor comparison.
 """
     with open(os.path.join(output_dir, "report.md"), "w") as f:
         f.write(report_content)
@@ -1163,4 +1166,3 @@ def _generate_figures_manifest(df: pd.DataFrame, output_dir: str):
     ]
     with open(os.path.join(output_dir, "figures_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-

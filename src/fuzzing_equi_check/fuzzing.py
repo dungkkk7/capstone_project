@@ -676,8 +676,42 @@ def normalize_process_stream(data: bytes, res: Dict[str, Any]) -> bytes:
             normalized = normalized.replace(path_bytes, b"<argv0>")
     return normalized
 
-def check_equivalence(res1: Dict[str, Any], res2: Dict[str, Any], compare_stderr: bool = False, stdin_data: Optional[bytes] = None, case_id: Optional[str] = None) -> Tuple[bool, str]:
+def check_equivalence(
+    res1: Dict[str, Any],
+    res2: Dict[str, Any],
+    compare_stderr: bool = False,
+    stdin_data: Optional[bytes] = None,
+    case_id: Optional[str] = None,
+    strict_oracle: bool = False,
+) -> Tuple[bool, str]:
     """Checks differential equivalence based on status, exit codes, and output streams."""
+    if strict_oracle:
+        left = (
+            bytes(res1.get("stdout", b"")),
+            bytes(res1.get("stderr", b"")),
+            res1.get("returncode"),
+            res1.get("signal"),
+            res1.get("status") == "timeout",
+        )
+        right = (
+            bytes(res2.get("stdout", b"")),
+            bytes(res2.get("stderr", b"")),
+            res2.get("returncode"),
+            res2.get("signal"),
+            res2.get("status") == "timeout",
+        )
+        if left == right:
+            return True, ""
+        if left[4] != right[4]:
+            return False, "Timeout status mismatch"
+        if left[3] != right[3]:
+            return False, "Terminating signal mismatch"
+        if left[2] != right[2]:
+            return False, "Exit code mismatch"
+        if left[0] != right[0]:
+            return False, "Stdout stream mismatch"
+        return False, "Stderr stream mismatch"
+
     def get_case_id(res: Dict[str, Any]) -> str:
         import re
         path = res.get("bin_path", "")
@@ -1217,7 +1251,8 @@ class SemanticFuzzer:
         timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         compare_stderr: bool = False,
         num_workers: int = 1,
-        seed_inputs: Optional[List[bytes]] = None
+        seed_inputs: Optional[List[bytes]] = None,
+        strict_oracle: bool = False,
     ) -> Dict[str, Any]:
         """Fallback differential testing loop using the default random/template generator."""
         report = {
@@ -1320,7 +1355,14 @@ class SemanticFuzzer:
                         if match:
                             case_id = match.group(1)
                             break
-            is_eq, reason = check_equivalence(res1, res2, compare_stderr, stdin_data, case_id)
+            is_eq, reason = check_equivalence(
+                res1,
+                res2,
+                compare_stderr,
+                stdin_data,
+                case_id,
+                strict_oracle,
+            )
             oracle_inconclusive = False
             if not is_eq:
                 stable1 = is_stable_observation(
@@ -1394,7 +1436,8 @@ class SemanticFuzzer:
         timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         compare_stderr: bool = False,
         num_workers: int = 1,
-        seed_inputs: Optional[List[bytes]] = None
+        seed_inputs: Optional[List[bytes]] = None,
+        strict_oracle: bool = False,
     ) -> Dict[str, Any]:
         """Runs the differential testing loops using AFL++ if available, else falls back to default fuzzer."""
         use_afl = os.environ.get("BRIGHTEN_USE_AFL", "1").lower() in {
@@ -1441,6 +1484,7 @@ class SemanticFuzzer:
                 compare_stderr,
                 num_workers,
                 seed_inputs=seed_inputs,
+                strict_oracle=strict_oracle,
             )
             
         try:
@@ -1888,7 +1932,14 @@ int main(int argc, char** argv) {
                             if match:
                                 case_id = match.group(1)
                                 break
-                is_eq, reason = check_equivalence(res1, res2, compare_stderr, stdin_data, case_id)
+                is_eq, reason = check_equivalence(
+                    res1,
+                    res2,
+                    compare_stderr,
+                    stdin_data,
+                    case_id,
+                    strict_oracle,
+                )
                 oracle_inconclusive = False
                 if not is_eq:
                     # A mismatch is actionable only when both observations
@@ -1965,6 +2016,7 @@ int main(int argc, char** argv) {
                 compare_stderr,
                 num_workers,
                 seed_inputs=seed_inputs,
+                strict_oracle=strict_oracle,
             )
 
     def cleanup(self):
