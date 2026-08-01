@@ -1,25 +1,17 @@
-# Build artifacts
 result/
+__pycache__/
+*.pyc
 build/
 target/
 scratch/
-__pycache__/
-*.pyc
-*.pyo
+*.bin
 *.so
 *.bc
-
-# Data
+llvm-link.095.*.json
 data/clean_src/test/
 data/obfuscated/test/
 data/test.csv
-*.bin
 
-# revng distributable (~2.1GB) — cài trên mỗi máy bằng: bash tools/setup_revng.sh
-dependency/revng/
-dependency/revng_install/
-dependency/revng_dist/
-
-# AFL++ prebuilt: commit trực tiếp (nhỏ, portable)
+# Ngoại lệ: cho phép commit binaries của AFL++ trong dependency/
 !dependency/AFLplusplus/
 !dependency/AFLplusplus/**

@@ -1,0 +1,42 @@
+  Case                     | Tên file                            | LOC (Số dòng)
+  --------------------------|-------------------------------------|--------------------------
+   p00001                   | s092364643_fla_bcf_instsub_final.ll | 652
+   p00008                   | s771404612_fla_bcf_instsub_final.ll | 1,421
+   p00033                   | s763935897_fla_bcf_instsub_final.ll | 1,059
+   p00165                   | s722254321_fla_bcf_instsub_final.ll | 886
+   p00327                   | s356526576_fla_bcf_instsub_final.ll | 1,023
+   p00678                   | s961523709_fla_bcf_instsub_final.ll | 6,350
+   p00693                   | s746355550_fla_bcf_instsub_final.ll | 1,609
+   p00793                   | s729150918_fla_bcf_instsub_final.ll | 5,582
+   p00859                   | s595927985_fla_bcf_instsub_final.ll | 3,235
+   p00867                   | s333068212_fla_bcf_instsub_final.ll | 13,987 (Max)
+   p01296                   | s236329906_fla_bcf_instsub_final.ll | 10,506
+   p01315                   | s212409236_fla_bcf_instsub_final.ll | 1,799
+   p00788                   | s998194081_fla_bcf_instsub_final.ll | 879
+   p01571                   | s327549193_fla_bcf_instsub_final.ll | 12,480
+   p01687                   | s146593197_fla_bcf_instsub_final.ll | 1,567
+   p01766                   | s942434524_fla_bcf_instsub_final.ll | 1,088
+   p01970                   | s660972586_fla_bcf_instsub_final.ll | 738
+   p02029                   | s891773536_fla_bcf_instsub_final.ll | 3,403
+   p02100                   | s624710482_fla_bcf_instsub_final.ll | 964
+   p02289                   | s913513064_fla_bcf_instsub_final.ll | 4,401
+   p02474                   | s383039486_fla_bcf_instsub_final.ll | 591
+   p02477                   | s228971816_fla_bcf_instsub_final.ll | 2,446
+   p02788                   | s653265412_fla_bcf_instsub_final.ll | 4,948
+   p02814                   | s915631953_fla_bcf_instsub_final.ll | 5,762
+   p02950                   | s864110221_fla_bcf_instsub_final.ll | 3,663
+   p03006                   | s125302006_fla_bcf_instsub_final.ll | 1,865
+   p03111                   | s152042503_fla_bcf_instsub_final.ll | 2,089
+   p03142                   | (Không có file final.ll)            | -
+   p03199                   | s752471056_fla_bcf_instsub_final.ll | 4,315
+   p03261                   | s577603531_fla_bcf_instsub_final.ll | 346
+   p03430                   | s601450783_fla_bcf_instsub_final.ll | 1,948
+   p03434                   | s567580506_fla_bcf_instsub_final.ll | 606
+   p03493                   | s344335879_fla_bcf_instsub_final.ll | 330
+   p03510                   | s583362876_fla_bcf_instsub_final.ll | 2,689
+   p03543                   | s082142762_fla_bcf_instsub_final.ll | 420
+   p03773                   | s799607332_fla_bcf_instsub_final.ll | 140 (Min)
+   p03776                   | s721771429_fla_bcf_instsub_final.ll | 13,804
+   p03835                   | s836003439_fla_bcf_instsub_final.ll | 155
+   p03854                   | s574999050_fla_bcf_instsub_final.ll | 358
+   p04028                   | s626776881_fla_bcf_instsub_final.ll | 1,567
