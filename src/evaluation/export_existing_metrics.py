@@ -34,11 +34,10 @@ def main() -> None:
 
     project_root = Path(__file__).resolve().parents[2]
     campaign_arg = Path(args.campaign)
-    campaign_dir = (
-        campaign_arg
-        if campaign_arg.is_absolute()
-        else project_root / args.result_root / campaign_arg
-    )
+    if campaign_arg.is_absolute() or campaign_arg.is_dir():
+        campaign_dir = campaign_arg
+    else:
+        campaign_dir = project_root / args.result_root / campaign_arg
     campaign_dir = campaign_dir.resolve()
     if not campaign_dir.is_dir():
         raise SystemExit(f"Campaign directory does not exist: {campaign_dir}")

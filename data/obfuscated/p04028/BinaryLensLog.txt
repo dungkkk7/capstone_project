@@ -1,0 +1,925 @@
+[BinaryLens] Asking question about function (sub_401180): 'hàm này có bị obfuscate j không'...
+[BinaryLens] Using model: ag/gemini-3-flash-agent
+[BinaryLens] Waiting for model response...
+Estimated token length of the request: 721
+Client created for URL: http://127.0.0.1:20128
+Body dumped successfully
+Request sent to endpoint: /v1/chat/completions
+
+==================== Q&A ====================
+Question: hàm này có bị obfuscate j không
+
+Answer:
+Hàm bị obfuscate. Dùng Control Flow Flattening và Opaque Predicates. Che giấu thuật toán lũy thừa nhanh $(a1^{a2} \pmod{1000000007})$. Loại bỏ switch-case và điều kiện giả từ `unk_405054`/`unk_405044` để khôi phục logic gốc.
+=============================================
+[BinaryLens] Variable renaming started. This may take a few minutes, please wait...
+[BinaryLens] Using model: ag/gemini-3-flash-agent
+[BinaryLens] Waiting for model response...
+
+========== Model Request: ==========
+System Prompt:
+ 
+You are an expert reverse engineering analyst specializing in analyzing IDA-decompiled C code. 
+You'll be provided with an IDA-decompiled function, and you must fully understand the function's logic.
+
+Task:
+1. Carefully analyze the given function and summarize its purpose and behavior.
+2. Identify and explain key APIs, library functions, system calls, and algorithms used in the function (e.g., VirtualAlloc, CreateFile, socket, memcpy, qsort, AES/RC4, XOR loop, Base64). Explain what each API/function/algorithm is doing specifically in this function's context and why it is used.
+3. Assign short, meaningful, and accurate PascalCase names to all local variables and arguments.
+
+Output format:
+Return your result ONLY as an INI using the following format:
+```ini
+[FunctionInfo]
+summary=Short summarized text explaining what the function does and its overall purpose.
+
+[ApiAndAlgorithmExplanations]
+// List each identified API, library function, or algorithm name and its detailed explanation:
+VirtualAlloc=Allocates executable memory buffer to hold decrypted shellcode payload.
+CreateFileA=Opens file handle to "config.dat" to load configuration settings.
+XOR Decryption=Uses a 1-byte XOR loop with key 0x5A to decrypt the payload in memory.
+
+[RenamedLocals]
+unk1=RenamedLocalVar
+unk2=RenamedArg
+```
+
+
+User Prompt
+__int64 __fastcall sub_401180(int a1_, int a2)
+{
+  int v2; // eax
+  int v3; // eax
+  int v4; // eax
+  int v5; // eax
+  int v7; // [rsp+4h] [rbp-14h]
+  int v9; // [rsp+Ch] [rbp-Ch]
+
+  v9 = 1;
+  v7 = 953862267;
+  while ( 1 )
+  {
+    while ( 1 )
+    {
+      while ( v7 == -1861301099 )
+      {
+        v9 = a1_ * (__int64)v9 % 1000000007;
+        v7 = 1471878503;
+      }
+      if ( v7 != -1670970432 )
+        break;
+      v7 = 953862267;
+    }
+    if ( v7 == -1562287744 )
+      break;
+    switch ( v7 )
+    {
+      case -385346531:
+        a1_ = a1_ * (__int64)a1_ % 1000000007;
+        a2 >>= 1;
+        v5 = 64375373;
+        if ( (unk_405054 < 10) ^ ((((unk_405044 - 1) * unk_405044) & 1) == 0)
+           | (unk_405054 < 10 && (((unk_405044 - 1) * unk_405044) & 1) == 0) )
+        {
+          v5 = -1670970432;
+        }
+        v7 = v5;
+        break;
+      case -203886293:
+        v3 = 1471878503;
+        if ( (a2 & (a2 ^ 0xFFFFFFFE)) != 0 )
+          v3 = -1861301099;
+        v7 = v3;
+        break;
+      case 64375373:
+        a1_ = a1_ * (__int64)a1_ % 1000000007;
+        a2 >>= 1;
+        v7 = -385346531;
+        break;
+      case 953862267:
+        v2 = -1562287744;
+        if ( a2 > 0 )
+          v2 = -203886293;
+        v7 = v2;
+        break;
+      default:
+        v4 = 64375373;
+        if ( (unk_405054 < 10 && (((unk_405044 - 1) * unk_405044) & 1) == 0)
+           | (unk_405054 < 10) ^ ((((unk_405044 - 1) * unk_405044) & 1) == 0) )
+        {
+          v4 = -385346531;
+        }
+        v7 = v4;
+        break;
+    }
+  }
+  return (unsigned int)v9;
+}
+
+====================
+
+Estimated token length of the request: 683
+Client created for URL: http://127.0.0.1:20128
+Body dumped successfully
+Request sent to endpoint: /v1/chat/completions
+
+========== Model Response: ==========
+```ini
+[FunctionInfo]
+summary=Computes modular exponentiation (Base^Exponent % 1000000007) using binary exponentiation algorithm obfuscated via control flow flattening.
+
+[ApiAndAlgorithmExplanations]
+Modular Exponentiation=Computes result by squaring the base and halving the exponent. Modulo is 1000000007.
+Control Flow Flattening=Obfuscates standard loop and conditional structures using state variable switch-cases and opaque predicates.
+
+[RenamedLocals]
+a1_=Base
+a2=Exponent
+v2=NextStateVal
+v3=BranchStateVal
+v4=StateFallback
+v5=StateTransition
+v7=State
+v9=Result
+```
+====================
+
+[BinaryLens] Model response received (took 3.06 sec)
+RenameVariablesFromFile lvar num: (11)
+Processing var: (a1_)
+Renamed (a1_) to (Base)
+Processing var: (a2)
+Renamed (a2) to (Exponent)
+Processing var: (v2)
+Renamed (v2) to (NextStateVal)
+Processing var: (v3)
+Renamed (v3) to (BranchStateVal)
+Processing var: (v4)
+Renamed (v4) to (StateFallback)
+Processing var: (v5)
+Renamed (v5) to (StateTransition)
+Processing var: (v7)
+Renamed (v7) to (State)
+Processing var: (v9)
+Renamed (v9) to (Result)
+[BinaryLens] Successfully renamed 8 variables.
+[BinaryLens] Added 0 inline comments for APIs/algorithms.
+[BinaryLens] Successfully set function comments & API/algorithm annotations.
+We highly recommend renaming all subroutines before analyzing specific functions, as this ensures more accurate renaming and analysis results.
+[BinaryLens] Variable renaming started. This may take a few minutes, please wait...
+[BinaryLens] Using model: ag/gemini-3-flash-agent
+[BinaryLens] Waiting for model response...
+
+========== Model Request: ==========
+System Prompt:
+ 
+You are an expert reverse engineering analyst specializing in analyzing IDA-decompiled C code. 
+You'll be provided with an IDA-decompiled function, and you must fully understand the function's logic.
+
+Task:
+1. Carefully analyze the given function and summarize its purpose and behavior.
+2. Identify and explain key APIs, library functions, system calls, and algorithms used in the function (e.g., VirtualAlloc, CreateFile, socket, memcpy, qsort, AES/RC4, XOR loop, Base64). Explain what each API/function/algorithm is doing specifically in this function's context and why it is used.
+3. Assign short, meaningful, and accurate PascalCase names to all local variables and arguments.
+
+Output format:
+Return your result ONLY as an INI using the following format:
+```ini
+[FunctionInfo]
+summary=Short summarized text explaining what the function does and its overall purpose.
+
+[ApiAndAlgorithmExplanations]
+// List each identified API, library function, or algorithm name and its detailed explanation:
+VirtualAlloc=Allocates executable memory buffer to hold decrypted shellcode payload.
+CreateFileA=Opens file handle to "config.dat" to load configuration settings.
+XOR Decryption=Uses a 1-byte XOR loop with key 0x5A to decrypt the payload in memory.
+
+[RenamedLocals]
+unk1=RenamedLocalVar
+unk2=RenamedArg
+```
+
+
+User Prompt
+__int64 __fastcall main(__int64 a1_, char **a2, char **a3)
+{
+  sub_401400(a1_, a2, a3);
+  return 0;
+}
+
+====================
+
+Estimated token length of the request: 44
+Client created for URL: http://127.0.0.1:20128
+Body dumped successfully
+Request sent to endpoint: /v1/chat/completions
+
+========== Model Response: ==========
+```ini
+[FunctionInfo]
+summary=Program entry point. Forwards command-line arguments and environment pointers to sub_401400. Returns zero.
+
+[ApiAndAlgorithmExplanations]
+sub_401400=Internal function executing core program logic.
+
+[RenamedLocals]
+a1_=Argc
+a2=Argv
+a3=Envp
+```
+====================
+
+[BinaryLens] Model response received (took 2.47 sec)
+RenameVariablesFromFile lvar num: (4)
+Processing var: (a1_)
+Renamed (a1_) to (Argc)
+Processing var: (a2)
+Renamed (a2) to (Argv)
+Processing var: (a3)
+Renamed (a3) to (Envp)
+[BinaryLens] Successfully renamed 3 variables.
+[BinaryLens] Added 1 inline comments for APIs/algorithms.
+[BinaryLens] Successfully set function comments & API/algorithm annotations.
+[BinaryLens] Variable renaming started. This may take a few minutes, please wait...
+[BinaryLens] Using model: ag/gemini-3-flash-agent
+[BinaryLens] Waiting for model response...
+
+========== Model Request: ==========
+System Prompt:
+ 
+You are an expert reverse engineering analyst specializing in analyzing IDA-decompiled C code. 
+You'll be provided with an IDA-decompiled function, and you must fully understand the function's logic.
+
+Task:
+1. Carefully analyze the given function and summarize its purpose and behavior.
+2. Identify and explain key APIs, library functions, system calls, and algorithms used in the function (e.g., VirtualAlloc, CreateFile, socket, memcpy, qsort, AES/RC4, XOR loop, Base64). Explain what each API/function/algorithm is doing specifically in this function's context and why it is used.
+3. Assign short, meaningful, and accurate PascalCase names to all local variables and arguments.
+
+Output format:
+Return your result ONLY as an INI using the following format:
+```ini
+[FunctionInfo]
+summary=Short summarized text explaining what the function does and its overall purpose.
+
+[ApiAndAlgorithmExplanations]
+// List each identified API, library function, or algorithm name and its detailed explanation:
+VirtualAlloc=Allocates executable memory buffer to hold decrypted shellcode payload.
+CreateFileA=Opens file handle to "config.dat" to load configuration settings.
+XOR Decryption=Uses a 1-byte XOR loop with key 0x5A to decrypt the payload in memory.
+
+[RenamedLocals]
+unk1=RenamedLocalVar
+unk2=RenamedArg
+```
+
+
+User Prompt
+int sub_401400()
+{
+  int v0_; // eax
+  __int64 v1; // rcx
+  int v2; // eax
+  __int64 v3; // rcx
+  int v4; // eax
+  __int64 v5; // rcx
+  int v6; // eax
+  int v7; // eax
+  __int64 v8; // rcx
+  int v9; // eax
+  int v10; // eax
+  __int64 v11; // rcx
+  int v12; // eax
+  __int64 v13; // rcx
+  int v14; // eax
+  int v15; // eax
+  int v16; // eax
+  int v17; // eax
+  int v18; // eax
+  int v19; // eax
+  int v20; // eax
+  int v21; // eax
+  __int64 v22; // rcx
+  int v23; // eax
+  int v24; // eax
+  __int64 v25; // rcx
+  int v26; // eax
+  int v27; // eax
+  __int64 v28; // rcx
+  int v29; // eax
+  __int64 v30; // rcx
+  int v31; // eax
+  int v32; // eax
+  int v33; // eax
+  int v34; // eax
+  __int64 v35; // rcx
+  int v36; // eax
+  __int64 v37; // rcx
+  int v38; // eax
+  int v39; // eax
+  int v40; // eax
+  int v41; // eax
+  int v42; // eax
+  __int128 v43; // rtt
+  __int64 v45; // rcx
+  __int64 v46; // rcx
+  __int64 v47; // [rsp+0h] [rbp-40h]
+  int v48; // [rsp+10h] [rbp-30h]
+  int v49; // [rsp+18h] [rbp-28h]
+  int v50; // [rsp+1Ch] [rbp-24h]
+  _DWORD *v51; // [rsp+20h] [rbp-20h]
+  int v52; // [rsp+2Ch] [rbp-14h]
+  char *s; // [rsp+30h] [rbp-10h]
+  int v54; // [rsp+38h] [rbp-8h] BYREF
+  bool v55; // [rsp+3Dh] [rbp-3h]
+  bool v56; // [rsp+3Eh] [rbp-2h]
+  bool v57; // [rsp+3Fh] [rbp-1h]
+
+  __isoc99_scanf(&unk_403008, &v54);
+  s = (char *)calloc(v54 + 1, 1u);
+  __isoc99_scanf(&unk_40300B, s);
+  v52 = strlen(s);
+  free(s);
+  v51 = calloc(2 * (v54 + 1), 4u);
+  *v51 = 1;
+  v50 = 1;
+  v48 = 1630282053;
+  while ( 1 )
+  {
+    while ( 1 )
+    {
+      while ( 1 )
+      {
+        while ( 1 )
+        {
+          while ( 1 )
+          {
+            while ( 1 )
+            {
+              while ( 1 )
+              {
+                while ( 1 )
+                {
+                  while ( 1 )
+                  {
+                    while ( v48 == -2089457879 )
+                    {
+                      ++v49;
+                      v48 = 2013542690;
+                    }
+                    if ( v48 != -2060946959 )
+                      break;
+                    v8 = (int)((v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)) + 1);
+                    v51[v8] -= 1000000007;
+                    v48 = -282456686;
+                  }
+                  if ( v48 != -2041280172 )
+                    break;
+                  v48 = 1748460776;
+                }
+                if ( v48 != -1978682005 )
+                  break;
+                v18 = -1548998738;
+                if ( v56 )
+                  v18 = 958180336;
+                v48 = v18;
+              }
+              if ( v48 != -1887600905 )
+                break;
+              v56 = v49 < v50;
+              v17 = 1036855432;
+              if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+                 | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+              {
+                v17 = -1978682005;
+              }
+              v48 = v17;
+            }
+            if ( v48 != -1844687063 )
+              break;
+            v25 = (int)(v49 - 1779383957 + 1779383956 + (v54 + 1) * ~(~v50 | 0xFFFFFFFE));
+            v51[v25] -= 1000000007;
+            v48 = -1682501732;
+          }
+          if ( v48 != -1811478955 )
+            break;
+          v32 = -1328106445;
+          if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+             | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+          {
+            v32 = -446067485;
+          }
+          v48 = v32;
+        }
+        if ( v48 != -1682501732 )
+          break;
+        v48 = 306564229;
+      }
+      if ( v48 != -1577127130 )
+        break;
+      ++v50;
+      v48 = 1630282053;
+    }
+    if ( v48 == -1572610354 )
+      break;
+    switch ( v48 )
+    {
+      case -1548998738:
+        v40 = 570952718;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v40 = -1043951082;
+        }
+        v48 = v40;
+        break;
+      case -1469893157:
+        v21 = -891389718;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v21 = -634722716;
+        }
+        v48 = v21;
+        break;
+      case -1443499165:
+        v33 = 820509166;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v33 = -145463439;
+        }
+        v48 = v33;
+        break;
+      case -1328106445:
+        v48 = -1811478955;
+        break;
+      case -1287985967:
+        v15 = 525863104;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 91 + 90) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 91 + 90) * unk_40504C) & 1) == 0) )
+        {
+          v15 = -645463778;
+        }
+        v48 = v15;
+        break;
+      case -1195876639:
+        memset(&v51[(v54 + 1) * ~(~v50 | 0xFFFFFFFE)], 0, 4LL * (v54 + 1));
+        v48 = 539257070;
+        break;
+      case -1186427724:
+        v39 = 1828288486;
+        if ( (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | ((unsigned __int8)~(unk_40505C < 10) ^ (unsigned __int8)~((((unk_40504C - 1) * unk_40504C) & 1) == 0)) & 1 )
+        {
+          v39 = -2041280172;
+        }
+        v48 = v39;
+        break;
+      case -1096932201:
+        v48 = -1577127130;
+        break;
+      case -1043951082:
+        v41 = 570952718;
+        if ( (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | ((unsigned __int8)~(unk_40505C < 10) ^ (unsigned __int8)~((((unk_40504C - 1) * unk_40504C) & 1) == 0)) & 1 )
+        {
+          v41 = -1096932201;
+        }
+        v48 = v41;
+        break;
+      case -891389718:
+        v46 = (int)((v54 + 1) * ~(~v50 | 0xFFFFFFFE) - (1 - v49));
+        v51[v46] += v51[(v54 + 1) * ~(~(v50 - 1728084835 + 1728084834) | 0xFFFFFFFE) + v49];
+        v48 = -634722716;
+        break;
+      case -839985399:
+        v48 = 1132636955;
+        break;
+      case -718930754:
+        v3 = (int)((v54 + 1) * ~(~v50 | 0xFFFFFFFE));
+        v51[v3] -= 1000000007;
+        v48 = -839985399;
+        break;
+      case -696480675:
+        v10 = 1030865427;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v10 = -477745081;
+        }
+        v48 = v10;
+        break;
+      case -645463778:
+        v48 = 335933103;
+        break;
+      case -634722716:
+        v22 = (int)(v49 - 1 + (v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)));
+        v51[v22] += v51[v49 + (v54 + 1) * ~(~(v50 - 1) | 0xFFFFFFFE)];
+        v57 = v51[v49 - 251616272 + 251616271 + (v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE))] >= 1000000007;
+        v23 = -891389718;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v23 = -157850862;
+        }
+        v48 = v23;
+        break;
+      case -580489979:
+        v13 = (int)((v54 + 1) * ~(~v50 | 0xFFFFFFFE) + 1);
+        v51[v13] -= 1000000007;
+        v48 = 1261244216;
+        break;
+      case -477745081:
+        v48 = 490372822;
+        break;
+      case -446067485:
+        v48 = -1443499165;
+        break;
+      case -429346387:
+        v48 = 650562467;
+        break;
+      case -282456686:
+        v48 = 1925901378;
+        break;
+      case -157850862:
+        v24 = -1682501732;
+        if ( v57 )
+          v24 = -1844687063;
+        v48 = v24;
+        break;
+      case -145463439:
+        v34 = 820509166;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v34 = 2119868713;
+        }
+        v48 = v34;
+        break;
+      case -45094259:
+        v37 = (int)(v49 + 1 + (v54 + 1) * ~(~v50 | 0xFFFFFFFE));
+        v51[v37] = v51[v37] - 1550930846 + 550930839;
+        v48 = 1529147812;
+        break;
+      case 220024461:
+        v48 = -1469893157;
+        break;
+      case 306564229:
+        v26 = -429346387;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v26 = 650562467;
+        }
+        v48 = v26;
+        break;
+      case 335933103:
+        v49 = 1;
+        v48 = 2013542690;
+        break;
+      case 490372822:
+        v11 = (int)((v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)) + 1);
+        v51[v11] += v51[(v54 + 1) * ~(~(v50 - 1) | 0xFFFFFFFE)];
+        v12 = 1261244216;
+        if ( (int)v51[(v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)) + 1] >= 1000000007 )
+          v12 = -580489979;
+        v48 = v12;
+        break;
+      case 525863104:
+        v48 = -1287985967;
+        break;
+      case 539257070:
+        v1 = (int)((v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)));
+        v51[v1] += v51[(v54 + 1) * ~(~(v50 - 1) | 0xFFFFFFFE)];
+        v2 = -839985399;
+        if ( (int)v51[(v54 + 1) * ~(~v50 | 0xFFFFFFFE)] >= 1000000007 )
+          v2 = -718930754;
+        v48 = v2;
+        break;
+      case 567858848:
+        v7 = -282456686;
+        if ( v55 )
+          v7 = -2060946959;
+        v48 = v7;
+        break;
+      case 570952718:
+        v48 = -1043951082;
+        break;
+      case 650562467:
+        v27 = -429346387;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v27 = 1599460721;
+        }
+        v48 = v27;
+        break;
+      case 677119094:
+        v5 = (int)((v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)) + 1);
+        v51[v5] += v51[(v54 + 1) * ((v50 - 1194936006 + 1194936005) & ((v50 - 1194936006 + 1194936005) ^ 0xFFFFFFFE))];
+        v55 = v51[(v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)) + 1] >= 1000000007;
+        v6 = 969832090;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v6 = 567858848;
+        }
+        v48 = v6;
+        break;
+      case 820509166:
+        v48 = -145463439;
+        break;
+      case 923098852:
+        v30 = (int)(v49 + 1 + (v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)));
+        v51[v30] -= 1000000007;
+        v48 = 1764259532;
+        break;
+      case 958180336:
+        v19 = 1387614846;
+        if ( (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v19 = 990152874;
+        }
+        v48 = v19;
+        break;
+      case 969832090:
+        v45 = (int)((v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE)) + 1);
+        v51[v45] += v51[(v54 + 1) * ~(~(v50 - 199243773 + 199243772) | 0xFFFFFFFE)];
+        v48 = 677119094;
+        break;
+      case 990152874:
+        v20 = 1387614846;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v20 = 220024461;
+        }
+        v48 = v20;
+        break;
+      case 1030865427:
+        v48 = -696480675;
+        break;
+      case 1036855432:
+        v48 = -1887600905;
+        break;
+      case 1122094167:
+        v35 = (int)((v54 + 1) * ~(~v50 | 0xFFFFFFFE) + v49 + 1);
+        v51[v35] += v51[v49
+                      + (v54 + 1) * ((v50 - 1334048713 + 1334048712) & ((v50 - 1334048713 + 1334048712) ^ 0xFFFFFFFE))];
+        v36 = 1529147812;
+        if ( (int)v51[v49 + 1 + (v54 + 1) * ~(~v50 | 0xFFFFFFFE)] >= 1000000007 )
+          v36 = -45094259;
+        v48 = v36;
+        break;
+      case 1132636955:
+        v48 = 1628503831;
+        break;
+      case 1261244216:
+        v14 = 525863104;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v14 = -1287985967;
+        }
+        v48 = v14;
+        break;
+      case 1387614846:
+        v48 = 990152874;
+        break;
+      case 1529147812:
+        v38 = 1828288486;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v38 = -1186427724;
+        }
+        v48 = v38;
+        break;
+      case 1549170262:
+        v28 = (int)(v49 + 1 + (v54 + 1) * ~(~v50 | 0xFFFFFFFE));
+        v51[v28] += v51[v49 + (v54 + 1) * ~(~(v50 - 1) | 0xFFFFFFFE)];
+        v29 = 1764259532;
+        if ( (int)v51[v49 + 1 + (v54 + 1) * (v50 & (v50 ^ 0xFFFFFFFE))] >= 1000000007 )
+          v29 = 923098852;
+        v48 = v29;
+        break;
+      case 1599460721:
+        v48 = 1549170262;
+        break;
+      case 1628503831:
+        v4 = 969832090;
+        if ( (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | ((unsigned __int8)~(unk_40505C < 10) ^ (unsigned __int8)~((((unk_40504C - 1) * unk_40504C) & 1) == 0)) & 1 )
+        {
+          v4 = 677119094;
+        }
+        v48 = v4;
+        break;
+      case 1630282053:
+        v0_ = -1572610354;
+        if ( v50 <= v54 )
+          v0_ = -1195876639;
+        v48 = v0_;
+        break;
+      case 1748460776:
+        v48 = -2089457879;
+        break;
+      case 1764259532:
+        v31 = -1328106445;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v31 = -1811478955;
+        }
+        v48 = v31;
+        break;
+      case 1828288486:
+        v48 = -1186427724;
+        break;
+      case 1925901378:
+        v9 = 1030865427;
+        if ( (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v9 = -696480675;
+        }
+        v48 = v9;
+        break;
+      case 2013542690:
+        v16 = 1036855432;
+        if ( (unk_40505C < 10) ^ ((((unk_40504C - 1) * unk_40504C) & 1) == 0)
+           | (unk_40505C < 10 && (((unk_40504C - 1) * unk_40504C) & 1) == 0) )
+        {
+          v16 = -1887600905;
+        }
+        v48 = v16;
+        break;
+      default:
+        v48 = 1122094167;
+        break;
+    }
+  }
+  v47 = (int)v51[v52 + (v54 + 1) * (v54 & (v54 ^ 0xFFFFFFFE))];
+  v42 = sub_4013E0(2);
+  v43 = (int)sub_401180(v42, v52) * v47;
+  return printf("%i\n", (unsigned int)(v43 % 1000000007));
+}
+
+====================
+
+Estimated token length of the request: 6359
+Client created for URL: http://127.0.0.1:20128
+Body dumped successfully
+Request sent to endpoint: /v1/chat/completions
+
+========== Model Response: ==========
+```ini
+[FunctionInfo]
+summary=Reads an integer N and a string of length K. Computes the binomial coefficient C(N, K) modulo 1000000007 using a space-optimized dynamic programming rolling array, multiplies it by a modular exponentiation result, and prints the product. The function is heavily obfuscated using control flow flattening.
+
+[ApiAndAlgorithmExplanations]
+calloc=Allocates memory for the input string buffer and the dynamic programming table.
+free=Releases the temporary input string buffer memory.
+strlen=Measures the length of the input string to determine the K parameter.
+__isoc99_scanf=Reads N and the input string from standard input.
+printf=Outputs the final computed modular arithmetic result to standard output.
+Control Flow Flattening=Obfuscates execution flow using a state variable loop-switch mechanism to hinder static analysis.
+Dynamic Programming Binomial Coefficient=Computes combination C(N, K) modulo 1000000007 using a rolling array of size 2*(N+1) for space optimization.
+
+[RenamedLocals]
+v54=InputN
+s=InputString
+v52=StringLengthK
+v51=DpTable
+v50=OuterLoopIdx
+v49=InnerLoopIdx
+v48=StateVar
+v47=BinomialCoefficient
+v42=BaseValue
+v43=ResultValue
+v55=IsGreaterOrEqual
+v56=IsInnerLessThanOuter
+v57=IsDpValGreaterOrEqual
+```
+====================
+
+[BinaryLens] Model response received (took 6.63 sec)
+RenameVariablesFromFile lvar num: (58)
+Processing var: (v0_)
+WARNING: Var not found in response, skipping it: (v0_)
+Processing var: (v1)
+WARNING: Var not found in response, skipping it: (v1)
+Processing var: (v2)
+WARNING: Var not found in response, skipping it: (v2)
+Processing var: (v3)
+WARNING: Var not found in response, skipping it: (v3)
+Processing var: (v4)
+WARNING: Var not found in response, skipping it: (v4)
+Processing var: (v5)
+WARNING: Var not found in response, skipping it: (v5)
+Processing var: (v6)
+WARNING: Var not found in response, skipping it: (v6)
+Processing var: (v7)
+WARNING: Var not found in response, skipping it: (v7)
+Processing var: (v8)
+WARNING: Var not found in response, skipping it: (v8)
+Processing var: (v9)
+WARNING: Var not found in response, skipping it: (v9)
+Processing var: (v10)
+WARNING: Var not found in response, skipping it: (v10)
+Processing var: (v11)
+WARNING: Var not found in response, skipping it: (v11)
+Processing var: (v12)
+WARNING: Var not found in response, skipping it: (v12)
+Processing var: (v13)
+WARNING: Var not found in response, skipping it: (v13)
+Processing var: (v14)
+WARNING: Var not found in response, skipping it: (v14)
+Processing var: (v15)
+WARNING: Var not found in response, skipping it: (v15)
+Processing var: (v16)
+WARNING: Var not found in response, skipping it: (v16)
+Processing var: (v17)
+WARNING: Var not found in response, skipping it: (v17)
+Processing var: (v18)
+WARNING: Var not found in response, skipping it: (v18)
+Processing var: (v19)
+WARNING: Var not found in response, skipping it: (v19)
+Processing var: (v20)
+WARNING: Var not found in response, skipping it: (v20)
+Processing var: (v21)
+WARNING: Var not found in response, skipping it: (v21)
+Processing var: (v22)
+WARNING: Var not found in response, skipping it: (v22)
+Processing var: (v23)
+WARNING: Var not found in response, skipping it: (v23)
+Processing var: (v24)
+WARNING: Var not found in response, skipping it: (v24)
+Processing var: (v25)
+WARNING: Var not found in response, skipping it: (v25)
+Processing var: (v26)
+WARNING: Var not found in response, skipping it: (v26)
+Processing var: (v27)
+WARNING: Var not found in response, skipping it: (v27)
+Processing var: (v28)
+WARNING: Var not found in response, skipping it: (v28)
+Processing var: (v29)
+WARNING: Var not found in response, skipping it: (v29)
+Processing var: (v30)
+WARNING: Var not found in response, skipping it: (v30)
+Processing var: (v31)
+WARNING: Var not found in response, skipping it: (v31)
+Processing var: (v32)
+WARNING: Var not found in response, skipping it: (v32)
+Processing var: (v33)
+WARNING: Var not found in response, skipping it: (v33)
+Processing var: (v34)
+WARNING: Var not found in response, skipping it: (v34)
+Processing var: (v35)
+WARNING: Var not found in response, skipping it: (v35)
+Processing var: (v36)
+WARNING: Var not found in response, skipping it: (v36)
+Processing var: (v37)
+WARNING: Var not found in response, skipping it: (v37)
+Processing var: (v38)
+WARNING: Var not found in response, skipping it: (v38)
+Processing var: (v39)
+WARNING: Var not found in response, skipping it: (v39)
+Processing var: (v40)
+WARNING: Var not found in response, skipping it: (v40)
+Processing var: (v41)
+WARNING: Var not found in response, skipping it: (v41)
+Processing var: (v42)
+Renamed (v42) to (BaseValue)
+Processing var: (v43)
+Renamed (v43) to (ResultValue)
+Processing var: (v45)
+WARNING: Var not found in response, skipping it: (v45)
+Processing var: (v46)
+WARNING: Var not found in response, skipping it: (v46)
+Processing var: (v47)
+Renamed (v47) to (BinomialCoefficient)
+Processing var: (v48)
+Renamed (v48) to (StateVar)
+Processing var: (v49)
+Renamed (v49) to (InnerLoopIdx)
+Processing var: (v50)
+Renamed (v50) to (OuterLoopIdx)
+Processing var: (v51)
+Renamed (v51) to (DpTable)
+Processing var: (v52)
+Renamed (v52) to (StringLengthK)
+Processing var: (s)
+Renamed (s) to (InputString)
+Processing var: (v54)
+Renamed (v54) to (InputN)
+Processing var: (v55)
+Renamed (v55) to (IsGreaterOrEqual)
+Processing var: (v56)
+Renamed (v56) to (IsInnerLessThanOuter)
+Processing var: (v57)
+Renamed (v57) to (IsDpValGreaterOrEqual)
+[BinaryLens] Successfully renamed 13 variables.
+[BinaryLens] Added 7 inline comments for APIs/algorithms.
+[BinaryLens] Successfully set function comments & API/algorithm annotations.
+We highly recommend renaming all subroutines before analyzing specific functions, as this ensures more accurate renaming and analysis results.

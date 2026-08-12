@@ -1,6 +1,6 @@
-# Pipeline Khôi Phục Mã Nguồn C11 Từ Binary Obfuscate (OLLVM) Bằng LLVM Pass, LLM & AFL++ Differential Fuzzing
+# Pipeline Khôi Phục Mã Nguồn C Từ Binary Obfuscate (OLLVM) Bằng LLVM Pass, LLM & AFL++ Differential Fuzzing
 
-Dự án này xây dựng một hệ thống khôi phục mã nguồn C11 tự động từ các file nhị phân Linux (ELF x86_64) bị làm rối (obfuscate) bằng framework OLLVM (Control Flow Flattening - CFF, Bogus Control Flow - BCF, Mixed Boolean Arithmetic - MBA).
+Dự án này xây dựng một hệ thống khôi phục mã nguồn C tự động từ các file nhị phân Linux (ELF x86_64) bị làm rối (obfuscate) bằng framework OLLVM (Control Flow Flattening - CFF, Bogus Control Flow - BCF, Mixed Boolean Arithmetic - MBA).
 
 Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass 010–100** (Làm sạch IR / Brightening), **LLVM-to-C Transpiler**, **Mô hình ngôn ngữ lớn LLM (Gemini)** với **5 Chế độ thực thi (5 Pipeline Flows)**, và bộ kiểm định tương đương ngữ nghĩa bằng **AFL++ Mutation Hook Differential Fuzzing (1,000 mutations)**.
 
@@ -29,7 +29,7 @@ Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass
 - **Đầu vào**: File binary ELF x86_64 đã bị obfuscate nặng bởi OLLVM (chứa CFF dispatcher switch, bogus control flow, và các biểu thức MBA phức tạp).
 - **Đầu ra**: 
   1. Mã LLVM IR đã deobfuscate làm sạch (`*_final.ll`).
-  2. Mã nguồn C11 độc lập tiêu chuẩn (`*_recovered.c`), giữ nguyên 100% ngữ nghĩa logic ban đầu.
+  2. Mã nguồn C độc lập tiêu chuẩn (`*_recovered.c`), giữ nguyên 100% ngữ nghĩa logic ban đầu.
   3. Báo cáo đánh giá Metrics tự động dạng CSV (`metrics.csv`).
 
 ### 📐 Sơ đồ kiến trúc tổng thể (Pipeline Architecture)
@@ -66,7 +66,7 @@ flowchart TD
         Mode1 & Mode2 & Mode3 & Mode4 & Mode5 --> LLM[Vertex AI / Gemini Model]
     end
 
-    LLM --> E[Recovered C11 Code]
+    LLM --> E[Recovered C Code]
 
     subgraph Verification_Engine ["AFL++ Mutation Hook Verification"]
         E --> Comp[Compile Recovered C -> Binary]
@@ -108,8 +108,8 @@ Bộ pass LLVM tùy biến được thiết kế chạy tuần tự trong `src/l
 | **Pass 060** | `brighten_060_extern_call_bridge` | Nối cầu (bridge) các lời gọi thư viện ngoại vi (`printf`, `scanf`, `malloc`, `free`, `memcpy`, v.v.) về hàm C tiêu chuẩn. |
 | **Pass 070** | `brighten_070_global_data_recovery` | Khôi phục mảng dữ liệu toàn cục, hằng số và các chuỗi ký tự literal (format string). |
 | **Pass 080** | `brighten_080_type_reconstruction` | Tái tạo hệ thống kiểu dữ liệu gốc (Pointer, Struct, Array, Integer Widths, Signedness). |
-| **Pass 090** | `brighten_090_native_cleanup` | Tiêu hủy các wrapper rác của McSema, thực thi Dead Code Elimination (DCE) và Sparse Conditional Constant Propagation (SCCP). |
-| **Pass 095** | `deobfuscate_095_deobfus_ollvm` | **Hạt nhân deobfuscate OLLVM**: Kết hợp Pattern Matching và Z3 SMT Solver để tiêu hủy 100% OLLVM BCF (opaque predicates), rút gọn MBA algebra, và tái cấu trúc CFF Dispatcher Loop thành control flow phẳng chuẩn. |
+| **Pass 090** | `brighten_090_native_cleanup` | Hạ State ABI và guest-frame đã được chứng minh an toàn, loại wrapper McSema dư thừa, rồi chạy các cleanup LLVM. Các carrier `undef`/`poison` chưa xác định được giữ nguyên thay vì tự suy diễn giá trị. |
+| **Pass 095** | `deobfuscate_095_deobfus_ollvm` | **Hạt nhân deobfuscate OLLVM**: kết hợp Pattern Matching và Z3 để rút gọn MBA/opaque predicate và phục hồi dispatcher khi đủ điều kiện chứng minh. Function chứa PHI carrier `undef`/`poison` không bị deflatten; lượt 095 sau delift chạy MBA-only bằng `-095-disable-deflatten` để tránh biến đổi lại CFG đã được rewrite một phần. |
 | **Pass 100** | `brighten_100_delift_bundle` | Thực thi bundle delifting tuần tự qua các giai đoạn `.01-verified-input.ll` $\rightarrow$ `.02-pointer-opt.ll` $\rightarrow$ `.03-storage-delift.ll` $\rightarrow$ `.04-storage-o3.ll` $\rightarrow$ `.05-unpinned.ll` và tạo file IR cuối cùng `*_final.ll`. |
 
 ---
@@ -128,16 +128,17 @@ Bộ pass LLVM tùy biến được thiết kế chạy tuần tự trong `src/l
 Production pseudocode được sinh bằng LLVM2C. Bốn representation mode của
 `src/main.py` là `clean_ir_and_pseudocode`, `clean_pseudocode`, `clean_ir`
 và `raw_ir`. Evaluation runner áp repair policy lên các representation đó để
-tạo F1–F5; report generator tạo F6 derived:
+tạo FL1–FL5; report generator tạo FL6 derived. **FL3 là flow chính được dùng
+làm cấu hình đại diện trong phân tích của đề tài.**
 
 | Flow | Evidence | Error context |
 |---|---|---|
-| F1 Full | Clean IR + LLVM2C pseudocode | Có, iterative |
-| F2 No error context | Clean IR + LLVM2C pseudocode | Không, one-call |
-| F3 No pseudocode | Clean IR | Có, iterative |
-| F4 No direct Clean IR | LLVM2C pseudocode | Có, iterative |
-| F5 Raw IR baseline | Raw IR | Có, iterative |
-| F6 Raw IR no error context | Raw IR | Không, derived từ first provider call của F5 |
+| FL1 Full | Clean IR + LLVM2C pseudocode | Có, iterative |
+| **FL3 Main** | **Clean IR** | **Có, iterative** |
+| FL2 No error context | Clean IR + LLVM2C pseudocode | Không, one-call |
+| FL4 No direct Clean IR | LLVM2C pseudocode | Có, iterative |
+| FL5 Raw IR baseline | Raw IR | Có, iterative |
+| FL6 Raw IR no error context | Raw IR | Không, derived từ first provider call của FL5 |
 
 Compile repair và behavioral repair được log thành hai loại case/round riêng.
 Behavioral feedback chỉ dùng counterexample đã replay tái hiện được. Original C
@@ -166,6 +167,23 @@ Bộ xác minh tương đương ngữ nghĩa nằm tại [`src/fuzzing_equi_chec
    - Mismatch chỉ trở thành final behavioral failure sau khi counterexample
      replay tái hiện được.
 
+#### Trạng thái semantic regression sau bản sửa 2026-08-01
+
+Toàn bộ 40 artifact được rebuild từ IR của pipeline
+`pipeline_20260801_123853` bằng code sau bản sửa và chạy differential execution
+trên 1.000 valid-domain input cho mỗi case:
+
+| Chỉ số | Kết quả |
+|---|---:|
+| Case semantic PASS | **40/40** |
+| Tổng lượt differential execution | **40.000** |
+| Output/status mismatch | **0** |
+| Asymmetric crash | **0** |
+
+Shared crash hoặc shared timeout chỉ được chấp nhận khi observation tuple của
+hai binary khớp theo behavioral oracle ở trên. Kết quả native-contract là một
+chỉ số cấu trúc riêng và không được dùng thay cho semantic equivalence.
+
 ---
 
 ### Phase 6: Evaluation Framework & Report Exporter
@@ -175,8 +193,17 @@ compilation attempt, fuzzing campaign, counterexample và repair case. Trước 
 aggregate, nó kiểm tra flow invariants, compile/fuzz relationships, status
 semantics và xuất `data_validation_errors.csv`; dữ liệu sai không bị tự sửa.
 
+Source Quality chỉ được chấm sau khi Candidate C đã vượt qua behavioral oracle
+và được chấp nhận thành Recovered C Source. Evaluator mặc định dùng
+`cx/gpt-5.5` qua cùng `API_BASE_URL` với recovery, chấm tuyệt đối theo thang 1–5
+trên Variables, Loops, Conditions, Logic flow và Structural integrity. Kết quả
+được cache kèm SHA-256 của source trong `readability_evaluation.json` (FL1–FL5)
+hoặc `readability_evaluation_f6.json` (FL6); cache sai source hash sẽ không được
+dùng. Điểm này chỉ đo khả năng đọc/phân tích mã C-like, không được dùng để kết
+luận correctness.
+
 Output gồm per-sample/per-attempt CSV, raw JSONL, metric tables, paired
-ablation, statistical tests, Markdown, LaTeX, HTML/dashboard và 17 figure ở cả
+ablation, statistical tests, Markdown, LaTeX, HTML/dashboard và 18 figure ở cả
 PNG/SVG/PDF. `export_existing_metrics.py` có thể regenerate toàn bộ report từ
 artifact cũ mà không gọi lại LLM hoặc fuzzing.
 
@@ -192,7 +219,8 @@ Toàn bộ cấu hình Model và Prompt được quản lý tập trung tại fi
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL & SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL = "gemini-2.5-flash"          # Tên model Vertex AI / Gemini
+MODEL = "ag/gemini-3-flash-agent"  # Model phục hồi mã nguồn
+READABILITY_MODEL = "cx/gpt-5.5"   # Model chấm Source Quality
 TEMPERATURE = 0.1                   # Độ sáng tạo (0.0 = định hình, 1.0 = sáng tạo)
 MAX_REPAIR_ITERATIONS = 5           # Số vòng lặp sửa lỗi tối đa
 FUZZ_ITERATIONS = 1000              # Số mutation AFL++ cho semantic check
@@ -200,7 +228,7 @@ FUZZ_ITERATIONS = 1000              # Số mutation AFL++ cho semantic check
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPT (Dùng chung cho cả 4 Mode)
 # ─────────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = r"""You are a senior reverse engineer and C11 compiler engineer..."""
+SYSTEM_PROMPT = r"""You are a senior reverse engineer and C compiler engineer..."""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMPT TEMPLATES CHO 4 MODE
@@ -254,59 +282,72 @@ python3 src/main.py data/custom_dataset.csv llm-recovery
 ### 2. Chạy Chiến Dịch Đánh Giá Song Song — 6 Flows (`run_experiment.py`) ⭐ Khuyên Dùng
 
 Đây là kịch bản thực nghiệm chính. Runner thực thi **5 flow độc lập
-(F1 → F5)** cho toàn bộ tập dữ liệu; framework báo cáo bổ sung **F6** bằng
-cách lấy checkpoint ở lần gọi provider đầu tiên của F5. Vì vậy, một chiến
-dịch 40 mẫu thực hiện 200 flow-run độc lập và tạo 40 record F6 derived, không
+(FL1 → FL5)** cho toàn bộ tập dữ liệu; framework báo cáo bổ sung **FL6** bằng
+cách lấy checkpoint ở lần gọi provider đầu tiên của FL5. Vì vậy, một chiến
+dịch 40 mẫu thực hiện 200 flow-run độc lập và tạo 40 record FL6 derived, không
 phải 240 lần gọi pipeline độc lập. Runner hỗ trợ resume và tự động xoay vùng
 Vertex AI:
 
 ```bash
-# Chạy chiến dịch đầy đủ (40 cases × 5 independent flows = 200 tasks)
-python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3
+# Chạy chiến dịch mới đầy đủ (40 cases × 5 independent flows = 200 tasks)
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv \
+    --fuzz-iterations=1000 \
+    --max-workers=10 \
+    --readability-model=cx/gpt-5.5 \
+    --readability-workers=10
 
-# Nếu bị gián đoạn, tiếp tục từ vị trí bị dừng:
-python3 src/evaluation/run_experiment.py data/custom_dataset.csv --max-workers=3 --resume eval_20260728_124405
+# Chỉ resume khi code, model, prompt, contract và fuzz config không đổi:
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv \
+    --fuzz-iterations=1000 \
+    --max-workers=10 \
+    --resume eval_YYYYMMDD_HHMMSS
 
 # Chạy thử nhanh N cases đầu tiên:
 python3 src/evaluation/run_experiment.py data/custom_dataset.csv --pilot=3 --max-workers=3
 ```
 
-#### Định Nghĩa 6 Flows (F1 → F6)
+#### Định Nghĩa 6 Flows (FL1 → FL6)
 
 `Error context` là toàn bộ compiler feedback và behavioral
 counterexample feedback dùng cho các vòng sửa tiếp theo.
 
 | Flow | Evidence ban đầu gửi vào LLM | Error context / repair | Nguồn record | Mục đích |
 |:---:|:---|:---:|:---:|:---|
-| **F1 — FULL** | Clean IR + LLVM2C pseudocode | Có, iterative | Chạy độc lập | Cấu hình đầy đủ |
-| **F2 — NO_ERROR_CONTEXT** | Clean IR + LLVM2C pseudocode | Không, đúng 1 provider call | Chạy độc lập | Đo tác dụng của error context so với F1 |
-| **F3 — NO_PSEUDOCODE** | Clean IR | Có, iterative | Chạy độc lập | Đo tác dụng của LLVM2C pseudocode so với F1 |
-| **F4 — NO_DIRECT_CLEAN_IR** | LLVM2C pseudocode | Có, iterative | Chạy độc lập | Đo tác dụng của Clean IR trực tiếp so với F1 |
-| **F5 — RAW_IR_BASELINE** | Raw IR | Có, iterative | Chạy độc lập | Đo tác dụng của deobfuscation/representation |
-| **F6 — RAW_IR_NO_ERROR_CONTEXT_DERIVED** | Raw IR | Không, đúng 1 provider call | Derived từ lần gọi provider đầu tiên của F5 | Đo tác dụng của error context trên Raw IR |
+| **FL1 — FULL** | Clean IR + LLVM2C pseudocode | Có, iterative | Chạy độc lập | Cấu hình đầy đủ |
+| **FL2 — NO_ERROR_CONTEXT** | Clean IR + LLVM2C pseudocode | Không, đúng 1 provider call | Chạy độc lập | Đo tác dụng của error context so với FL1 |
+| **FL3 — MAIN / NO_PSEUDOCODE** | Clean IR | Có, iterative | Chạy độc lập | **Cấu hình chính; đo baseline Clean IR trực tiếp** |
+| **FL4 — NO_DIRECT_CLEAN_IR** | LLVM2C pseudocode | Có, iterative | Chạy độc lập | Đo tác dụng của Clean IR trực tiếp so với FL1 |
+| **FL5 — RAW_IR_BASELINE** | Raw IR | Có, iterative | Chạy độc lập | Đo tác dụng của deobfuscation/representation |
+| **FL6 — RAW_IR_NO_ERROR_CONTEXT_DERIVED** | Raw IR | Không, đúng 1 provider call | Derived từ lần gọi provider đầu tiên của FL5 | Đo tác dụng của error context trên Raw IR |
 
-F6 không tính retry do `MAX_TOKENS`, không lấy compiler/counterexample
+FL6 không tính retry do `MAX_TOKENS`, không lấy compiler/counterexample
 feedback và không lấy candidate ở vòng sau. Nếu artifact của checkpoint đầu
 không đủ, record được đánh dấu `CANCELLED`; framework không tự đoán dữ liệu.
-Do F6 dùng lại checkpoint của F5, F5–F6 là paired derived comparison, không
+Do FL6 dùng lại checkpoint của FL5, FL5–FL6 là paired derived comparison, không
 được mô tả như hai chiến dịch độc lập.
 
-#### Kết Quả Canonical E2E Hiện Tại
+#### Kết Quả Executable Availability Hiện Tại
 
-Canonical E2E dùng toàn bộ mẫu eligible trong mẫu số, nên generation fail,
-compile fail và `CANCELLED` không bị loại khỏi denominator.
+Executable availability ở đây chỉ đo recovered C có tạo được executable để chạy, dùng
+toàn bộ mẫu eligible trong mẫu số; không kiểm tra semantic output. Generation
+fail, compile fail và `CANCELLED` không bị loại khỏi denominator. Semantic /
+behavioral correctness được báo cáo riêng bằng Canonical E2E. Số liệu dưới đây
+lấy từ canonical report `experiment_20260801_182616` gồm 200 run độc lập
+FL1–FL5 và 40 record FL6 derived; validation ghi nhận 0 error. Campaign dùng
+model `ag/gemini-3-flash-agent`, 1.000 fuzz iteration và ghi nhận Git commit
+`c7675ca0b5105a52a987d3bd5c4049be701aefdd`.
 
-| Flow | Accepted behavioral PASS / eligible | Canonical E2E |
+| Flow | Executable / eligible | Executable availability |
 |:---:|:---:|:---:|
-| F1 (Full) | 31/40 | **77.5%** |
-| F2 (No error context) | 21/31 | 67.7% |
-| F3 (No pseudocode) | 32/40 | **80.0%** |
-| F4 (No direct Clean IR) | 32/40 | **80.0%** |
-| F5 (Raw IR iterative) | 25/40 | 62.5% |
-| F6 (Raw IR one-call, derived) | 7/40 | 17.5% |
+| FL1 (Full) | 37/40 | **92.5%** |
+| FL2 (No error context) | 30/40 | 75.0% |
+| **FL3 (Main; No pseudocode)** | **37/40** | **92.5%** |
+| FL4 (No direct Clean IR) | 40/40 | **100.0%** |
+| FL5 (Raw IR iterative) | 38/40 | 95.0% |
+| FL6 (Raw IR one-call, derived) | 23/40 | 57.5% |
 
 Không cộng sáu hàng thành một “overall pass rate”: chúng là các cấu hình
-paired trên cùng dataset, và F6 còn là checkpoint derived từ F5.
+paired trên cùng dataset, và FL6 còn là checkpoint derived từ FL5.
 
 ### 3. Chạy Pipeline Đơn Tuần Tự theo Mode (`src/main.py`)
 
@@ -316,21 +357,21 @@ Dùng khi muốn chạy tuần tự từng binary với một mode cụ thể (k
 # Chạy toàn bộ dataset với mode mặc định (Clean IR + LLVM2C pseudocode)
 python3 src/main.py data/custom_dataset.csv llm-recovery
 
-# Representation của F4 — LLVM2C pseudocode (không kèm Clean IR)
+# Representation của FL4 — LLVM2C pseudocode (không kèm Clean IR)
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_pseudocode
 
-# Representation của F1/F2 — LLVM2C pseudocode + Clean IR
+# Representation của FL1/FL2 — LLVM2C pseudocode + Clean IR
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir_and_pseudocode
 
-# Representation của F5/F6 — Raw IR trực tiếp vào LLM
+# Representation của FL5/FL6 — Raw IR trực tiếp vào LLM
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=raw_ir
 
-# Representation của F3 — Clean IR trực tiếp vào LLM
+# Representation của FL3 — Clean IR trực tiếp vào LLM
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir
 ```
 
 `--mode` chỉ chọn representation; nó không tự biến một lần chạy đơn thành
-flow ablation đầy đủ với đúng repair policy và provenance của F1–F6.
+flow ablation đầy đủ với đúng repair policy và provenance của FL1–FL6.
 
 ### 4. Chạy Độc Lập Bộ Thu Thập Metrics CSV (`collect_metrics.py`)
 
@@ -348,21 +389,35 @@ python3 src/evaluation/collect_metrics.py \
 
 ### 5. Vẽ Biểu Đồ & Trực Quan Hóa Thực Nghiệm (`visualize_experiment.py`)
 
-Sau khi chạy chiến dịch hoàn tất, framework xuất 17 figure
+Sau khi chạy chiến dịch hoàn tất, framework xuất 18 figure
 publication-ready ở cả PNG, SVG và PDF, cùng CSV/JSON, LaTeX, Markdown,
 HTML và dashboard trong `reports/experiment_YYYYMMDD_HHMMSS/`. Có thể
 regenerate hoàn toàn offline từ artifact đã có, không gọi lại LLM hay fuzzing:
 
 ```bash
 python3 src/evaluation/export_existing_metrics.py \
-    result/eval_20260728_124405
+    eval_20260801_182616
+```
+
+Nếu campaign cũ chưa có Source Quality, chấm riêng các Recovered C Source đã
+accept rồi regenerate report bằng lệnh sau. Lần chạy lại sẽ dùng cache nếu
+SHA-256 của source, rubric và model vẫn khớp; thêm `--force` để chấm lại:
+
+```bash
+python3 src/evaluation/evaluate_source_quality.py \
+    eval_20260801_182616 \
+    --model=cx/gpt-5.5 \
+    --max-workers=10
 ```
 
 **Các tham số bổ sung hữu ích cho `run_experiment.py`:**
-* `--resume <campaign_id>`: Tiếp tục chạy chiến dịch cũ bị gián đoạn. Hệ thống tự động quét, đọc kết quả đã lưu trong các tệp `flow_result.json` và chỉ lập lịch chạy tiếp những case còn thiếu.
+* `--resume <campaign_id>`: Tiếp tục campaign bị gián đoạn bằng cách đọc `flow_result.json`, chỉ lập lịch flow còn thiếu và có thể tiếp tục `recovery_state.json` của flow đang dang dở. **Cơ chế hiện tại chưa kiểm tra fingerprint của Git commit, model, prompt, input contract hoặc fuzz config.** Vì vậy chỉ resume trong cùng một cấu hình bất biến; sau khi sửa code/config phải bỏ `--resume` và tạo campaign mới để không trộn artifact hoặc checkpoint cũ với mới.
 * `--pilot <N>`: Chỉ chạy thử nghiệm trên N cases đầu tiên để kiểm chứng nhanh.
 * `--no-rotate-regions`: Tắt tính năng tự động xoay vòng vùng (mặc định bật xoay vòng qua 6 Region để tăng hạn ngạch RPM/TPM lên gấp 6 lần).
 * `--model <model_id>`: Chỉ định mô hình chạy (ví dụ: `gemini-2.5-pro` hoặc `ag/gemini-3-flash-agent`). Mặc định kế thừa biến `MODEL` từ file `configs/prompts_config.py`.
+* `--readability-model <model_id>`: Model chấm Source Quality; mặc định `cx/gpt-5.5`.
+* `--readability-workers <N>`: Số source được chấm song song; mặc định 8.
+* `--skip-readability`: Bỏ qua bước chấm Source Quality trong lần chạy này; report vẫn giữ N/A nếu chưa có cache hợp lệ.
 
 *Lưu ý về cơ chế tự vệ:* Script tích hợp sẵn **Automatic 404 Region Fallback** — nếu mô hình chưa khả dụng ở một region, client tự động chuyển hướng sang `us-central1`. Nhấn `Ctrl+C` sẽ kết thúc sạch sẽ toàn bộ tiến trình con ngay lập tức.
 
@@ -381,8 +436,11 @@ capstone_project/
 │   ├── main.py                    # Entry point chính của toàn bộ Pipeline
 │   ├── modes_runner.py            # Quản lý thực thi 4 chế độ chạy LLM Recovery & thu thập chỉ số
 │   ├── evaluation/
-│   │   ├── collect_metrics.py     # Script thu thập toàn bộ 38 chỉ số đo lường ra file CSV
-│   │   └── metrics_evaluator.py   # Module tính toán % giảm LOC, BB, CC và C metrics
+│   │   ├── run_experiment.py      # Runner 5 flow độc lập + FL6 derived và report canonical
+│   │   ├── readability.py         # Evaluator Source Quality 1–5 cho accepted source
+│   │   ├── evaluate_source_quality.py # Chấm/reuse cache cho campaign đã có
+│   │   ├── artifact_loader.py     # Nạp artifact và kiểm tra provenance/cache
+│   │   └── reporting.py           # Xuất CSV, Markdown, LaTeX, HTML và figures
 │   ├── fuzzing_equi_check/
 │   │   └── fuzzing.py             # Bộ fuzzer AFL++ Live Mutation Hook (1,000 runs) & Differential Execution
 │   ├── llm_recovery/
@@ -410,8 +468,9 @@ capstone_project/
 │       ├── dashboard.html
 │       ├── report.{md,tex,html}
 │       ├── raw_results.jsonl
+│       ├── source_quality_{metrics,summary}.csv
 │       ├── *.csv
-│       └── figures/               # 17 figure × PNG/SVG/PDF
+│       └── figures/               # 18 figure × PNG/SVG/PDF
 └── README.md                      # Tài liệu hướng dẫn chi tiết dự án
 ```
 
@@ -419,22 +478,65 @@ capstone_project/
 
 ## 6. KẾT QUẢ ĐÁNH GIÁ THỰC NGHIỆM (BENCHMARK RESULTS)
 
-Report `experiment_20260728_124405` được regenerate từ artifact của 40 bài
-toán ELF x86_64 obfuscated. Metric correctness chính được phát biểu là “không
-phát hiện reproducible behavioral divergence trong valid inputs và fuzzing
-budget đã dùng”, không phải tương đương với mọi input.
+Report canonical `experiment_20260801_182616` được tạo từ artifact của 40 bài
+toán ELF x86_64 obfuscated, gồm 200 run độc lập FL1–FL5 và 40 record FL6 derived.
+Campaign ghi nhận Git commit `c7675ca0b5105a52a987d3bd5c4049be701aefdd`,
+model `ag/gemini-3-flash-agent`, Python 3.12.3, LLVM/Clang 21.1.8 và 1.000
+fuzz iteration cho mỗi behavioral campaign. Validation có 0 error và 525
+provenance warning; các warning được giữ trong
+`data_validation_errors.csv` thay vì bị tự sửa. Metric correctness chính được
+phát biểu là “không phát hiện reproducible behavioral divergence trong valid
+inputs và fuzzing budget đã dùng”, không phải tương đương với mọi input.
 
-| Flow | Program Behavioral Pass | Canonical E2E |
-|---|---:|---:|
-| F1 Full | 31/38 (81.6%) | 31/40 (77.5%) |
-| F2 No error context | 21/30 (70.0%) | 21/31 (67.7%) |
-| F3 No pseudocode | 32/40 (80.0%) | 32/40 (80.0%) |
-| F4 No direct Clean IR | 32/40 (80.0%) | 32/40 (80.0%) |
-| F5 Raw IR iterative | 25/37 (67.6%) | 25/40 (62.5%) |
-| F6 Raw IR one-call, derived | 7/21 (33.3%) | 7/40 (17.5%) |
+| Flow | Program Behavioral Pass | Executable availability | Canonical E2E (semantic) | Mean tokens | Mean runtime |
+|---|---:|---:|---:|---:|
+| FL1 Full | 36/37 (97.3%) | **37/40 (92.5%)** | 36/40 (90.0%) | 467.513 | 169,5s |
+| FL2 No error context | 21/30 (70.0%) | 30/40 (75.0%) | 21/40 (52.5%) | 158.288 | 75,7s |
+| **FL3 Main — No pseudocode** | **36/37 (97.3%)** | **37/40 (92.5%)** | **36/40 (90.0%)** | 279.570 | 143,0s |
+| FL4 No direct Clean IR | 36/40 (90.0%) | **40/40 (100.0%)** | 36/40 (90.0%) | 237.525 | 176,5s |
+| FL5 Raw IR iterative | 24/38 (63.2%) | 38/40 (95.0%) | 24/40 (60.0%) | 1.154.891 | 293,3s |
+| FL6 Raw IR one-call, derived | 11/23 (47.8%) | 23/40 (57.5%) | 11/40 (27.5%) | 367.079 | N/A |
 
 Program Behavioral Pass loại generation/compile failure khỏi mẫu số và chỉ
-dùng run hoàn thành behavioral validation. Canonical E2E dùng toàn bộ eligible
-samples. F6 là checkpoint derived từ F5, không phải run độc lập.
+dùng run hoàn thành behavioral validation. Executable availability chỉ phản ánh
+khả năng tạo executable trên toàn bộ eligible samples. Canonical E2E là metric
+semantic nghiêm ngặt hơn; FL6 là checkpoint derived từ FL5, không phải run độc lập.
+
+Theo executable availability, FL4 đạt 100,0%, FL5 đạt 95,0%, còn FL3 (flow
+chính) đạt 92,5%. Theo semantic Canonical E2E, FL3 đạt 36/40 = 90,0%, ngang
+FL1 và FL4. FL3 dùng ít token hơn FL1 và có runtime trung bình thấp hơn trong
+campaign này. FL2/FL6 cho thấy mức giảm rõ rệt khi bỏ error context; FL5 tạo
+được nhiều executable nhưng semantic E2E chỉ đạt 60,0%.
+
+### Source Quality — Readability Score (1–5)
+
+Phần này chỉ đánh giá Candidate C đã được behavioral oracle chấp nhận thành
+Recovered C Source. `cx/gpt-5.5` chấm độc lập từng source theo rubric cố định:
+
+| Điểm | Diễn giải |
+|---:|---|
+| 1 | Rất khó đọc, chủ yếu là low-level artefact |
+| 2 | Có dạng C nhưng dữ liệu và control flow còn rối |
+| 3 | Hiểu được logic chính nhưng còn nhiều biến tạm, cast hoặc `goto` |
+| 4 | Cấu trúc tương đối rõ, phần lớn logic dễ theo dõi |
+| 5 | Mã C-like rõ ràng và gần với cách viết C thông thường |
+
+Năm thành phần được chấm là Variables, Loops, Conditions, Logic flow và
+Structural integrity. Overall là trung bình cộng của đúng năm điểm thành phần.
+Canonical campaign có đủ evaluation cho **164/164 accepted source (100%)**:
+
+| Flow | Accepted / Evaluated | Variables | Loops | Conditions | Logic flow | Structural integrity | Overall |
+|:---:|:---:|---:|---:|---:|---:|---:|---:|
+| FL1 | 36/36 | 2.94 | 3.86 | 3.61 | 3.78 | 3.58 | **3.56** |
+| FL2 | 21/21 | 2.71 | 3.95 | 3.48 | 3.81 | 3.67 | **3.52** |
+| **FL3 (Main)** | **36/36** | **3.53** | **4.14** | **3.97** | **4.19** | **4.06** | **3.98** |
+| FL4 | 36/36 | 2.81 | 3.86 | 3.56 | 3.86 | 3.64 | **3.54** |
+| FL5 | 24/24 | 3.83 | 4.46 | 4.38 | 4.50 | 4.38 | **4.31** |
+| FL6 | 11/11 | 4.00 | 4.73 | 4.64 | 4.73 | 4.64 | **4.55** |
+
+Điểm FL5/FL6 cao hơn chỉ mô tả **tập con source đã được accept**; hai flow này
+có Canonical E2E lần lượt 60,0% và 27,5%, nên không thể suy ra chúng khôi phục
+đúng tốt hơn. Readability được tách khỏi executable availability và Canonical
+E2E; tuyệt đối không thay thế compile/fuzz/semantic correctness.
 
 ---

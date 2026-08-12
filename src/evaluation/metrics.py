@@ -66,6 +66,11 @@ def canonical_e2e_rate(successes: int, samples: int) -> Optional[float]:
     return rate(successes, samples)
 
 
+def re_executability_rate(successes: int, samples: int) -> Optional[float]:
+    """Rate of eligible samples for which an executable was produced."""
+    return rate(successes, samples)
+
+
 def flow_specific_recovery_rate(successes: int, samples: int) -> Optional[float]:
     return rate(successes, samples)
 

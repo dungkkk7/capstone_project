@@ -216,7 +216,7 @@ def generate_figures(
         [
             ("First-pass RSR", "first_pass_rsr_percent"),
             ("Behavioral pass", "program_behavioral_pass_rate_percent"),
-            ("Canonical E2E", "canonical_e2e_rate_percent"),
+            ("Re-executability", "re_executability_rate_percent"),
         ],
         lookup,
         directory,
@@ -229,13 +229,13 @@ def generate_figures(
                 "program_behavioral_pass_rate_ci_low",
                 "program_behavioral_pass_rate_ci_high",
             ),
-            "canonical_e2e_rate_percent": (
-                "canonical_e2e_ci_low",
-                "canonical_e2e_ci_high",
+            "re_executability_rate_percent": (
+                "re_executability_ci_low",
+                "re_executability_ci_high",
             ),
         },
     )
-    manifest.append({"figure_id": "overall_performance", "caption": "Primary recovery outcomes with flow order F1–F6; F6 is derived from F5's first provider call."})
+    manifest.append({"figure_id": "overall_performance", "caption": "Primary recovery outcomes with executable availability over all eligible samples; F6 is derived from F5's first provider call."})
 
     fig, axes = plt.subplots(1, 3, figsize=(11.5, 4.2))
     x = np.arange(len(FLOW_ORDER))
@@ -353,6 +353,111 @@ def generate_figures(
             "caption": (
                 "Behavioral repair effectiveness; "
                 f"{one_shot_label} repair fields are N/A."
+            ),
+        }
+    )
+
+    # Direct matched-evidence view for the iterative-feedback ablation. This
+    # uses the common all-eligible re-executability denominator instead of mixing
+    # behavioral-campaign counts or conditional pass rates.
+    feedback_pairs = (
+        ("Clean IR + LLVM2C", "F2", "F1"),
+        ("Raw IR", "F6", "F5"),
+    )
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    y_positions = np.arange(len(feedback_pairs))[::-1]
+    for y_position, (evidence, one_shot_flow, iterative_flow) in zip(
+        y_positions, feedback_pairs
+    ):
+        one_shot = lookup[one_shot_flow]
+        iterative = lookup[iterative_flow]
+        one_shot_rate = float(one_shot["re_executability_rate_percent"])
+        iterative_rate = float(iterative["re_executability_rate_percent"])
+        one_shot_count = int(one_shot["re_executability_success_count"])
+        iterative_count = int(iterative["re_executability_success_count"])
+        denominator = int(iterative["eligible_sample_count"])
+        gain = iterative_rate - one_shot_rate
+
+        ax.annotate(
+            "",
+            xy=(iterative_rate, y_position),
+            xytext=(one_shot_rate, y_position),
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": "#666666",
+                "linewidth": 2.5,
+                "mutation_scale": 16,
+            },
+            zorder=1,
+        )
+        ax.scatter(
+            one_shot_rate,
+            y_position,
+            s=150,
+            marker="o",
+            color=COLORS[1],
+            edgecolor="black",
+            linewidth=0.7,
+            zorder=3,
+        )
+        ax.scatter(
+            iterative_rate,
+            y_position,
+            s=165,
+            marker="D",
+            color=COLORS[0],
+            edgecolor="black",
+            linewidth=0.7,
+            zorder=3,
+        )
+        ax.text(
+            one_shot_rate,
+            y_position - 0.18,
+            f"{one_shot_flow} one-shot\n{one_shot_count}/{denominator} · "
+            f"{one_shot_rate:.1f}%",
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#9A6700",
+        )
+        ax.text(
+            iterative_rate,
+            y_position - 0.18,
+            f"{iterative_flow} iterative\n{iterative_count}/{denominator} · "
+            f"{iterative_rate:.1f}%",
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#005A8D",
+            fontweight="bold",
+        )
+        ax.text(
+            (one_shot_rate + iterative_rate) / 2,
+            y_position + 0.14,
+            f"+{gain:.1f} pp",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+            color="#007A5E",
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.5},
+        )
+
+    ax.set_yticks(y_positions, [pair[0] for pair in feedback_pairs])
+    ax.set_xlim(0, 103)
+    ax.set_ylim(-0.52, 1.52)
+    ax.set_xticks(np.arange(0, 101, 20))
+    ax.set_xlabel("Re-executability (% of eligible cases)")
+    ax.set_title("Effect of iterative feedback", fontweight="bold")
+    ax.grid(axis="x", alpha=0.25)
+    ax.tick_params(axis="y", length=0, pad=10)
+    _save(fig, directory, "iterative_feedback_vs_one_shot")
+    manifest.append(
+        {
+            "figure_id": "iterative_feedback_vs_one_shot",
+            "caption": (
+                "Matched-evidence re-executability comparison of iterative "
+                "feedback against one-shot reconstruction."
             ),
         }
     )
@@ -493,7 +598,7 @@ def generate_figures(
     forest = [
         row
         for row in comparisons
-        if row["metric_name"] == "Canonical E2E Rate"
+        if row["metric_name"] == "Re-executability Rate"
         and row["absolute_difference"] is not None
     ]
     fig, ax = plt.subplots(figsize=(7.2, 4.2))
@@ -516,10 +621,10 @@ def generate_figures(
     ax.set_yticks(positions, [row["contrast_id"] for row in forest], fontsize=8)
     ax.set_xlabel("Paired effect (percentage points)")
     _save(fig, directory, "ablation_forest_plot")
-    manifest.append({"figure_id": "ablation_forest_plot", "caption": "Paired Canonical E2E effects with bootstrap 95% CI."})
+    manifest.append({"figure_id": "ablation_forest_plot", "caption": "Paired re-executability effects with bootstrap 95% CI."})
 
     wtl = [
-        row for row in comparisons if row["metric_name"] == "Canonical E2E Rate"
+        row for row in comparisons if row["metric_name"] == "Re-executability Rate"
     ]
     fig, ax = plt.subplots(figsize=(7.2, 4.2))
     y = np.arange(len(wtl))
@@ -536,10 +641,10 @@ def generate_figures(
     ax.set_xlabel("Paired samples")
     _legend_above(ax, columns=3)
     _save(fig, directory, "ablation_win_tie_loss")
-    manifest.append({"figure_id": "ablation_win_tie_loss", "caption": "Paired win/tie/loss counts for Canonical E2E."})
+    manifest.append({"figure_id": "ablation_win_tie_loss", "caption": "Paired win/tie/loss counts for re-executability."})
 
     for name, x_field, y_field, x_label, y_label in (
-        ("tokens_vs_e2e", "total_tokens", "canonical_e2e_success", "Total tokens", "Canonical E2E outcome"),
+        ("tokens_vs_e2e", "total_tokens", "re_executability_success", "Total tokens", "Re-executability outcome"),
         ("runtime_vs_behavioral_pass", "total_runtime", "final_behavioral_pass", "Runtime (seconds)", "Behavioral pass outcome"),
     ):
         fig, ax = plt.subplots(figsize=(7.2, 4.2))

@@ -573,7 +573,11 @@ def _counterexample_records(
 
 
 def _source_quality(
-    original: Path | None, recovered: Path | None
+    original: Path | None,
+    recovered: Path | None,
+    evaluation: Path | None = None,
+    *,
+    accepted: bool = False,
 ) -> dict[str, Any]:
     clang_format = shutil.which("clang-format")
     base = {
@@ -583,14 +587,22 @@ def _source_quality(
         "readability_logic_flow": None,
         "readability_structure": None,
         "readability_overall": None,
+        "readability_variables_rationale": None,
+        "readability_loops_rationale": None,
+        "readability_conditions_rationale": None,
+        "readability_logic_flow_rationale": None,
+        "readability_structure_rationale": None,
+        "readability_summary": None,
+        "readability_rubric_version": None,
+        "readability_source_sha256": None,
+        "readability_evaluated_at": None,
+        "readability_correctness_assessed": None,
         "evaluator_id": None,
         "evaluation_method": None,
         "original_sloc": None,
         "recovered_sloc": None,
         "sloc_ratio": None,
     }
-    if not clang_format or not original or not recovered or not original.is_file() or not recovered.is_file():
-        return base
 
     def sloc(path: Path) -> int | None:
         process = subprocess.run(
@@ -602,8 +614,16 @@ def _source_quality(
         text = re.sub(r"//.*", "", text)
         return sum(bool(line.strip()) for line in text.splitlines())
 
-    original_sloc = sloc(original)
-    recovered_sloc = sloc(recovered)
+    original_sloc = (
+        sloc(original)
+        if clang_format and original and original.is_file()
+        else None
+    )
+    recovered_sloc = (
+        sloc(recovered)
+        if clang_format and recovered and recovered.is_file()
+        else None
+    )
     base.update(
         {
             "original_sloc": original_sloc,
@@ -613,6 +633,84 @@ def _source_quality(
                 if original_sloc and recovered_sloc is not None
                 else None
             ),
+        }
+    )
+    if (
+        not accepted
+        or not recovered
+        or not recovered.is_file()
+        or not evaluation
+        or not evaluation.is_file()
+    ):
+        return base
+
+    try:
+        record = _read_json(evaluation)
+        source_hash = sha256_file(recovered)
+        if not source_hash or record.get("source_sha256") != source_hash:
+            return base
+        scores = record.get("scores") or {}
+        rationales = record.get("rationales") or {}
+        dimensions = (
+            "variables",
+            "loops",
+            "conditions",
+            "logic_flow",
+            "structural_integrity",
+        )
+        score_values = {key: scores[key] for key in dimensions}
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value not in range(1, 6)
+            for value in score_values.values()
+        ):
+            return base
+        overall = float(record.get("overall_score"))
+        expected_overall = round(
+            sum(score_values.values()) / len(score_values), 2
+        )
+        if (
+            not 1.0 <= overall <= 5.0
+            or abs(overall - expected_overall) > 0.001
+            or record.get("accepted_candidate_only") is not True
+            or record.get("correctness_assessed") is not False
+            or not str(record.get("evaluator_id") or "").strip()
+            or not str(record.get("evaluation_method") or "").strip()
+            or any(
+                not str(rationales.get(key) or "").strip()
+                for key in dimensions
+            )
+            or not str(record.get("summary") or "").strip()
+        ):
+            return base
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return base
+
+    base.update(
+        {
+            "readability_variables": score_values["variables"],
+            "readability_loops": score_values["loops"],
+            "readability_conditions": score_values["conditions"],
+            "readability_logic_flow": score_values["logic_flow"],
+            "readability_structure": score_values["structural_integrity"],
+            "readability_overall": overall,
+            "readability_variables_rationale": rationales.get("variables"),
+            "readability_loops_rationale": rationales.get("loops"),
+            "readability_conditions_rationale": rationales.get("conditions"),
+            "readability_logic_flow_rationale": rationales.get("logic_flow"),
+            "readability_structure_rationale": rationales.get(
+                "structural_integrity"
+            ),
+            "readability_summary": record.get("summary"),
+            "readability_rubric_version": record.get("rubric_version"),
+            "readability_source_sha256": source_hash,
+            "readability_evaluated_at": record.get("evaluated_at"),
+            "readability_correctness_assessed": bool(
+                record.get("correctness_assessed", False)
+            ),
+            "evaluator_id": record.get("evaluator_id"),
+            "evaluation_method": record.get("evaluation_method"),
         }
     )
     return base
@@ -795,6 +893,32 @@ def _append_derived_f6(
         if derived_gap:
             warnings.append(f"Derived F6 evidence gap: {derived_gap}.")
 
+        first_source_path = (
+            Path(str(first_llm["candidate_source_path"]))
+            if first_llm and first_llm.get("candidate_source_path")
+            else None
+        )
+        f6_evaluation_path = (
+            first_source_path.parent / "readability_evaluation_f6.json"
+            if first_source_path
+            else None
+        )
+        f6_quality = _source_quality(
+            None,
+            first_source_path,
+            f6_evaluation_path,
+            accepted=status == "PASS",
+        )
+        f6_quality["original_sloc"] = source.get("original_sloc")
+        if f6_quality["original_sloc"] and f6_quality["recovered_sloc"] is not None:
+            f6_quality["sloc_ratio"] = (
+                f6_quality["recovered_sloc"] / f6_quality["original_sloc"]
+            )
+        if status == "PASS" and f6_quality["readability_overall"] is None:
+            warnings.append(
+                "Accepted derived F6 candidate has no valid readability evaluator record."
+            )
+
         derived = dict(source)
         derived.update(
             {
@@ -917,6 +1041,12 @@ def _append_derived_f6(
                 "llm_generation_completed": candidate_available,
                 "compilation_completed": compile_success,
                 "candidate_accepted": status == "PASS",
+                # This project-level re-executability metric intentionally
+                # measures executable availability only. Semantic/behavioral
+                # correctness is reported separately as Canonical E2E.
+                "re_executability_success": bool(
+                    first_compile and first_compile.get("compile_success")
+                ),
                 "canonical_e2e_success": bool(
                     status == "PASS"
                     and source.get("binary_lifting_completed")
@@ -928,16 +1058,7 @@ def _append_derived_f6(
                 "flow_specific_recovery_success": bool(
                     status == "PASS" and source.get("raw_ir_generated")
                 ),
-                "readability_variables": None,
-                "readability_loops": None,
-                "readability_conditions": None,
-                "readability_logic_flow": None,
-                "readability_structure": None,
-                "readability_overall": None,
-                "evaluator_id": None,
-                "evaluation_method": None,
-                "recovered_sloc": None,
-                "sloc_ratio": None,
+                **f6_quality,
                 "provenance_warnings": warnings,
             }
         )
@@ -1229,7 +1350,12 @@ def load_campaign(
             recovered_path = flow_dir / f"{sample_id}_recovered.c"
             source_row = row.get("clean_source") or row.get("source_c")
             original_path = project_root / source_row if source_row else None
-            quality = _source_quality(original_path, recovered_path)
+            quality = _source_quality(
+                original_path,
+                recovered_path,
+                flow_dir / "readability_evaluation.json",
+                accepted=status == "PASS",
+            )
             total_input_tokens = sum(
                 int(attempt["input_tokens"] or 0) for attempt in flow_llm
             )
@@ -1277,6 +1403,10 @@ def load_campaign(
                 warnings.append("At least one LLM call has no response/metadata artifact.")
             if quality["sloc_ratio"] is None:
                 warnings.append("clang-format or source prerequisite unavailable; SLOC metrics are null.")
+            if status == "PASS" and quality["readability_overall"] is None:
+                warnings.append(
+                    "Accepted candidate has no valid readability evaluator record."
+                )
             final_fuzz_config = (
                 (final_campaign.get("report") or {}).get("fuzz_config") or {}
                 if final_campaign
@@ -1457,6 +1587,9 @@ def load_campaign(
                 "llm_generation_completed": bool(flow_llm),
                 "compilation_completed": any_compile,
                 "candidate_accepted": status == "PASS",
+                # Executable availability is deliberately separate from the
+                # semantic PASS status below.
+                "re_executability_success": bool(any_compile),
                 "canonical_e2e_success": bool(status == "PASS" and canonical_ready),
                 "flow_specific_recovery_success": bool(status == "PASS" and required_ready),
                 "peak_memory": None,

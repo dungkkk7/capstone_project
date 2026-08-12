@@ -21,6 +21,7 @@ from evaluation.metrics import (
     input_match_rate,
     program_behavioral_pass_rate,
     rate,
+    re_executability_rate,
     reproducibility_rate,
     semantic_repair_success_rate,
     valid_input_rate,
@@ -129,6 +130,15 @@ def aggregate_flows(
             run["behavioral_repair_success"] is True for run in behavior_cases
         )
         canonical_successes = sum(run["canonical_e2e_success"] for run in flow)
+        reexec_successes = sum(
+            bool(
+                run.get(
+                    "re_executability_success",
+                    run.get("any_compile_success_within_budget"),
+                )
+            )
+            for run in flow
+        )
         flow_successes = sum(run["flow_specific_recovery_success"] for run in flow)
         total_recorded_tokens = sum(
             int(run["total_tokens"])
@@ -155,6 +165,17 @@ def aggregate_flows(
         )
         canonical_ci = _ci_rate(
             [bool(run["canonical_e2e_success"]) for run in flow]
+        )
+        reexec_ci = _ci_rate(
+            [
+                bool(
+                    run.get(
+                        "re_executability_success",
+                        run.get("any_compile_success_within_budget"),
+                    )
+                )
+                for run in flow
+            ]
         )
         row: dict[str, Any] = {
             "flow_id": flow_id,
@@ -254,6 +275,12 @@ def aggregate_flows(
             ),
             "canonical_e2e_ci_low": canonical_ci[0],
             "canonical_e2e_ci_high": canonical_ci[1],
+            "re_executability_success_count": reexec_successes,
+            "re_executability_rate_percent": re_executability_rate(
+                reexec_successes, len(flow)
+            ),
+            "re_executability_ci_low": reexec_ci[0],
+            "re_executability_ci_high": reexec_ci[1],
             "flow_specific_recovery_success_count": flow_successes,
             "flow_specific_recovery_rate_percent": flow_specific_recovery_rate(
                 flow_successes, len(flow)

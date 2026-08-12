@@ -207,6 +207,7 @@ def make_run(sample: str, flow: str, **overrides):
         "llm_generation_completed": True,
         "compilation_completed": True,
         "candidate_accepted": True,
+        "re_executability_success": True,
         "canonical_e2e_success": True,
         "flow_specific_recovery_success": True,
         "input_tokens": 10,
@@ -231,6 +232,7 @@ def make_run(sample: str, flow: str, **overrides):
         "readability_logic_flow": None,
         "readability_structure": None,
         "readability_overall": None,
+        "readability_correctness_assessed": None,
         "evaluator_id": None,
         "evaluation_method": None,
         "original_sloc": None,
@@ -300,6 +302,22 @@ def test_middle_candidate_compile_success_is_monotonic():
     assert f3["compilation_repair_success_rate_percent"] == 100.0
 
 
+def test_reexecutability_does_not_require_semantic_pass():
+    run = make_run(
+        "p1",
+        "F4",
+        status="FAIL_BEHAVIORAL",
+        canonical_e2e_success=False,
+        re_executability_success=True,
+        final_behavioral_pass=False,
+        fuzz_mismatches=1,
+    )
+    row = next(item for item in aggregate_flows([run], [], []) if item["flow_id"] == "F4")
+    assert row["re_executability_success_count"] == 1
+    assert row["re_executability_rate_percent"] == 100.0
+    assert row["canonical_e2e_success_count"] == 0
+
+
 def test_data_validation_rules():
     invalid = make_run(
         "p1",
@@ -319,8 +337,56 @@ def test_data_validation_rules():
     assert "RULE_7_FUZZ_COUNTS" in rules
 
 
+def test_readability_validation_is_accepted_bounded_and_not_correctness():
+    scored = {
+        "readability_variables": 4,
+        "readability_loops": 3,
+        "readability_conditions": 4,
+        "readability_logic_flow": 3,
+        "readability_structure": 4,
+        "readability_overall": 3.6,
+        "readability_correctness_assessed": False,
+        "evaluator_id": "cx/gpt-5.5",
+        "evaluation_method": "llm_absolute_rubric_1_to_5",
+    }
+    assert not [
+        error
+        for error in validate_run(make_run("p1", "F1", **scored))
+        if error["severity"] == "ERROR"
+    ]
+
+    invalid = make_run(
+        "p2",
+        "F1",
+        **{
+            **scored,
+            "candidate_accepted": False,
+            "readability_variables": 6,
+            "readability_correctness_assessed": True,
+        },
+    )
+    rules = {error["violated_rule"] for error in validate_run(invalid)}
+    assert "RULE_11_READABILITY_ACCEPTED_ONLY" in rules
+    assert "RULE_12_READABILITY_SCHEMA" in rules
+    assert "RULE_13_READABILITY_NOT_CORRECTNESS" in rules
+
+
 def test_report_and_all_figure_generation(tmp_path: Path):
     runs = [make_run("p1", flow) for flow in FLOW_ORDER]
+    for run in runs:
+        run.update(
+            {
+                "readability_variables": 4,
+                "readability_loops": 3,
+                "readability_conditions": 4,
+                "readability_logic_flow": 3,
+                "readability_structure": 4,
+                "readability_overall": 3.6,
+                "readability_correctness_assessed": False,
+                "evaluator_id": "cx/gpt-5.5",
+                "evaluation_method": "llm_absolute_rubric_1_to_5",
+            }
+        )
     llvm = [
         {
             "experiment_id": "experiment_fixture",
@@ -390,6 +456,7 @@ def test_report_and_all_figure_generation(tmp_path: Path):
         "reliability_metrics.csv",
         "llvm_metrics.csv",
         "source_quality_metrics.csv",
+        "source_quality_summary.csv",
         "cost_metrics.csv",
         "stage_completion_metrics.csv",
         "ablation_comparisons.csv",
@@ -406,12 +473,20 @@ def test_report_and_all_figure_generation(tmp_path: Path):
     }
     assert required <= {path.name for path in tmp_path.iterdir()}
     manifest = json.loads((tmp_path / "figures_manifest.json").read_text())
-    assert len(manifest) == 17
+    assert len(manifest) == 18
+    assert any(
+        item["figure_id"] == "iterative_feedback_vs_one_shot"
+        for item in manifest
+    )
     dashboard = (tmp_path / "dashboard.html").read_text(encoding="utf-8")
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "Source quality: accepted Recovered C Source only" in report
+    assert "Source quality: accepted Recovered C Source only" in dashboard
+    assert "3.60" in report
     assert "Flow contracts" not in dashboard
-    assert dashboard.count("<b>Ý nghĩa:</b>") == 17
-    assert dashboard.count("<b>Cách tính:</b>") == 17
-    assert dashboard.count("<b>Cách đọc:</b>") == 17
+    assert dashboard.count("<b>Ý nghĩa:</b>") == 18
+    assert dashboard.count("<b>Cách tính:</b>") == 18
+    assert dashboard.count("<b>Cách đọc:</b>") == 18
     for item in manifest:
         for extension in ("png", "svg", "pdf"):
             assert (tmp_path / "figures" / f"{item['figure_id']}.{extension}").is_file()

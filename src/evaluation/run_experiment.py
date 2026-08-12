@@ -47,8 +47,12 @@ from evaluation.schema import FLOW_SPECS, flow_contract
 try:
     import configs.prompts_config as _prompts_cfg
     DEFAULT_MODEL = getattr(_prompts_cfg, "MODEL", "gemini-3.5-flash")
+    DEFAULT_READABILITY_MODEL = getattr(
+        _prompts_cfg, "READABILITY_MODEL", "cx/gpt-5.5"
+    )
 except ImportError:
     DEFAULT_MODEL = "gemini-3.5-flash"
+    DEFAULT_READABILITY_MODEL = "cx/gpt-5.5"
 
 # Supported Vertex AI regions for Gemini models
 VERTEX_GEMINI_REGIONS = [
@@ -171,7 +175,7 @@ class CaseTracker:
         self.original_sloc = 0
         self.recovered_sloc = 0
         self.sloc_ratio = 0.0
-        self.readability_score = 0.0
+        self.readability_score = None
         
         # Status (PASS, FAIL_COMPILE, FAIL_BEHAVIORAL, INCONCLUSIVE)
         self.status = "INCONCLUSIVE"
@@ -284,7 +288,7 @@ class CaseTracker:
         tracker.original_sloc = data.get("original_sloc", 0)
         tracker.recovered_sloc = data.get("recovered_sloc", 0)
         tracker.sloc_ratio = data.get("sloc_ratio", 0.0)
-        tracker.readability_score = data.get("readability_score", 0.0)
+        tracker.readability_score = data.get("readability_score")
         tracker.behavior_before_repair = data.get("behavior_before_repair", "")
         tracker.behavior_after_repair = data.get("behavior_after_repair", "")
         tracker.status = data.get("status", "INCONCLUSIVE")
@@ -691,7 +695,8 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         if last_fuzz_report:
             tracker.behavior_after_repair = f"matches={last_fuzz_report.get('matches')}, mismatches={last_fuzz_report.get('mismatches')}"
             
-        # Post-hoc SLOC and Readability Metrics (if original source exists)
+        # Post-hoc SLOC only. Readability is evaluated independently after an
+        # accepted candidate exists and is persisted as an auditable artifact.
         if original_src and os.path.exists(original_src):
             try:
                 orig_lines = [l.strip() for l in Path(original_src).read_text(errors="ignore").splitlines() if l.strip() and not l.strip().startswith("//")]
@@ -700,9 +705,6 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
                     rec_lines = [l.strip() for l in tracker.final_candidate.splitlines() if l.strip() and not l.strip().startswith("//")]
                     tracker.recovered_sloc = len(rec_lines)
                     tracker.sloc_ratio = tracker.recovered_sloc / max(1, tracker.original_sloc)
-                    # Simple readability metric (comment ratio & identifier clarity heuristic)
-                    comment_count = sum(1 for l in tracker.final_candidate.splitlines() if "//" in l or "/*" in l)
-                    tracker.readability_score = min(1.0, (comment_count / max(1, tracker.recovered_sloc)) * 5.0 + 0.5)
             except Exception:
                 pass
 
@@ -774,6 +776,22 @@ def main():
     parser.add_argument("--fuzz-iterations", type=int, default=1000, help="Number of fuzz iterations")
     parser.add_argument("--max-workers", type=int, default=15, help="Max parallel flows running simultaneously")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Vertex AI model to use")
+    parser.add_argument(
+        "--readability-model",
+        default=DEFAULT_READABILITY_MODEL,
+        help="Model used only for accepted-source readability scoring",
+    )
+    parser.add_argument(
+        "--readability-workers",
+        type=int,
+        default=8,
+        help="Concurrent readability evaluator requests",
+    )
+    parser.add_argument(
+        "--skip-readability",
+        action="store_true",
+        help="Skip accepted-source readability evaluation",
+    )
     parser.add_argument("--no-rotate-regions", action="store_false", dest="rotate_regions", default=True, help="Disable regional endpoints rotation")
     parser.add_argument("--resume", type=str, default=None, help="Campaign directory name to resume (e.g. eval_20260728_043618)")
     args = parser.parse_args()
@@ -937,6 +955,29 @@ def main():
     else:
         print("[✓] All tasks in the dataset are already completed. Regenerating reports...", flush=True)
                 
+    if not args.skip_readability:
+        try:
+            from evaluation.readability import evaluate_campaign
+
+            readability_summary = evaluate_campaign(
+                Path(project_root),
+                Path(project_root) / "result" / campaign_id,
+                experiment_id,
+                model=args.readability_model.strip(),
+                max_workers=args.readability_workers,
+            )
+            marker = "[!]" if readability_summary["failures"] else "[✓]"
+            print(
+                f"{marker} Readability evaluation: "
+                f"{readability_summary['evaluated']}/"
+                f"{readability_summary['accepted_candidates']} accepted sources "
+                f"({readability_summary['cache_hits']} cached, "
+                f"{len(readability_summary['failures'])} failed).",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[!] Readability evaluation failed: {exc}", flush=True)
+
     # Export metrics CSVs
     export_metrics_csvs(all_trackers, reports_dir, experiment_id)
     print(f"\n[✓] All experiments completed. Results exported to {reports_dir}/", flush=True)
@@ -971,7 +1012,10 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
                 t.llvm_ir_verification_success,
                 t.instructions_raw, t.instructions_clean, t.basic_blocks_raw, t.basic_blocks_clean, t.conditional_branches_raw, t.conditional_branches_clean,
                 f"{t.instruction_reduction:.2f}", f"{t.bb_reduction:.2f}", f"{t.branches_reduction:.2f}",
-                t.original_sloc, t.recovered_sloc, f"{t.sloc_ratio:.2f}", f"{t.readability_score:.2f}",
+                t.original_sloc,
+                t.recovered_sloc,
+                f"{t.sloc_ratio:.2f}",
+                "" if t.readability_score is None else f"{t.readability_score:.2f}",
                 t.status, t.input_tokens, t.output_tokens, t.llm_latency, t.compile_time, t.fuzzing_time, t.total_runtime
             ])
 

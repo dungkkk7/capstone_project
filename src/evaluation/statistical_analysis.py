@@ -37,6 +37,7 @@ METRICS = (
     ("Input Match Rate", "input_match_rate", "continuous", True),
     ("Counterexample Detection Rate", "reproducible_final_counterexample", "binary", False),
     ("Canonical E2E Rate", "canonical_e2e_success", "binary", True),
+    ("Re-executability Rate", "re_executability_success", "binary", True),
     ("Flow-specific Recovery Rate", "flow_specific_recovery_success", "binary", True),
     ("Compile Repair Rounds", "compile_repair_rounds", "continuous", False),
     ("Behavioral Repair Rounds", "behavioral_repair_rounds", "continuous", False),

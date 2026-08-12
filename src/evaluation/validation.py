@@ -116,6 +116,91 @@ def validate_run(run: dict[str, Any]) -> list[dict[str, Any]]:
 
     for warning in run.get("provenance_warnings") or []:
         errors.append(_error(run, "RULE_10_SOURCE_DATA_GAP", {"warning": warning}, warning, severity="WARNING"))
+
+    readability_fields = (
+        "readability_variables",
+        "readability_loops",
+        "readability_conditions",
+        "readability_logic_flow",
+        "readability_structure",
+    )
+    readability_values = {
+        field: run.get(field) for field in readability_fields
+    }
+    overall = run.get("readability_overall")
+    has_readability = overall is not None or any(
+        value is not None for value in readability_values.values()
+    )
+    if has_readability:
+        if run.get("candidate_accepted") is not True:
+            errors.append(
+                _error(
+                    run,
+                    "RULE_11_READABILITY_ACCEPTED_ONLY",
+                    {
+                        "candidate_accepted": run.get("candidate_accepted"),
+                        "status": status,
+                        "readability_overall": overall,
+                    },
+                    "Readability may only be attached to an accepted Recovered C Source.",
+                )
+            )
+
+        invalid_scores = {
+            field: value
+            for field, value in readability_values.items()
+            if isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 5
+        }
+        provenance = {
+            "evaluator_id": run.get("evaluator_id"),
+            "evaluation_method": run.get("evaluation_method"),
+        }
+        if (
+            invalid_scores
+            or not isinstance(overall, (int, float))
+            or isinstance(overall, bool)
+            or not 1.0 <= float(overall) <= 5.0
+            or not all(provenance.values())
+        ):
+            errors.append(
+                _error(
+                    run,
+                    "RULE_12_READABILITY_SCHEMA",
+                    {
+                        **readability_values,
+                        "readability_overall": overall,
+                        **provenance,
+                    },
+                    "Readability requires five integer scores from 1 to 5, a bounded overall score, and evaluator provenance.",
+                )
+            )
+        elif abs(
+            float(overall)
+            - sum(readability_values.values()) / len(readability_values)
+        ) > 0.011:
+            errors.append(
+                _error(
+                    run,
+                    "RULE_12_READABILITY_SCHEMA",
+                    {
+                        **readability_values,
+                        "readability_overall": overall,
+                    },
+                    "Readability overall must equal the arithmetic mean of the five component scores.",
+                )
+            )
+
+        if run.get("readability_correctness_assessed") is True:
+            errors.append(
+                _error(
+                    run,
+                    "RULE_13_READABILITY_NOT_CORRECTNESS",
+                    {"readability_correctness_assessed": True},
+                    "Readability evaluation must remain separate from correctness assessment.",
+                )
+            )
     return errors
 
 

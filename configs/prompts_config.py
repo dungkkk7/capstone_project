@@ -11,6 +11,7 @@
 # MODEL & SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 MODEL = "ag/gemini-3-flash-agent"    # Sử dụng model Gemini 3.5 Flash thông qua 9router
+READABILITY_MODEL = "cx/gpt-5.5"      # Judge Source Quality qua cùng API_BASE_URL
 API_KEY = "sk-56d9318c7bdcdcad-dayiif-c44e8cb6"  # 9router API Key
 API_BASE_URL = "http://localhost:20128/v1"      # 9router API Base URL (thay thế generativelanguage)
 # MODEL = "gemini-2.5-pro"            # Dòng Pro thế hệ mới, thông minh nhất, hỗ trợ 2M context window

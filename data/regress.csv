@@ -1,4 +1,2 @@
 submission_id,token_count,file_size_bytes,clean_source,obfuscated_binary
 s146593197,364,1159,data/clean_src/p01687/s146593197.c,data/obfuscated/p01687/s146593197_fla_bcf_instsub.elf
-s624710482,260,527,data/clean_src/p02100/s624710482.c,data/obfuscated/p02100/s624710482_fla_bcf_instsub.elf
-s722254321,282,816,data/clean_src/p00165/s722254321.c,data/obfuscated/p00165/s722254321_fla_bcf_instsub.elf

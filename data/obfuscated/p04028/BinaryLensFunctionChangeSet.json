@@ -1,0 +1,17 @@
+{
+  "changes": [
+    {
+      "kind": "function_name",
+      "new_value": "mod_pow",
+      "old_value": "sub_401180"
+    },
+    {
+      "kind": "function_comment",
+      "new_value": "[BinaryLens semantic report]\nPurpose: Compute modular exponentiation (base^exp % 1000000007) using binary exponentiation.\nCategories: modular-arithmetic, obfuscated-control-flow",
+      "old_value": ""
+    }
+  ],
+  "schema_version": 1,
+  "target_address": "0x401180",
+  "target_name": "sub_401180"
+}

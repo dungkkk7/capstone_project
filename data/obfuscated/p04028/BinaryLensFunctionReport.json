@@ -1,0 +1,491 @@
+{
+  "apply_plan": {
+    "comments": false,
+    "function_name": false,
+    "locals": false,
+    "prototype": "requires_review",
+    "structs": "requires_review"
+  },
+  "behavior": {
+    "categories": [
+      "call-containing"
+    ],
+    "invariants": [],
+    "phases": []
+  },
+  "contract": {
+    "concurrency": [],
+    "failure_modes": [],
+    "inputs": [],
+    "outputs": [],
+    "ownership": [],
+    "postconditions": [],
+    "preconditions": [],
+    "purpose": "Semantic synthesis has not been run; this report contains static facts only.",
+    "side_effects": []
+  },
+  "evidence": [
+    {
+      "address": "0x402ED0",
+      "confidence": 1.0,
+      "id": "ev_1",
+      "level": "fact",
+      "location": "0x402ED0",
+      "source": "decompiler",
+      "statement": "Target function is main"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.949999988079071,
+      "id": "ev_2",
+      "level": "fact",
+      "location": "0x402ED0",
+      "source": "ctree",
+      "statement": "Hex-Rays pseudocode is available for the target function"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.949999988079071,
+      "id": "ev_3",
+      "level": "fact",
+      "location": "assembly",
+      "source": "assembly",
+      "statement": "Disassembly is available as a low-level fallback for semantic validation"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.6800000071525574,
+      "id": "ev_4",
+      "level": "inference",
+      "location": "return-register",
+      "source": "assembly",
+      "statement": "Return paths visibly materialize a value through the 32-bit EAX register; validate int32/uint32 versus a wider return type against callers and sign behavior."
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.9200000166893005,
+      "id": "ev_5",
+      "level": "fact",
+      "location": "microcode",
+      "source": "microcode",
+      "statement": "Microcode is available for operand, width and value-flow analysis"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.949999988079071,
+      "id": "ev_6",
+      "level": "fact",
+      "location": "CFG",
+      "source": "control-flow",
+      "statement": "Control-flow graph contains 1 basic blocks"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.550000011920929,
+      "id": "ev_7",
+      "level": "fact",
+      "location": "lvar_1",
+      "source": "decompiler",
+      "statement": "Decompiler exposes local a1 with type unknown"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.550000011920929,
+      "id": "ev_8",
+      "level": "fact",
+      "location": "lvar_2",
+      "source": "decompiler",
+      "statement": "Decompiler exposes local a2 with type unknown"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.550000011920929,
+      "id": "ev_9",
+      "level": "fact",
+      "location": "lvar_3",
+      "source": "decompiler",
+      "statement": "Decompiler exposes local a3 with type unknown"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.550000011920929,
+      "id": "ev_10",
+      "level": "fact",
+      "location": "lvar_4",
+      "source": "decompiler",
+      "statement": "Decompiler exposes local  with type unknown"
+    },
+    {
+      "address": "0x402EDF",
+      "confidence": 0.8399999737739563,
+      "id": "ev_11",
+      "level": "fact",
+      "location": "0x402EDF",
+      "source": "ctree",
+      "statement": "Ctree contains a block statement: {sub_401400(a1, a2, a3);return 0;}"
+    },
+    {
+      "address": "0x402EDF",
+      "confidence": 0.8399999737739563,
+      "id": "ev_12",
+      "level": "fact",
+      "location": "0x402EDF",
+      "source": "ctree",
+      "statement": "Ctree contains a expression_statement statement: sub_401400(a1, a2, a3);"
+    },
+    {
+      "address": "0x402EDF",
+      "confidence": 0.8600000143051147,
+      "id": "ev_13",
+      "level": "fact",
+      "location": "0x402EDF",
+      "source": "ctree",
+      "statement": "sub_401400(a1, a2, a3)"
+    },
+    {
+      "address": "0x402EE6",
+      "confidence": 0.8399999737739563,
+      "id": "ev_14",
+      "level": "fact",
+      "location": "0x402EE6",
+      "source": "ctree",
+      "statement": "Ctree contains a return statement: return 0;"
+    },
+    {
+      "address": "0x4010A8",
+      "confidence": 0.8500000238418579,
+      "id": "ev_15",
+      "level": "fact",
+      "location": "0x4010A8",
+      "source": "xref",
+      "statement": "Incoming o reference from 0x4010A8"
+    },
+    {
+      "address": "0x401400",
+      "confidence": 1.0,
+      "id": "ev_16",
+      "level": "fact",
+      "location": "0x401400",
+      "source": "decompiler",
+      "statement": "Decompiler warning: using guessed type __int64 __fastcall sub_401400(_QWORD, _QWORD, _QWORD);"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.8999999761581421,
+      "id": "ev_17",
+      "level": "fact",
+      "location": "microblock 0",
+      "source": "microcode",
+      "statement": "Microcode use/def sets: must_use=, may_use=, must_def=, may_def=rdx.8,rdi.16"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.8999999761581421,
+      "id": "ev_18",
+      "level": "fact",
+      "location": "microblock 1",
+      "source": "microcode",
+      "statement": "Microcode use/def sets: must_use=rdx.8,rdi.16, may_use=rdx.8,rdi.16,GLBLOW,GLBHIGH, must_def=rax.8, may_def=cf.1,zf.1,sf.1,of.1,pf.1,rax.16,rcx.8,r8.8,r9.8,r10.8,r11.8,fps.2,fl.1,c0.1,c2.1,c3.1,df.1,if.1,xmm4.16,xmm5.16,GLBLOW,GLBHIGH"
+    },
+    {
+      "address": "0x402EDF",
+      "confidence": 0.8600000143051147,
+      "id": "ev_19",
+      "level": "fact",
+      "location": "microcode 56",
+      "source": "microcode",
+      "statement": "call   $sub_401400 <fast:_QWORD a1.8,_QWORD a2.8,_QWORD a3.8> => __int64 .0"
+    },
+    {
+      "address": "0x402EE4",
+      "confidence": 0.8600000143051147,
+      "id": "ev_20",
+      "level": "fact",
+      "location": "microcode 4",
+      "source": "microcode",
+      "statement": "mov    #0.8, ?3.8"
+    },
+    {
+      "address": "",
+      "confidence": 0.8999999761581421,
+      "id": "ev_21",
+      "level": "fact",
+      "location": "microblock 2",
+      "source": "microcode",
+      "statement": "Microcode use/def sets: must_use=, may_use=rax.8, must_def=, may_def="
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.8799999952316284,
+      "id": "ev_22",
+      "level": "inference",
+      "location": "lvar_1",
+      "source": "type-info",
+      "statement": "Value is exposed as a function argument by the decompiler"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.8799999952316284,
+      "id": "ev_23",
+      "level": "inference",
+      "location": "lvar_2",
+      "source": "type-info",
+      "statement": "Value is exposed as a function argument by the decompiler"
+    },
+    {
+      "address": "0x402ED0",
+      "confidence": 0.8799999952316284,
+      "id": "ev_24",
+      "level": "inference",
+      "location": "lvar_3",
+      "source": "type-info",
+      "statement": "Value is exposed as a function argument by the decompiler"
+    },
+    {
+      "address": "0x401400",
+      "confidence": 0.7799999713897705,
+      "id": "ev_25",
+      "level": "fact",
+      "location": "callee_summary",
+      "source": "decompiler",
+      "statement": "Bounded callee snapshot; it is context, not a second analysis target."
+    },
+    {
+      "address": "0x401090",
+      "confidence": 0.7799999713897705,
+      "id": "ev_26",
+      "level": "fact",
+      "location": "caller_site",
+      "source": "xref",
+      "statement": "Caller site references the target at 0x4010A8"
+    },
+    {
+      "address": "0x401400",
+      "confidence": 0.7799999713897705,
+      "id": "ev_27",
+      "level": "fact",
+      "location": "assembly_slice",
+      "source": "xref",
+      "statement": "Assembly slice requested because decompiler confidence is limited."
+    }
+  ],
+  "interactions": [
+    {
+      "address": "0x402EDF",
+      "confidence": 0.8199999928474426,
+      "evidence_ids": [
+        "ev_13"
+      ],
+      "inputs": [],
+      "kind": "internal-function",
+      "outputs": [],
+      "role_in_function": "semantic role not yet resolved",
+      "side_effects": [],
+      "target": "sub_401400",
+      "target_address": "0x401400"
+    }
+  ],
+  "memory_objects": [],
+  "refactored_view": {
+    "conservative": "__int64 __fastcall main(__int64 a1, char **a2, char **a3)\n{\n  sub_401400(a1, a2, a3);\n  return 0;\n}\n",
+    "interpretive": "Interpretive view unavailable until semantic synthesis completes."
+  },
+  "schema_version": 1,
+  "signature": {
+    "confidence": 0.0,
+    "current": "__int64 __fastcall(__int64 a1, char **a2, char **a3)",
+    "proposed": "__int64 __fastcall(__int64 a1, char **a2, char **a3)"
+  },
+  "symbols": [
+    {
+      "address": "",
+      "confidence": 0.44999998807907104,
+      "evidence_ids": [
+        "ev_7"
+      ],
+      "id": "lvar_1",
+      "old_name": "a1",
+      "proposed_name": "a1",
+      "proposed_type": "unknown",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.44999998807907104,
+      "evidence_ids": [
+        "ev_8"
+      ],
+      "id": "lvar_2",
+      "old_name": "a2",
+      "proposed_name": "a2",
+      "proposed_type": "unknown",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.44999998807907104,
+      "evidence_ids": [
+        "ev_9"
+      ],
+      "id": "lvar_3",
+      "old_name": "a3",
+      "proposed_name": "a3",
+      "proposed_type": "unknown",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.44999998807907104,
+      "evidence_ids": [
+        "ev_10"
+      ],
+      "id": "lvar_4",
+      "old_name": "",
+      "proposed_name": "",
+      "proposed_type": "unknown",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.0,
+      "evidence_ids": [],
+      "id": "micro_value_1",
+      "old_name": "$sub_401400",
+      "proposed_name": "$sub_401400",
+      "proposed_type": "unknown",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.0,
+      "evidence_ids": [],
+      "id": "micro_value_2",
+      "old_name": "<fast:_QWORD a1.8,_QWORD a2.8,_QWORD a3.8> => __int64 .0",
+      "proposed_name": "<fast:_QWORD a1.8,_QWORD a2.8,_QWORD a3.8> => __int64 .0",
+      "proposed_type": "unknown",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.6200000047683716,
+      "evidence_ids": [
+        "ev_20"
+      ],
+      "id": "micro_value_3",
+      "old_name": "#0.8",
+      "proposed_name": "#0.8",
+      "proposed_type": "scalar (8 bytes)",
+      "role": "unresolved"
+    },
+    {
+      "address": "",
+      "confidence": 0.6200000047683716,
+      "evidence_ids": [
+        "ev_20"
+      ],
+      "id": "micro_value_4",
+      "old_name": "?3.8",
+      "proposed_name": "?3.8",
+      "proposed_type": "scalar (8 bytes)",
+      "role": "unresolved"
+    }
+  ],
+  "target": {
+    "address": "0x402ED0",
+    "category": "call-containing",
+    "confidence": 0.0,
+    "current_name": "main",
+    "proposed_name": ""
+  },
+  "uncertainties": [
+    {
+      "evidence_ids": [
+        "ev_6"
+      ],
+      "level": "fact",
+      "statement": "The target has an explicit control-flow graph with 1 basic blocks"
+    },
+    {
+      "evidence_ids": [
+        "ev_11"
+      ],
+      "level": "fact",
+      "statement": "Ctree exposes a block control-flow statement"
+    },
+    {
+      "evidence_ids": [
+        "ev_12"
+      ],
+      "level": "fact",
+      "statement": "Ctree exposes a expression_statement control-flow statement"
+    },
+    {
+      "evidence_ids": [
+        "ev_14"
+      ],
+      "level": "fact",
+      "statement": "Ctree exposes a return control-flow statement"
+    },
+    {
+      "evidence_ids": [
+        "ev_15"
+      ],
+      "level": "fact",
+      "statement": "The target is referenced by code outside the function"
+    },
+    {
+      "evidence_ids": [
+        "ev_16"
+      ],
+      "level": "fact",
+      "statement": "Decompiler warning may limit semantic confidence: using guessed type __int64 __fastcall sub_401400(_QWORD, _QWORD, _QWORD);"
+    },
+    {
+      "evidence_ids": [
+        "ev_17"
+      ],
+      "level": "fact",
+      "statement": "Microcode exposes block-level use/def sets for value-flow analysis"
+    },
+    {
+      "evidence_ids": [
+        "ev_18"
+      ],
+      "level": "fact",
+      "statement": "Microcode exposes block-level use/def sets for value-flow analysis"
+    },
+    {
+      "evidence_ids": [
+        "ev_21"
+      ],
+      "level": "fact",
+      "statement": "Microcode exposes block-level use/def sets for value-flow analysis"
+    },
+    {
+      "evidence_ids": [
+        "ev_25"
+      ],
+      "level": "fact",
+      "statement": "Bounded context was collected for callee_summary"
+    },
+    {
+      "evidence_ids": [
+        "ev_26"
+      ],
+      "level": "fact",
+      "statement": "Bounded context was collected for caller_site"
+    },
+    {
+      "evidence_ids": [
+        "ev_27"
+      ],
+      "level": "fact",
+      "statement": "Bounded context was collected for assembly_slice"
+    },
+    {
+      "evidence_ids": [],
+      "level": "hypothesis",
+      "statement": "Purpose, semantic names and conservative refactor proposals require model synthesis and validation."
+    }
+  ]
+}

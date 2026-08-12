@@ -11,10 +11,11 @@ from typing import Any, Iterable
 from evaluation.aggregate import (
     aggregate_flows,
     failure_rows,
+    invalid_keys,
     stage_completion_rows,
 )
 from evaluation.metrics import format_ratio
-from evaluation.schema import FLOW_LAYOUT_VERSION
+from evaluation.schema import FLOW_LAYOUT_VERSION, FLOW_ORDER
 from evaluation.statistical_analysis import paired_analysis
 from evaluation.validation import validate_runs
 
@@ -22,17 +23,18 @@ from evaluation.validation import validate_runs
 FIGURE_GUIDES: dict[str, dict[str, str]] = {
     "overall_performance": {
         "meaning": (
-            "So sánh ba kết quả chính của từng flow: compile ngay lần đầu, "
-            "PASS hành vi cuối, và thành công end-to-end."
+            "So sánh compile lần đầu, re-executability và PASS hành vi cuối "
+            "của từng flow."
         ),
         "calculation": (
             "First-pass RSR = first compile success / initial candidates; "
-            "Behavioral pass = final PASS / completed behavioral validations; "
-            "Canonical E2E = accepted PASS / all eligible samples."
+            "Re-executability = executable produced / all eligible samples; "
+            "Behavioral pass = final PASS / completed behavioral validations."
         ),
         "reading": (
-            "Cột càng cao càng tốt. Ba cột có thể dùng mẫu số khác nhau; thanh "
-            "đen là 95% CI, không phải lỗi chạy."
+            "Re-executability chỉ đo executable availability, không đo semantic "
+            "correctness. Semantic correctness nằm ở Canonical E2E. Thanh đen "
+            "là 95% CI."
         ),
     },
     "compilation_performance": {
@@ -78,6 +80,20 @@ FIGURE_GUIDES: dict[str, dict[str, str]] = {
         "reading": (
             "After cao hơn Before, success rate cao và gain dương nghĩa là "
             "repair có ích. F2 là one-shot nên các repair metric là N/A."
+        ),
+    },
+    "iterative_feedback_vs_one_shot": {
+        "meaning": (
+            "Cô lập tác dụng của iterative compiler/behavioral feedback trên "
+            "hai cặp dùng cùng initial evidence: F1–F2 và F5–F6."
+        ),
+        "calculation": (
+            "Mỗi điểm là Re-executability successes / all eligible cases; mũi tên "
+            "đi từ one-shot sang iterative và nhãn là chênh lệch điểm phần trăm."
+        ),
+        "reading": (
+            "Mũi tên sang phải càng dài thì iterative feedback cải thiện recovery "
+            "càng nhiều. F6 là first-call checkpoint derived từ F5."
         ),
     },
     "cumulative_compile_success_by_round": {
@@ -156,9 +172,9 @@ FIGURE_GUIDES: dict[str, dict[str, str]] = {
         ),
     },
     "ablation_forest_plot": {
-        "meaning": "Ước lượng chênh lệch Canonical E2E cho từng cặp flow paired.",
+        "meaning": "Ước lượng chênh lệch re-executability cho từng cặp flow paired.",
         "calculation": (
-            "Effect = E2E(flow A) - E2E(flow B) theo cùng sample/repeat, đơn vị "
+            "Effect = re-executability(flow A) - re-executability(flow B) theo cùng sample/repeat, đơn vị "
             "điểm phần trăm; interval là bootstrap 95% CI."
         ),
         "reading": (
@@ -169,7 +185,7 @@ FIGURE_GUIDES: dict[str, dict[str, str]] = {
     "ablation_win_tie_loss": {
         "meaning": "Đếm kết quả thắng/hòa/thua của Flow A so với Flow B theo sample.",
         "calculation": (
-            "A win: A E2E PASS và B FAIL; tie: cùng kết quả; B win: B PASS và A FAIL."
+            "A win: A re-exec PASS và B FAIL; tie: cùng kết quả; B win: B PASS và A FAIL."
         ),
         "reading": (
             "So sánh phần A wins với B wins; nhiều tie nghĩa là hai flow thường "
@@ -177,10 +193,10 @@ FIGURE_GUIDES: dict[str, dict[str, str]] = {
         ),
     },
     "tokens_vs_e2e": {
-        "meaning": "Liên hệ lượng token của một run với kết quả Canonical E2E.",
+        "meaning": "Liên hệ lượng token của một run với kết quả re-executability.",
         "calculation": (
             "Mỗi chấm là một run: trục X = total input + output tokens; trục Y "
-            "= E2E No/Yes; màu/ký hiệu = flow."
+            "= re-executability No/Yes; màu/ký hiệu = flow."
         ),
         "reading": (
             "Xem nhóm PASS có cần nhiều token hơn không. Đây là association, "
@@ -340,11 +356,11 @@ def _flow_summary(flow_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "completed_behavioral_validation_count",
                     "counterexample_detection_rate_percent",
                 ),
-                "Canonical E2E": _rate_cell(
+                "Re-executability Rate": _rate_cell(
                     row,
-                    "canonical_e2e_success_count",
+                    "re_executability_success_count",
                     "eligible_sample_count",
-                    "canonical_e2e_rate_percent",
+                    "re_executability_rate_percent",
                 ),
                 "Compilation Repair Gain": (
                     "N/A"
@@ -414,6 +430,43 @@ def _latex_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(body)
 
 
+def _source_quality_summary(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dimensions = (
+        ("Variables", "readability_variables"),
+        ("Loops", "readability_loops"),
+        ("Conditions", "readability_conditions"),
+        ("Logic flow", "readability_logic_flow"),
+        ("Structural integrity", "readability_structure"),
+        ("Overall", "readability_overall"),
+    )
+    rows: list[dict[str, Any]] = []
+    for flow_id in FLOW_ORDER:
+        accepted = [
+            run
+            for run in runs
+            if run.get("flow_id") == flow_id and run.get("candidate_accepted")
+        ]
+        evaluated = [
+            run for run in accepted if run.get("readability_overall") is not None
+        ]
+        row: dict[str, Any] = {
+            "Flow": flow_id,
+            "Accepted": len(accepted),
+            "Evaluated": len(evaluated),
+            "Coverage": (
+                f"{len(evaluated)}/{len(accepted)} "
+                f"({100.0 * len(evaluated) / len(accepted):.1f}%)"
+                if accepted
+                else "0/0 (N/A)"
+            ),
+        }
+        for label, field in dimensions:
+            values = [float(run[field]) for run in evaluated if run.get(field) is not None]
+            row[label] = f"{sum(values) / len(values):.2f}" if values else "N/A"
+        rows.append(row)
+    return rows
+
+
 def _report_markdown(
     experiment_id: str,
     summary_rows: list[dict[str, Any]],
@@ -422,6 +475,7 @@ def _report_markdown(
     manifest: list[dict[str, str]],
     flow_layout_version: str | None,
     metric_guide_rows: list[dict[str, Any]],
+    source_quality_rows: list[dict[str, Any]],
     historical_artifacts: bool,
 ) -> str:
     error_count = sum(error["severity"] == "ERROR" for error in errors)
@@ -437,7 +491,7 @@ def _report_markdown(
             "W/T/L": f"{row['flow_a_wins']}/{row['ties']}/{row['flow_b_wins']}",
         }
         for row in comparisons
-        if row["metric_name"] == "Canonical E2E Rate"
+        if row["metric_name"] == "Re-executability Rate"
     ]
     figures = "\n".join(
         f"- `{item['figure_id']}`: {item['caption']}" for item in manifest
@@ -473,6 +527,12 @@ def _report_markdown(
         if historical_artifacts
         else ""
     )
+    readability_count = sum(row["Evaluated"] for row in source_quality_rows)
+    readability_note = (
+        "Readability scores are available from persisted evaluator records."
+        if readability_count
+        else "Readability is N/A because no valid evaluator record exists."
+    )
     return f"""# Six-flow source recovery evaluation
 
 Experiment: `{experiment_id}`
@@ -499,11 +559,33 @@ intervals. `n` is the number of eligible samples after data validation.
 
 {_markdown_table(summary_rows)}
 
-`Canonical E2E` measures accepted recovery over all eligible samples. The
-flow-specific rate remains available in machine-readable CSV output but is
-omitted here because it is identical to Canonical E2E in this campaign.
+`Re-executability Rate` measures executable availability only: recovered C must
+produce an executable, with all eligible samples in the denominator. It does
+not check semantic output. `Canonical E2E` remains the stricter behavioral /
+semantic metric. The flow-specific rate remains available in machine-readable
+CSV output.
 Rate cells show `numerator/denominator (percentage)`. {one_shot_flow}
 repair metrics are N/A because error context is disabled.
+
+## Source quality: accepted Recovered C Source only
+
+Readability is judged independently from correctness on a 1-to-5 absolute
+rubric. Only Candidate C already accepted by compilation and behavioral
+validation is eligible. The five dimensions are Variables, Loops, Conditions,
+Logic flow, and Structural integrity; Overall is their arithmetic mean.
+
+| Score | Interpretation |
+|---:|---|
+| 1 | Very difficult to read; dominated by low-level artifacts. |
+| 2 | Recognizably C, but data and control flow remain tangled. |
+| 3 | Main logic is understandable, with many temporaries, casts, or gotos. |
+| 4 | Structure is reasonably clear and most logic is easy to follow. |
+| 5 | Clear C-like source close to conventional human-written C. |
+
+{_markdown_table(source_quality_rows)}
+
+Readability measures analyzability only. It is never used to infer semantic
+correctness, behavioral equivalence, or Re-executability success.
 
 ## Data validity and historical limitations
 
@@ -512,13 +594,13 @@ repair metrics are N/A because error context is disabled.
   eligible aggregates and paired inference.
 {historical_oracle_note}
 - Exact five-tuple comparison is implemented for schema-v2 observations.
-- Readability is N/A because no evaluator record exists. SLOC Ratio is N/A when
-  the required common `clang-format` tool is unavailable.
+- {readability_note} SLOC Ratio is N/A when the required common `clang-format`
+  tool is unavailable.
 - LLVM reduction measures simplification only and is not a correctness oracle.
 
 See `data_validation_errors.csv` for every affected paired key.
 
-## Main paired contrasts (Canonical E2E)
+## Main paired contrasts (Re-executability)
 
 {_markdown_table(contrast_rows)}
 
@@ -571,6 +653,18 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
     )
     comparisons, tests = paired_analysis(data["runs"], errors)
     summary_rows = _flow_summary(flow_rows)
+    invalid = invalid_keys(errors)
+    valid_runs = [
+        run
+        for run in data["runs"]
+        if (
+            str(run.get("sample_id")),
+            str(run.get("flow_id")),
+            int(run.get("repeat_id", 0)),
+        )
+        not in invalid
+    ]
+    source_quality_rows = _source_quality_summary(valid_runs)
     metric_guide_rows = [
         {
             "Metric": "First-pass RSR",
@@ -601,6 +695,11 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
             "Metric": "Counterexample Detection Rate",
             "Meaning": "A reproducible divergence was found for the final candidate.",
             "Denominator": "Samples that completed behavioral validation.",
+        },
+        {
+            "Metric": "Re-executability Rate",
+            "Meaning": "Recovered C produced an executable; semantic correctness is not required.",
+            "Denominator": "All eligible samples, including generation and compile failures.",
         },
         {
             "Metric": "Canonical E2E",
@@ -699,26 +798,44 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         ],
     )
     write_csv(report_dir / "llvm_metrics.csv", data["llvm_samples"])
+    accepted_sources = [
+        run for run in valid_runs if run.get("candidate_accepted")
+    ]
     write_csv(
         report_dir / "source_quality_metrics.csv",
-        data["runs"],
+        accepted_sources,
         [
             "experiment_id",
             "sample_id",
             "flow_id",
             "repeat_id",
+            "status",
+            "candidate_accepted",
             "readability_variables",
             "readability_loops",
             "readability_conditions",
             "readability_logic_flow",
             "readability_structure",
             "readability_overall",
+            "readability_variables_rationale",
+            "readability_loops_rationale",
+            "readability_conditions_rationale",
+            "readability_logic_flow_rationale",
+            "readability_structure_rationale",
+            "readability_summary",
+            "readability_rubric_version",
+            "readability_source_sha256",
+            "readability_evaluated_at",
+            "readability_correctness_assessed",
             "evaluator_id",
             "evaluation_method",
             "original_sloc",
             "recovered_sloc",
             "sloc_ratio",
         ],
+    )
+    write_csv(
+        report_dir / "source_quality_summary.csv", source_quality_rows
     )
     cost_columns = [
         "experiment_id",
@@ -806,6 +923,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         manifest,
         flow_layout_version,
         metric_guide_rows,
+        source_quality_rows,
         historical_artifacts,
     )
     (report_dir / "report.md").write_text(markdown, encoding="utf-8")
@@ -813,6 +931,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         _markdown_table(summary_rows) + "\n", encoding="utf-8"
     )
     latex_table = _latex_table(summary_rows)
+    source_quality_latex = _latex_table(source_quality_rows)
     (report_dir / "flow_summary_table.tex").write_text(
         latex_table + "\n", encoding="utf-8"
     )
@@ -827,6 +946,14 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         )
         + "\n"
         + latex_table
+        + "\n"
+        + r"\section*{Source quality: accepted Recovered C Source only}"
+        + "\n"
+        + _latex_escape(
+            "Readability is an independent 1-to-5 assessment of Variables, Loops, Conditions, Logic flow, and Structural integrity. It is not a correctness metric."
+        )
+        + "\n"
+        + source_quality_latex
         + "\n"
         + "\n".join(
             r"\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/"
@@ -857,6 +984,14 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
             f"<td>{html.escape(str(row[column]))}</td>" for column in summary_rows[0]
         ) + "</tr>" for row in summary_rows
     ) + "</tbody></table>"
+    source_quality_html = "<table><thead><tr>" + "".join(
+        f"<th>{html.escape(column)}</th>" for column in source_quality_rows[0]
+    ) + "</tr></thead><tbody>" + "".join(
+        "<tr>" + "".join(
+            f"<td>{html.escape(str(row[column]))}</td>"
+            for column in source_quality_rows[0]
+        ) + "</tr>" for row in source_quality_rows
+    ) + "</tbody></table>"
     figure_cards: list[str] = []
     for item in manifest:
         guide = FIGURE_GUIDES[item["figure_id"]]
@@ -874,7 +1009,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
     figures_html = '<div class="grid">' + "".join(figure_cards) + "</div>"
     report_html = _html_document(
         data["experiment_id"],
-        f"<h1>Six-flow source recovery evaluation</h1><p>Offline regeneration; no LLM or fuzzing was executed.</p><div class=\"derived-note\"><b>F6 provenance:</b> F6 is derived from the first actual provider call of each F5 run. It is a paired one-call checkpoint, not an independent recovery run. Missing first-call or first-campaign artifacts are marked CANCELLED rather than guessed.</div><h2>How to read the metrics</h2>{metric_guide_html}<p><b>Flow order:</b> F1 Full; F2 no error context; F3 no pseudocode; F4 no direct Clean IR; F5 Raw IR iterative; F6 Raw IR one-call derived from F5. Error bars are 95% confidence intervals, and <code>n</code> is the eligible sample count after validation.</p><h2>Flow summary</h2>{table_html}<h2>Figures</h2>{figures_html}",
+        f"<h1>Six-flow source recovery evaluation</h1><p>Offline regeneration; no recovery LLM, compiler, or fuzzer was executed.</p><div class=\"derived-note\"><b>F6 provenance:</b> F6 is derived from the first actual provider call of each F5 run. It is a paired one-call checkpoint, not an independent recovery run. Missing first-call or first-campaign artifacts are marked CANCELLED rather than guessed.</div><h2>How to read the metrics</h2>{metric_guide_html}<p><b>Flow order:</b> F1 Full; F2 no error context; F3 no pseudocode; F4 no direct Clean IR; F5 Raw IR iterative; F6 Raw IR one-call derived from F5. Error bars are 95% confidence intervals, and <code>n</code> is the eligible sample count after validation.</p><h2>Flow summary</h2>{table_html}<h2>Source quality: accepted Recovered C Source only</h2><p>Readability uses an absolute 1-to-5 rubric over Variables, Loops, Conditions, Logic flow, and Structural integrity. Overall is their arithmetic mean. It is not a correctness metric.</p>{source_quality_html}<h2>Figures</h2>{figures_html}",
     )
     (report_dir / "report.html").write_text(report_html, encoding="utf-8")
     (report_dir / "dashboard.html").write_text(report_html, encoding="utf-8")
@@ -893,6 +1028,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         ),
         "sample_count": len({run["sample_id"] for run in data["runs"]}),
         "flow_metrics": flow_rows,
+        "source_quality_metrics": source_quality_rows,
         "validation": {
             "error_count": sum(error["severity"] == "ERROR" for error in errors),
             "warning_count": sum(error["severity"] == "WARNING" for error in errors),

@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "/home/dungbv/clau/src/llvm_pass/brighten_090_native_cleanup"
+    "cmake.sourceDirectory": "/home/dungbv/clau/src/llvm_pass/brighten_090_native_cleanup",
+    "liveServer.settings.port": 5501
 }
