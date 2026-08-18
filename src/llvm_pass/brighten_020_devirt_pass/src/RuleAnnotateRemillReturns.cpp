@@ -19,70 +19,40 @@ using namespace llvm;
 static constexpr int64_t kOffRAX = 2216;
 
 static bool IsRAXPointer(Value *Ptr, const DataLayout &DL) {
-  if (!Ptr) {
+  if (!Ptr)
     return false;
-  }
 
   Value *Stripped = Ptr->stripPointerCasts();
-  if (auto *GV = dyn_cast<GlobalValue>(Stripped)) {
-    if (GV->getName().starts_with("RAX_")) {
+  if (auto *GV = dyn_cast<GlobalValue>(Stripped))
+    if (GV->getName().starts_with("RAX_"))
       return true;
-    }
-  }
 
   auto *GEP = dyn_cast<GEPOperator>(Stripped);
-  if (!GEP) {
+  if (!GEP)
     return false;
-  }
 
   Value *Base = GEP->getPointerOperand()->stripPointerCasts();
   auto *BaseGV = dyn_cast<GlobalValue>(Base);
-  if (!BaseGV || BaseGV->getName() != "__mcsema_reg_state") {
+  if (!BaseGV || BaseGV->getName() != "__mcsema_reg_state")
     return false;
-  }
 
   APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0, true);
   if (GEP->accumulateConstantOffset(DL, Offset) &&
-      Offset.getSExtValue() == kOffRAX) {
+      Offset.getSExtValue() == kOffRAX)
     return true;
-  }
 
-  if (GEP->getNumOperands() >= 4) {
-    if (auto *Idx = dyn_cast<ConstantInt>(GEP->getOperand(3))) {
+  if (GEP->getNumOperands() >= 4)
+    if (auto *Idx = dyn_cast<ConstantInt>(GEP->getOperand(3)))
       return Idx->getZExtValue() == 1;
-    }
-  }
-
   return false;
 }
 
-static Value *NormalizeCandidate(Value *V) {
-  if (!V) {
-    return nullptr;
-  }
-
-  if (auto *Cast = dyn_cast<CastInst>(V)) {
-    switch (Cast->getOpcode()) {
-    case Instruction::Trunc:
-    case Instruction::ZExt:
-    case Instruction::SExt:
-    case Instruction::PtrToInt:
-    case Instruction::IntToPtr:
-    case Instruction::BitCast:
-      return V;
-    default:
-      break;
-    }
-  }
-
-  return V;
-}
+static Value *NormalizeCandidate(Value *V) { return V; }
 
 static bool CallMayClobberState(CallBase *CB) {
-  if (Function *Callee = CB->getCalledFunction()) {
+  if (Function *Callee = CB->getCalledFunction())
     if (Callee->onlyReadsMemory() || Callee->doesNotAccessMemory())
       return false;
-  }
   return true;
 }
 
@@ -91,12 +61,8 @@ static Value *FindRAXStoreInBlock(BasicBlock *BB, const DataLayout &DL,
   Clobbered = false;
   for (auto It = BB->rbegin(); It != BB->rend(); ++It) {
     auto *SI = dyn_cast<StoreInst>(&*It);
-    if (SI && IsRAXPointer(SI->getPointerOperand(), DL)) {
+    if (SI && IsRAXPointer(SI->getPointerOperand(), DL))
       return NormalizeCandidate(SI->getValueOperand());
-    }
-    // A lifted/native call can update RAX through the shared State even when
-    // its LLVM return value is the memory token.  Never use a stale store from
-    // before such a call as the recovered application return value.
     if (auto *CB = dyn_cast<CallBase>(&*It); CB && CallMayClobberState(CB)) {
       Clobbered = true;
       return nullptr;
@@ -109,20 +75,16 @@ static Value *FindExistingPhiForPredValues(BasicBlock *BB,
                                            ArrayRef<BasicBlock *> Preds,
                                            ArrayRef<Value *> Values) {
   for (PHINode &Phi : BB->phis()) {
-    if (Phi.getNumIncomingValues() != Preds.size()) {
+    if (Phi.getNumIncomingValues() != Preds.size())
       continue;
-    }
-
     bool Match = true;
-    for (unsigned I = 0, E = Preds.size(); I < E; ++I) {
+    for (unsigned I = 0, E = Preds.size(); I < E; ++I)
       if (Phi.getIncomingValueForBlock(Preds[I]) != Values[I]) {
         Match = false;
         break;
       }
-    }
-    if (Match) {
+    if (Match)
       return &Phi;
-    }
   }
   return nullptr;
 }
@@ -179,18 +141,16 @@ static MDNode *MakeCandidateMetadata(LLVMContext &Ctx, StringRef Prefix,
   raw_string_ostream OS(Ty);
   OS << Prefix << ":";
   V->getType()->print(OS);
-  if (V->hasName()) {
+  if (V->hasName())
     OS << ":" << V->getName();
-  }
   return MDNode::get(Ctx, {MDString::get(Ctx, OS.str())});
 }
 
 static bool HasReturnMarker(ReturnInst *RI) {
   Instruction *Prev = RI->getPrevNode();
   auto *CB = dyn_cast_or_null<CallBase>(Prev);
-  if (!CB) {
+  if (!CB)
     return false;
-  }
   Function *Callee = CB->getCalledFunction();
   return Callee && Callee->getIntrinsicID() == Intrinsic::sideeffect &&
          CB->hasOperandBundles() &&
@@ -199,14 +159,8 @@ static bool HasReturnMarker(ReturnInst *RI) {
 
 static bool InsertReturnMarker(Module &M, ReturnInst *RI, Value *RAX,
                                DominatorTree &DT) {
-  if (HasReturnMarker(RI)) {
+  if (HasReturnMarker(RI))
     return true;
-  }
-
-  // The operand bundle is a real use of RAX.  In particular, a value found
-  // in one predecessor cannot be attached directly to a return in a join
-  // block unless it dominates that return.  Skipping the annotation is
-  // conservative; emitting invalid IR would poison every later pass.
   if (auto *Def = dyn_cast<Instruction>(RAX)) {
     if (!DT.dominates(Def, RI)) {
       errs() << "[brighten-devirt] skipping non-dominating return RAX in "
@@ -216,10 +170,11 @@ static bool InsertReturnMarker(Module &M, ReturnInst *RI, Value *RAX,
   }
 
   IRBuilder<> B(RI);
-  FunctionCallee SideEffect =
-      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::sideeffect);
+  Function *SideEffect =
+      Intrinsic::getDeclaration(&M, Intrinsic::sideeffect);
+  FunctionCallee Callee(SideEffect->getFunctionType(), SideEffect);
   OperandBundleDef Bundle("brighten_return_rax", RAX);
-  B.CreateCall(SideEffect, {}, {Bundle});
+  B.CreateCall(Callee, {}, {Bundle});
   return true;
 }
 
@@ -229,26 +184,16 @@ bool BrightenDevirtPass::AnnotateRemillReturns(Module &M) {
   bool Changed = false;
 
   for (Function &F : M) {
-    if (F.isDeclaration()) {
+    if (F.isDeclaration())
       continue;
-    }
-
     DominatorTree DT(F);
-
     for (BasicBlock &BB : F) {
       auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
-      if (!RI) {
+      if (!RI)
         continue;
-      }
-
       Value *RAX = FindRAXValueBeforeRet(RI, DL);
-      if (!RAX) {
+      if (!RAX || !InsertReturnMarker(M, RI, RAX, DT))
         continue;
-      }
-
-      if (!InsertReturnMarker(M, RI, RAX, DT)) {
-        continue;
-      }
       RI->setMetadata("brighten.return_rax.info",
                       MakeCandidateMetadata(Ctx, "rax", RAX));
       RI->setMetadata("brighten.return_candidate",
@@ -258,7 +203,6 @@ bool BrightenDevirtPass::AnnotateRemillReturns(Module &M) {
       Changed = true;
     }
   }
-
   return Changed;
 }
 
