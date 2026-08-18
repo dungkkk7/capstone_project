@@ -25,6 +25,8 @@ jobs:
         shell: bash
         run: |
           ! grep -q 'RuleImplementExternCallBridge.cpp' src/llvm_pass/brighten_015_runtime_helper_materialization/CMakeLists.txt
+          ! grep -q 'RuleRecoverStackFrame.cpp' src/llvm_pass/brighten_040_stack_frame_pass/CMakeLists.txt
+          ! grep -q 'RuleCompactPostStateFrame.cpp' src/llvm_pass/brighten_040_stack_frame_pass/CMakeLists.txt
           ! grep -q 'NativeCleanup.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
           ! grep -q 'NativeStateSSA.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
           ! grep -q 'Chernobog.*Rules.cpp' src/llvm_pass/deobfuscate_095_deobfus_ollvm/CMakeLists.txt
@@ -34,8 +36,26 @@ jobs:
         run: |
           PYTHONPATH=src python - <<'PY'
           from llvm_pass.britening_ir import DEFAULT_PASS_PIPELINE
-          p = DEFAULT_PASS_PIPELINE
-          required = [
+
+          def top_level(text):
+              out, current, depth = [], [], 0
+              for ch in text:
+                  if ch == '(':
+                      depth += 1
+                  elif ch == ')':
+                      depth -= 1
+                  if ch == ',' and depth == 0:
+                      out.append(''.join(current))
+                      current = []
+                  else:
+                      current.append(ch)
+              if current:
+                  out.append(''.join(current))
+              assert depth == 0
+              return out
+
+          parts = top_level(DEFAULT_PASS_PIPELINE)
+          first_wave = [
               'brighten-repair-pass',
               'brighten-remill-runtime-pass',
               'brighten-devirt-pass',
@@ -46,12 +66,12 @@ jobs:
               'brighten-global-data-recovery-pass',
               'brighten-type-reconstruct',
               '095',
-              'brighten-region-ssa-unflatten-pass',
-              'brighten-native-cleanup-pass',
-              'verify',
           ]
-          positions = [p.index(x) for x in required]
-          assert positions == sorted(positions), (required, positions)
-          assert p.count('095') == 1
-          assert 'brighten-native-cleanup-final-pass' not in p
+          positions = [parts.index(x) for x in first_wave]
+          assert positions == sorted(positions), (first_wave, positions)
+          assert parts.count('095') == 1
+          assert parts.index('brighten-region-ssa-unflatten-pass') > parts.index('095')
+          assert parts.index('brighten-native-cleanup-pass') > parts.index('brighten-region-ssa-unflatten-pass')
+          assert parts[-1] == 'verify'
+          assert 'brighten-native-cleanup-final-pass' not in parts
           PY
