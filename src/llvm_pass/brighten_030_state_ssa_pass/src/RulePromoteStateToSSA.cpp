@@ -401,20 +401,22 @@ bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
       for (auto &Entry : Cells) {
         uint64_t Base = Entry.first;
         IntegerType *CellTy = CellTypes[Base];
-        Value *Value = B.CreateLoad(CellTy, CellAllocas[Base],
-                                    "state.cell.flush");
-        Value *Ptr = statePointer(B, StatePtr, Base, "state.cell.flush.ptr");
-        createUnalignedStore(B, Value, Ptr);
+        Value *CellValue = B.CreateLoad(CellTy, CellAllocas[Base],
+                                        "state.cell.flush");
+        Value *CellAddress =
+            statePointer(B, StatePtr, Base, "state.cell.flush.ptr");
+        createUnalignedStore(B, CellValue, CellAddress);
       }
     };
     auto reloadCells = [&](IRBuilder<> &B) {
       for (auto &Entry : Cells) {
         uint64_t Base = Entry.first;
         IntegerType *CellTy = CellTypes[Base];
-        Value *Ptr = statePointer(B, StatePtr, Base, "state.cell.reload.ptr");
-        Value *Value = createUnalignedLoad(
-            B, CellTy, Ptr, "state.cell.reload");
-        B.CreateStore(Value, CellAllocas[Base]);
+        Value *CellAddress =
+            statePointer(B, StatePtr, Base, "state.cell.reload.ptr");
+        Value *CellValue = createUnalignedLoad(
+            B, CellTy, CellAddress, "state.cell.reload");
+        B.CreateStore(CellValue, CellAllocas[Base]);
       }
     };
 

@@ -5,10 +5,10 @@ target triple = "x86_64-unknown-linux-gnu"
 
 define void @test_dyn_array(i64 %idx) {
 entry:
-  ; CHECK: %obj = alloca [64 x [1 x i8]]
+  ; CHECK: %obj = alloca [64 x i8]
+  ; CHECK-NOT: brighten.gep
   %obj = alloca [64 x i8], align 4
 
-  ; CHECK: {{%brighten.gep.*}} = getelementptr [64 x [1 x i8]], ptr %obj, i32 0, i64 %idx, i64 0
   %p = getelementptr [64 x i8], ptr %obj, i64 0, i64 %idx
   store i32 100, ptr %p, align 4
 

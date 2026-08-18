@@ -18,11 +18,11 @@ static cl::opt<TypeMode> TypeModeOpt(
                clEnumValN(TypeMode::Aggressive, "aggressive", "Aggressive mode")));
 
 static cl::opt<unsigned> MinConfidenceOpt(
-    "brighten-type-min-confidence", cl::init(0),
+    "brighten-type-min-confidence", cl::init(80),
     cl::desc("Minimum confidence to rewrite"));
 
 static cl::opt<unsigned> MaxDepthOpt(
-    "brighten-type-max-depth", cl::init(4),
+    "brighten-type-max-depth", cl::init(16),
     cl::desc("Maximum search depth for pointer tracing"));
 
 static cl::opt<unsigned> MinArrayElementsOpt(
@@ -34,7 +34,7 @@ static cl::opt<std::string> ReportPathOpt(
     cl::desc("Path to write type reconstruction report"));
 
 static cl::opt<bool> VerifyOpt(
-    "brighten-type-verify", cl::init(false),
+    "brighten-type-verify", cl::init(true),
     cl::desc("Run verifier after transformation"));
 
 static cl::opt<bool> DumpRejectionsOpt(
@@ -60,7 +60,8 @@ bool RunTypeReconstruction(Module &M, TypeMode Mode, bool OnlyStruct, bool OnlyA
   
   if (DiscoverCandidates(Ctx)) {
     AnalyzePointerOffsets(Ctx);
-    Changed |= PlanAndRewrite(Ctx, OnlyStruct, OnlyArray);
+    if (CollectAccessEvidence(Ctx) && SolveTypeConstraints(Ctx))
+      Changed |= PlanAndRewrite(Ctx, OnlyStruct, OnlyArray);
     VerifyReconstruction(Ctx);
   }
 
@@ -78,8 +79,11 @@ bool RunTypeReconstruction(Module &M, TypeMode Mode, bool OnlyStruct, bool OnlyA
       OS << "  \"allocas_retyped\": " << Ctx.Report.AllocasRetyped << ",\n";
       OS << "  \"geps_rewritten\": " << Ctx.Report.GEPsRewritten << ",\n";
       OS << "  \"objects_rejected_overlap\": " << Ctx.Report.ObjectsRejectedOverlap << ",\n";
+      OS << "  \"objects_rejected_conflict\": " << Ctx.Report.ObjectsRejectedConflict << ",\n";
       OS << "  \"objects_rejected_escape\": " << Ctx.Report.ObjectsRejectedEscape << ",\n";
       OS << "  \"objects_rejected_unknown_offset\": " << Ctx.Report.ObjectsRejectedUnknownOffset << ",\n";
+      OS << "  \"objects_rejected_non_affine\": " << Ctx.Report.ObjectsRejectedNonAffine << ",\n";
+      OS << "  \"objects_rejected_out_of_bounds\": " << Ctx.Report.ObjectsRejectedOutOfBounds << ",\n";
       OS << "  \"objects_rejected_initializer\": " << Ctx.Report.ObjectsRejectedInitializer << ",\n";
       OS << "  \"verification_failures\": " << Ctx.Report.VerificationFailures << "\n";
       OS << "}\n";

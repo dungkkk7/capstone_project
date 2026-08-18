@@ -5,7 +5,8 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
 define void @test_memcpy(ptr %src) {
 entry:
-  ; CHECK: %obj = alloca %brighten.struct.stack.test_memcpy.obj
+  ; CHECK: %obj = alloca [16 x i8]
+  ; CHECK-NOT: %brighten.struct.stack.test_memcpy.obj
   %obj = alloca [16 x i8], align 8
 
   ; CHECK: call void @llvm.memcpy

@@ -1,9 +1,15 @@
 #include "BrightenTypeReconstructionPass.h"
 #include "TypeReconstructionContext.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/TypeSize.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -12,52 +18,6 @@
 namespace brighten_type {
 
 using namespace llvm;
-
-static void ResolveIndexExpression(Value *Idx, int64_t CurrentStride, int64_t &ConstantOffsetAccumulator, int64_t &FinalStride, Value *&FinalIdx) {
-  if (auto *BO = dyn_cast<BinaryOperator>(Idx)) {
-    if (BO->getOpcode() == Instruction::Add) {
-      Value *LHS = BO->getOperand(0);
-      Value *RHS = BO->getOperand(1);
-      if (auto *CI = dyn_cast<ConstantInt>(RHS)) {
-        ConstantOffsetAccumulator += CI->getSExtValue() * CurrentStride;
-        ResolveIndexExpression(LHS, CurrentStride, ConstantOffsetAccumulator, FinalStride, FinalIdx);
-        return;
-      } else if (auto *CI = dyn_cast<ConstantInt>(LHS)) {
-        ConstantOffsetAccumulator += CI->getSExtValue() * CurrentStride;
-        ResolveIndexExpression(RHS, CurrentStride, ConstantOffsetAccumulator, FinalStride, FinalIdx);
-        return;
-      }
-    } else if (BO->getOpcode() == Instruction::Sub) {
-      Value *LHS = BO->getOperand(0);
-      Value *RHS = BO->getOperand(1);
-      if (auto *CI = dyn_cast<ConstantInt>(RHS)) {
-        ConstantOffsetAccumulator -= CI->getSExtValue() * CurrentStride;
-        ResolveIndexExpression(LHS, CurrentStride, ConstantOffsetAccumulator, FinalStride, FinalIdx);
-        return;
-      }
-    } else if (BO->getOpcode() == Instruction::Mul) {
-      Value *LHS = BO->getOperand(0);
-      Value *RHS = BO->getOperand(1);
-      if (auto *CI = dyn_cast<ConstantInt>(RHS)) {
-        ResolveIndexExpression(LHS, CurrentStride * CI->getSExtValue(), ConstantOffsetAccumulator, FinalStride, FinalIdx);
-        return;
-      } else if (auto *CI = dyn_cast<ConstantInt>(LHS)) {
-        ResolveIndexExpression(RHS, CurrentStride * CI->getSExtValue(), ConstantOffsetAccumulator, FinalStride, FinalIdx);
-        return;
-      }
-    } else if (BO->getOpcode() == Instruction::Shl) {
-      Value *LHS = BO->getOperand(0);
-      Value *RHS = BO->getOperand(1);
-      if (auto *CI = dyn_cast<ConstantInt>(RHS)) {
-        ResolveIndexExpression(LHS, CurrentStride * (1LL << CI->getZExtValue()), ConstantOffsetAccumulator, FinalStride, FinalIdx);
-        return;
-      }
-    }
-  }
-
-  FinalIdx = Idx;
-  FinalStride = CurrentStride;
-}
 
 static std::optional<uint8_t> ExtractByteFromConstant(Constant *C,
                                                      uint64_t Offset,
@@ -268,126 +228,145 @@ Constant *RebuildConstant(Constant *OldInit, Type *NewTy, uint64_t Offset, const
   return nullptr;
 }
 
-static void GetGEPIndices(Type *Ty, uint64_t Offset, const DataLayout &DL, LLVMContext &Context,
-                          std::vector<Value *> &Indices) {
-  if (Offset == 0 && !Ty->isAggregateType())
-    return;
+static bool AppendGEPPath(Type *Ty, uint64_t Offset, const DataLayout &DL,
+                          LLVMContext &Context,
+                          SmallVectorImpl<Value *> &Indices) {
+  if (!Ty || !Ty->isSized())
+    return false;
+  TypeSize Size = DL.getTypeAllocSize(Ty);
+  if (Size.isScalable() || Offset >= Size.getFixedValue())
+    return Offset == 0 && !Ty->isAggregateType();
 
   if (auto *STy = dyn_cast<StructType>(Ty)) {
     const StructLayout *SL = DL.getStructLayout(STy);
-    unsigned F = SL->getElementContainingOffset(Offset);
-    Indices.push_back(ConstantInt::get(Type::getInt32Ty(Context), F));
-    GetGEPIndices(STy->getElementType(F), Offset - SL->getElementOffset(F), DL, Context, Indices);
-  } else if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
-    Type *ElemTy = ArrTy->getElementType();
-    uint64_t ElemSize = DL.getTypeAllocSize(ElemTy).getFixedValue();
-    uint64_t Index = Offset / ElemSize;
-    Indices.push_back(ConstantInt::get(Type::getInt64Ty(Context), Index));
-    GetGEPIndices(ElemTy, Offset % ElemSize, DL, Context, Indices);
-  } else {
-    return;
+    unsigned Field = SL->getElementContainingOffset(Offset);
+    Indices.push_back(ConstantInt::get(Type::getInt32Ty(Context), Field));
+    return AppendGEPPath(STy->getElementType(Field),
+                         Offset - SL->getElementOffset(Field), DL, Context,
+                         Indices);
   }
+  if (auto *ArrTy = dyn_cast<ArrayType>(Ty)) {
+    Type *ElemTy = ArrTy->getElementType();
+    TypeSize ElemSizeTS = DL.getTypeAllocSize(ElemTy);
+    if (ElemSizeTS.isScalable() || ElemSizeTS.getFixedValue() == 0)
+      return false;
+    uint64_t ElemSize = ElemSizeTS.getFixedValue();
+    uint64_t Index = Offset / ElemSize;
+    if (Index >= ArrTy->getNumElements())
+      return false;
+    Indices.push_back(ConstantInt::get(Type::getInt64Ty(Context), Index));
+    return AppendGEPPath(ElemTy, Offset % ElemSize, DL, Context, Indices);
+  }
+  return Offset == 0;
 }
 
-static bool GetOffsetTrace(Value *Val, Value *BaseVal, int64_t &Offset, Value *&IndexExpr, int64_t &Stride,
-                           const DataLayout &DL, std::set<Value *> &Visited) {
-  if (Val == BaseVal)
+static Value *BuildPointerForFact(IRBuilder<> &Builder, Value *NewBase,
+                                  InferredTypePlan &Plan,
+                                  const AccessFact &Fact,
+                                  TypeReconstructionContext &Ctx) {
+  if (!Fact.ConstantOffset.has_value() || *Fact.ConstantOffset < 0)
+    return nullptr;
+  uint64_t Offset = static_cast<uint64_t>(*Fact.ConstantOffset);
+  SmallVector<Value *, 8> Indices;
+  Indices.push_back(
+      ConstantInt::get(Type::getInt32Ty(Ctx.M.getContext()), 0));
+
+  Type *PathType = Plan.ProposedRootType;
+  if (Fact.DynamicIndexExpr) {
+    auto *Array = dyn_cast<ArrayType>(Plan.ProposedRootType);
+    if (!Plan.IsArray || !Array)
+      return nullptr;
+    Indices.push_back(Fact.DynamicIndexExpr);
+    PathType = Array->getElementType();
+  }
+  if (Offset != 0 || PathType->isAggregateType()) {
+    if (!AppendGEPPath(PathType, Offset, Ctx.DL, Ctx.M.getContext(),
+                       Indices))
+      return nullptr;
+  }
+  return Builder.CreateGEP(Plan.ProposedRootType, NewBase, Indices,
+                           "brighten.gep");
+}
+
+static bool RewriteAccessPointer(Instruction &Inst, const AccessFact &Fact,
+                                 Value *Pointer) {
+  if (auto *LI = dyn_cast<LoadInst>(&Inst)) {
+    LI->setOperand(LI->getPointerOperandIndex(), Pointer);
     return true;
-
-  if (Visited.count(Val))
-    return false;
-  Visited.insert(Val);
-
-  if (auto *GEP = dyn_cast<GetElementPtrInst>(Val)) {
-    if (GetOffsetTrace(GEP->getPointerOperand(), BaseVal, Offset, IndexExpr, Stride, DL, Visited)) {
-      int64_t ConstantOffset = 0;
-      auto GeptIt = gep_type_begin(GEP);
-      for (unsigned i = 1, e = GEP->getNumOperands(); i != e; ++i, ++GeptIt) {
-        Value *Idx = GEP->getOperand(i);
-        if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
-          if (StructType *STy = GeptIt.getStructTypeOrNull()) {
-            ConstantOffset += DL.getStructLayout(STy)->getElementOffset(CI->getZExtValue());
-          } else {
-            uint64_t ElementSize = DL.getTypeAllocSize(GeptIt.getIndexedType()).getFixedValue();
-            ConstantOffset += CI->getSExtValue() * ElementSize;
-          }
-        } else {
-          int64_t CurrentStride = DL.getTypeAllocSize(GeptIt.getIndexedType()).getFixedValue();
-          int64_t AccOffset = 0;
-          ResolveIndexExpression(Idx, CurrentStride, AccOffset, Stride, IndexExpr);
-          ConstantOffset += AccOffset;
-        }
-      }
-      Offset += ConstantOffset;
+  }
+  if (auto *SI = dyn_cast<StoreInst>(&Inst)) {
+    SI->setOperand(SI->getPointerOperandIndex(), Pointer);
+    return true;
+  }
+  if (auto *RMW = dyn_cast<AtomicRMWInst>(&Inst)) {
+    RMW->setOperand(RMW->getPointerOperandIndex(), Pointer);
+    return true;
+  }
+  if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&Inst)) {
+    CX->setOperand(CX->getPointerOperandIndex(), Pointer);
+    return true;
+  }
+  if (auto *MI = dyn_cast<MemIntrinsic>(&Inst)) {
+    if (Fact.IsWrite) {
+      MI->setDest(Pointer);
+      return true;
+    }
+    if (auto *MT = dyn_cast<MemTransferInst>(MI)) {
+      MT->setSource(Pointer);
       return true;
     }
   }
-
-  if (auto *Cast = dyn_cast<CastInst>(Val)) {
-    return GetOffsetTrace(Cast->getOperand(0), BaseVal, Offset, IndexExpr, Stride, DL, Visited);
-  }
-
   return false;
 }
 
-void RewritePointerUses(Value *OldVal, Value *NewBase, InferredTypePlan &Plan, TypeReconstructionContext &Ctx) {
-  std::vector<Instruction *> DeadInsts;
-  std::vector<User *> Users(OldVal->user_begin(), OldVal->user_end());
-
-  for (User *U : Users) {
-    Instruction *Inst = dyn_cast<Instruction>(U);
-    if (!Inst)
+static void CollectDerivedPointerInstructions(Value *Root,
+                                              SmallVectorImpl<Instruction *> &Out) {
+  SmallVector<Value *, 32> Worklist{Root};
+  SmallPtrSet<Value *, 32> Seen;
+  while (!Worklist.empty()) {
+    Value *Current = Worklist.pop_back_val();
+    if (!Seen.insert(Current).second)
       continue;
-
-    int64_t Offset = 0;
-    Value *IndexExpr = nullptr;
-    int64_t Stride = 0;
-    std::set<Value *> Visited;
-
-    if (!GetOffsetTrace(Inst, Plan.Candidate->BaseVal, Offset, IndexExpr, Stride, Ctx.DL, Visited)) {
-      Inst->replaceUsesOfWith(OldVal, NewBase);
-      continue;
-    }
-
-    std::vector<Value *> Indices;
-    Indices.push_back(ConstantInt::get(Type::getInt32Ty(Ctx.M.getContext()), 0));
-
-    if (Plan.IsArray && IndexExpr) {
-      Indices.push_back(IndexExpr);
-      if (auto *ArrTy = dyn_cast<ArrayType>(Plan.ProposedRootType)) {
-        GetGEPIndices(ArrTy->getElementType(), Offset, Ctx.DL, Ctx.M.getContext(), Indices);
-      }
-    } else {
-      GetGEPIndices(Plan.ProposedRootType, Offset, Ctx.DL, Ctx.M.getContext(), Indices);
-      if (IndexExpr) {
-        Indices.push_back(IndexExpr);
+    for (User *U : Current->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I)
+        continue;
+      if (isa<GetElementPtrInst>(I) || isa<CastInst>(I) ||
+          isa<FreezeInst>(I) || isa<BinaryOperator>(I)) {
+        Out.push_back(I);
+        Worklist.push_back(I);
       }
     }
+  }
+}
 
-    Instruction *InsertPt = Inst;
-    if (isa<PHINode>(Inst)) {
+void RewritePointerUses(Value *OldVal, Value *NewBase, InferredTypePlan &Plan,
+                        TypeReconstructionContext &Ctx) {
+  SmallVector<Instruction *, 32> Derived;
+  CollectDerivedPointerInstructions(OldVal, Derived);
+
+  SmallPtrSet<Instruction *, 32> Rewritten;
+  for (const AccessFact &Fact : Plan.Candidate->Accesses) {
+    Instruction *Inst = Fact.SourceInst;
+    if (!Inst || !Inst->getParent() || !Rewritten.insert(Inst).second)
       continue;
-    }
-
-    IRBuilder<> Builder(InsertPt);
-    Value *NewGEP = Builder.CreateGEP(Plan.ProposedRootType, NewBase, Indices, "brighten.gep");
+    IRBuilder<> Builder(Inst);
+    Value *Pointer = BuildPointerForFact(Builder, NewBase, Plan, Fact, Ctx);
+    if (!Pointer || !RewriteAccessPointer(*Inst, Fact, Pointer))
+      report_fatal_error(
+          "brighten type reconstruction lost a prevalidated access");
     Ctx.Report.GEPsRewritten++;
-
-    if (auto *LI = dyn_cast<LoadInst>(Inst)) {
-      LI->setOperand(LI->getPointerOperandIndex(), NewGEP);
-    } else if (auto *SI = dyn_cast<StoreInst>(Inst)) {
-      SI->setOperand(SI->getPointerOperandIndex(), NewGEP);
-    } else {
-      Inst->replaceAllUsesWith(NewGEP);
-      DeadInsts.push_back(Inst);
-    }
   }
 
-  for (auto *Dead : DeadInsts) {
-    if (Dead->use_empty()) {
-      Dead->eraseFromParent();
-    }
-  }
+  // Opaque pointers make this replacement representation-preserving for
+  // lifetime markers, comparisons and other non-typing uses.  Typed memory
+  // accesses have already received exact subobject GEPs above.
+  if (OldVal != NewBase && !OldVal->use_empty())
+    OldVal->replaceAllUsesWith(NewBase);
+
+  for (Instruction *I : reverse(Derived))
+    if (I->getParent() && isInstructionTriviallyDead(I))
+      RecursivelyDeleteTriviallyDeadInstructions(I);
 }
 
 } // namespace brighten_type

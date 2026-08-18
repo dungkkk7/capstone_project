@@ -242,10 +242,11 @@ target triple = "x86_64-unknown-linux-gnu"
 
 define void @test_unknown_dyn(i64 %idx) {
 entry:
-  ; CHECK: %obj = alloca [64 x [1 x i8]]
+  ; CHECK: %obj = alloca [64 x i8]
+  ; CHECK-NOT: brighten.gep
   %obj = alloca [64 x i8], align 4
 
-  ; Unknown offset calculation: shift left by a dynamic variable or non-linear arithmetic
+  ; Non-affine offset: the shift amount is itself dynamic.
   %shift = shl i64 %idx, %idx
   %p = getelementptr [64 x i8], ptr %obj, i64 0, i64 %shift
   store i32 100, ptr %p, align 4
@@ -321,7 +322,8 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
 define void @test_memcpy(ptr %src) {
 entry:
-  ; CHECK: %obj = alloca %brighten.struct.stack.test_memcpy.obj
+  ; CHECK: %obj = alloca [16 x i8]
+  ; CHECK-NOT: %brighten.struct.stack.test_memcpy.obj
   %obj = alloca [16 x i8], align 8
 
   ; CHECK: call void @llvm.memcpy

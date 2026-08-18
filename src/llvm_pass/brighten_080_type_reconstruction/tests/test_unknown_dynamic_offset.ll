@@ -3,7 +3,8 @@ target triple = "x86_64-unknown-linux-gnu"
 
 define void @test_unknown_dyn(i64 %idx) {
 entry:
-  ; CHECK: %obj = alloca [64 x [1 x i8]]
+  ; CHECK: %obj = alloca [64 x i8]
+  ; CHECK-NOT: brighten.gep
   %obj = alloca [64 x i8], align 4
 
   ; Unknown offset calculation: shift left by a dynamic variable or non-linear arithmetic

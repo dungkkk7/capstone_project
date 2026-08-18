@@ -1,213 +1,147 @@
 #include "BrightenTypeReconstructionPass.h"
 #include "TypeReconstructionContext.h"
+
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DerivedTypes.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/TypeSize.h"
+
 #include <algorithm>
+#include <string>
+#include <tuple>
+#include <vector>
 
 namespace brighten_type {
 
 using namespace llvm;
 
-struct StructField {
+namespace {
+
+struct LayoutField {
   uint64_t Offset = 0;
   uint64_t Size = 0;
   Type *Ty = nullptr;
-
-  bool operator<(const StructField &Other) const {
-    if (Offset != Other.Offset)
-      return Offset < Other.Offset;
-    return Size > Other.Size;
-  }
 };
 
-Type *InferStructType(ObjectCandidate &Cand, TypeReconstructionContext &Ctx) {
-  if (Cand.Accesses.empty() || Cand.ObjectSize == 0)
-    return nullptr;
-
-  std::vector<StructField> RawFields;
-  for (const auto &Fact : Cand.Accesses) {
-    if (Fact.DynamicIndexExpr)
-      return nullptr;
-
-    if (!Fact.ConstantOffset.has_value())
-      return nullptr;
-
-    int64_t Off = Fact.ConstantOffset.value();
-    if (Off < 0 || (uint64_t)Off >= Cand.ObjectSize)
-      return nullptr;
-
-    uint64_t Size = Fact.AccessSize;
-    if (Size == 0 || Off + Size > Cand.ObjectSize)
-      return nullptr;
-
-    RawFields.push_back({(uint64_t)Off, Size, Fact.ObservedType});
-  }
-
-  if (RawFields.empty())
-    return nullptr;
-
-  std::sort(RawFields.begin(), RawFields.end());
-
-  std::vector<StructField> DisjointFields;
-  for (const auto &Field : RawFields) {
-    bool Handled = false;
-    for (auto &Active : DisjointFields) {
-      if (Field.Offset == Active.Offset) {
-        if (Field.Size == Active.Size) {
-          if (Field.Ty != Active.Ty) {
-            if (Ctx.Mode == TypeMode::Conservative) {
-              Cand.RejectionReasons.push_back("type-conflict-at-same-offset");
-              return nullptr;
-            } else {
-              Active.Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), Active.Size);
-              Handled = true;
-              break;
-            }
-          } else {
-            Handled = true;
-            break;
-          }
-        } else if (Field.Size < Active.Size) {
-          Handled = true;
-          break;
-        } else {
-          Active = Field;
-          Handled = true;
-          break;
-        }
-      }
-      if (Field.Offset < Active.Offset + Active.Size && Active.Offset < Field.Offset + Field.Size) {
-        if (Field.Offset >= Active.Offset && Field.Offset + Field.Size <= Active.Offset + Active.Size) {
-          Handled = true;
-          break;
-        }
-        
-        if (Ctx.Mode == TypeMode::Conservative) {
-          Cand.RejectionReasons.push_back("overlapping-field-conflict");
-          return nullptr;
-        } else {
-          uint64_t NewStart = std::min(Active.Offset, Field.Offset);
-          uint64_t NewEnd = std::max(Active.Offset + Active.Size, Field.Offset + Field.Size);
-          Active.Offset = NewStart;
-          Active.Size = NewEnd - NewStart;
-          Active.Ty = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), Active.Size);
-          Handled = true;
-          break;
-        }
-      }
-    }
-
-    if (!Handled) {
-      DisjointFields.push_back(Field);
-    }
-  }
-
-  std::sort(DisjointFields.begin(), DisjointFields.end());
-
-  // Group consecutive identical fields into arrays
-  std::vector<StructField> GroupedFields;
-  for (size_t i = 0; i < DisjointFields.size(); ) {
-    size_t j = i + 1;
-    uint64_t ElemSize = DisjointFields[i].Size;
-    Type *ElemTy = DisjointFields[i].Ty;
-
-    while (j < DisjointFields.size() &&
-           DisjointFields[j].Ty == ElemTy &&
-           DisjointFields[j].Offset == DisjointFields[j-1].Offset + DisjointFields[j-1].Size &&
-           DisjointFields[j].Size == ElemSize) {
-      ++j;
-    }
-
-    uint64_t Count = j - i;
-    if (Count >= Ctx.MinArrayElements) {
-      StructField ArrField;
-      ArrField.Offset = DisjointFields[i].Offset;
-      ArrField.Size = Count * ElemSize;
-      ArrField.Ty = ArrayType::get(ElemTy, Count);
-      GroupedFields.push_back(ArrField);
-    } else {
-      for (size_t k = i; k < j; ++k) {
-        GroupedFields.push_back(DisjointFields[k]);
-      }
-    }
-    i = j;
-  }
-  DisjointFields = std::move(GroupedFields);
-
-  std::vector<StructField> FinalFields;
-  uint64_t CurrentOffset = 0;
-
-  for (const auto &Field : DisjointFields) {
-    if (Field.Offset > CurrentOffset) {
-      uint64_t PadSize = Field.Offset - CurrentOffset;
-      Type *PadTy = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), PadSize);
-      FinalFields.push_back({CurrentOffset, PadSize, PadTy});
-    }
-    FinalFields.push_back(Field);
-    CurrentOffset = Field.Offset + Field.Size;
-  }
-
-  if (CurrentOffset < Cand.ObjectSize) {
-    uint64_t PadSize = Cand.ObjectSize - CurrentOffset;
-    Type *PadTy = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), PadSize);
-    FinalFields.push_back({CurrentOffset, PadSize, PadTy});
-  }
-
-  std::vector<Type *> StructElements;
-  for (const auto &Field : FinalFields) {
-    StructElements.push_back(Field.Ty);
-  }
-
-  bool IsPacked = false;
-  StructType *AnonSTy = StructType::get(Ctx.M.getContext(), StructElements, false);
-  const StructLayout *Layout = Ctx.DL.getStructLayout(AnonSTy);
-
-  bool LayoutMatches = true;
-  for (size_t i = 0; i < FinalFields.size(); ++i) {
-    if (Layout->getElementOffset(i) != FinalFields[i].Offset) {
-      LayoutMatches = false;
-      break;
-    }
-  }
-
-  if (!LayoutMatches) {
-    AnonSTy = StructType::get(Ctx.M.getContext(), StructElements, true);
-    Layout = Ctx.DL.getStructLayout(AnonSTy);
-    LayoutMatches = true;
-    for (size_t i = 0; i < FinalFields.size(); ++i) {
-      if (Layout->getElementOffset(i) != FinalFields[i].Offset) {
-        LayoutMatches = false;
-        break;
-      }
-    }
-    IsPacked = true;
-  }
-
-  if (!LayoutMatches || Layout->getSizeInBytes().getFixedValue() != Cand.ObjectSize) {
-    Cand.RejectionReasons.push_back("struct-layout-offset-mismatch");
-    return nullptr;
-  }
-
-  std::string BaseName = "brighten.struct.";
+static std::string typeName(const ObjectCandidate &Cand, StringRef Suffix) {
+  std::string Name = "brighten.struct.";
   if (Cand.Kind == ObjectKind::Stack) {
-    BaseName += "stack.";
+    Name += "stack.";
     if (auto *AI = dyn_cast<AllocaInst>(Cand.BaseVal)) {
-      BaseName += AI->getFunction()->getName().str() + ".";
+      Name += AI->getFunction()->getName().str();
+      Name += ".";
     }
   } else if (Cand.Kind == ObjectKind::Global) {
-    BaseName += "global.";
+    Name += "global.";
   } else {
-    BaseName += "anon.";
+    Name += "proven.";
   }
-  BaseName += Cand.Name;
+  Name += Cand.Name;
+  Name += Suffix.str();
+  return Name;
+}
 
-  std::string UniqueName = BaseName;
-  unsigned Suffix = 0;
-  while (StructType::getTypeByName(Ctx.M.getContext(), UniqueName)) {
-    UniqueName = BaseName + "." + std::to_string(Suffix++);
+static bool layoutMatches(ArrayRef<LayoutField> Fields, StructType *Ty,
+                          const DataLayout &DL, uint64_t ObjectSize) {
+  const StructLayout *Layout = DL.getStructLayout(Ty);
+  if (Layout->getSizeInBytes().isScalable() ||
+      Layout->getSizeInBytes().getFixedValue() != ObjectSize)
+    return false;
+  if (Fields.size() != Ty->getNumElements())
+    return false;
+  for (size_t I = 0; I < Fields.size(); ++I)
+    if (Layout->getElementOffset(I) != Fields[I].Offset)
+      return false;
+  return true;
+}
+
+} // namespace
+
+Type *BuildStructTypeFromSolvedFields(ObjectCandidate &Cand,
+                                      ArrayRef<SolvedField> Solved,
+                                      uint64_t ObjectSize,
+                                      TypeReconstructionContext &Ctx,
+                                      StringRef NameSuffix) {
+  if (Solved.empty() || ObjectSize == 0)
+    return nullptr;
+
+  SmallVector<SolvedField, 16> Fields(Solved.begin(), Solved.end());
+  llvm::sort(Fields, [](const SolvedField &A, const SolvedField &B) {
+    return std::tie(A.Offset, A.Size) < std::tie(B.Offset, B.Size);
+  });
+
+  // Convert repeated, fully observed adjacent fields into an array field.  No
+  // missing interval is invented as an element, so sparse evidence cannot
+  // turn padding into application data.
+  SmallVector<LayoutField, 16> Grouped;
+  for (size_t I = 0; I < Fields.size();) {
+    size_t J = I + 1;
+    while (J < Fields.size() && Fields[J].Ty == Fields[I].Ty &&
+           Fields[J].Size == Fields[I].Size &&
+           Fields[J].Offset == Fields[J - 1].Offset + Fields[I].Size)
+      ++J;
+    uint64_t Count = J - I;
+    if (Count >= Ctx.MinArrayElements) {
+      Grouped.push_back({Fields[I].Offset, Count * Fields[I].Size,
+                         ArrayType::get(Fields[I].Ty, Count)});
+    } else {
+      for (size_t K = I; K < J; ++K)
+        Grouped.push_back({Fields[K].Offset, Fields[K].Size, Fields[K].Ty});
+    }
+    I = J;
   }
 
-  return StructType::create(Ctx.M.getContext(), StructElements, UniqueName, IsPacked);
+  SmallVector<LayoutField, 24> WithPadding;
+  uint64_t Cursor = 0;
+  Type *Byte = Type::getInt8Ty(Ctx.M.getContext());
+  for (const LayoutField &Field : Grouped) {
+    if (!Field.Ty || Field.Offset < Cursor || Field.Offset > ObjectSize ||
+        Field.Size > ObjectSize - Field.Offset) {
+      Cand.RejectionReasons.push_back("invalid-solved-field-layout");
+      return nullptr;
+    }
+    if (Field.Offset > Cursor) {
+      uint64_t Padding = Field.Offset - Cursor;
+      WithPadding.push_back(
+          {Cursor, Padding, ArrayType::get(Byte, Padding)});
+    }
+    WithPadding.push_back(Field);
+    Cursor = Field.Offset + Field.Size;
+  }
+  if (Cursor < ObjectSize)
+    WithPadding.push_back(
+        {Cursor, ObjectSize - Cursor,
+         ArrayType::get(Byte, ObjectSize - Cursor)});
+
+  SmallVector<Type *, 24> Elements;
+  for (const LayoutField &Field : WithPadding)
+    Elements.push_back(Field.Ty);
+
+  StructType *Literal = StructType::get(Ctx.M.getContext(), Elements, false);
+  bool Packed = false;
+  if (!layoutMatches(WithPadding, Literal, Ctx.DL, ObjectSize)) {
+    Literal = StructType::get(Ctx.M.getContext(), Elements, true);
+    Packed = true;
+  }
+  if (!layoutMatches(WithPadding, Literal, Ctx.DL, ObjectSize)) {
+    Cand.RejectionReasons.push_back("struct-layout-does-not-preserve-bytes");
+    return nullptr;
+  }
+
+  std::string Base = typeName(Cand, NameSuffix);
+  std::string Unique = Base;
+  for (unsigned Suffix = 0;
+       StructType::getTypeByName(Ctx.M.getContext(), Unique);
+       ++Suffix)
+    Unique = Base + "." + std::to_string(Suffix);
+  return StructType::create(Ctx.M.getContext(), Elements, Unique, Packed);
+}
+
+Type *InferStructType(ObjectCandidate &Cand, TypeReconstructionContext &Ctx) {
+  const TypeConstraintSolution *Solution = GetTypeSolution(Cand, Ctx);
+  if (!Solution || !Solution->Valid || Solution->HasDynamicIndex)
+    return nullptr;
+  return BuildStructTypeFromSolvedFields(Cand, Solution->Fields,
+                                         Cand.ObjectSize, Ctx);
 }
 
 } // namespace brighten_type

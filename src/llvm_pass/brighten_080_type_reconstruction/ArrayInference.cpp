@@ -1,104 +1,82 @@
 #include "BrightenTypeReconstructionPass.h"
 #include "TypeReconstructionContext.h"
-#include "llvm/Support/raw_ostream.h"
-#include <algorithm>
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/TypeSize.h"
+
+#include <set>
 
 namespace brighten_type {
 
 using namespace llvm;
 
-extern Type *InferStructType(ObjectCandidate &Cand, TypeReconstructionContext &Ctx);
+namespace {
+
+static std::optional<uint64_t> fixedAllocSize(Type *Ty, const DataLayout &DL) {
+  if (!Ty || !Ty->isSized())
+    return std::nullopt;
+  TypeSize Size = DL.getTypeAllocSize(Ty);
+  if (Size.isScalable())
+    return std::nullopt;
+  return Size.getFixedValue();
+}
+
+} // namespace
 
 Type *InferArrayType(ObjectCandidate &Cand, TypeReconstructionContext &Ctx) {
-  if (Cand.Accesses.empty() || Cand.ObjectSize == 0)
+  const TypeConstraintSolution *Solution = GetTypeSolution(Cand, Ctx);
+  if (!Solution || !Solution->Valid || Solution->Fields.empty())
     return nullptr;
 
-  // Case 1: Dynamic affine access
-  Value *CommonIdx = nullptr;
-  int64_t CommonStride = 0;
-  bool HasDynamic = false;
-  bool UniformDynamic = true;
+  if (Solution->HasDynamicIndex) {
+    if (!Solution->DynamicIndexExpr || Solution->ElementStride == 0 ||
+        Solution->ElementCount < Ctx.MinArrayElements)
+      return nullptr;
 
-  for (const auto &Fact : Cand.Accesses) {
-    if (Fact.DynamicIndexExpr) {
-      HasDynamic = true;
-      if (!CommonIdx) {
-        CommonIdx = Fact.DynamicIndexExpr;
-        CommonStride = Fact.Stride;
-      } else if (CommonIdx != Fact.DynamicIndexExpr || CommonStride != Fact.Stride) {
-        UniformDynamic = false;
-      }
+    Type *ElementType = nullptr;
+    if (Solution->Fields.size() == 1 && Solution->Fields.front().Offset == 0 &&
+        Solution->Fields.front().Size == Solution->ElementStride) {
+      auto Size = fixedAllocSize(Solution->Fields.front().Ty, Ctx.DL);
+      if (Size && *Size == Solution->ElementStride)
+        ElementType = Solution->Fields.front().Ty;
     }
+    if (!ElementType)
+      ElementType = BuildStructTypeFromSolvedFields(
+          Cand, Solution->Fields, Solution->ElementStride, Ctx, ".elem");
+    if (!ElementType)
+      return nullptr;
+    auto ElementSize = fixedAllocSize(ElementType, Ctx.DL);
+    if (!ElementSize || *ElementSize != Solution->ElementStride)
+      return nullptr;
+    return ArrayType::get(ElementType, Solution->ElementCount);
   }
 
-  if (HasDynamic && UniformDynamic && CommonIdx && CommonStride > 0) {
-    if (Cand.ObjectSize % CommonStride != 0)
-      return nullptr;
-
-    uint64_t Count = Cand.ObjectSize / CommonStride;
-    if (Count < Ctx.MinArrayElements)
-      return nullptr;
-
-    // Create a dummy candidate to infer the element type of size CommonStride
-    ObjectCandidate Dummy;
-    Dummy.BaseVal = Cand.BaseVal;
-    Dummy.ObjectSize = CommonStride;
-    Dummy.ABIAlignment = Cand.ABIAlignment;
-    Dummy.AddressSpace = Cand.AddressSpace;
-    Dummy.Kind = Cand.Kind;
-    Dummy.Name = Cand.Name + ".elem";
-
-    for (const auto &Fact : Cand.Accesses) {
-      AccessFact DummyFact = Fact;
-      DummyFact.DynamicIndexExpr = nullptr;
-      DummyFact.ConstantOffset = Fact.ConstantOffset.value_or(0);
-      Dummy.Accesses.push_back(DummyFact);
-    }
-
-    Type *ElemTy = InferStructType(Dummy, Ctx);
-    if (!ElemTy) {
-      ElemTy = ArrayType::get(Type::getInt8Ty(Ctx.M.getContext()), CommonStride);
-    }
-    return ArrayType::get(ElemTy, Count);
-  }
-
-  // Case 2: Constant offset repeated access
-  Type *CommonTy = nullptr;
-  std::set<int64_t> Offsets;
-  bool UniformType = true;
-
-  for (const auto &Fact : Cand.Accesses) {
-    if (Fact.DynamicIndexExpr)
-      return nullptr;
-
-    if (!Fact.ConstantOffset.has_value())
-      return nullptr;
-
-    Offsets.insert(Fact.ConstantOffset.value());
-    if (!CommonTy) {
-      CommonTy = Fact.ObservedType;
-    } else if (CommonTy != Fact.ObservedType) {
-      UniformType = false;
-    }
-  }
-
-  if (!UniformType || !CommonTy || Offsets.size() < Ctx.MinArrayElements)
+  Type *ElementType = Solution->Fields.front().Ty;
+  uint64_t ElementSize = Solution->Fields.front().Size;
+  if (!ElementType || ElementSize == 0 ||
+      Solution->Fields.front().Offset != 0 ||
+      Solution->Fields.size() < Ctx.MinArrayElements ||
+      Cand.ObjectSize % ElementSize != 0)
     return nullptr;
 
-  uint64_t ElemSize = Ctx.DL.getTypeAllocSize(CommonTy).getFixedValue();
-  if (ElemSize == 0 || Cand.ObjectSize % ElemSize != 0)
+  auto AllocSize = fixedAllocSize(ElementType, Ctx.DL);
+  if (!AllocSize || *AllocSize != ElementSize)
     return nullptr;
 
-  uint64_t Count = Cand.ObjectSize / ElemSize;
-  if (Count < Ctx.MinArrayElements)
-    return nullptr;
-
-  for (int64_t Off : Offsets) {
-    if (Off < 0 || (uint64_t)Off >= Cand.ObjectSize || Off % ElemSize != 0)
+  std::set<uint64_t> SeenElements;
+  for (const SolvedField &Field : Solution->Fields) {
+    if (Field.Ty != ElementType || Field.Size != ElementSize ||
+        Field.Offset % ElementSize != 0)
       return nullptr;
+    SeenElements.insert(Field.Offset / ElementSize);
   }
+  if (SeenElements.size() < Ctx.MinArrayElements)
+    return nullptr;
 
-  return ArrayType::get(CommonTy, Count);
+  uint64_t Count = Cand.ObjectSize / ElementSize;
+  if (*SeenElements.rbegin() >= Count)
+    return nullptr;
+  return ArrayType::get(ElementType, Count);
 }
 
 } // namespace brighten_type
