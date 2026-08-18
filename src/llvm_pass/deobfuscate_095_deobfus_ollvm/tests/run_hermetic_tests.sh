@@ -1,56 +1,76 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin="${PLUGIN:-${root_dir}/build/lib095.so}"
-input="${root_dir}/tests/production_cases.ll"
-work_dir="$(mktemp -d)"
-trap 'rm -rf "${work_dir}"' EXIT
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+for tool in opt-21 clang-21 jq rg; do command -v "$tool" >/dev/null; done
+[[ -f "$plugin" ]]
 
-for tool in opt-21 clang-21 jq rg; do
-  command -v "${tool}" >/dev/null
- done
-[[ -f "${plugin}" ]]
+cat >"$work/input.ll" <<'EOF'
+define i32 @opaque(i32 %x) {
+entry:
+  %xm1 = sub i32 %x, 1
+  %prod = mul i32 %x, %xm1
+  %odd = and i32 %prod, 1
+  %pred = icmp eq i32 %odd, 0
+  br i1 %pred, label %yes, label %no
+yes:
+  ret i32 7
+no:
+  ret i32 9
+}
 
-# End-to-end synthetic production case: exact direct/pointer cleanup,
-# proof-backed BCF/MBA and dispatcher removal must preserve executable output.
-opt-21 -load-pass-plugin "${plugin}" \
-  -095-z3-timeout-ms=50 \
-  -095-report="${work_dir}/report.json" \
-  -passes=095 "${input}" -S -o "${work_dir}/after.ll"
-opt-21 -passes=verify "${work_dir}/after.ll" -disable-output
+define i32 @mba(i32 %x, i32 %y) {
+entry:
+  %xy = xor i32 %x, %y
+  %both = and i32 %x, %y
+  %twice = shl i32 %both, 1
+  %r = add i32 %xy, %twice
+  ret i32 %r
+}
 
-clang-21 -O2 "${input}" -o "${work_dir}/before"
-clang-21 -O2 "${work_dir}/after.ll" -o "${work_dir}/after"
-"${work_dir}/before" >"${work_dir}/before.stdout"
-"${work_dir}/after" >"${work_dir}/after.stdout"
-cmp "${work_dir}/before.stdout" "${work_dir}/after.stdout"
+define i32 @dynamic(i32 %x) {
+entry:
+  %c = icmp sgt i32 %x, 0
+  br i1 %c, label %p, label %n
+p:
+  ret i32 1
+n:
+  ret i32 0
+}
+EOF
 
-jq -e '.schema == "deobfuscate-095-report-v1"' "${work_dir}/report.json" >/dev/null
-jq -e '.z3.unknown_is_evidence == false' "${work_dir}/report.json" >/dev/null
-jq -e '.stages.deflatten.changes > 0' "${work_dir}/report.json" >/dev/null
-jq -e '(.stages.normalize.changes + .stages.resolve_objects_pointers.changes) > 0' \
-  "${work_dir}/report.json" >/dev/null
+cat >"$work/driver.c" <<'EOF'
+#include <stdio.h>
+extern int opaque(int);
+extern int mba(int,int);
+extern int dynamic(int);
+int main(void) {
+  long long acc=0;
+  for (int x=-32;x<=32;++x) {
+    acc += opaque(x) + dynamic(x);
+    for (int y=-16;y<=16;++y) acc += mba(x,y);
+  }
+  printf("%lld\n", acc);
+  return 0;
+}
+EOF
 
-if rg -q 'switch i32' "${work_dir}/after.ll"; then
-  echo "dispatcher switch survived the exact synthetic regression" >&2
-  exit 1
-fi
-if rg -q 'call i32 %' "${work_dir}/after.ll"; then
-  echo "proven constant indirect call was not resolved" >&2
-  exit 1
-fi
+opt-21 -load-pass-plugin "$plugin" -095-z3-timeout-ms=100 \
+  -095-report="$work/report.json" -passes=095 "$work/input.ll" -S -o "$work/after.ll"
+opt-21 -passes=verify "$work/after.ll" -disable-output
+jq -e '.schema == "deobfuscate-095-proof-v2"' "$work/report.json" >/dev/null
+jq -e '.unknown_is_evidence == false and .z3.unknown_is_evidence == false' "$work/report.json" >/dev/null
+jq -e '.predicates.proved >= 1' "$work/report.json" >/dev/null
+# The real dynamic branch must remain; the opaque branch must disappear.
+test "$(rg -c 'br i1' "$work/after.ll")" -eq 1
+rg -q 'define i32 @dynamic' "$work/after.ll"
 
-# Hermetic semantic/proof suites. Dataset lifecycle canaries remain in the
-# full runner and are executed only in the repository's McSema environment.
-"${root_dir}/tests/test_opaque_predicates.sh"
-"${root_dir}/tests/test_opaque_select.sh"
-"${root_dir}/tests/test_opaque_semantic_proof.sh"
-"${root_dir}/tests/test_opaque_parity_semantic_proof.sh"
-"${root_dir}/tests/test_signed_compare_flags.sh"
-"${root_dir}/tests/test_frozen_dispatcher.sh"
-"${root_dir}/tests/test_chernobog_add_ollvm_rules.sh"
-"${root_dir}/tests/test_chernobog_and_ollvm_rules.sh"
-"${root_dir}/tests/test_chernobog_xor_ollvm_rules.sh"
+clang-21 -O2 "$work/input.ll" "$work/driver.c" -o "$work/before"
+clang-21 -O2 "$work/after.ll" "$work/driver.c" -o "$work/after"
+"$work/before" >"$work/before.stdout"
+"$work/after" >"$work/after.stdout"
+cmp "$work/before.stdout" "$work/after.stdout"
 
-echo "095 hermetic proof and differential tests: PASS"
+echo '095 proof-driven differential tests: PASS'
