@@ -29,6 +29,7 @@ jobs:
           ! grep -q 'RuleCompactPostStateFrame.cpp' src/llvm_pass/brighten_040_stack_frame_pass/CMakeLists.txt
           ! grep -q 'GenerateObjectCandidates.cpp' src/llvm_pass/brighten_070_global_data_recovery/CMakeLists.txt
           ! grep -q 'MaterializeRecoveredGlobals.cpp' src/llvm_pass/brighten_070_global_data_recovery/CMakeLists.txt
+          ! grep -q 'NativePointerProvenance.cpp' src/llvm_pass/brighten_080_type_reconstruction/CMakeLists.txt
           ! grep -q 'NativeCleanup.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
           ! grep -q 'NativeStateSSA.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
           ! grep -q 'Chernobog.*Rules.cpp' src/llvm_pass/deobfuscate_095_deobfus_ollvm/CMakeLists.txt
