@@ -57,6 +57,21 @@ jobs:
           FILECHECK_BIN=$(command -v FileCheck-21) \
           PLUGIN="$GITHUB_WORKSPACE/src/llvm_pass/brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so" \
             bash src/llvm_pass/brighten_030_state_ssa_pass/tests/run_tests.sh
+      - name: Build cross-pass dependencies for type reconstruction tests
+        if: matrix.pass == 'brighten_080_type_reconstruction'
+        shell: bash
+        run: |
+          for dependency in \
+            brighten_040_stack_frame_pass \
+            brighten_060_extern_call_bridge \
+            brighten_090_native_cleanup; do
+            dependency_dir="src/llvm_pass/$dependency"
+            rm -rf "$dependency_dir/build"
+            cmake -S "$dependency_dir" -B "$dependency_dir/build" -G Ninja \
+              -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            cmake --build "$dependency_dir/build" --parallel 2
+          done
       - name: Run type reconstruction regression tests
         if: matrix.pass == 'brighten_080_type_reconstruction'
         shell: bash
