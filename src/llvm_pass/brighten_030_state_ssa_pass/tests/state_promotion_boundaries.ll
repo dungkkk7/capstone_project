@@ -52,11 +52,12 @@ entry:
 
 ; Canonical register families use one shared cell per full architectural
 ; register. XMM aliases therefore occupy one i128 cell even when the observed
-; access is only the low i64 half.
-; CHECK: %state_cell_2216 = alloca i64{{.*}}!brighten.state.offset
-; CHECK: %state_cell_16 = alloca i128{{.*}}!brighten.state.offset
-; CHECK: %state_cell_2312 = alloca i64{{.*}}!brighten.state.offset
-; CHECK: %state_cell_2328 = alloca i64{{.*}}!brighten.state.offset
+; access is only the low i64 half. Cell creation order is intentionally not an
+; invariant, so the four independent declarations are checked as a DAG.
+; CHECK-DAG: %state_cell_2216 = alloca i64{{.*}}!brighten.state.offset
+; CHECK-DAG: %state_cell_16 = alloca i128{{.*}}!brighten.state.offset
+; CHECK-DAG: %state_cell_2312 = alloca i64{{.*}}!brighten.state.offset
+; CHECK-DAG: %state_cell_2328 = alloca i64{{.*}}!brighten.state.offset
 ; CHECK-NOT: %state_cell_2200 = alloca
 ; CHECK-NOT: %state_cell_2204 = alloca
 ; CHECK: call void @native_helper(ptr %buffer)
