@@ -1,0 +1,16 @@
+level,boundary,instructions_before,instructions_after,instructions_delta,blocks_delta,memory_ops_delta,calls_delta,loads_delta,stores_delta,geps_delta,phis_delta,conditional_branches_delta
+O1,main_default_opt_1,1445,1383,-62,-7,-57,-8,-2,-33,-20,13,0
+O1,main_default_opt_2,1388,1378,-10,0,4,-2,2,2,0,0,0
+O1,bundle_default_opt_3,1176,1062,-114,0,-114,0,-27,-87,0,0,0
+O1,bundle_default_opt_4,1062,1050,-12,0,-12,0,-6,-6,0,0,0
+O1,bundle_post_opt_4_custom_cleanup,1050,959,-91,0,-91,0,0,-91,0,0,0
+O2,main_default_opt_1,1445,1375,-70,-7,-62,-8,-2,-38,-20,13,0
+O2,main_default_opt_2,1380,1370,-10,0,4,-2,2,2,0,0,0
+O2,bundle_default_opt_3,1173,966,-207,0,-207,0,-33,-174,0,0,0
+O2,bundle_default_opt_4,966,958,-8,0,-8,0,0,-8,0,0,0
+O2,bundle_post_opt_4_custom_cleanup,958,958,0,0,0,0,0,0,0,0,0
+O3,main_default_opt_1,1445,1375,-70,-7,-62,-8,-2,-38,-20,13,0
+O3,main_default_opt_2,1380,1370,-10,0,4,-2,2,2,0,0,0
+O3,bundle_default_opt_3,1173,966,-207,0,-207,0,-33,-174,0,0,0
+O3,bundle_default_opt_4,966,958,-8,0,-8,0,0,-8,0,0,0
+O3,bundle_post_opt_4_custom_cleanup,958,958,0,0,0,0,0,0,0,0,0
