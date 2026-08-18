@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: agent/tmp-premerge-source-export
       - run: tar --exclude=.git --exclude=dependency --exclude=result --exclude=reports -czf premerge-source.tar.gz src tests tools configs docs README.md
       - uses: actions/upload-artifact@v4
         with:
