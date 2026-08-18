@@ -272,7 +272,7 @@ static void verifyOrDie(Module &M) {
   std::string E;
   raw_string_ostream OS(E);
   if (verifyModule(M, &OS))
-    report_fatal_error("040 v2 produced invalid IR:\n" + OS.str());
+    report_fatal_error(Twine("040 v2 produced invalid IR:\n") + OS.str());
 }
 
 static bool recover(Module &M) {

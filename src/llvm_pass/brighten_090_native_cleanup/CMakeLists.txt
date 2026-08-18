@@ -11,10 +11,9 @@ add_definitions(${LLVM_DEFINITIONS})
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
-# 090 v2 is a narrow final residual-elimination boundary.  The legacy
-# NativeCleanup.cpp/NativeStateSSA.cpp god pass is intentionally not compiled:
-# State/stack/ABI/object reconstruction must be completed by 030/040/050/060/
-# 070/080 before this point.
+# 090 is a narrow final residual-elimination boundary. State/stack/ABI/object
+# reconstruction must be completed by 030/040/050/060/070/080 before this
+# point.
 add_llvm_pass_plugin(BrightenNativeCleanupPass
   src/main.cpp
   src/NativeCleanupV2.cpp

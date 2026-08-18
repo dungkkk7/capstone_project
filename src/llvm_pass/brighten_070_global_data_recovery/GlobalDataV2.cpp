@@ -173,7 +173,8 @@ resolvePointer(Value *V, MutableArrayRef<Segment> Segs, const DataLayout &DL,
     return Done(Base);
   }
 
-  if (auto *ITP = dyn_cast<IntToPtrOperator>(V)) {
+  if (auto *ITP = dyn_cast<Operator>(V);
+      ITP && ITP->getOpcode() == Instruction::IntToPtr) {
     auto *CI = dyn_cast<ConstantInt>(ITP->getOperand(0));
     if (!CI || CI->getBitWidth() > 64)
       return Done(std::nullopt);
@@ -429,7 +430,7 @@ static void verifyOrDie(Module &M) {
   std::string E;
   raw_string_ostream OS(E);
   if (verifyModule(M, &OS))
-    report_fatal_error("070 v2 produced invalid IR:\n" + OS.str());
+    report_fatal_error(Twine("070 v2 produced invalid IR:\n") + OS.str());
 }
 
 } // namespace

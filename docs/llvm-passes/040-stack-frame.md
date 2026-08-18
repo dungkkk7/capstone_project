@@ -10,7 +10,7 @@ thành `alloca` mới chưa khởi tạo.
 
 ## Phục hồi architectural stack
 
-`RuleRecoverStackFrame.cpp` models RSP/RBP as `StackExpr`:
+`StackFrameV2.cpp` models RSP/RBP as `StackExpr`:
 
 ```text
 Unreachable | Unknown | NonStack | StackConst(base, offset) |

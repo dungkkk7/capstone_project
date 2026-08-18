@@ -29,8 +29,9 @@ PreservedAnalyses BrightenRuntimeHelperPass::run(Module &M,
   std::string Error;
   raw_string_ostream OS(Error);
   if (verifyModule(M, &OS))
-    report_fatal_error("015 runtime materialization produced invalid IR:\n" +
-                       OS.str());
+    report_fatal_error(
+        Twine("015 runtime materialization produced invalid IR:\n") +
+        OS.str());
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

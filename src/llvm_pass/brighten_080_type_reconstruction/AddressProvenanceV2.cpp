@@ -2,6 +2,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -39,8 +40,9 @@ static bool exactPointerRoundTrips(Module &M) {
     if (!ITP->getParent() || !isIntegralPointer(ITP->getType(), DL))
       continue;
     auto *PTI = dyn_cast<PtrToIntInst>(ITP->getOperand(0));
-    if (!PTI || !isIntegralPointer(PTI->getPointerOperandType(), DL) ||
-        PTI->getPointerOperandType() != ITP->getType())
+    Type *PointerTy = PTI ? PTI->getPointerOperand()->getType() : nullptr;
+    if (!PTI || !isIntegralPointer(PointerTy, DL) ||
+        PointerTy != ITP->getType())
       continue;
     unsigned PtrBits = DL.getPointerTypeSizeInBits(ITP->getType());
     auto *ITy = dyn_cast<IntegerType>(PTI->getType());
@@ -80,8 +82,9 @@ static void verifyOrDie(Module &M) {
   std::string Error;
   raw_string_ostream OS(Error);
   if (verifyModule(M, &OS))
-    report_fatal_error("080 address provenance v2 produced invalid IR:\n" +
-                       OS.str());
+    report_fatal_error(
+        Twine("080 address provenance v2 produced invalid IR:\n") +
+        OS.str());
 }
 
 } // namespace

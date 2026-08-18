@@ -19,8 +19,7 @@ include(AddLLVM)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
-# 095 v2 deliberately drops the Chernobog rule-authority layer. Candidate
-# discovery and equivalence authority are now both centralized in the
+# 095 v2 keeps candidate discovery and equivalence authority centralized in the
 # bit-vector Z3 translation validator. CFG unflattening is owned by 020.
 add_llvm_pass_plugin(Deobfuscate095
   src/Plugin.cpp

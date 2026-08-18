@@ -37,8 +37,8 @@ enum class CandidateKind {
   Not1,
   Neg0,
   Neg1,
-  // Binary/constant recipes used by the LLVM adapter for Chernobog's
-  // larger rule families.  The proof records operand indices so a rewrite
+  // Binary/constant recipes used by the LLVM adapter for larger rule
+  // families. The proof records operand indices so a rewrite
   // is not tied to traversal order beyond the verified translation.
   PairAdd,
   PairSub,

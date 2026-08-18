@@ -12,9 +12,9 @@ add_definitions(${LLVM_DEFINITIONS})
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
-# 080 v2 keeps type reconstruction as evidence collection -> constraint solve
-# -> rewrite -> verifier.  The former 65KB NativePointerProvenance.cpp is not
-# production code; exact pointer representation cleanup is isolated below.
+# 080 keeps type reconstruction as evidence collection -> constraint solve
+# -> rewrite -> verifier. Exact pointer representation cleanup is isolated
+# below.
 add_llvm_pass_plugin(BrightenTypeReconstructionPass
   main.cpp
   ObjectDiscovery.cpp

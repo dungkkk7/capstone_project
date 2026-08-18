@@ -16,11 +16,8 @@ add_definitions(${LLVM_DEFINITIONS})
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
-# 015 is runtime semantic materialization only.  The old
-# RuleImplementExternCallBridge.cpp mixed ABI recovery, guest-pointer repair,
-# libc knowledge and runtime definition in one 32KB rule file; 060 now owns
-# external ABI reconstruction, so the duplicate implementation is not part of
-# the production plugin.
+# 015 is runtime semantic materialization only. External ABI reconstruction is
+# owned by 060, so this plugin contains no duplicate call-bridge authority.
 add_llvm_pass_plugin(BrightenRuntimeHelperPass
   src/main.cpp
   src/Helpers.cpp

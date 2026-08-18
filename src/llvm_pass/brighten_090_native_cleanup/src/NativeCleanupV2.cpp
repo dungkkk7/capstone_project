@@ -68,7 +68,7 @@ static SmallVector<std::string,16> violations(Module &M) {
   return V;
 }
 static void verify(Module &M, bool Enforce) {
-  std::string E; raw_string_ostream OS(E); if (verifyModule(M,&OS)) report_fatal_error("090 invalid IR:\n"+OS.str());
+  std::string E; raw_string_ostream OS(E); if (verifyModule(M,&OS)) report_fatal_error(Twine("090 invalid IR:\n")+OS.str());
   auto V=violations(M); errs()<<"brighten-native-cleanup report:\n  native contract violations: "<<V.size()<<"\n";
   for (auto &X:V) errs()<<"  native contract finding: "<<X<<"\n";
   if ((Enforce||Strict)&&!V.empty()) report_fatal_error("090 strict clean contract failed: residual lifted semantics remain");
