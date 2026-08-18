@@ -8,7 +8,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(LLVM REQUIRED CONFIG)
 if(NOT LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL "21" OR
    LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL "22")
-  message(FATAL_ERROR "Deobfuscate095 requires LLVM 21.x (found ${LLVM_PACKAGE_VERSION})")
+  message(FATAL_ERROR
+          "Deobfuscate095 requires LLVM 21.x (found ${LLVM_PACKAGE_VERSION})")
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(Z3 REQUIRED IMPORTED_TARGET z3)
@@ -19,11 +20,27 @@ include(AddLLVM)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
-# 095 v2 keeps candidate discovery and equivalence authority centralized in the
-# bit-vector Z3 translation validator. CFG unflattening is owned by 020.
+# Fresh LLVM implementation of Chernobog's public 108-rule identity catalog.
+# Deterministic matching owns the hot path; Z3 is linked for catalog
+# certification and an explicitly bounded, default-off fallback only.
 add_llvm_pass_plugin(Deobfuscate095
   src/Plugin.cpp
   src/Deobfuscate095.cpp
+  src/Z3Fallback.cpp
+  src/RuleReport.cpp
+  src/RuleCatalog.cpp
+  src/RuleCatalogAdd.cpp
+  src/RuleCatalogAnd.cpp
+  src/RuleCatalogOr.cpp
+  src/RuleCatalogSub.cpp
+  src/RuleCatalogXor.cpp
+  src/RuleCatalogMisc.cpp
+  src/RuleMatcher.cpp
+  src/RuleMatcherSelfTest.cpp
+  src/PredicateRules.cpp
+  src/JumpRules.cpp
+  src/ControlCleanup.cpp
+  src/RuleEngine.cpp
   src/Z3Prover.cpp
 )
 
