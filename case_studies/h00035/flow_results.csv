@@ -1,0 +1,8 @@
+treatment,representation,feedback,calls,iteration_1_match,iteration_2_match,iteration_3_match,final_status
+B0,Ghidra,no,1,722,,,FAIL_BEHAVIORAL
+B1,Ghidra,yes,2,728,1000,,PASS
+B2,objdump assembly,no,1,703,,,FAIL_BEHAVIORAL
+B3,objdump assembly,yes,3,0,157,1000,PASS
+F3-O1,Clean LLVM IR,yes,1,1000,,,PASS
+F3-O2,Clean LLVM IR,yes,3,155,344,1000,PASS
+F3-O3,Clean LLVM IR,yes,1,1000,,,PASS

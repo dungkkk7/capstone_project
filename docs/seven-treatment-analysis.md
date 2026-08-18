@@ -268,3 +268,5 @@ boundary-level measurement và insight về điều kiện giúp/hại.
 - `reports/ir_boundary_own_20260816/optimization_boundary_analysis.json`
 - `reports/ir_boundary_public_20260816/optimization_boundary_analysis.json`
 - `docs/optimization-ir-boundary-analysis.md`
+- `case_studies/h00035/README.md`: case hoàn chỉnh từ source, obfuscation,
+  Ghidra/assembly, raw/Clean IR, pass 095, O-boundary, LLM loop đến validation.

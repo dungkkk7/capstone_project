@@ -448,6 +448,9 @@ statistics và attribution nằm ở
 [`docs/seven-treatment-analysis.md`](docs/seven-treatment-analysis.md). Phân
 tích O1/O2/O3 tại từng biên IR trên cả own và public dataset nằm ở
 [`docs/optimization-ir-boundary-analysis.md`](docs/optimization-ir-boundary-analysis.md).
+Hồ sơ một sample hoàn chỉnh, kèm script replay và kịch bản bảo vệ trước hội
+đồng, nằm ở
+[`case_studies/h00035/README.md`](case_studies/h00035/README.md).
 
 Campaign B0–F3 phải báo riêng public-corpus cases và 40 `own_dataset` cases.
 Metric chính là Canonical E2E trên toàn bộ eligible cases; kết quả
