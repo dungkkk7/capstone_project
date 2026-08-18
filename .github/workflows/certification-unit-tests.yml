@@ -1,0 +1,64 @@
+name: certification-unit-tests
+
+on:
+  pull_request:
+    paths:
+      - "configs/certification_protocol_v1.json"
+      - "docs/certifying-brightening-methodology.md"
+      - "src/llvm_pass/certification.py"
+      - "src/llvm_pass/certifying_runtime.py"
+      - "src/llvm_pass/certifying_gates.py"
+      - "src/llvm_pass/run_certifying_brightening.py"
+      - "src/llvm_pass/brighten_100_delift_bundle/entrypoint_contract.py"
+      - "src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh"
+      - "tests/test_certification.py"
+      - "tests/test_entrypoint_contract.py"
+      - "tests/test_bundle_entrypoint_contract.py"
+      - "tests/test_certifying_behavior_corpus.py"
+      - ".github/workflows/certification-unit-tests.yml"
+  push:
+    branches: [master]
+    paths:
+      - "configs/certification_protocol_v1.json"
+      - "docs/certifying-brightening-methodology.md"
+      - "src/llvm_pass/certification.py"
+      - "src/llvm_pass/certifying_runtime.py"
+      - "src/llvm_pass/certifying_gates.py"
+      - "src/llvm_pass/run_certifying_brightening.py"
+      - "src/llvm_pass/brighten_100_delift_bundle/entrypoint_contract.py"
+      - "src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh"
+      - "tests/test_certification.py"
+      - "tests/test_entrypoint_contract.py"
+      - "tests/test_bundle_entrypoint_contract.py"
+      - "tests/test_certifying_behavior_corpus.py"
+      - ".github/workflows/certification-unit-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --disable-pip-version-check pytest
+      - name: Compile Python entrypoints
+        run: |
+          python -m py_compile \
+            src/llvm_pass/certification.py \
+            src/llvm_pass/certifying_runtime.py \
+            src/llvm_pass/certifying_gates.py \
+            src/llvm_pass/run_certifying_brightening.py \
+            src/llvm_pass/brighten_100_delift_bundle/entrypoint_contract.py
+      - name: Check bundle shell syntax
+        run: bash -n src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh
+      - name: Run fail-closed certification tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q \
+            tests/test_certification.py \
+            tests/test_entrypoint_contract.py \
+            tests/test_bundle_entrypoint_contract.py \
+            tests/test_certifying_behavior_corpus.py

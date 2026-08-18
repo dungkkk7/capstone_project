@@ -21,6 +21,15 @@ S5="$WORKDIR/${BASE}.05-unpinned.ll"
 FINAL_LL="$WORKDIR/${BASE}.ll"
 FINAL_O="$WORKDIR/${BASE}.o"
 FINAL_BIN="$WORKDIR/${BASE}.bin"
+ENTRYPOINT_SYMBOL="${BRIGHTEN_ENTRYPOINT_SYMBOL:-main}"
+ENTRYPOINT_CHECK="$SCRIPT_DIR/entrypoint_contract.py"
+ENTRYPOINT_PRE_REPORT="$WORKDIR/${BASE}.entrypoint-before-native.json"
+ENTRYPOINT_FINAL_REPORT="$WORKDIR/${BASE}.entrypoint-final.json"
+
+# Direct bundle invocations may reuse an output prefix.  Remove every authority
+# artifact and report before the first command so an early failure cannot make a
+# stale file look like the result of the current run.
+rm -f   "$S1" "$S2" "$S3" "$S4" "$S5"   "$FINAL_LL" "$FINAL_O" "$FINAL_BIN"   "$ENTRYPOINT_PRE_REPORT" "$ENTRYPOINT_FINAL_REPORT"
 
 "${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -S -passes=verify "$INPUT" -o "$S1"
 python3 "$SCRIPT_DIR/run_exact_llvm_passes.py" "$S1" "$S2"
@@ -60,6 +69,13 @@ if [[ -f "$DEOBF_PLUGIN" ]]; then
   mv "$FINAL_LL.post095-o3" "$FINAL_LL"
   "$OPT_TOOL" -passes=verify -disable-output "$FINAL_LL"
 fi
+
+# This bundle emits a complete executable, not a library.  Freeze the public
+# entrypoint contract before the interprocedural cleanup tail.  The check uses
+# llvm-as/llvm-nm and therefore cannot be fooled by comments or textual names.
+python3 "$ENTRYPOINT_CHECK" "$FINAL_LL" \
+  --symbol "$ENTRYPOINT_SYMBOL" --report "$ENTRYPOINT_PRE_REPORT"
+
 # The bundle's O3/095 stages are allowed to expose source-level loop PHIs, but
 # they must not run after the authoritative native contract report. Consume
 # only those late frame products, run bounded scalar cleanup, consume any
@@ -72,16 +88,14 @@ fi
 # This script always links a complete executable whose public entry is `main`.
 # Once the first post-frame pass has created any required source-ABI adapters,
 # LLVM's whole-program internalizer can make non-entry definitions local and
-# global DCE can remove adapters with no in-module users.  The same closed
-# callgraph lets LLVM's interprocedural constant propagation expose constant
-# State-SSA parameters, then dead-argument elimination removes unused
-# parameters and aggregate return fields with its ordinary ABI proof.  This is
-# a linkage proof at the executable boundary; the reusable 090 module pass
-# itself keeps externally visible compatibility wrappers.
+# global DCE can remove adapters with no in-module users.  Preserve the entry
+# symbol explicitly: relying on incidental linkage caused h00038 to lose
+# `main` during the finalization tail.
 NATIVE_CLEANUP_PLUGIN="${NATIVE_CLEANUP_PLUGIN:-$SCRIPT_DIR/../brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so}"
 if [[ -f "$NATIVE_CLEANUP_PLUGIN" ]]; then
   OPT_TOOL="${OPT_BIN:-$(command -v opt-21 || command -v opt)}"
   "$OPT_TOOL" -load-pass-plugin="$NATIVE_CLEANUP_PLUGIN" -S \
+    "-internalize-public-api-list=$ENTRYPOINT_SYMBOL" \
     -passes='brighten-native-cleanup-post-frame-pass,internalize,ipsccp,deadargelim,globalopt,function(instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,adce,simplifycfg,instcombine<no-verify-fixpoint>,simplifycfg,dce,adce),globaldce,function(dce,adce),globaldce,ipsccp,deadargelim,function(instcombine<no-verify-fixpoint>,simplifycfg,dce,adce),globaldce,brighten-native-cleanup-post-frame-pass,brighten-native-cleanup-final-pass,verify' \
     "$FINAL_LL" -o "$FINAL_LL.native-final"
   mv "$FINAL_LL.native-final" "$FINAL_LL"
@@ -89,6 +103,13 @@ fi
 python3 "$SCRIPT_DIR/compact_ir_text.py" "$FINAL_LL" "$FINAL_LL.compact"
 mv "$FINAL_LL.compact" "$FINAL_LL"
 "${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -passes=verify -disable-output "$FINAL_LL"
+
+# A verifier-successful module can still be unusable as an executable.  Make
+# entrypoint preservation a hard release gate and persist machine-readable
+# evidence beside the final artifact.
+python3 "$ENTRYPOINT_CHECK" "$FINAL_LL" \
+  --symbol "$ENTRYPOINT_SYMBOL" --report "$ENTRYPOINT_FINAL_REPORT"
+
 CLANG_BIN="${CLANG_BIN:-$(command -v clang-21 || command -v clang || true)}"
 if [[ -z "$CLANG_BIN" ]]; then
   echo "clang-21/clang not found" >&2
@@ -113,3 +134,4 @@ fi
 printf 'final IR:     %s\n' "$FINAL_LL"
 printf 'final object: %s\n' "$FINAL_O"
 printf 'final binary: %s\n' "$FINAL_BIN"
+printf 'entrypoint:   %s\n' "$ENTRYPOINT_FINAL_REPORT"
