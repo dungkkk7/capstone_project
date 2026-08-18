@@ -24,10 +24,15 @@ FINAL_BIN="$WORKDIR/${BASE}.bin"
 
 "${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -S -passes=verify "$INPUT" -o "$S1"
 python3 "$SCRIPT_DIR/run_exact_llvm_passes.py" "$S1" "$S2"
-DELIFT_OPT_PIPELINE='default<O3>,verify' python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S2" "$S3"
+DELIFT_OPT_LEVEL="${DELIFT_OPT_LEVEL:-${BRIGHTEN_OPT_LEVEL:-O3}}"
+if [[ ! "$DELIFT_OPT_LEVEL" =~ ^O[123]$ ]]; then
+  echo "DELIFT_OPT_LEVEL must be O1, O2, or O3; got: $DELIFT_OPT_LEVEL" >&2
+  exit 2
+fi
+DELIFT_OPT_PIPELINE="default<${DELIFT_OPT_LEVEL}>,verify" python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S2" "$S3"
 python3 "$SCRIPT_DIR/delift_storage.py" "$S3" "$S4"
 python3 "$SCRIPT_DIR/strip_brighten_residuals.py" "$S4" "$S5"
-DELIFT_OPT_PIPELINE='default<O3>,verify' \
+DELIFT_OPT_PIPELINE="default<${DELIFT_OPT_LEVEL}>,verify" \
   python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S5" "$FINAL_LL"
 python3 "$SCRIPT_DIR/dedup_pointer_selects.py" "$FINAL_LL" "$FINAL_LL.dedup"
 mv "$FINAL_LL.dedup" "$FINAL_LL"
@@ -90,7 +95,20 @@ if [[ -z "$CLANG_BIN" ]]; then
   exit 127
 fi
 "$CLANG_BIN" -O2 -c "$FINAL_LL" -o "$FINAL_O"
-"$CLANG_BIN" -O2 "$FINAL_LL" -lm -o "$FINAL_BIN"
+LINK_ARGS=("$FINAL_LL" -lm)
+# Compatibility-class IR may retain McSema's callback trampoline solely
+# through CRT constructor/destructor wrappers.  Link the matching audited
+# McSema runtime only when that symbol is actually unresolved; fully-native IR
+# remains independent of the compatibility runtime.
+MCSEMA_RUNTIME_LIB="${MCSEMA_RUNTIME_LIB:-$SCRIPT_DIR/../../../dependency/mcsema/mcsema/lib/libmcsema_rt64-10.0.a}"
+if "${NM_BIN:-$(command -v nm)}" -u "$FINAL_O" | grep -q '__mcsema_attach_call'; then
+  if [[ ! -f "$MCSEMA_RUNTIME_LIB" ]]; then
+    echo "missing McSema compatibility runtime: $MCSEMA_RUNTIME_LIB" >&2
+    exit 1
+  fi
+  LINK_ARGS+=("$MCSEMA_RUNTIME_LIB")
+fi
+"$CLANG_BIN" -O2 "${LINK_ARGS[@]}" -o "$FINAL_BIN"
 
 printf 'final IR:     %s\n' "$FINAL_LL"
 printf 'final object: %s\n' "$FINAL_O"

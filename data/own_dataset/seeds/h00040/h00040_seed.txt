@@ -1,0 +1,7 @@
+Mode=fast
+threshold=17
+Path=/tmp/own
+mode=careful
+token=Q7x9
+threshold=23
+end

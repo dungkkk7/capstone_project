@@ -32,9 +32,8 @@ python3 src/main.py data/custom_dataset.csv llm-recovery \
     --mode=raw_ir
 ```
 
-`--mode` chỉ chọn representation. Muốn chạy đúng ablation contract, repair
-policy và artifact logging của evaluation framework thì dùng
-`src/evaluation/run_experiment.py`.
+`--mode` chỉ chọn representation. Muốn chạy đúng primary evaluation contract
+thì dùng `src/evaluation/run_two_flow_experiment.py`.
 
 ## Evidence routing
 
@@ -49,21 +48,21 @@ Original C chỉ được dùng cho đánh giá hậu nghiệm; tuyệt đối k
 recovery prompt. Obfuscated Binary là behavioral reference khi differential
 execution.
 
-## Sáu evaluation flow
+## Primary evaluation B0/F3 và feedback-policy ablations B1/B2/B3
 
 | Flow | Cấu hình |
 |---|---|
-| F1 `FULL` | Clean IR + LLVM2C pseudocode + error context, iterative |
-| F2 `NO_ERROR_CONTEXT` | Clean IR + LLVM2C pseudocode, đúng một provider call |
-| F3 `NO_PSEUDOCODE` | Clean IR + error context, iterative |
-| F4 `NO_DIRECT_CLEAN_IR` | LLVM2C pseudocode + error context, iterative |
-| F5 `RAW_IR_BASELINE` | Raw IR + error context, iterative |
-| F6 `RAW_IR_NO_ERROR_CONTEXT_DERIVED` | Raw IR, checkpoint provider call đầu tiên của F5 |
+| B0 `LLM4DECOMPILE_GHIDRA_ONESHOT` | Original obfuscated ELF → Ghidra program pseudocode → đúng một provider call, không feedback |
+| B1 `GHIDRA_PSEUDOCODE_ITERATIVE` | Cùng Ghidra evidence và byte-identical request đầu của B0 → validation-guided repair, tối đa năm response |
+| B2 `LLM4DECOMPILE_ASSEMBLY_ONESHOT` | Original ELF → cleaned program-level `objdump -d` assembly → exact LLM4Decompile assembly prompt, một response |
+| B3 `LLM4DECOMPILE_ASSEMBLY_ITERATIVE` | Cùng assembly và byte-identical request đầu của B2 → validation-guided repair, tối đa năm response |
+| F3 `CLEAN_IR_ITERATIVE_MAIN` | Original obfuscated ELF → custom pass 010–100 → Clean IR → compiler/reproducible-counterexample repair |
 
-F1–F5 là flow chạy độc lập. F6 được report generator suy ra từ lần gọi
-provider thực tế đầu tiên của F5, bỏ retry `MAX_TOKENS` và mọi candidate/feedback
-về sau. Vì thế F6 là paired derived checkpoint, không phải một pipeline run độc
-lập. Artifact thiếu được ghi `CANCELLED`, không nội suy.
+Prompt, exact hash, paper provenance và call budget nằm trong
+`src/evaluation/two_flow_protocol.py`. B1 và B3 là registered non-primary
+feedback ablations; B2 là raw-assembly external baseline. Chúng không được đổi
+tên thành primary flow hoặc dùng để thay thế frozen B0/F3. Các experiment
+legacy không thuộc primary claim.
 
 ## Repair và behavioral oracle
 

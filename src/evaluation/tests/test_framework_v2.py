@@ -125,7 +125,7 @@ def test_full_first_flow_layout_and_legacy_contract_detection(tmp_path: Path):
             False,
         ),
     }
-    assert tuple(FLOW_SPECS) == FLOW_ORDER
+    assert tuple(FLOW_SPECS) == ("B1", "B2", "B3", *FLOW_ORDER)
     assert LEGACY_TO_CURRENT_FLOW_ID == {
         "F2": "F1",
         "F5": "F2",
@@ -142,7 +142,14 @@ def test_full_first_flow_layout_and_legacy_contract_detection(tmp_path: Path):
             spec.iterative,
         )
         for flow_id, spec in FLOW_SPECS.items()
+        if flow_id.startswith("F")
     } == expected
+    assert FLOW_SPECS["B1"].requires_pseudocode
+    assert FLOW_SPECS["B1"].iterative
+    assert FLOW_SPECS["B2"].requires_assembly
+    assert not FLOW_SPECS["B2"].iterative
+    assert FLOW_SPECS["B3"].requires_assembly
+    assert FLOW_SPECS["B3"].iterative
 
     legacy_dir = tmp_path / "legacy" / "F5"
     legacy_dir.mkdir(parents=True)

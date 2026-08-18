@@ -85,9 +85,33 @@ PLUGINS = [
     "brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so",
     "deobfuscate_095_deobfus_ollvm/build/lib095.so"
 ]
-PASS_PIPELINE = (
+DEFAULT_PASS_PIPELINE = (
     "brighten-repair-pass,brighten-remill-runtime-pass,brighten-devirt-pass,always-inline,brighten-state-ssa-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-global-data-recovery-pass,brighten-devirt-pass,brighten-type-reconstruct,deadargelim,function-attrs,ipsccp,sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,globaldce,brighten-native-cleanup-pass,brighten-guest-pointer-resolver-canonicalize,095,brighten-devirt-pass,brighten-address-canonicalize,brighten-stack-frame-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-type-reconstruct,dfa-jump-threading,simplifycfg,adce,default<O3>,brighten-native-cleanup-pass,brighten-abi-recovery-pass,brighten-extern-call-bridge,brighten-late-residual-format-string-recovery,brighten-guest-pointer-resolver-canonicalize,brighten-local-state-ssa-pass,brighten-region-ssa-unflatten-pass,brighten-address-canonicalize,simplifycfg,adce,jump-threading,simplifycfg,sroa,mem2reg,adce,default<O3>,brighten-address-canonicalize,brighten-post-state-frame-pass,brighten-heap-proven-resolver-collapse,brighten-native-cleanup-post-frame-pass,dce,globaldce,brighten-native-cleanup-final-pass,verify"
 )
+
+
+def _selected_optimization_level():
+    """Return the explicit LLVM IR optimization treatment for this run."""
+
+    level = os.environ.get("BRIGHTEN_OPT_LEVEL", "O3").strip().upper()
+    if level not in {"O1", "O2", "O3"}:
+        raise ValueError(
+            "BRIGHTEN_OPT_LEVEL must be one of O1, O2, O3; "
+            f"received {level!r}"
+        )
+    return level
+
+
+def pipeline_for_optimization_level(pipeline, level=None):
+    """Replace only standard LLVM default<O*> treatments in a pass string."""
+
+    selected = (level or _selected_optimization_level()).strip().upper()
+    if selected not in {"O1", "O2", "O3"}:
+        raise ValueError(f"Unsupported LLVM optimization level: {selected!r}")
+    return re.sub(r"default<O[123]>", f"default<{selected}>", pipeline)
+
+
+PASS_PIPELINE = pipeline_for_optimization_level(DEFAULT_PASS_PIPELINE)
 if os.environ.get("BRIGHTEN_DISABLE_STACK_FRAME", "").lower() in {"1", "true", "yes"}:
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-stack-frame-pass", "")
     PASS_PIPELINE = PASS_PIPELINE.replace(",brighten-post-state-frame-pass", "")
@@ -591,7 +615,10 @@ def brighten_ir(input_path, output_path=None, binary_path=None):
     ])
 
     # Thiết lập pipeline pass và file input/output
-    pipeline = os.environ.get("BRIGHTEN_PASS_PIPELINE", PASS_PIPELINE)
+    pipeline = os.environ.get(
+        "BRIGHTEN_PASS_PIPELINE",
+        pipeline_for_optimization_level(DEFAULT_PASS_PIPELINE),
+    )
     for skipped in os.environ.get("BRIGHTEN_SKIP_PASSES", "").split(","):
         skipped = skipped.strip()
         if skipped:
@@ -710,7 +737,15 @@ def main():
     parser = argparse.ArgumentParser(description="Chạy các pass brightening IR bằng các plugin .so có sẵn")
     parser.add_argument("-i", "--input", required=True, help="Đường dẫn file LLVM Bitcode (.bc) hoặc IR (.ll) đầu vào")
     parser.add_argument("-o", "--output", help="Đường dẫn file đầu ra (.bc hoặc .ll)")
+    parser.add_argument(
+        "--opt-level",
+        choices=("O1", "O2", "O3"),
+        help="Mức default<O*> dùng ở hai treatment point; mặc định O3",
+    )
     args = parser.parse_args()
+
+    if args.opt_level:
+        os.environ["BRIGHTEN_OPT_LEVEL"] = args.opt_level
 
     success = brighten_ir(args.input, args.output)
     if not success:

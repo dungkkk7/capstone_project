@@ -1,0 +1,9 @@
+push 17
+mul 9
+xor 255
+emit
+push 73
+reset
+mul 11
+emit
+stop

@@ -149,9 +149,18 @@ class RecoveryConfig:
     request_timeout: float = field(
         default_factory=lambda: float(os.environ.get("LLM_RECOVERY_REQUEST_TIMEOUT", "900"))
     )
-    # Gemini 2.5 Pro supports a provider maximum of 65,535 output tokens.
-    # This is not the recovery-loop limit; max_iterations remains the only loop bound.
-    max_output_tokens: Optional[int] = 65535
+    # Freeze the requested output budget from the experiment configuration.
+    # This is independent of the recovery-loop bound in ``max_iterations``.
+    max_output_tokens: Optional[int] = field(
+        default_factory=lambda: int(
+            os.environ.get(
+                "LLM_RECOVERY_MAX_OUTPUT_TOKENS",
+                str(getattr(_prompts_cfg, "MAX_OUTPUT_TOKENS", 8192))
+                if _prompts_cfg
+                else "8192",
+            )
+        )
+    )
     context_window_tokens: Optional[int] = None
     context_safety_margin_tokens: int = 1024
     pseudo_backend: str = field(
@@ -864,6 +873,21 @@ def build_system_prompt(
         mode_evidence = (
             "This request carries LLVM2C pseudocode generated from cleaned LLVM "
             "IR. No LLVM IR is supplied in this flow; do not invent absent IR."
+        )
+    elif selected_mode == "ghidra_pseudocode":
+        mode_evidence = (
+            "This request carries program-level Ghidra pseudocode exported from "
+            "the original obfuscated ELF. No LLVM IR, source, tests or oracle are "
+            "supplied; reconstruct only from that pseudocode and explicit "
+            "validation feedback."
+        )
+    elif selected_mode == "assembly":
+        mode_evidence = (
+            "This request carries program-level AT&T assembly produced by the "
+            "paper-derived objdump cleaner from the original obfuscated ELF. "
+            "No pseudocode, LLVM IR, source, tests or oracle are supplied; "
+            "reconstruct only from instructions, symbols, control/data flow "
+            "and explicit validation feedback."
         )
     elif selected_mode == "llvm_ir":
         mode_evidence = (
@@ -1585,6 +1609,8 @@ def build_repair_prompt(
     )
     normalized_source_label = source_label.lower()
     is_pseudocode = "pseudo" in normalized_source_label
+    is_ghidra = "ghidra" in normalized_source_label
+    is_assembly = "assembly" in normalized_source_label
     is_dual = is_pseudocode and "llvm ir" in normalized_source_label
     inventory = (
         _summarize_pseudocode_evidence(ir_text)
@@ -1592,6 +1618,19 @@ def build_repair_prompt(
         else "LLVM mode."
     )
     mode_rule = (
+        r"""For this Ghidra pseudocode repair, re-derive behavior from literal
+calls, decompiler data flow, loop transitions and explicit validation feedback.
+Resolve decompiler types/import thunks into standard C11, but do not invent
+source facts, tests or oracle values absent from the supplied evidence."""
+        if is_ghidra
+        else
+        r"""For this assembly repair, re-derive behavior from literal
+instructions, call targets, register/stack data flow and branch transitions.
+Treat addresses and compiler/obfuscator scaffolding as low-level evidence, not
+as source-level names. Do not invent source facts, tests or oracle values absent
+from the supplied assembly and validation feedback."""
+        if is_assembly
+        else
         r"""For this LLVM2C pseudocode repair, re-derive behavior from literal
 call sites, def-use, loop transitions and memory accesses. Do not reintroduce
 `frame_storage_backing_*`, `__brighten_native_data_pointer`, import thunks,
@@ -1607,6 +1646,18 @@ dispatcher constants or guessed source logic."""
             repair_rule = getattr(
                 _prompts_cfg,
                 "REPAIR_RULE_CLEAN_IR_AND_PSEUDOCODE",
+                mode_rule,
+            )
+        elif is_ghidra:
+            repair_rule = getattr(
+                _prompts_cfg,
+                "REPAIR_RULE_GHIDRA",
+                mode_rule,
+            )
+        elif is_assembly:
+            repair_rule = getattr(
+                _prompts_cfg,
+                "REPAIR_RULE_ASSEMBLY",
                 mode_rule,
             )
         elif is_pseudocode:
@@ -2856,6 +2907,15 @@ def run_recovery_loop(
     config = config or RecoveryConfig()
     client = model_client or VertexGemini(config)
     metadata = dict(metadata or {})
+    raw_initial_prompt_override = metadata.get("initial_prompt_override")
+    initial_prompt_override = (
+        raw_initial_prompt_override
+        if isinstance(raw_initial_prompt_override, str)
+        else ""
+    )
+    initial_prompt_has_no_system = bool(
+        metadata.get("initial_prompt_has_no_system", False)
+    )
     output_dir = str(Path(case_output_dir).resolve())
     os.makedirs(output_dir, exist_ok=True)
     recovery_state_path = Path(
@@ -2890,12 +2950,21 @@ def run_recovery_loop(
         backend_mode = "llvm2c"
     elif backend in {"2", "ir", "llvm", "raw_ir", "raw"}:
         backend_mode = "ir"
+    elif backend in {"ghidra", "ghidra_pseudocode", "external_pseudocode"}:
+        backend_mode = "ghidra_pseudocode"
+    elif backend in {"assembly", "asm", "objdump", "raw_assembly"}:
+        backend_mode = "assembly"
     else:
         raise RecoveryError(
-            f"Unsupported pseudocode backend {backend!r}; use 'llvm2c' or 'ir'."
+            f"Unsupported pseudocode backend {backend!r}; use 'llvm2c', "
+            "'ghidra', 'assembly', or 'ir'."
         )
 
-    use_pseudocode = backend_mode == "llvm2c"
+    use_pseudocode = backend_mode in {
+        "llvm2c",
+        "ghidra_pseudocode",
+        "assembly",
+    }
     if backend_mode == "llvm2c":
         print(
             "[LLM] LLVM2C mode: transpile Clean LLVM IR thành C pseudocode "
@@ -2927,6 +2996,41 @@ def run_recovery_loop(
         print(
             "[LLM] [✓] LLVM2C pseudocode ready: "
             f"{os.path.relpath(pseudo_path, output_dir)}"
+        )
+    elif backend_mode == "ghidra_pseudocode":
+        print(
+            "[LLM] Ghidra mode: use the frozen program-level pseudocode as "
+            "model evidence."
+        )
+        pseudo_source = ir_text
+        if not pseudo_source.strip():
+            raise RecoveryError("Ghidra produced an empty pseudocode artifact.")
+        input_pseudocode = (
+            _text(metadata.get("input_ir"))
+            if isinstance(metadata, Mapping)
+            else ""
+        )
+        pseudo_path_for_api = (
+            input_pseudocode if input_pseudocode and os.path.isfile(input_pseudocode)
+            else None
+        )
+    elif backend_mode == "assembly":
+        print(
+            "[LLM] Assembly mode: use the frozen program-level objdump "
+            "representation as model evidence."
+        )
+        pseudo_source = ir_text
+        if not pseudo_source.strip():
+            raise RecoveryError("objdump produced an empty assembly artifact.")
+        input_assembly = (
+            _text(metadata.get("input_ir"))
+            if isinstance(metadata, Mapping)
+            else ""
+        )
+        pseudo_path_for_api = (
+            input_assembly
+            if input_assembly and os.path.isfile(input_assembly)
+            else None
         )
     else:
         print("[LLM] Direct IR mode: send LLVM IR as model evidence.")
@@ -3014,7 +3118,14 @@ def run_recovery_loop(
         )
         os.replace(temporary, recovery_state_path)
 
-    total_model_calls = len(list(Path(output_dir).glob("recovery_iter*.response.txt")))
+    # Count both normal responses and the first response preserved before a
+    # MAX_TOKENS retry.  This keeps the physical-call budget correct after an
+    # interrupted process is resumed.
+    response_artifacts = list(Path(output_dir).glob("recovery_iter*.response.txt"))
+    max_tokens_response_artifacts = list(
+        Path(output_dir).glob("recovery_iter*.max_tokens.response.txt")
+    )
+    total_model_calls = len(response_artifacts) + len(max_tokens_response_artifacts)
     # The flow contract owns the provider-call budget. A one-shot flow sets
     # max_iterations=1 and must remain a literal one-call flow even when the
     # provider returns MAX_TOKENS.
@@ -3042,6 +3153,12 @@ def run_recovery_loop(
                 "pseudocode": (
                     "COMPLETE LLVM2C PSEUDOCODE ATTACHED IN THIS REQUEST"
                 ),
+                "ghidra_pseudocode": (
+                    "COMPLETE GHIDRA PROGRAM PSEUDOCODE ATTACHED IN THIS REQUEST"
+                ),
+                "assembly": (
+                    "COMPLETE OBJDUMP PROGRAM ASSEMBLY ATTACHED IN THIS REQUEST"
+                ),
                 "llvm_ir": (
                     "COMPLETE CLEANED/DELIFTED LLVM IR ATTACHED IN THIS REQUEST"
                 ),
@@ -3053,6 +3170,8 @@ def run_recovery_loop(
                 "COMPLETE MODEL INPUT ARTIFACT ATTACHED IN THIS REQUEST",
             )
             if iteration == 1:
+                if initial_prompt_override:
+                    return initial_prompt_override
                 if use_pseudocode and pseudo_source is None:
                     raise RecoveryError(
                         "LLVM2C pseudocode is missing from pseudocode mode."
@@ -3097,6 +3216,8 @@ def run_recovery_loop(
             source_label = {
                 "dual": "LLVM2C pseudocode plus cleaned/delifted LLVM IR",
                 "pseudocode": "LLVM2C transpiled pseudocode",
+                "ghidra_pseudocode": "program-level Ghidra pseudocode",
+                "assembly": "program-level objdump assembly",
                 "llvm_ir": "cleaned/delifted LLVM IR",
                 "raw_ir": "raw non-deobfuscated LLVM IR",
             }.get(
@@ -3163,15 +3284,25 @@ def run_recovery_loop(
             evidence_mode = (
                 "dual"
                 if use_pseudocode and config.attach_clean_ir
+                else "ghidra_pseudocode"
+                if backend_mode == "ghidra_pseudocode"
+                else "assembly"
+                if backend_mode == "assembly"
                 else "pseudocode"
                 if use_pseudocode
                 else "raw_ir"
                 if _text(config.ir_representation).lower() == "raw"
                 else "llvm_ir"
             )
-            system_prompt = build_system_prompt(
-                config.attach_clean_ir,
-                evidence_mode=evidence_mode,
+            system_prompt = (
+                ""
+                if iteration == 1
+                and initial_prompt_override
+                and initial_prompt_has_no_system
+                else build_system_prompt(
+                    config.attach_clean_ir,
+                    evidence_mode=evidence_mode,
+                )
             )
             model_prompt = make_prompt(None, evidence_mode)
             initial_context = _recovery_context_check(
@@ -3197,9 +3328,15 @@ def run_recovery_loop(
                 else:
                     evidence_mode = "pseudocode"
                     attachment_paths = [pseudo_attachment]
-                system_prompt = build_system_prompt(
-                    config.attach_clean_ir,
-                    evidence_mode=evidence_mode,
+                system_prompt = (
+                    ""
+                    if iteration == 1
+                    and initial_prompt_override
+                    and initial_prompt_has_no_system
+                    else build_system_prompt(
+                        config.attach_clean_ir,
+                        evidence_mode=evidence_mode,
+                    )
                 )
                 model_prompt = make_prompt(None, evidence_mode)
                 selected_context = _recovery_context_check(

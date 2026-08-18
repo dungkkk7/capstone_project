@@ -1,0 +1,68 @@
+{
+  "baseline_prompt": {
+    "instruction": "Generate linux compilable C/C++ code of the main and other functions in the supplied snippet without using goto, fix any missing headers. Do not explain anything.",
+    "instruction_sha256": "236005f155c0542448ccb0d1d79376423ec004be9bd9a2b8a0dfeeec022fe65a",
+    "serialization": "instruction + two LF bytes + raw Ghidra export",
+    "source": "https://arxiv.org/abs/2403.05286v3",
+    "source_section": "4.2.1",
+    "system_instruction": null
+  },
+  "campaign_id": "twoflow_20260815_213257",
+  "dataset": "/home/dungbv/clau/data/own_dataset.csv",
+  "dataset_sha256": "af1ccad0eb3566d67b5bf074b08f24d2410254b2e983eb708ce8b947371933e0",
+  "executed_flows": [
+    "B0"
+  ],
+  "f3_llvm_optimization_level": "O3",
+  "flows": {
+    "B0": {
+      "behavioral_feedback": false,
+      "compiler_feedback": false,
+      "contribution_role": "external baseline",
+      "flow_id": "B0",
+      "model_input": "program-level Ghidra pseudocode from the original obfuscated ELF",
+      "name": "LLM4DECOMPILE_GHIDRA_ONESHOT",
+      "provider_call_budget": 1
+    },
+    "F3": {
+      "behavioral_feedback": true,
+      "compiler_feedback": true,
+      "contribution_role": "proposed method",
+      "flow_id": "F3",
+      "model_input": "clean LLVM IR produced by the custom deobfuscation pipeline",
+      "name": "CLEAN_IR_ITERATIVE_MAIN",
+      "provider_call_budget": 5
+    }
+  },
+  "fuzz_iterations": 1000,
+  "generation_config": {
+    "candidate_count": 1,
+    "max_output_tokens": 65535,
+    "temperature": 0.05,
+    "top_p": 0.9
+  },
+  "ghidra_headless": "/opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless",
+  "git": {
+    "commit": "9866ad92129b7a3d0ef319952740a2868b486daa",
+    "worktree_dirty": true
+  },
+  "historical_six_flow_role": "archived exploratory ablation; excluded from the primary claim",
+  "implementation_sha256": {
+    "configs/prompts_config.py": "3ff94cb31103842efa6a26ea98cd18843424d1c8c96e96c12a79cbe472924df9",
+    "src/evaluation/ghidra/ExportProgramDecomp.java": "68ffddf430da23a0f37297d18efc4d6324d63bcf65c9d02d6e9ebc076e1dc013",
+    "src/evaluation/ghidra_baseline.py": "15079f322cdacb786d2401cf49a875bb534e67c4b91788378fb7f81aee7591b0",
+    "src/evaluation/run_experiment.py": "e165d562be38cdcc57790545528515393f0c94c0b4516063342e69cdb059cf38",
+    "src/evaluation/run_two_flow_experiment.py": "672f9da5f3d3543d59be12a0c1117898146469e02deb82b90bea9353c57169ef",
+    "src/evaluation/two_flow_protocol.py": "caa3ddda31feeae6e113060ea47e9ee5119ffd74e21a7bc422e1047d76d963f6",
+    "src/llm_recovery/llm_recovery.py": "a4f79731e17214407936aba4e44ac865e6a8977556aac5478cb55d12b9ab5029",
+    "src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh": "3b9a6a9a1e60d197832ace66209afd54e34f6d9b3bc8c257d80877e3eb049353",
+    "src/llvm_pass/britening_ir.py": "bd3a4797009620519c141d3988f23be2836f017653c04056e5680b80f9d96af6"
+  },
+  "location": "us-central1",
+  "model": "ag/gemini-3-flash-agent",
+  "primary_flow_order": [
+    "B0",
+    "F3"
+  ],
+  "protocol_version": "two-flow-b0-f3-v1"
+}

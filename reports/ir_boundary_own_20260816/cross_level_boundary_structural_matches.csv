@@ -1,0 +1,16 @@
+dataset,left_level,right_level,boundary,n,before_structural_matches,after_structural_matches
+own_v1,O1,O2,bundle_default_opt_3,40,0,5
+own_v1,O1,O2,bundle_default_opt_4,40,5,5
+own_v1,O1,O2,bundle_post_opt_4_custom_cleanup,40,5,7
+own_v1,O1,O2,main_default_opt_1,40,40,0
+own_v1,O1,O2,main_default_opt_2,40,6,0
+own_v1,O1,O3,bundle_default_opt_3,40,0,5
+own_v1,O1,O3,bundle_default_opt_4,40,5,5
+own_v1,O1,O3,bundle_post_opt_4_custom_cleanup,40,5,7
+own_v1,O1,O3,main_default_opt_1,40,40,0
+own_v1,O1,O3,main_default_opt_2,40,6,0
+own_v1,O2,O3,bundle_default_opt_3,40,29,29
+own_v1,O2,O3,bundle_default_opt_4,40,29,29
+own_v1,O2,O3,bundle_post_opt_4_custom_cleanup,40,29,30
+own_v1,O2,O3,main_default_opt_1,40,40,26
+own_v1,O2,O3,main_default_opt_2,40,26,26

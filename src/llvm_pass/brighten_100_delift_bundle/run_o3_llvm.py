@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run LLVM's O3 pipeline through the installed opt binary."""
+"""Run a declared LLVM default<O1/O2/O3> pipeline through opt."""
 
 import shutil
 import subprocess
@@ -10,7 +10,11 @@ import sys
 opt = shutil.which("opt-21") or shutil.which("opt")
 if not opt:
     raise SystemExit("opt-21/opt not found")
-pipeline = os.environ.get("DELIFT_OPT_PIPELINE", "default<O3>,verify")
+level = os.environ.get("DELIFT_OPT_LEVEL", os.environ.get("BRIGHTEN_OPT_LEVEL", "O3"))
+level = level.strip().upper()
+if level not in {"O1", "O2", "O3"}:
+    raise SystemExit(f"DELIFT_OPT_LEVEL must be O1, O2, or O3; received {level!r}")
+pipeline = os.environ.get("DELIFT_OPT_PIPELINE", f"default<{level}>,verify")
 command = [opt, "-S"]
 if os.environ.get("DELIFT_ENABLE_VECTORIZATION", "0").lower() not in {
     "1", "true", "yes", "on"

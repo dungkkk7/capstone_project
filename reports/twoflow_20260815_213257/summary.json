@@ -1,0 +1,12 @@
+{
+  "flows": [
+    {
+      "canonical_e2e_rate": 0.25,
+      "flow_id": "B0",
+      "mean_logical_llm_calls": 1.0,
+      "n": 40,
+      "pass_count": 10,
+      "role": "external baseline"
+    }
+  ]
+}

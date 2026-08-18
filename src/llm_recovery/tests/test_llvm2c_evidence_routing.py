@@ -197,22 +197,33 @@ def test_llvm2c_inline_dual_prompt_contains_both_representations(
     assert "brightened LLVM IR" in prompt
 
 
-def test_removed_ghidra_backend_fails_before_model_call(
+def test_ghidra_backend_accepts_frozen_program_pseudocode(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = CapturingClient()
+    monkeypatch.setattr(
+        recovery,
+        "_run_compile_check",
+        lambda *_args, **_kwargs: (True, None),
+    )
+    ghidra = "int main(void) { return 0; }\n"
 
-    with pytest.raises(recovery.RecoveryError, match="Unsupported pseudocode"):
-        recovery.run_recovery_loop(
-            ir_text="define i32 @main() { ret i32 0 }\n",
-            output_recovered_c_path=str(tmp_path / "candidate.c"),
-            case_output_dir=str(tmp_path / "generation"),
-            metadata={},
-            config=recovery.RecoveryConfig(
-                max_iterations=1,
-                pseudo_backend="ghidra",
-            ),
-            model_client=client,
-        )
+    result = recovery.run_recovery_loop(
+        ir_text=ghidra,
+        output_recovered_c_path=str(tmp_path / "candidate.c"),
+        case_output_dir=str(tmp_path / "generation"),
+        metadata={},
+        fuzzer_callback=lambda _candidate: PASSING_REPORT,
+        config=recovery.RecoveryConfig(
+            max_iterations=1,
+            pseudo_backend="ghidra",
+            use_file_api=False,
+            require_json=False,
+        ),
+        model_client=client,
+    )
 
-    assert client.calls == []
+    assert result.success is True
+    assert len(client.calls) == 1
+    assert ghidra in client.calls[0][0]

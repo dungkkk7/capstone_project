@@ -30,6 +30,7 @@ def load_passes(overrides=None):
         "BRIGHTEN_DISABLE_ABI_RECOVERY",
         "BRIGHTEN_DISABLE_EXTERN_BRIDGE",
         "BRIGHTEN_PASS_PIPELINE",
+        "BRIGHTEN_OPT_LEVEL",
     }
     saved = {key: os.environ.get(key) for key in keys}
     try:
@@ -52,6 +53,10 @@ def load_passes(overrides=None):
 
 
 passes = load_passes()
+
+o1_passes = load_passes({"BRIGHTEN_OPT_LEVEL": "O1"})
+assert o1_passes.count("default<O1>") == 2
+assert "default<O3>" not in o1_passes
 
 split_spec = importlib.util.spec_from_file_location(
     "britening_ir_split_boundary", pipeline_file

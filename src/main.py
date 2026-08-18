@@ -71,6 +71,7 @@ def _resolve_seed_paths(project_root, binary_path):
 
     data_obfuscated_root = os.path.join(project_root, "data", "obfuscated")
     data_clean_root = os.path.join(project_root, "data", "clean_src")
+    own_dataset_root = os.path.join(project_root, "data", "own_dataset")
 
     if binary_abs.startswith(data_obfuscated_root + os.sep):
         rel_path = os.path.relpath(binary_abs, data_obfuscated_root)
@@ -78,9 +79,16 @@ def _resolve_seed_paths(project_root, binary_path):
     elif binary_abs.startswith(data_clean_root + os.sep):
         rel_path = os.path.relpath(binary_abs, data_clean_root)
         candidate_case = rel_path.split(os.sep)[0]
+    elif binary_abs.startswith(own_dataset_root + os.sep):
+        rel_path = os.path.relpath(binary_abs, own_dataset_root)
+        parts = rel_path.split(os.sep)
+        candidate_case = next(
+            (part for part in parts if re.fullmatch(r"h\d+", part)), None
+        )
+        seed_root = os.path.join(own_dataset_root, "seeds")
     else:
         for part in reversed(binary_abs.split(os.sep)):
-            if part.startswith("p000"):
+            if re.fullmatch(r"[ph]\d+", part):
                 candidate_case = part
                 break
 
@@ -233,13 +241,21 @@ def _find_reference_source(project_root, binary_path):
     """Find the clean C source belonging to a dataset binary, if present."""
     binary_abs = os.path.abspath(binary_path)
     obfuscated_root = os.path.join(project_root, "data", "obfuscated")
-    if not binary_abs.startswith(obfuscated_root + os.sep):
+    own_obfuscated_root = os.path.join(
+        project_root, "data", "own_dataset", "obfuscated"
+    )
+    if binary_abs.startswith(obfuscated_root + os.sep):
+        rel_path = os.path.relpath(binary_abs, obfuscated_root)
+        clean_root = os.path.join(project_root, "data", "clean_src")
+    elif binary_abs.startswith(own_obfuscated_root + os.sep):
+        rel_path = os.path.relpath(binary_abs, own_obfuscated_root)
+        clean_root = os.path.join(project_root, "data", "own_dataset", "src")
+    else:
         return None
-    rel_path = os.path.relpath(binary_abs, obfuscated_root)
     case = rel_path.split(os.sep)[0]
     stem = os.path.splitext(os.path.basename(binary_abs))[0]
     source_stem = stem.split("_", 1)[0]
-    candidate = os.path.join(project_root, "data", "clean_src", case, source_stem + ".c")
+    candidate = os.path.join(clean_root, case, source_stem + ".c")
     if os.path.isfile(candidate):
         return candidate
     return None

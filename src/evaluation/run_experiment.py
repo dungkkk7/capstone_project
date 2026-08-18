@@ -42,6 +42,7 @@ from fuzzing_equi_check.input_contracts import (
     validate_contract_payload,
 )
 from evaluation.schema import FLOW_SPECS, flow_contract
+from evaluation.two_flow_protocol import build_b0_prompt, build_b2_prompt
 
 # Load default model from prompts_config.py
 try:
@@ -490,11 +491,24 @@ def run_fuzzing_tracked(candidate_path: str, ref_binary: str, contract: Any, gen
 def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str, location: str, original_src: Optional[str] = None) -> CaseTracker:
     tracker = CaseTracker(sample_id, flow_id)
     t_start = time.time()
+    flow_spec = FLOW_SPECS[flow_id]
     
     # Stage status
-    tracker.stage_raw_ir = os.path.exists(raw_ir) and os.path.getsize(raw_ir) > 0
-    tracker.stage_clean_ir = os.path.exists(clean_ir) and os.path.getsize(clean_ir) > 0
-    tracker.stage_pseudocode = True  # Pseudo pipeline ready
+    tracker.stage_raw_ir = (
+        flow_spec.requires_raw_ir
+        and os.path.exists(raw_ir)
+        and os.path.getsize(raw_ir) > 0
+    )
+    tracker.stage_clean_ir = (
+        flow_spec.requires_clean_ir
+        and os.path.exists(clean_ir)
+        and os.path.getsize(clean_ir) > 0
+    )
+    tracker.stage_pseudocode = (
+        (flow_spec.requires_pseudocode or flow_spec.requires_assembly)
+        and os.path.exists(clean_ir)
+        and os.path.getsize(clean_ir) > 0
+    )
     
     # Verify native contract if available
     contract_report = native_contract_report_path(case_output_dir)
@@ -506,6 +520,12 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         
     flow_dir = os.path.join(case_output_dir, flow_id)
     os.makedirs(flow_dir, exist_ok=True)
+    # Resume accounting must include the response preserved before an in-place
+    # MAX_TOKENS retry.  The two non-overlapping glob classes correspond to
+    # physical provider responses already consumed by this case.
+    tracker.llm_calls = len(
+        list(Path(flow_dir).glob("recovery_iter*.response.txt"))
+    ) + len(list(Path(flow_dir).glob("recovery_iter*.max_tokens.response.txt")))
     Path(os.path.join(flow_dir, "oracle_contract.json")).write_text(
         json.dumps(
             {
@@ -529,8 +549,32 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
     
     # Configure the full-first ablation layout. Every iterative flow receives
     # the same error-context policy; F2 is the sole one-shot ablation.
-    flow_spec = FLOW_SPECS[flow_id]
-    if flow_id == "F1":
+    initial_prompt_override = ""
+    initial_prompt_has_no_system = False
+    if flow_id == "B1":
+        config.pseudo_backend = "ghidra"
+        config.ir_representation = "ghidra_pseudocode"
+        config.attach_clean_ir = False
+        config.max_iterations = 5
+        # B0 serializes its Ghidra evidence inline and sends no system
+        # instruction.  B1 holds that first physical request byte-identical;
+        # only later calls use the registered repair profile.
+        config.use_file_api = False
+        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
+        initial_prompt_override = build_b0_prompt(ir_text)
+        initial_prompt_has_no_system = True
+    elif flow_id in {"B2", "B3"}:
+        config.pseudo_backend = "assembly"
+        config.ir_representation = "raw_assembly"
+        config.attach_clean_ir = False
+        config.max_iterations = 1 if flow_id == "B2" else 5
+        # Match the official LLM4Decompile-End inference serialization for the
+        # first request.  B3 alone may issue later validation-guided repairs.
+        config.use_file_api = False
+        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
+        initial_prompt_override = build_b2_prompt(ir_text)
+        initial_prompt_has_no_system = True
+    elif flow_id == "F1":
         config.pseudo_backend = "llvm2c"
         config.ir_representation = "clean"
         config.attach_clean_ir = True
@@ -622,6 +666,16 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         "input_ir": raw_ir if flow_spec.requires_raw_ir else clean_ir,
         "original_binary": original_binary,
     }
+    if initial_prompt_override:
+        metadata["initial_prompt_override"] = initial_prompt_override
+        metadata["initial_prompt_has_no_system"] = initial_prompt_has_no_system
+        metadata["prompt_profile"] = (
+            "b0_first_request_then_iterative_feedback"
+            if flow_id == "B1"
+            else "llm4decompile_assembly_oneshot"
+            if flow_id == "B2"
+            else "b2_first_request_then_iterative_feedback"
+        )
     
     try:
         res = run_recovery_loop(

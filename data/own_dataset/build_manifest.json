@@ -1,0 +1,2220 @@
+{
+  "schema_version": 1,
+  "dataset_id": "own-dataset-v1-20260815",
+  "dataset_manifest_sha256": "c7279a7f70b9e61d3871b31a45bcc4648a3ef4d0b0f45088ecfb47655f899b42",
+  "dataset_csv_sha256": "af1ccad0eb3566d67b5bf074b08f24d2410254b2e983eb708ce8b947371933e0",
+  "input_contract_sha256": "ea53c6a9f75522db8e7c4a36d823b32d8da5cce02b7af9a029cf05aa4c2cabef",
+  "builder_sha256": "84c490e4898c54a4ef69265d5c7789c6f8677327a29261d61d4cfa6fd93ef3ed",
+  "compiler": "clang-21",
+  "compiler_version": "Ubuntu clang version 21.1.8 (++20251221032922+2078da43e25a-1~exp1~20251221153059.70)",
+  "opt": "opt-21",
+  "opt_version": "Ubuntu LLVM version 21.1.8",
+  "plugin": "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+  "plugin_sha256": "f2fd8cb691c16001b167c5e698f15518ece65542a64085fa5ff6e0bc9daf4b5f",
+  "plugin_source_sha256": "91235184907f8d8cdea2e2ba0e681682ea9e90410d4f51331bcb97f698544e12",
+  "plugin_cmake_sha256": "90d6ff0e3f11510196aca6cec7b5d3322c6d910b04904a8f4838d01bacc9fdb7",
+  "pass_pipeline": "function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+  "plain_only": false,
+  "cases": [
+    {
+      "case_id": "h00001",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00001/n26081501.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00001.plain"
+      ],
+      "plain_binary_sha256": "4959aedd7842dbb0dfe20ff5256d415f9680c60c0a23de9cf26462d8e819d0a9",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00001/n26081501.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00001.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00001.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00001.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00001.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00001.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 66,
+        "fla": 72,
+        "bcf": 300
+      },
+      "obfuscated_bitcode_sha256": "2a919dbc8a0f4ad50cd876fd63b1ae7a12a3b0fc4847855b75f9444f95b725d9",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00001/n26081501_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "eab42d7387a98e724d6f930d265c08563e13347a8dcf74bf8dbf7ffd93be8da2",
+      "obfuscated_size_bytes": 16016
+    },
+    {
+      "case_id": "h00002",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00002/n26081502.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00002.plain"
+      ],
+      "plain_binary_sha256": "0ead6896d7feafc6bd7f078b4ced5eb39da4e045939a51cf655d6578fce3ff83",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00002/n26081502.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00002.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00002.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00002.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00002.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00002.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 48,
+        "fla": 70,
+        "bcf": 299
+      },
+      "obfuscated_bitcode_sha256": "e9763a4ea1c1a5eeb2a3735887d66507b5b279ff67f271e62a195aae92218b1a",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00002/n26081502_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "023325816576920fd0d94255730eb2fe58130d321608c6cba9f5e7825cfdea21",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00003",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00003/n26081503.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00003.plain"
+      ],
+      "plain_binary_sha256": "0d2408594b4945bcfacaa915e5de0a5a7fcb973259259d8870630497a7e4f4c8",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00003/n26081503.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00003.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00003.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00003.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00003.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00003.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 56,
+        "fla": 88,
+        "bcf": 305
+      },
+      "obfuscated_bitcode_sha256": "3f59b5fdbc8b9efb0e95e33bf064e3bc4e68f8c4ef1411c35a00400d523c2bc9",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00003/n26081503_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "d413c40a423ee2ee2039a0dedab6e93c45555fe3d1b80760c3d033ac0c0eecaa",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00004",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00004/n26081504.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00004.plain"
+      ],
+      "plain_binary_sha256": "242fc0c9c3f0ed61a1d20041de7dcfca85653e234bdbbf4631ab5064f9e968e3",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00004/n26081504.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00004.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00004.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00004.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00004.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00004.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 46,
+        "fla": 56,
+        "bcf": 294
+      },
+      "obfuscated_bitcode_sha256": "bc822f213e571153a45fc00aef318fc5225e4548a462dce1b5812bf210606dce",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00004/n26081504_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "aadcd7dc6ff9a0b050d84d2d63e86284dabab5c26c473cb15bddc5d6ff8570cb",
+      "obfuscated_size_bytes": 16064
+    },
+    {
+      "case_id": "h00005",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00005/n26081505.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00005.plain"
+      ],
+      "plain_binary_sha256": "fc3a0d8ccfb32acf3b38e8b7b29b300d01c7227f1faa2c2f1d74a72dec66311c",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00005/n26081505.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00005.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00005.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00005.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00005.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00005.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 26,
+        "fla": 48,
+        "bcf": 291
+      },
+      "obfuscated_bitcode_sha256": "f126f2e6fb835fe80993b8dbdceccd43a04df31d501dc24106d3e00237783c28",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00005/n26081505_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "4164c98dc092df654f15e49adaa2447580b41cf62d5bdf9f6b1041613c16fd2c",
+      "obfuscated_size_bytes": 16120
+    },
+    {
+      "case_id": "h00006",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00006/n26081506.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00006.plain"
+      ],
+      "plain_binary_sha256": "813cf472a4bf0ac2d7b7a31bad74e7fd83cf95e5fe1bf46396bb88dc7adb67f1",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00006/n26081506.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00006.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00006.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00006.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00006.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00006.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 105,
+        "fla": 90,
+        "bcf": 307
+      },
+      "obfuscated_bitcode_sha256": "e4d5663547a069a1d2acacc7046802857ca87cd724f885bff4bf3b935dfe9a1d",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00006/n26081506_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "90b826ff96dac9ce0ccd766737fffcff6896307453519c86b92f90ad5ae668d0",
+      "obfuscated_size_bytes": 16016
+    },
+    {
+      "case_id": "h00007",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00007/n26081507.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00007.plain"
+      ],
+      "plain_binary_sha256": "260e950d14c0bbd78c377cf82fd8bab939039698a99969f38f6f932d108d0c33",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00007/n26081507.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00007.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00007.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00007.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00007.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00007.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 65,
+        "fla": 92,
+        "bcf": 580
+      },
+      "obfuscated_bitcode_sha256": "8ad308b8e9a6ccc904623f7d0e7ba8ddc83dde28486ce93d0032fc0dc6d331dd",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00007/n26081507_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "ba4d9cd1f597cfd8b8403d287a04a52b3d797ba4d7ebabdf6d13b39abd4001b8",
+      "obfuscated_size_bytes": 16104
+    },
+    {
+      "case_id": "h00008",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00008/n26081508.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00008.plain"
+      ],
+      "plain_binary_sha256": "97ba01b07aee7049e200edea6bea222bd7e568310ab8a165299a2f0473f191b2",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00008/n26081508.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00008.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00008.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00008.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00008.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00008.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 48,
+        "fla": 66,
+        "bcf": 298
+      },
+      "obfuscated_bitcode_sha256": "c653a6142aa6d12406577e7846f6ab67cca9c62d51e4f813555827898ec1f36f",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00008/n26081508_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "9c9b8ecf6149d7dbd03e2503100cb8ae99318e9016dfa0c9cb091c16a45d27fe",
+      "obfuscated_size_bytes": 16072
+    },
+    {
+      "case_id": "h00009",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00009/n26081509.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00009.plain"
+      ],
+      "plain_binary_sha256": "29ff2f3387a2e2d501d9dbe13edfe62c1bc611cf05dba920bca99ca0179bfb0e",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00009/n26081509.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00009.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00009.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00009.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00009.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00009.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 68,
+        "fla": 120,
+        "bcf": 317
+      },
+      "obfuscated_bitcode_sha256": "98cd4a9bfd6b742bda489b984c42a1d308c0a306fe5295f80bbbb805e9db3f1d",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00009/n26081509_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "b4c311c71a716668aecadc73cd22ed6cabe07ecc8ba7b9980b968cf39863988b",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00010",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00010/n26081510.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00010.plain"
+      ],
+      "plain_binary_sha256": "fdd2ffbf3c1d605ed1c82fed71f6ae80add9840ef449ad9338b3aab0630f294d",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00010/n26081510.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00010.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00010.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00010.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00010.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00010.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 103,
+        "fla": 80,
+        "bcf": 303
+      },
+      "obfuscated_bitcode_sha256": "efacadd9472e5b381c8b42923272a765be3ca4cac191284f682b6f26788a066a",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00010/n26081510_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "98889a165bfc64e28ea164346e799f3adea0c4e64266b06ffd3802cc80641ec7",
+      "obfuscated_size_bytes": 16064
+    },
+    {
+      "case_id": "h00011",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00011/n26081511.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00011.plain"
+      ],
+      "plain_binary_sha256": "b58071e22018aef50de2e2d2717d2897e76926b3c84e9fdd0f43f661a4dbb62a",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00011/n26081511.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00011.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00011.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00011.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00011.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00011.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 40,
+        "fla": 56,
+        "bcf": 294
+      },
+      "obfuscated_bitcode_sha256": "b7ede68d4faa34a8ef21a3780d23eeaf8362cfffd0fa0307f3f0ee7ddee570c9",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00011/n26081511_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "e6604a5b835e808a943b3ddae951a6ba5d51566917612701fa6893b98a046fae",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00012",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00012/n26081512.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00012.plain"
+      ],
+      "plain_binary_sha256": "3c9242e962e4ee8e519ae4fe8127f4477954921cb7fac43588c4f29b3927e0c0",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00012/n26081512.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00012.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00012.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00012.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00012.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00012.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 67,
+        "fla": 34,
+        "bcf": 263
+      },
+      "obfuscated_bitcode_sha256": "2af6544cf4f6b495f0b7a610d160e29da6088d114e621eb41496e3407dc782e5",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00012/n26081512_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "f5f1bcb0817354234d4a5a02a1fc21ef5322c7e85279f1ffaaa4e35cd2261274",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00013",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00013/n26081513.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00013.plain"
+      ],
+      "plain_binary_sha256": "c552d7f02078fbeaa9f00fe01a9fed156edf362ada37d212e72bb66d4462ba29",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00013/n26081513.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00013.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00013.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00013.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00013.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00013.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 41,
+        "fla": 42,
+        "bcf": 289
+      },
+      "obfuscated_bitcode_sha256": "0568e8c189cbe8019fa3c99b3f33f6133ab3595ec4ecb11e88d294adcde04353",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00013/n26081513_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "0c96e812d789d5cae5720d0f95f19425be87cb8d96062fb3c7d495b4e7da5579",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00014",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00014/n26081514.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00014.plain"
+      ],
+      "plain_binary_sha256": "2ca2fa3e8848761867015e6a5fb43c247eeedc1e2082b4e09be12930a7746650",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00014/n26081514.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00014.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00014.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00014.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00014.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00014.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 50,
+        "fla": 106,
+        "bcf": 470
+      },
+      "obfuscated_bitcode_sha256": "5af5d50e5aaeb08c08d7953d49db608ce90d1de1a1ec820d9a1900c3af901842",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00014/n26081514_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "b156397c918ba1d2f46399190694a22c7d117940d9574aa5819139122f41c36a",
+      "obfuscated_size_bytes": 16096
+    },
+    {
+      "case_id": "h00015",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00015/n26081515.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00015.plain"
+      ],
+      "plain_binary_sha256": "583775b61c3f7e45d79891949da1a6c78f104a998e1909dbdaea79420d0c9a56",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00015/n26081515.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00015.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00015.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00015.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00015.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00015.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 50,
+        "fla": 72,
+        "bcf": 300
+      },
+      "obfuscated_bitcode_sha256": "8cd53014e1d058cc45ab8f6332f6df98639ee968090b7cace1cfa4c40f3e4334",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00015/n26081515_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "f1bcb44c6090b88486d756fb06d65b1c7ce6269144907e8dc9b8b2532a5d2de9",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00016",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00016/n26081516.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00016.plain"
+      ],
+      "plain_binary_sha256": "396a9f39b283de818e89775f337d3d070a76086c7d4db0c7d3dc1fbe4d33d3f6",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00016/n26081516.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00016.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00016.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00016.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00016.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00016.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 65,
+        "fla": 80,
+        "bcf": 303
+      },
+      "obfuscated_bitcode_sha256": "323ba666e7f4d3b753023098c3d7696106e2bfc2bdff803513955fe6a5dd0ac1",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00016/n26081516_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "c39c1356a9550e0ecf7fcdbb8dd249d07154b3f63a8d69db4c863c31055dd08e",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00017",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00017/n26081517.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00017.plain"
+      ],
+      "plain_binary_sha256": "6b7f6557728ab9c7832a55e0a9095986a4e7a1b9b42a61568e07b1b9b2f5b300",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00017/n26081517.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00017.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00017.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00017.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00017.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00017.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 80,
+        "fla": 68,
+        "bcf": 298
+      },
+      "obfuscated_bitcode_sha256": "0563ecc810332f60dc9ece23a281a868531506c3fe3450a7c40a597abbdc0460",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00017/n26081517_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "97f8cf181dad99456062acba1ba2fb44f3d10ad8ab5ba524652bf8ec8b345ab2",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00018",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00018/n26081518.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00018.plain"
+      ],
+      "plain_binary_sha256": "49980a10ba2edebef77b6bcc82ba2dd15bc17507d21690963d5ab1b6e496fa39",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00018/n26081518.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00018.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00018.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00018.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00018.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00018.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 100,
+        "fla": 124,
+        "bcf": 319
+      },
+      "obfuscated_bitcode_sha256": "12a9adc4e0aa8f809a553e128ad6f7dbb859788e1a4f630ca4dd991ab33087d3",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00018/n26081518_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "3a357400247c326cb85b45725d916a4b20501ae9314c0a76d37ef6f91c6e48b7",
+      "obfuscated_size_bytes": 16072
+    },
+    {
+      "case_id": "h00019",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00019/n26081519.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00019.plain"
+      ],
+      "plain_binary_sha256": "a4fc490ab950d54a3762b93dbc5cb54122c1dc5cc31416412a28d18294f2c170",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00019/n26081519.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00019.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00019.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00019.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00019.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00019.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 58,
+        "fla": 100,
+        "bcf": 310
+      },
+      "obfuscated_bitcode_sha256": "f90992ae655c6c196b42c8390d744a856bfae0e4848c68f67dba7ec07a32d005",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00019/n26081519_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "74a142f23dbb4f87fc141956d0ec13b8155bb5efe22dd9066e488ec9d1e8d9e6",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00020",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00020/n26081520.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00020.plain"
+      ],
+      "plain_binary_sha256": "326558f7a12254eaaef3e37b1369616772c50e2534bf4bce580f017de844c956",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00020/n26081520.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00020.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00020.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00020.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00020.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00020.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 89,
+        "fla": 74,
+        "bcf": 301
+      },
+      "obfuscated_bitcode_sha256": "ac64252c9fd44971baef22775129745f4dd065138e033969e5fd4a0ebc47f024",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00020/n26081520_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "87718b9fdd6114f8aaaa5deaa182f635f2001181a9e367c4ca8707193e53a8bd",
+      "obfuscated_size_bytes": 16088
+    },
+    {
+      "case_id": "h00021",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00021/n26081521.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00021.plain"
+      ],
+      "plain_binary_sha256": "8d14acf9ffbcf278e48c4dfa0f8b504b3ed04b851d6d11b4ef425c1b270e8a9a",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00021/n26081521.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00021.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00021.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00021.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00021.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00021.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 57,
+        "fla": 68,
+        "bcf": 298
+      },
+      "obfuscated_bitcode_sha256": "005400284c7f6a1ab600017b6740fb171fb83d166e9e2e6fdf56ef2ce649c14e",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00021/n26081521_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "4522315b1b4e1d748bb9476ad80da38a6200c19e2fc48bb2ddd252b64b808db0",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00022",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00022/n26081522.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00022.plain"
+      ],
+      "plain_binary_sha256": "be26cfd9dbdce79cf78cce17cd3f3505a2b383decc35546451ed6df9cc48bfbe",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00022/n26081522.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00022.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00022.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00022.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00022.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00022.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 48,
+        "fla": 16,
+        "bcf": 95
+      },
+      "obfuscated_bitcode_sha256": "0a056ad7c85026bf7f37189d5310e8671447d043e540e68931c2929313703010",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00022/n26081522_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "209a2662560eda6c7d5c93ac2a22dffd749052b55a841c2c5538bf4ea0682ef7",
+      "obfuscated_size_bytes": 16016
+    },
+    {
+      "case_id": "h00023",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00023/n26081523.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00023.plain"
+      ],
+      "plain_binary_sha256": "4092e1eddbc0ce589489ccdfd70bb1696dd36ce272e498dbae68e2479f424848",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00023/n26081523.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00023.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00023.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00023.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00023.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00023.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 87,
+        "fla": 90,
+        "bcf": 307
+      },
+      "obfuscated_bitcode_sha256": "91b093fd1592cc198eee54952fb78bf55eca8053df52ccc6eb0966c387d10c43",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00023/n26081523_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "6cff7e59e588389d60a92a754466e9e40393d50830f415a4b2fbbb7fa2732c30",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00024",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00024/n26081524.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00024.plain"
+      ],
+      "plain_binary_sha256": "927293df4e84e886d5ae8e9a9822bc542d63973580b6c866853df17978a19d58",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00024/n26081524.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00024.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00024.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00024.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00024.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00024.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 51,
+        "fla": 40,
+        "bcf": 288
+      },
+      "obfuscated_bitcode_sha256": "6d9cbe7e95bcff6a55a3dbece6949d6c0e6d168886833fac82afa4ce43f3ebe4",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00024/n26081524_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "3c495491517bb133382f1a6a504687b30e1365c479937102622bd1ac4731fcb7",
+      "obfuscated_size_bytes": 16072
+    },
+    {
+      "case_id": "h00025",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00025/n26081525.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00025.plain"
+      ],
+      "plain_binary_sha256": "5eb5f7e8c42c35dbd1b69c4ea9f3b60eaa1621803263b83ea4cb0d0005ab0878",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00025/n26081525.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00025.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00025.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00025.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00025.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00025.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 56,
+        "fla": 70,
+        "bcf": 299
+      },
+      "obfuscated_bitcode_sha256": "8f3666a91722085905a8256081b69f22686523edb499329958883f4f76eb0d10",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00025/n26081525_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "592be06bb319e4da1270338d5c35eddbcdbf16a1570c657bbd81345ffabedb68",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00026",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00026/n26081526.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00026.plain"
+      ],
+      "plain_binary_sha256": "467000cda56a6d64adb6a98ea56481551466c64beb7491a5e5ab7010c4afc153",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00026/n26081526.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00026.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00026.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00026.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00026.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00026.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 81,
+        "fla": 168,
+        "bcf": 335
+      },
+      "obfuscated_bitcode_sha256": "079b89e8be8496a96b16b4372cacea451405bcb7dc219e9a0a94b405f8337a6b",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00026/n26081526_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "9a551cf6cb6b971a139122c1d05b36f5156afeba043542e4c9936472b8228389",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00027",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00027/n26081527.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00027.plain"
+      ],
+      "plain_binary_sha256": "01480eef75a267e8edbf89a198285a52032b09371775b3f44cc0b0528e812e47",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00027/n26081527.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00027.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00027.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00027.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00027.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00027.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 79,
+        "fla": 168,
+        "bcf": 336
+      },
+      "obfuscated_bitcode_sha256": "06156b3eacd531276149d8a3c6ccad4be4af03c324eaa1e6ebb15a4552d04549",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00027/n26081527_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "837bea69a6da7ade9c265c4c321c3ddddb047126c1c80dd1b3a66ecc2711f979",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00028",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00028/n26081528.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00028.plain"
+      ],
+      "plain_binary_sha256": "bbf5d9aeede1b43449a8d9e1d02c810466398b2ba0cbdf46ca7e43084e71c829",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00028/n26081528.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00028.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00028.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00028.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00028.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00028.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 72,
+        "fla": 154,
+        "bcf": 329
+      },
+      "obfuscated_bitcode_sha256": "8b0d099446c16ac1322316b9182bc8f8a1920041bf4d03cc22172a384214df67",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00028/n26081528_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "93dab2b6aaad097bdf3cc8b98b578aff7a0fcc857c715aba34d527a564ae7e0f",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00029",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00029/n26081529.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00029.plain"
+      ],
+      "plain_binary_sha256": "2fc927de894a225341cdb1b7377b7a47422dae08e91778cd232e8d3de7c561d0",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00029/n26081529.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00029.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00029.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00029.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00029.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00029.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 56,
+        "fla": 160,
+        "bcf": 422
+      },
+      "obfuscated_bitcode_sha256": "41094c876fdecd00a1b69fe8fede48d1f846343c991daad3f8077c1007e9fa26",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00029/n26081529_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "e906a716562bb85148b4522a6061fc58f7d35803493e862ac0a8ababc58aa136",
+      "obfuscated_size_bytes": 16112
+    },
+    {
+      "case_id": "h00030",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00030/n26081530.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00030.plain"
+      ],
+      "plain_binary_sha256": "24a3d191ee118cba175dbe45727b572072018ab6a249ef0a4e80e074421d6ea2",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00030/n26081530.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00030.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00030.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00030.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00030.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00030.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 84,
+        "fla": 240,
+        "bcf": 363
+      },
+      "obfuscated_bitcode_sha256": "73c5d6659a87100597ea8c329be0cbc52d20da21aa8a9a809bca1c592392dbc8",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00030/n26081530_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "b4e1b091c7b4b706dffbd2ee05d77363d0db5e3d798a026d1e56dcb1827c9fd6",
+      "obfuscated_size_bytes": 20080
+    },
+    {
+      "case_id": "h00031",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00031/n26081531.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00031.plain"
+      ],
+      "plain_binary_sha256": "76d38b4b1c40e54c480516c02d93b68890e7522bbd85b50fb1967e9fdea649a4",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00031/n26081531.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00031.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00031.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00031.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00031.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00031.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 83,
+        "fla": 138,
+        "bcf": 325
+      },
+      "obfuscated_bitcode_sha256": "2f5e805b32497c28b77c01bee104065d0177902661f7765514177cf60d88addd",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00031/n26081531_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "1ef47a579dc0c6e061090f40dbc393307baa11fff3da10b57cb715f2e33dfe0f",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00032",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00032/n26081532.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00032.plain"
+      ],
+      "plain_binary_sha256": "f1e46a98e6fb492e38200f3889640383515b30d1c2f70be3b2fb3d84ce11f332",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00032/n26081532.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00032.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00032.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00032.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00032.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00032.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 33,
+        "fla": 140,
+        "bcf": 325
+      },
+      "obfuscated_bitcode_sha256": "c3c5c32988677f0ebf2d1c61d291a05569246f400165414e5efddaeab1aa2eea",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00032/n26081532_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "b8c7b9a6af1387bbefa3507432586871369d487ed55e6cb498481e183804c2ef",
+      "obfuscated_size_bytes": 16016
+    },
+    {
+      "case_id": "h00033",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00033/n26081533.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00033.plain"
+      ],
+      "plain_binary_sha256": "b909e08ea5fb40f8b51d8bf8268f704a10d589b96b6900d6f1507d1eeb999b99",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00033/n26081533.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00033.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00033.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00033.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00033.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00033.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 59,
+        "fla": 116,
+        "bcf": 316
+      },
+      "obfuscated_bitcode_sha256": "0954507a6e6413daecc04e32642a3de8625a26a716b95ee6bbb72781c1d09bda",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00033/n26081533_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "510113dad6fd43688b23d00d53a9d810a6344700d385ba340cce17a600afb008",
+      "obfuscated_size_bytes": 16032
+    },
+    {
+      "case_id": "h00034",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00034/n26081534.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00034.plain"
+      ],
+      "plain_binary_sha256": "044130608ad041e06bad70505a6a25df5ab6988405dcc1af7c95879fddc01317",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00034/n26081534.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00034.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00034.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00034.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00034.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00034.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 56,
+        "fla": 140,
+        "bcf": 326
+      },
+      "obfuscated_bitcode_sha256": "bb82d19193b63ce0eb5379cb20f992b2595eb52c8a348e392d8ceadf021f82b4",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00034/n26081534_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "2c5500bc9a97ed8b91730da897d081dff095168d43fc2fe5cb7e27009a33d05b",
+      "obfuscated_size_bytes": 16328
+    },
+    {
+      "case_id": "h00035",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00035/n26081535.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00035.plain"
+      ],
+      "plain_binary_sha256": "f8d33a025aae0a6b507caed83cb11da1e9ba714ef0c127c294cc9fff666d3c0a",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00035/n26081535.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00035.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00035.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00035.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00035.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00035.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 88,
+        "fla": 96,
+        "bcf": 398
+      },
+      "obfuscated_bitcode_sha256": "23298f745fad499ab7444d246569ba7c5b7c57fcd35d26b40adb6bea1a14cf0f",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "0389fac14b9b17a15cd5b89747764dfec59fbcc1827e781d0b9351b1cf8c92bd",
+      "obfuscated_size_bytes": 16112
+    },
+    {
+      "case_id": "h00036",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00036/n26081536.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00036.plain"
+      ],
+      "plain_binary_sha256": "4ed22df9c7a3cb56ba83e42b794ce682b0180d80fe2520282e94378f1d299049",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00036/n26081536.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00036.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00036.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00036.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00036.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00036.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 46,
+        "fla": 34,
+        "bcf": 263
+      },
+      "obfuscated_bitcode_sha256": "744e22e9c549df7220606b29a00c2d71659bbc304146dcb6060423cbe9bed12b",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00036/n26081536_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "55b6608d921116a82705543fb011725d25e9c8af4c3a24ff8abffa91e7522e5b",
+      "obfuscated_size_bytes": 15976
+    },
+    {
+      "case_id": "h00037",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00037/n26081537.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00037.plain"
+      ],
+      "plain_binary_sha256": "ebb1c223328b8f96f11b14735a658a013f52d7137d5d9607a6bad6cb3f019621",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00037/n26081537.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00037.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00037.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00037.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00037.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00037.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 32,
+        "fla": 42,
+        "bcf": 289
+      },
+      "obfuscated_bitcode_sha256": "8b582929b698fdadb3d8ded1f23fef750c935d90779a78f1466cf888a85056e3",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00037/n26081537_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "3475b14a1a2ceadc0f5b759d1a179a9e78335d32900525ec966efa507c81260d",
+      "obfuscated_size_bytes": 16160
+    },
+    {
+      "case_id": "h00038",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00038/n26081538.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00038.plain"
+      ],
+      "plain_binary_sha256": "b413baf39d00a1accf08147cf5c6e513ba23c9cbe2a1fdebf88254b1862e5b8b",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00038/n26081538.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00038.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00038.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00038.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00038.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00038.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 94,
+        "fla": 114,
+        "bcf": 563
+      },
+      "obfuscated_bitcode_sha256": "5181cecbc4a16d86f740ca98d58268f59d675acb1cd2d0084cf879245cd46880",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00038/n26081538_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "374fa72cc1fbb4d6cd49f3dc073a054fb1da442d829fbb485acc294175d0adf7",
+      "obfuscated_size_bytes": 16176
+    },
+    {
+      "case_id": "h00039",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00039/n26081539.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00039.plain"
+      ],
+      "plain_binary_sha256": "3d581fbf668294d561c772b2c67f75601d58434606498b831153648c7f00ad23",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00039/n26081539.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00039.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00039.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00039.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00039.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00039.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 91,
+        "fla": 54,
+        "bcf": 293
+      },
+      "obfuscated_bitcode_sha256": "0eddbbf312b0f37de01582d8710f8cdbe84aad666b64896a42231fffcbc6a359",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00039/n26081539_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "95bb1ef9d5ce145c045dca2341ec9ae3c737938507f3d3c5a6ddf2898bac3abd",
+      "obfuscated_size_bytes": 15984
+    },
+    {
+      "case_id": "h00040",
+      "plain_command": [
+        "clang-21",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "/home/dungbv/clau/data/own_dataset/src/h00040/n26081540.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00040.plain"
+      ],
+      "plain_binary_sha256": "609ecdcbe48a14971f23a92cc0645a9b544dcb42395460f69ea8b9f379af44b8",
+      "oracle_verified": true,
+      "compile_ir_command": [
+        "clang-21",
+        "-std=c11",
+        "-O0",
+        "-Xclang",
+        "-disable-O0-optnone",
+        "-fno-discard-value-names",
+        "-emit-llvm",
+        "-c",
+        "/home/dungbv/clau/data/own_dataset/src/h00040/n26081540.c",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00040.raw.bc"
+      ],
+      "obfuscation_command": [
+        "opt-21",
+        "-load-pass-plugin",
+        "/home/dungbv/clau/tools/own_obfuscator/build/libOwnObfuscator.so",
+        "-passes=function(reg2mem,own-instsub,own-fla,own-bcf),verify",
+        "/tmp/own-dataset-build-cmn4lk7q/h00040.raw.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00040.obf.bc"
+      ],
+      "link_command": [
+        "clang-21",
+        "-O0",
+        "-no-pie",
+        "/tmp/own-dataset-build-cmn4lk7q/h00040.obf.bc",
+        "-o",
+        "/tmp/own-dataset-build-cmn4lk7q/h00040.obf.elf"
+      ],
+      "marker_counts": {
+        "instsub": 72,
+        "fla": 130,
+        "bcf": 323
+      },
+      "obfuscated_bitcode_sha256": "feade7ddc1e33488a9243da542f0a6c206fa1bcfdc4ab75daccc3b1c8207683b",
+      "obfuscated_binary": "data/own_dataset/obfuscated/h00040/n26081540_fla_bcf_instsub.elf",
+      "obfuscated_binary_sha256": "50b163c6797bb996fd4fdf454c4988acce8e15d2e32a5661c3564c7754e82eb4",
+      "obfuscated_size_bytes": 16256
+    }
+  ]
+}

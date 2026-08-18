@@ -36,9 +36,36 @@ class FlowSpec:
     requires_clean_ir: bool
     requires_pseudocode: bool
     iterative: bool
+    requires_assembly: bool = False
 
 
 FLOW_SPECS = {
+    "B1": FlowSpec(
+        "B1",
+        "GHIDRA_PSEUDOCODE_ITERATIVE",
+        False,
+        False,
+        True,
+        True,
+    ),
+    "B2": FlowSpec(
+        "B2",
+        "OBJDUMP_ASSEMBLY_ONESHOT",
+        False,
+        False,
+        False,
+        False,
+        requires_assembly=True,
+    ),
+    "B3": FlowSpec(
+        "B3",
+        "OBJDUMP_ASSEMBLY_ITERATIVE",
+        False,
+        False,
+        False,
+        True,
+        requires_assembly=True,
+    ),
     "F1": FlowSpec(
         "F1",
         "FULL",
@@ -123,6 +150,7 @@ def flow_contract(spec: FlowSpec) -> dict[str, Any]:
         "requires_raw_ir": spec.requires_raw_ir,
         "requires_clean_ir": spec.requires_clean_ir,
         "requires_pseudocode": spec.requires_pseudocode,
+        "requires_assembly": spec.requires_assembly,
         "error_context_enabled": spec.iterative,
         "iterative": spec.iterative,
     }

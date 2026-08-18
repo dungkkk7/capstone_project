@@ -196,8 +196,15 @@ def _manifest_path(project_root: str) -> Path:
     return Path(project_root) / "data" / "input_contracts" / "custom_dataset.json"
 
 
-def _custom_manifest_path(project_root: str) -> Path:
-    return Path(project_root) / "data" / "input_contracts" / "custom_dataset.json"
+def _custom_manifest_paths(project_root: str) -> List[Path]:
+    """Return every repository-owned evaluation contract manifest.
+
+    The public-corpus campaign and repository-owned dataset are intentionally stored
+    separately so their denominators and contamination claims cannot be mixed.
+    """
+
+    root = Path(project_root) / "data" / "input_contracts"
+    return [root / "custom_dataset.json", root / "own_dataset.json"]
 
 
 def _load_manifest(path: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -221,7 +228,12 @@ def load_contracts(
     ``prefer_custom=True`` to resolve only custom contracts first.
     """
     if prefer_custom:
-        custom_contracts = _load_manifest(_custom_manifest_path(project_root))
+        custom_contracts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for path in _custom_manifest_paths(project_root):
+            for key, contract in _load_manifest(path).items():
+                if key in custom_contracts:
+                    raise ValueError(f"Duplicate input contract key {key} in {path}")
+                custom_contracts[key] = contract
         if custom_contracts:
             return custom_contracts
     return _load_manifest(_manifest_path(project_root))
@@ -233,11 +245,21 @@ def resolve_input_contract(
     """Resolve a contract from a dataset binary path such as p00183/s868*.elf.
 
     By default, resolve using the standard manifest and fallback as before.
-    Set ``only_custom=True`` to restrict lookup to custom_dataset.json only.
+    Set ``only_custom=True`` to restrict lookup to the repository-owned public
+    and repository-owned contract manifests.
     """
     path = Path(binary_path)
-    case_id = next((part for part in path.parts if re.fullmatch(r"p\d+", part)), None)
-    submission_id = next((part for part in path.name.split("_", 1) if re.fullmatch(r"s\d+", part)), None)
+    case_id = next(
+        (part for part in path.parts if re.fullmatch(r"[ph]\d+", part)), None
+    )
+    submission_id = next(
+        (
+            part
+            for part in path.name.split("_", 1)
+            if re.fullmatch(r"[sn]\d+", part)
+        ),
+        None,
+    )
     if not case_id or not submission_id:
         return None
 

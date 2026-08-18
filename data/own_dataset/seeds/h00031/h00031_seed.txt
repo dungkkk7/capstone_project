@@ -1,0 +1,11 @@
+3
+put 8
+put 3
+get 8
+put 5
+put 9
+get 3
+get 5
+put 2
+get 8
+end
