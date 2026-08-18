@@ -1,0 +1,63 @@
+name: core-brightening-build
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [agent/core-brightening-rebuild]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pass:
+          - brighten_010_repair_pass
+          - brighten_015_runtime_helper_materialization
+          - brighten_020_devirt_pass
+          - brighten_030_state_ssa_pass
+          - brighten_040_stack_frame_pass
+          - brighten_050_abi_recovery
+          - brighten_060_extern_call_bridge
+          - brighten_070_global_data_recovery
+          - brighten_080_type_reconstruction
+          - brighten_090_native_cleanup
+          - deobfuscate_095_deobfus_ollvm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM 21 build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release cmake ninja-build pkg-config libz3-dev
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg
+          codename=$(lsb_release -cs)
+          echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-21 main" | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-21 llvm-21-dev llvm-21-tools clang-21 lld-21
+      - name: Configure and build ${{ matrix.pass }} from source
+        shell: bash
+        run: |
+          pass_dir="src/llvm_pass/${{ matrix.pass }}"
+          rm -rf "$pass_dir/build"
+          cmake -S "$pass_dir" -B "$pass_dir/build" -G Ninja \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build "$pass_dir/build" --parallel 2
+      - name: Run State SSA semantic regression tests
+        if: matrix.pass == 'brighten_030_state_ssa_pass'
+        shell: bash
+        run: |
+          OPT_BIN=$(command -v opt-21) \
+          FILECHECK_BIN=$(command -v FileCheck-21) \
+          PLUGIN="$GITHUB_WORKSPACE/src/llvm_pass/brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so" \
+            bash src/llvm_pass/brighten_030_state_ssa_pass/tests/run_tests.sh
+      - name: Run type reconstruction regression tests
+        if: matrix.pass == 'brighten_080_type_reconstruction'
+        shell: bash
+        run: python3 src/llvm_pass/brighten_080_type_reconstruction/tests/run_tests.py
