@@ -2,6 +2,7 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -81,6 +82,16 @@ static bool hasPoisonFlags(const BinaryOperator &BO) {
   return false;
 }
 
+static std::optional<unsigned> shiftAmount(const APInt &Amount,
+                                           unsigned BitWidth) {
+  if (Amount.getActiveBits() > 64)
+    return std::nullopt;
+  uint64_t Limited = Amount.getLimitedValue();
+  if (Limited >= BitWidth)
+    return std::nullopt;
+  return static_cast<unsigned>(Limited);
+}
+
 static std::optional<APInt> evaluateBinary(unsigned Opcode, const APInt &LHS,
                                            const APInt &RHS) {
   if (LHS.getBitWidth() != RHS.getBitWidth())
@@ -99,24 +110,25 @@ static std::optional<APInt> evaluateBinary(unsigned Opcode, const APInt &LHS,
   case Instruction::Or:
     return LHS | RHS;
   case Instruction::Shl:
-    if (RHS.uge(LHS.getBitWidth()))
-      return std::nullopt;
-    return LHS.shl(static_cast<unsigned>(RHS.getLimitedValue()));
+    if (auto Amount = shiftAmount(RHS, LHS.getBitWidth()))
+      return LHS.shl(*Amount);
+    return std::nullopt;
   case Instruction::LShr:
-    if (RHS.uge(LHS.getBitWidth()))
-      return std::nullopt;
-    return LHS.lshr(static_cast<unsigned>(RHS.getLimitedValue()));
+    if (auto Amount = shiftAmount(RHS, LHS.getBitWidth()))
+      return LHS.lshr(*Amount);
+    return std::nullopt;
   case Instruction::AShr:
-    if (RHS.uge(LHS.getBitWidth()))
-      return std::nullopt;
-    return LHS.ashr(static_cast<unsigned>(RHS.getLimitedValue()));
+    if (auto Amount = shiftAmount(RHS, LHS.getBitWidth()))
+      return LHS.ashr(*Amount);
+    return std::nullopt;
   default:
     return std::nullopt;
   }
 }
 
-static bool evaluatePredicate(CmpInst::Predicate Predicate, const APInt &LHS,
-                              const APInt &RHS) {
+static std::optional<bool> evaluatePredicate(CmpInst::Predicate Predicate,
+                                             const APInt &LHS,
+                                             const APInt &RHS) {
   switch (Predicate) {
   case CmpInst::ICMP_EQ:
     return LHS == RHS;
@@ -139,7 +151,7 @@ static bool evaluatePredicate(CmpInst::Predicate Predicate, const APInt &LHS,
   case CmpInst::ICMP_SLE:
     return LHS.sle(RHS);
   default:
-    return false;
+    return std::nullopt;
   }
 }
 
@@ -155,7 +167,6 @@ public:
       return It->second;
     if (!Active.insert(V).second)
       return FiniteValues::unknown();
-
     FiniteValues Result = evaluateImpl(V);
     Active.erase(V);
     Cache[V] = Result;
@@ -172,11 +183,9 @@ private:
     if (auto *PN = dyn_cast<PHINode>(V)) {
       if (PN->getParent() == Hub) {
         int Index = PN->getBasicBlockIndex(EdgePred);
-        if (Index < 0)
-          return FiniteValues::unknown();
-        return evaluate(PN->getIncomingValue(Index));
+        return Index < 0 ? FiniteValues::unknown()
+                         : evaluate(PN->getIncomingValue(Index));
       }
-
       FiniteValues Joined;
       Joined.Known = true;
       for (Value *Incoming : PN->incoming_values())
@@ -185,19 +194,19 @@ private:
       return Joined.Values.empty() ? FiniteValues::unknown() : Joined;
     }
 
-    if (auto *FI = dyn_cast<FreezeInst>(V))
-      return evaluate(FI->getOperand(0));
+    if (auto *Freeze = dyn_cast<FreezeInst>(V))
+      return evaluate(Freeze->getOperand(0));
 
-    if (auto *CI = dyn_cast<CastInst>(V)) {
-      FiniteValues Input = evaluate(CI->getOperand(0));
-      if (!Input.Known || !CI->getType()->isIntegerTy())
+    if (auto *Cast = dyn_cast<CastInst>(V)) {
+      FiniteValues Input = evaluate(Cast->getOperand(0));
+      if (!Input.Known || !Cast->getType()->isIntegerTy())
         return FiniteValues::unknown();
-      unsigned Width = cast<IntegerType>(CI->getType())->getBitWidth();
+      unsigned Width = cast<IntegerType>(Cast->getType())->getBitWidth();
       FiniteValues Result;
       Result.Known = true;
       for (const APInt &Value : Input.Values) {
         APInt Converted = Value;
-        switch (CI->getOpcode()) {
+        switch (Cast->getOpcode()) {
         case Instruction::Trunc:
           Converted = Value.trunc(Width);
           break;
@@ -229,13 +238,12 @@ private:
         return FiniteValues::unknown();
       FiniteValues Result;
       Result.Known = true;
-      for (const APInt &LHS : Left.Values) {
+      for (const APInt &LHS : Left.Values)
         for (const APInt &RHS : Right.Values) {
           auto Folded = evaluateBinary(BO->getOpcode(), LHS, RHS);
           if (!Folded || !Result.add(*Folded))
             return FiniteValues::unknown();
         }
-      }
       return Result.Values.empty() ? FiniteValues::unknown() : Result;
     }
 
@@ -247,10 +255,11 @@ private:
       FiniteValues Result;
       Result.Known = true;
       for (const APInt &LHS : Left.Values)
-        for (const APInt &RHS : Right.Values)
-          if (!Result.add(APInt(1, evaluatePredicate(Cmp->getPredicate(),
-                                                     LHS, RHS))))
+        for (const APInt &RHS : Right.Values) {
+          auto Folded = evaluatePredicate(Cmp->getPredicate(), LHS, RHS);
+          if (!Folded || !Result.add(APInt(1, *Folded)))
             return FiniteValues::unknown();
+        }
       return Result;
     }
 
@@ -280,18 +289,16 @@ static bool collectSelectorGraph(Value *V, BasicBlock *Hub,
   auto *I = dyn_cast<Instruction>(V);
   if (!I || I->getParent() != Hub)
     return true;
-
   if (!(isa<PHINode>(I) || isa<BinaryOperator>(I) || isa<CastInst>(I) ||
         isa<SelectInst>(I) || isa<ICmpInst>(I) || isa<FreezeInst>(I)))
     return false;
   if (I->mayReadOrWriteMemory() || I->mayHaveSideEffects())
     return false;
-
   Instructions.insert(I);
   if (isa<PHINode>(I))
     return true;
-  for (Value *Operand : I->operands())
-    if (!collectSelectorGraph(Operand, Hub, Instructions, Seen))
+  for (Use &Operand : I->operands())
+    if (!collectSelectorGraph(Operand.get(), Hub, Instructions, Seen))
       return false;
   return true;
 }
@@ -367,7 +374,8 @@ bool BrightenDevirtPass::RecoverFiniteStateSwitches(Module &M) {
   bool Changed = false;
   for (SwitchInst *SW : Worklist) {
     BasicBlock *Hub = SW->getParent();
-    if (!Hub || pred_empty(Hub) || !SW->getCondition()->getType()->isIntegerTy())
+    if (!Hub || pred_empty(Hub) ||
+        !SW->getCondition()->getType()->isIntegerTy())
       continue;
 
     SmallPtrSet<Instruction *, 32> SelectorInstructions;
@@ -404,7 +412,10 @@ bool BrightenDevirtPass::RecoverFiniteStateSwitches(Module &M) {
       continue;
 
     SmallVector<PhiExpansion, 16> PhiExpansions;
+    SmallPtrSet<BasicBlock *, 8> SeenDestinations;
     for (BasicBlock *Destination : successors(Hub)) {
+      if (!SeenDestinations.insert(Destination).second)
+        continue;
       SmallVector<BasicBlock *, 8> NewPreds;
       for (const EdgeRewrite &Rewrite : Rewrites)
         if (Rewrite.Destination == Destination &&
@@ -433,8 +444,6 @@ bool BrightenDevirtPass::RecoverFiniteStateSwitches(Module &M) {
     if (!Proven)
       continue;
 
-    // Add edge-specific PHI values before removing the old hub edge.  The
-    // values were proven available on each new predecessor edge above.
     for (PhiExpansion &Expansion : PhiExpansions)
       for (BasicBlock *Pred : Expansion.Preds)
         Expansion.Phi->addIncoming(Expansion.Value, Pred);
@@ -445,10 +454,6 @@ bool BrightenDevirtPass::RecoverFiniteStateSwitches(Module &M) {
     errs() << "[devirt-v2] abstractly recovered finite-state switch in @"
            << F->getName() << " with " << Rewrites.size()
            << " proven edge(s)\n";
-
-    // DeleteDeadBlock removes the obsolete Hub incoming from successor PHIs.
-    // Every live hub instruction was part of the selector DAG and had no user
-    // outside the hub, so no application value is discarded.
     DeleteDeadBlock(Hub);
     Changed = true;
   }
