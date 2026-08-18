@@ -1,176 +1,163 @@
 #include "BrightenTypeReconstructionPass.h"
 #include "TypeReconstructionContext.h"
+
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace brighten_type {
 
 using namespace llvm;
 
-extern Constant *RebuildConstant(Constant *OldInit, Type *NewTy, uint64_t Offset, const DataLayout &DL, LLVMContext &Ctx);
-extern void RewritePointerUses(Value *OldVal, Value *NewBase, InferredTypePlan &Plan, TypeReconstructionContext &Ctx);
-extern bool PrevalidateTypePlan(InferredTypePlan &Plan, TypeReconstructionContext &Ctx);
+extern Constant *RebuildConstant(Constant *OldInit, Type *NewTy,
+                                 uint64_t Offset, const DataLayout &DL,
+                                 LLVMContext &Ctx);
+extern void RewritePointerUses(Value *OldVal, Value *NewBase,
+                               InferredTypePlan &Plan,
+                               TypeReconstructionContext &Ctx);
+extern bool PrevalidateTypePlan(InferredTypePlan &Plan,
+                                TypeReconstructionContext &Ctx);
 
 Type *InferArrayType(ObjectCandidate &Cand, TypeReconstructionContext &Ctx);
 Type *InferStructType(ObjectCandidate &Cand, TypeReconstructionContext &Ctx);
 
-bool PlanAndRewrite(TypeReconstructionContext &Ctx, bool OnlyStruct, bool OnlyArray) {
+namespace {
+
+static void dumpRejection(const ObjectCandidate &Cand,
+                          const InferredTypePlan *Plan,
+                          TypeReconstructionContext &Ctx) {
+  if (!Ctx.DumpRejections)
+    return;
+  errs() << "[type-reconstruct] rejected " << Cand.Name << "\n";
+  for (const std::string &Reason : Cand.RejectionReasons)
+    errs() << "  candidate: " << Reason << "\n";
+  if (Plan)
+    for (const std::string &Reason : Plan->RejectionReasons)
+      errs() << "  plan: " << Reason << "\n";
+}
+
+static bool isExternallyOwned(const GlobalVariable &GV) {
+  return GV.hasExternalLinkage() || GV.hasWeakLinkage() ||
+         GV.hasLinkOnceLinkage() || GV.isExternallyInitialized();
+}
+
+} // namespace
+
+bool PlanAndRewrite(TypeReconstructionContext &Ctx, bool OnlyStruct,
+                    bool OnlyArray) {
   bool Changed = false;
 
-  for (auto &Cand : Ctx.Candidates) {
-    if (Cand->Accesses.empty())
+  for (auto &Owned : Ctx.Candidates) {
+    ObjectCandidate &Cand = *Owned;
+    const TypeConstraintSolution *Solution = GetTypeSolution(Cand, Ctx);
+    if (!Solution || !Solution->Valid || Cand.Accesses.empty()) {
+      Ctx.Report.ObjectsRejectedUnknownOffset++;
+      dumpRejection(Cand, nullptr, Ctx);
       continue;
-
-    if (Cand->Escaped) {
+    }
+    if (Cand.Escaped) {
       Ctx.Report.ObjectsRejectedEscape++;
-      if (Ctx.DumpRejections) {
-        errs() << "Rejected candidate " << Cand->Name << " due to escape.\n";
-        for (const auto &Reason : Cand->RejectionReasons) {
-          errs() << "  Reason: " << Reason << "\n";
-        }
-      }
+      dumpRejection(Cand, nullptr, Ctx);
       continue;
     }
 
     Type *InferredTy = nullptr;
     bool IsArray = false;
-
     if (!OnlyStruct) {
-      InferredTy = InferArrayType(*Cand, Ctx);
-      if (InferredTy)
-        IsArray = true;
+      InferredTy = InferArrayType(Cand, Ctx);
+      IsArray = InferredTy != nullptr;
     }
-
-    if (!InferredTy && !OnlyArray) {
-      InferredTy = InferStructType(*Cand, Ctx);
-    }
-
+    if (!InferredTy && !OnlyArray)
+      InferredTy = InferStructType(Cand, Ctx);
     if (!InferredTy) {
       Ctx.Report.ObjectsRejectedUnknownOffset++;
-      if (Ctx.DumpRejections) {
-        errs() << "Rejected candidate " << Cand->Name << " due to no inferred type.\n";
-        for (const auto &Reason : Cand->RejectionReasons) {
-          errs() << "  Reason: " << Reason << "\n";
-        }
-      }
+      dumpRejection(Cand, nullptr, Ctx);
       continue;
     }
 
     auto Plan = std::make_unique<InferredTypePlan>();
-    Plan->Candidate = Cand.get();
+    Plan->Candidate = &Cand;
     Plan->ProposedRootType = InferredTy;
     Plan->IsArray = IsArray;
-    Plan->TotalSize = Cand->ObjectSize;
+    Plan->TotalSize = Cand.ObjectSize;
+    Plan->Confidence = Solution->Confidence;
 
     if (!PrevalidateTypePlan(*Plan, Ctx)) {
       Ctx.Report.ObjectsRejectedInitializer++;
-      if (Ctx.DumpRejections) {
-        errs() << "Rejected candidate " << Cand->Name << " during plan pre-validation.\n";
-        for (const auto &Reason : Plan->RejectionReasons) {
-          errs() << "  Reason: " << Reason << "\n";
-        }
-      }
+      dumpRejection(Cand, Plan.get(), Ctx);
       continue;
     }
 
-    if (Cand->Kind == ObjectKind::Stack) {
-      auto *AI = cast<AllocaInst>(Cand->BaseVal);
-      BasicBlock &Entry = AI->getFunction()->getEntryBlock();
-      Instruction *InsertBefore = &*Entry.getFirstInsertionPt();
-      
-      AllocaInst *NewAI = new AllocaInst(InferredTy, AI->getType()->getAddressSpace(), nullptr,
-                                         AI->getAlign(), "brighten.stack." + Cand->Name, InsertBefore->getIterator());
-      NewAI->takeName(AI);
+    if (Cand.Kind == ObjectKind::Stack) {
+      auto *Old = cast<AllocaInst>(Cand.BaseVal);
+      IRBuilder<> Builder(&*Old->getFunction()->getEntryBlock().getFirstInsertionPt());
+      AllocaInst *New = Builder.CreateAlloca(
+          InferredTy, Old->getAddressSpace(), nullptr,
+          "brighten.stack." + Cand.Name);
+      New->setAlignment(Old->getAlign());
+      New->copyMetadata(*Old);
+      New->takeName(Old);
 
-      RewritePointerUses(AI, NewAI, *Plan, Ctx);
-
-      if (AI->use_empty()) {
-        AI->eraseFromParent();
-      }
-
+      RewritePointerUses(Old, New, *Plan, Ctx);
+      if (!Old->use_empty())
+        report_fatal_error(
+            "type reconstruction left uses of a replaced stack object");
+      Old->eraseFromParent();
       Ctx.Report.AllocasRetyped++;
-      Ctx.Report.ObjectsReconstructed++;
-      if (IsArray) {
-        Ctx.Report.ArraysRecovered++;
+    } else if (Cand.Kind == ObjectKind::Global) {
+      auto *Old = cast<GlobalVariable>(Cand.BaseVal);
+      if (isExternallyOwned(*Old)) {
+        // External storage layout is an ABI contract.  Keep the object itself
+        // and rewrite only in-module accesses to exact typed GEPs.
+        RewritePointerUses(Old, Old, *Plan, Ctx);
       } else {
-        Ctx.Report.StructsReconstructed++;
-      }
-      Plan->Committed = true;
-      Changed = true;
-
-    } else if (Cand->Kind == ObjectKind::Global) {
-      auto *GV = cast<GlobalVariable>(Cand->BaseVal);
-
-      bool CanRetypeGlobal = true;
-      if (GV->hasExternalLinkage() || GV->hasWeakLinkage() ||
-          GV->hasLinkOnceLinkage() || GV->isExternallyInitialized()) {
-        CanRetypeGlobal = false;
-      }
-
-      if (CanRetypeGlobal) {
-        if (!GV->hasInitializer()) {
+        if (!Old->hasInitializer()) {
+          Plan->RejectionReasons.push_back("internal-global-has-no-initializer");
           Ctx.Report.ObjectsRejectedInitializer++;
-          if (Ctx.DumpRejections) {
-            errs() << "Rejected candidate " << Cand->Name
-                   << " because global has no initializer to rebuild.\n";
-          }
+          dumpRejection(Cand, Plan.get(), Ctx);
+          continue;
+        }
+        Constant *Initializer = RebuildConstant(
+            Old->getInitializer(), InferredTy, 0, Ctx.DL, Ctx.M.getContext());
+        if (!Initializer) {
+          Plan->RejectionReasons.push_back(
+              "initializer-cannot-be-rebuilt-without-guessing");
+          Ctx.Report.ObjectsRejectedInitializer++;
+          dumpRejection(Cand, Plan.get(), Ctx);
           continue;
         }
 
-        Constant *NewInit = nullptr;
-        NewInit = RebuildConstant(GV->getInitializer(), InferredTy, 0, Ctx.DL, Ctx.M.getContext());
+        auto *New = new GlobalVariable(
+            Ctx.M, InferredTy, Old->isConstant(), Old->getLinkage(), Initializer,
+            "brighten.global." + Cand.Name, nullptr, Old->getThreadLocalMode(),
+            Old->getAddressSpace(), Old->isExternallyInitialized());
+        New->copyAttributesFrom(Old);
+        New->copyMetadata(Old, 0);
+        New->takeName(Old);
 
-        if (NewInit) {
-          GlobalVariable *NewGV = new GlobalVariable(Ctx.M, InferredTy, GV->isConstant(),
-                                                     GV->getLinkage(), NewInit, "brighten.global." + Cand->Name,
-                                                     nullptr, GV->getThreadLocalMode(), GV->getType()->getAddressSpace(),
-                                                     GV->isExternallyInitialized());
-          NewGV->copyAttributesFrom(GV);
-          // Retyping replaces the storage object, not its provenance.
-          // GlobalObject attributes do not include metadata, and dropping
-          // brighten.guest.range here makes later pointer recovery leave
-          // valid guest addresses as raw inttoptrs.
-          NewGV->copyMetadata(GV, 0);
-          NewGV->takeName(GV);
-
-          RewritePointerUses(GV, NewGV, *Plan, Ctx);
-
-          // With opaque pointers both globals have the same `ptr` value type,
-          // even when their storage element types differ.  Keeping the old
-          // global for pointer uses that the typed-GEP planner did not rewrite
-          // creates two independent host allocations for one guest object:
-          // libc writes one allocation while reconstructed indexed accesses
-          // read the other.  Redirect every residual use to the new backing
-          // object; each existing GEP retains its own source element type.
-          if (!GV->use_empty())
-            GV->replaceAllUsesWith(NewGV);
-          GV->eraseFromParent();
-
-          Ctx.Report.GlobalsRetyped++;
-          Ctx.Report.ObjectsReconstructed++;
-          if (IsArray) {
-            Ctx.Report.ArraysRecovered++;
-          } else {
-            Ctx.Report.StructsReconstructed++;
-          }
-          Plan->Committed = true;
-          Changed = true;
-        } else {
-          Ctx.Report.ObjectsRejectedInitializer++;
-        }
-      } else {
-        RewritePointerUses(GV, GV, *Plan, Ctx);
-
-        Ctx.Report.ObjectsReconstructed++;
-        if (IsArray) {
-          Ctx.Report.ArraysRecovered++;
-        } else {
-          Ctx.Report.StructsReconstructed++;
-        }
-        Plan->Committed = true;
-        Changed = true;
+        RewritePointerUses(Old, New, *Plan, Ctx);
+        if (!Old->use_empty())
+          Old->replaceAllUsesWith(New);
+        if (!Old->use_empty())
+          report_fatal_error(
+              "type reconstruction left uses of a replaced global object");
+        Old->eraseFromParent();
+        Ctx.Report.GlobalsRetyped++;
       }
+    } else {
+      Plan->RejectionReasons.push_back("unsupported-proven-object-kind");
+      dumpRejection(Cand, Plan.get(), Ctx);
+      continue;
     }
+
+    Ctx.Report.ObjectsReconstructed++;
+    if (IsArray)
+      Ctx.Report.ArraysRecovered++;
+    else
+      Ctx.Report.StructsReconstructed++;
+    Plan->Committed = true;
+    Ctx.Plans[Cand.BaseVal] = std::move(Plan);
+    Changed = true;
   }
 
   return Changed;

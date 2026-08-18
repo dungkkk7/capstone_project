@@ -1,299 +1,442 @@
 #include "BrightenStateSSAPass.h"
 #include "StateOffsetResolver.h"
-#include "llvm/ADT/SmallVector.h"
+#include "../../common/StateSliceSemantics.h"
+
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/DataLayout.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/Support/Alignment.h"
+#include "llvm/Support/TypeSize.h"
 
-#include <optional>
+#include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <optional>
 
 namespace brighten_state_ssa {
 
 using namespace llvm;
+using brighten_state_semantics::StateSlice;
+using brighten_state_semantics::WriteKind;
+using brighten_state_semantics::classifyArchitecturalSlice;
+using brighten_state_semantics::classifyFallbackSlice;
 
-static Value *buildStateFieldGEP(IRBuilder<> &B, Value *StatePtr, unsigned offset, Type *Ty) {
-  return B.CreateConstGEP1_64(B.getInt8Ty(), StatePtr, offset);
+namespace {
+
+enum class AccessKind {
+  Load,
+  Store,
+};
+
+struct StateAccess {
+  Instruction *Inst = nullptr;
+  Type *Ty = nullptr;
+  StateSlice Slice;
+  AccessKind Kind = AccessKind::Load;
+};
+
+struct StateCell {
+  uint64_t BaseOffset = 0;
+  unsigned CellBits = 0;
+  bool Architectural = false;
+  SmallVector<StateAccess, 8> Accesses;
+};
+
+static unsigned fixedStoreBits(Type *Ty, const DataLayout &DL) {
+  if (!Ty || !Ty->isSized())
+    return 0;
+  TypeSize Bytes = DL.getTypeStoreSize(Ty);
+  if (Bytes.isScalable() || Bytes.getFixedValue() > UINT_MAX / 8)
+    return 0;
+  return static_cast<unsigned>(Bytes.getFixedValue() * 8);
 }
+
+static Value *resizeInteger(IRBuilder<> &B, Value *V, unsigned Bits,
+                            const Twine &Name) {
+  auto *SrcTy = dyn_cast<IntegerType>(V->getType());
+  if (!SrcTy || !Bits)
+    return nullptr;
+  IntegerType *DstTy = IntegerType::get(B.getContext(), Bits);
+  if (SrcTy == DstTy)
+    return V;
+  if (SrcTy->getBitWidth() > Bits)
+    return B.CreateTrunc(V, DstTy, Name);
+  return B.CreateZExt(V, DstTy, Name);
+}
+
+static Value *toIntegerBits(IRBuilder<> &B, Value *V, unsigned Bits,
+                            const DataLayout &DL, const Twine &Name) {
+  if (!V || !Bits)
+    return nullptr;
+  Type *Ty = V->getType();
+  if (Ty->isIntegerTy())
+    return resizeInteger(B, V, Bits, Name);
+  if (Ty->isPointerTy()) {
+    unsigned PointerBits = DL.getPointerSizeInBits(
+        cast<PointerType>(Ty)->getAddressSpace());
+    Value *Integer = B.CreatePtrToInt(
+        V, IntegerType::get(B.getContext(), PointerBits), Name + ".ptr");
+    return resizeInteger(B, Integer, Bits, Name);
+  }
+  unsigned SourceBits = fixedStoreBits(Ty, DL);
+  if (!SourceBits ||
+      !(Ty->isFloatingPointTy() || isa<FixedVectorType>(Ty)))
+    return nullptr;
+  Value *Integer = B.CreateBitCast(
+      V, IntegerType::get(B.getContext(), SourceBits), Name + ".bits");
+  return resizeInteger(B, Integer, Bits, Name);
+}
+
+static Value *fromIntegerBits(IRBuilder<> &B, Value *V, Type *Ty,
+                              const DataLayout &DL, const Twine &Name) {
+  if (!V || !V->getType()->isIntegerTy() || !Ty)
+    return nullptr;
+  if (Ty->isIntegerTy())
+    return resizeInteger(B, V, cast<IntegerType>(Ty)->getBitWidth(), Name);
+  if (Ty->isPointerTy()) {
+    unsigned PointerBits = DL.getPointerSizeInBits(
+        cast<PointerType>(Ty)->getAddressSpace());
+    Value *Integer = resizeInteger(B, V, PointerBits, Name + ".ptrbits");
+    return Integer ? B.CreateIntToPtr(Integer, Ty, Name) : nullptr;
+  }
+  unsigned DestinationBits = fixedStoreBits(Ty, DL);
+  if (!DestinationBits ||
+      !(Ty->isFloatingPointTy() || isa<FixedVectorType>(Ty)))
+    return nullptr;
+  Value *Integer = resizeInteger(B, V, DestinationBits, Name + ".bits");
+  return Integer ? B.CreateBitCast(Integer, Ty, Name) : nullptr;
+}
+
+static Value *statePointer(IRBuilder<> &B, Value *State, uint64_t Offset,
+                           const Twine &Name) {
+  return B.CreateConstGEP1_64(B.getInt8Ty(), State, Offset, Name);
+}
+
+static LoadInst *createUnalignedLoad(IRBuilder<> &B, Type *Ty, Value *Ptr,
+                                     const Twine &Name) {
+  LoadInst *Load = B.CreateLoad(Ty, Ptr, Name);
+  Load->setAlignment(Align(1));
+  return Load;
+}
+
+static StoreInst *createUnalignedStore(IRBuilder<> &B, Value *V, Value *Ptr) {
+  StoreInst *Store = B.CreateStore(V, Ptr);
+  Store->setAlignment(Align(1));
+  return Store;
+}
+
+static bool intervalsOverlap(uint64_t AOffset, unsigned ABits,
+                             uint64_t BOffset, unsigned BBits) {
+  uint64_t ABytes = ABits / 8;
+  uint64_t BBytes = BBits / 8;
+  if (!ABytes || !BBytes || AOffset > UINT64_MAX - ABytes ||
+      BOffset > UINT64_MAX - BBytes)
+    return true;
+  return AOffset < BOffset + BBytes && BOffset < AOffset + ABytes;
+}
+
+static Value *buildStoredCellValue(IRBuilder<> &B, Value *Stored,
+                                   const StateSlice &Slice, IntegerType *CellTy,
+                                   Value *CellPtr, const DataLayout &DL) {
+  Value *Bits = toIntegerBits(B, Stored, Slice.AccessBits, DL,
+                              "state.store.bits");
+  if (!Bits)
+    return nullptr;
+
+  if (Slice.StoreKind == WriteKind::ZeroExtend) {
+    if (Slice.BitOffset != 0 || Slice.AccessBits >= Slice.CellBits)
+      return nullptr;
+    return B.CreateZExt(Bits, CellTy, "state.gpr32.zero_extend");
+  }
+
+  if (Slice.StoreKind == WriteKind::Replace && Slice.BitOffset == 0)
+    return resizeInteger(B, Bits, Slice.CellBits, "state.store.replace");
+
+  if (Slice.StoreKind != WriteKind::Merge ||
+      Slice.AccessBits > Slice.CellBits - Slice.BitOffset)
+    return nullptr;
+
+  Value *Wide = resizeInteger(B, Bits, Slice.CellBits, "state.store.wide");
+  if (!Wide)
+    return nullptr;
+  if (Slice.BitOffset)
+    Wide = B.CreateShl(
+        Wide, ConstantInt::get(CellTy, Slice.BitOffset),
+        "state.store.shifted");
+
+  APInt Mask = APInt::getLowBitsSet(Slice.CellBits, Slice.AccessBits);
+  if (Slice.BitOffset)
+    Mask <<= Slice.BitOffset;
+  Value *Old = B.CreateLoad(CellTy, CellPtr, "state.store.old");
+  Value *Keep = B.CreateAnd(
+      Old, ConstantInt::get(CellTy, ~Mask), "state.store.keep");
+  return B.CreateOr(Keep, Wide, "state.store.merge");
+}
+
+} // namespace
 
 bool BrightenStateSSAPass::PromoteStateToSSA(Module &M) {
   bool Changed = false;
   const DataLayout &DL = M.getDataLayout();
   LLVMContext &Ctx = M.getContext();
-
   GlobalVariable *StateGV = M.getGlobalVariable("__mcsema_reg_state");
 
   for (Function &F : M) {
-    // An arbitrary native function can also have a first pointer argument and
-    // a large constant GEP.  Treating that pointer as Remill State corrupts
-    // unrelated application memory, so promotion is restricted to the
-    // canonical lifted ABI.
-    if (F.isDeclaration() || !IsLiftedFunction(F)) continue;
+    if (F.isDeclaration() || !IsLiftedFunction(F))
+      continue;
 
-    bool HasUnsupportedCallBoundary = false;
+    // State promotion is an exact memory-model rewrite.  EH/control-flow calls
+    // and inline assembly need a separate memory-effect model; do not guess.
+    bool UnsupportedBoundary = false;
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (isa<InvokeInst>(I) || isa<CallBrInst>(I)) {
-          HasUnsupportedCallBoundary = true;
+          UnsupportedBoundary = true;
           break;
         }
-        if (auto *CI = dyn_cast<CallInst>(&I); CI && CI->isMustTailCall()) {
-          HasUnsupportedCallBoundary = true;
-          break;
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (CI->isMustTailCall() || CI->isInlineAsm()) {
+            UnsupportedBoundary = true;
+            break;
+          }
         }
       }
-      if (HasUnsupportedCallBoundary) break;
+      if (UnsupportedBoundary)
+        break;
     }
-    if (HasUnsupportedCallBoundary) continue;
+    if (UnsupportedBoundary ||
+        FunctionHasUnsupportedStateBoundary(F, StateGV, DL))
+      continue;
 
-    struct FieldInfo {
-      unsigned offset;
-      Type *type = nullptr;
-      unsigned max_access_size = 0;
-      SmallVector<LoadInst *, 4> loads;
-      SmallVector<StoreInst *, 4> stores;
-    };
-
-    DenseMap<unsigned, FieldInfo> fields;
-    DenseSet<unsigned> unsupported_fields;
+    DenseMap<uint64_t, StateCell> Cells;
+    DenseSet<uint64_t> InvalidCells;
     std::optional<StateBaseKind> FunctionBase;
     bool MixedStateBases = false;
     bool UnsupportedStateAccess = false;
 
+    auto recordAccess = [&](Instruction &I, Value *Ptr, Type *Ty,
+                            AccessKind Kind, bool IsVolatile,
+                            bool IsAtomic) {
+      auto Resolved = ResolveStateOffset(Ptr, DL, F, StateGV);
+      if (!Resolved || Resolved->Offset > std::numeric_limits<unsigned>::max())
+        return;
+      if (!FunctionBase)
+        FunctionBase = Resolved->Base;
+      else if (*FunctionBase != Resolved->Base)
+        MixedStateBases = true;
+
+      unsigned AccessBits = fixedStoreBits(Ty, DL);
+      if (IsVolatile || IsAtomic || !AccessBits || AccessBits % 8) {
+        UnsupportedStateAccess = true;
+        return;
+      }
+
+      StateSlice Slice;
+      if (auto Architectural =
+              classifyArchitecturalSlice(Resolved->Offset, AccessBits)) {
+        Slice = *Architectural;
+      } else {
+        Slice = classifyFallbackSlice(Resolved->Offset, AccessBits, AccessBits);
+      }
+
+      StateCell &Cell = Cells[Slice.BaseOffset];
+      if (!Cell.CellBits) {
+        Cell.BaseOffset = Slice.BaseOffset;
+        Cell.CellBits = Slice.CellBits;
+        Cell.Architectural = Slice.Architectural;
+      } else if (Cell.Architectural != Slice.Architectural) {
+        InvalidCells.insert(Slice.BaseOffset);
+      } else if (Slice.Architectural && Cell.CellBits != Slice.CellBits) {
+        InvalidCells.insert(Slice.BaseOffset);
+      } else if (!Slice.Architectural) {
+        Cell.CellBits = std::max(Cell.CellBits, Slice.AccessBits);
+      }
+      Cell.Accesses.push_back(StateAccess{&I, Ty, Slice, Kind});
+    };
+
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
-          auto Resolved = ResolveStateOffset(LI->getPointerOperand(), DL, F, StateGV);
-          if (Resolved &&
-              Resolved->Offset <= std::numeric_limits<unsigned>::max()) {
-            unsigned u_off = static_cast<unsigned>(Resolved->Offset);
-            if (!FunctionBase) FunctionBase = Resolved->Base;
-            else if (*FunctionBase != Resolved->Base) MixedStateBases = true;
-            if (LI->isVolatile() || LI->isAtomic()) {
-              unsupported_fields.insert(u_off);
-              UnsupportedStateAccess = true;
-              continue;
-            }
-            auto &info = fields[u_off];
-            info.offset = u_off;
-            unsigned sz = DL.getTypeStoreSize(LI->getType());
-            if (sz > info.max_access_size) {
-              info.max_access_size = sz;
-              info.type = LI->getType();
-            }
-            info.loads.push_back(LI);
-          }
+          recordAccess(I, LI->getPointerOperand(), LI->getType(),
+                       AccessKind::Load, LI->isVolatile(), LI->isAtomic());
         } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-          auto Resolved = ResolveStateOffset(SI->getPointerOperand(), DL, F, StateGV);
-          if (Resolved &&
-              Resolved->Offset <= std::numeric_limits<unsigned>::max()) {
-            unsigned u_off = static_cast<unsigned>(Resolved->Offset);
-            if (!FunctionBase) FunctionBase = Resolved->Base;
-            else if (*FunctionBase != Resolved->Base) MixedStateBases = true;
-            if (SI->isVolatile() || SI->isAtomic()) {
-              unsupported_fields.insert(u_off);
-              UnsupportedStateAccess = true;
-              continue;
-            }
-            auto &info = fields[u_off];
-            info.offset = u_off;
-            unsigned sz = DL.getTypeStoreSize(SI->getValueOperand()->getType());
-            if (sz > info.max_access_size) {
-              info.max_access_size = sz;
-              info.type = SI->getValueOperand()->getType();
-            }
-            info.stores.push_back(SI);
-          }
+          recordAccess(I, SI->getPointerOperand(),
+                       SI->getValueOperand()->getType(), AccessKind::Store,
+                       SI->isVolatile(), SI->isAtomic());
         }
       }
     }
 
-    if (MixedStateBases || UnsupportedStateAccess || !FunctionBase) continue;
+    if (MixedStateBases || UnsupportedStateAccess || !FunctionBase ||
+        Cells.empty())
+      continue;
 
-    // Exact-offset slots may be accessed at several widths, but independently
-    // promoting partially-overlapping slots makes writes incoherent.  Keep
-    // every ambiguous interval in State for a later byte-accurate recovery.
-    for (auto A = fields.begin(); A != fields.end(); ++A) {
-      uint64_t AEnd = uint64_t(A->first) + A->second.max_access_size;
-      for (auto B = std::next(A); B != fields.end(); ++B) {
-        uint64_t BEnd = uint64_t(B->first) + B->second.max_access_size;
-        if (uint64_t(A->first) < BEnd && uint64_t(B->first) < AEnd) {
-          unsupported_fields.insert(A->first);
-          unsupported_fields.insert(B->first);
+    // Unknown byte ranges are promoted only when they form disjoint cells.
+    // Known GPR/XMM aliases intentionally share one architectural cell.
+    SmallVector<uint64_t, 32> Bases;
+    for (const auto &Entry : Cells)
+      Bases.push_back(Entry.first);
+    for (unsigned I = 0; I < Bases.size(); ++I) {
+      StateCell &A = Cells[Bases[I]];
+      for (unsigned J = I + 1; J < Bases.size(); ++J) {
+        StateCell &B = Cells[Bases[J]];
+        if (intervalsOverlap(A.BaseOffset, A.CellBits,
+                             B.BaseOffset, B.CellBits)) {
+          InvalidCells.insert(A.BaseOffset);
+          InvalidCells.insert(B.BaseOffset);
         }
       }
     }
-    for (unsigned Offset : unsupported_fields)
-      fields.erase(Offset);
-    if (fields.empty()) continue;
+    for (uint64_t Base : InvalidCells)
+      Cells.erase(Base);
+    if (Cells.empty())
+      continue;
+
+    for (auto &Entry : Cells) {
+      StateCell &Cell = Entry.second;
+      for (StateAccess &Access : Cell.Accesses) {
+        if (!Access.Slice.Architectural) {
+          Access.Slice.CellBits = Cell.CellBits;
+          Access.Slice.StoreKind =
+              Access.Slice.AccessBits == Cell.CellBits
+                  ? WriteKind::Replace
+                  : WriteKind::Merge;
+        }
+      }
+    }
 
     Value *StatePtr = *FunctionBase == StateBaseKind::Arg0
                           ? static_cast<Value *>(F.getArg(0))
                           : static_cast<Value *>(StateGV);
-    if (!StatePtr) continue;
+    if (!StatePtr)
+      continue;
 
-    // Create allocas in the entry block
-    IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
-    DenseMap<unsigned, AllocaInst *> field_allocas;
-
-    for (auto &pair : fields) {
-      unsigned offset = pair.first;
-      auto &info = pair.second;
-
-      // Force type to be integer of maximum access size
-      Type *AllocaTy = Type::getIntNTy(Ctx, info.max_access_size * 8);
-      info.type = AllocaTy;
-
-      AllocaInst *Alloca = EntryBuilder.CreateAlloca(AllocaTy, nullptr, "state_" + std::to_string(offset));
+    IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
+    DenseMap<uint64_t, AllocaInst *> CellAllocas;
+    DenseMap<uint64_t, IntegerType *> CellTypes;
+    for (auto &Entry : Cells) {
+      StateCell &Cell = Entry.second;
+      IntegerType *CellTy = IntegerType::get(Ctx, Cell.CellBits);
+      AllocaInst *Alloca = EntryBuilder.CreateAlloca(
+          CellTy, nullptr, "state_cell_" + std::to_string(Cell.BaseOffset));
       Alloca->setMetadata(
           "brighten.state.offset",
-          MDNode::get(Ctx, ConstantAsMetadata::get(
-                               ConstantInt::get(Type::getInt64Ty(Ctx), offset))));
-      field_allocas[offset] = Alloca;
-
-      // Initialize alloca from state
-      IRBuilder<> B(Alloca->getNextNode());
-      Value *GEP = buildStateFieldGEP(B, StatePtr, offset, AllocaTy);
-      Value *InitVal = B.CreateLoad(AllocaTy, GEP, "state_init");
-      B.CreateStore(InitVal, Alloca);
+          MDNode::get(Ctx, ConstantAsMetadata::get(ConstantInt::get(
+                               Type::getInt64Ty(Ctx), Cell.BaseOffset))));
+      CellAllocas[Cell.BaseOffset] = Alloca;
+      CellTypes[Cell.BaseOffset] = CellTy;
     }
 
-    // Replace loads
-    for (auto &pair : fields) {
-      unsigned offset = pair.first;
-      auto &info = pair.second;
-      AllocaInst *Alloca = field_allocas[offset];
+    auto InsertIt = F.getEntryBlock().getFirstInsertionPt();
+    while (InsertIt != F.getEntryBlock().end() && isa<AllocaInst>(*InsertIt))
+      ++InsertIt;
+    IRBuilder<> InitBuilder(&*InsertIt);
+    for (auto &Entry : Cells) {
+      uint64_t Base = Entry.first;
+      IntegerType *CellTy = CellTypes[Base];
+      Value *Ptr = statePointer(InitBuilder, StatePtr, Base,
+                                "state.cell.init.ptr");
+      Value *Initial = createUnalignedLoad(
+          InitBuilder, CellTy, Ptr, "state.cell.init");
+      InitBuilder.CreateStore(Initial, CellAllocas[Base]);
+    }
 
-      for (LoadInst *LI : info.loads) {
-        IRBuilder<> B(LI);
-        Value *Loaded = B.CreateLoad(info.type, Alloca);
-        
-        Type *LITy = LI->getType();
-        Value *Replacement = nullptr;
-        if (LITy == info.type) {
-          Replacement = Loaded;
-        } else if (LITy->isPointerTy()) {
-          Replacement = B.CreateIntToPtr(Loaded, LITy);
-        } else if (LITy->isIntegerTy()) {
-          Replacement = B.CreateTrunc(Loaded, LITy);
+    bool RewriteFailed = false;
+    for (auto &Entry : Cells) {
+      uint64_t Base = Entry.first;
+      IntegerType *CellTy = CellTypes[Base];
+      Value *CellPtr = CellAllocas[Base];
+      for (StateAccess &Access : Entry.second.Accesses) {
+        if (!Access.Inst->getParent())
+          continue;
+        if (Access.Kind == AccessKind::Load) {
+          auto *LI = cast<LoadInst>(Access.Inst);
+          IRBuilder<> B(LI);
+          Value *Bits = B.CreateLoad(CellTy, CellPtr, "state.cell.load");
+          if (Access.Slice.BitOffset)
+            Bits = B.CreateLShr(
+                Bits, ConstantInt::get(CellTy, Access.Slice.BitOffset),
+                "state.slice.shift");
+          Bits = resizeInteger(B, Bits, Access.Slice.AccessBits,
+                               "state.slice.bits");
+          Value *Replacement =
+              fromIntegerBits(B, Bits, Access.Ty, DL, "state.slice.value");
+          if (!Replacement) {
+            RewriteFailed = true;
+            break;
+          }
+          LI->replaceAllUsesWith(Replacement);
+          LI->eraseFromParent();
         } else {
-          // bitcast for floats or vectors
-          Value *IntVal = B.CreateTrunc(Loaded, Type::getIntNTy(Ctx, DL.getTypeStoreSize(LITy) * 8));
-          Replacement = B.CreateBitCast(IntVal, LITy);
+          auto *SI = cast<StoreInst>(Access.Inst);
+          IRBuilder<> B(SI);
+          Value *NewValue = buildStoredCellValue(
+              B, SI->getValueOperand(), Access.Slice, CellTy, CellPtr, DL);
+          if (!NewValue) {
+            RewriteFailed = true;
+            break;
+          }
+          B.CreateStore(NewValue, CellPtr);
+          SI->eraseFromParent();
         }
-
-        LI->replaceAllUsesWith(Replacement);
-        LI->eraseFromParent();
       }
+      if (RewriteFailed)
+        break;
     }
 
-    // Replace stores
-    for (auto &pair : fields) {
-      unsigned offset = pair.first;
-      auto &info = pair.second;
-      AllocaInst *Alloca = field_allocas[offset];
+    // Every access was validated before mutation, so failure here indicates an
+    // unsupported LLVM type.  Abort rather than emit a partially rewritten
+    // State model that would mix the old bytes with new SSA cells.
+    if (RewriteFailed)
+      report_fatal_error("brighten-state-ssa: unsupported State slice coercion");
 
-      for (StoreInst *SI : info.stores) {
-        IRBuilder<> B(SI);
-        Value *StoredVal = SI->getValueOperand();
-        Type *SITy = StoredVal->getType();
-
-        Value *IntStoredVal = nullptr;
-        if (SITy->isIntegerTy()) {
-          IntStoredVal = StoredVal;
-        } else if (SITy->isPointerTy()) {
-          IntStoredVal = B.CreatePtrToInt(StoredVal, Type::getIntNTy(Ctx, DL.getTypeStoreSize(SITy) * 8));
-        } else {
-          Type *IntTy = Type::getIntNTy(Ctx, DL.getTypeStoreSize(SITy) * 8);
-          IntStoredVal = B.CreateBitCast(StoredVal, IntTy);
-        }
-
-        unsigned val_bits = DL.getTypeStoreSize(SITy) * 8;
-        unsigned alloca_bits = info.max_access_size * 8;
-
-        if (val_bits == alloca_bits) {
-          B.CreateStore(IntStoredVal, Alloca);
-        } else {
-          // Sub-register write (masking)
-          Value *Curr = B.CreateLoad(info.type, Alloca);
-          APInt MaskValue = ~APInt::getLowBitsSet(alloca_bits, val_bits);
-          Value *Mask = ConstantInt::get(info.type, MaskValue);
-          Value *Cleared = B.CreateAnd(Curr, Mask);
-          Value *ZextVal = B.CreateZExt(IntStoredVal, info.type);
-          Value *NewVal = B.CreateOr(Cleared, ZextVal);
-          B.CreateStore(NewVal, Alloca);
-        }
-
-        SI->eraseFromParent();
+    auto flushCells = [&](IRBuilder<> &B) {
+      for (auto &Entry : Cells) {
+        uint64_t Base = Entry.first;
+        IntegerType *CellTy = CellTypes[Base];
+        Value *CellValue = B.CreateLoad(CellTy, CellAllocas[Base],
+                                        "state.cell.flush");
+        Value *CellAddress =
+            statePointer(B, StatePtr, Base, "state.cell.flush.ptr");
+        createUnalignedStore(B, CellValue, CellAddress);
       }
-    }
+    };
+    auto reloadCells = [&](IRBuilder<> &B) {
+      for (auto &Entry : Cells) {
+        uint64_t Base = Entry.first;
+        IntegerType *CellTy = CellTypes[Base];
+        Value *CellAddress =
+            statePointer(B, StatePtr, Base, "state.cell.reload.ptr");
+        Value *CellValue = createUnalignedLoad(
+            B, CellTy, CellAddress, "state.cell.reload");
+        B.CreateStore(CellValue, CellAllocas[Base]);
+      }
+    };
 
-    // Flush/reload around calls
     for (BasicBlock &BB : F) {
-      for (auto InstIt = BB.begin(); InstIt != BB.end(); ) {
-        Instruction &I = *InstIt++;
+      for (auto It = BB.begin(); It != BB.end();) {
+        Instruction &I = *It++;
         auto *CI = dyn_cast<CallInst>(&I);
-        if (!CI || CI->isInlineAsm()) continue;
-
-        Function *Callee = CI->getCalledFunction();
-        if (Callee) {
-          // Skip libc calls and declarations unless they take State parameter
-          bool takes_state = false;
-          for (auto &arg : CI->args()) {
-            if (arg.get() == StatePtr || arg.get() == StateGV) { takes_state = true; break; }
-          }
-          if (Callee->isDeclaration() && !takes_state) {
-            continue;
-          }
-        }
-
-        if (CI->arg_size() < 1) continue;
-        // Flush before call
-        {
-          IRBuilder<> B(CI);
-          for (auto &pair : fields) {
-            unsigned offset = pair.first;
-            auto &info = pair.second;
-            AllocaInst *Alloca = field_allocas[offset];
-            Value *Val = B.CreateLoad(info.type, Alloca);
-            Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
-            B.CreateStore(Val, GEP);
-          }
-        }
-
-        // Reload after call
-        {
-          IRBuilder<> B(CI->getNextNode());
-          for (auto &pair : fields) {
-            unsigned offset = pair.first;
-            auto &info = pair.second;
-            AllocaInst *Alloca = field_allocas[offset];
-            Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
-            Value *Val = B.CreateLoad(info.type, GEP);
-            B.CreateStore(Val, Alloca);
-          }
-        }
+        if (!CI || !CallMayAccessState(CI, F, StateGV, DL))
+          continue;
+        IRBuilder<> Before(CI);
+        flushCells(Before);
+        IRBuilder<> After(CI->getNextNode());
+        reloadCells(After);
       }
     }
 
-    // Flush before returns
     for (BasicBlock &BB : F) {
-      Instruction *Term = BB.getTerminator();
-      if (auto *RI = dyn_cast<ReturnInst>(Term)) {
+      if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
         IRBuilder<> B(RI);
-        for (auto &pair : fields) {
-          unsigned offset = pair.first;
-          auto &info = pair.second;
-          AllocaInst *Alloca = field_allocas[offset];
-          Value *Val = B.CreateLoad(info.type, Alloca);
-          Value *GEP = buildStateFieldGEP(B, StatePtr, offset, info.type);
-          B.CreateStore(Val, GEP);
-        }
+        flushCells(B);
       }
     }
 

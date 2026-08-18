@@ -367,7 +367,7 @@ Các block nhỏ:
 
 1. Normalize arithmetic/CFG.
 2. Resolve object/pointer candidates.
-3. Exact Chernobog/MBA identities.
+3. Exact proof-backed MBA identities.
 4. Z3 proof cho opaque predicate; `unknown` không phải evidence.
 5. Chỉ thay branch terminator sau proof.
 6. Deflatten theo transaction; nếu không dựng đủ CFG/value thì giữ dispatcher.

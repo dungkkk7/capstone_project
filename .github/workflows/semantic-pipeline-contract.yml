@@ -1,0 +1,80 @@
+name: semantic-pipeline-contract
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [agent/core-brightening-rebuild]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile production runner
+        run: python -m py_compile src/llvm_pass/britening_ir.py
+      - name: Check strict publication shell
+        run: bash -n src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh
+      - name: Enforce pass ownership boundaries
+        shell: bash
+        run: |
+          ! grep -q 'RuleImplementExternCallBridge.cpp' src/llvm_pass/brighten_015_runtime_helper_materialization/CMakeLists.txt
+          ! grep -q 'RuleRecoverStackFrame.cpp' src/llvm_pass/brighten_040_stack_frame_pass/CMakeLists.txt
+          ! grep -q 'RuleCompactPostStateFrame.cpp' src/llvm_pass/brighten_040_stack_frame_pass/CMakeLists.txt
+          ! grep -q 'GenerateObjectCandidates.cpp' src/llvm_pass/brighten_070_global_data_recovery/CMakeLists.txt
+          ! grep -q 'MaterializeRecoveredGlobals.cpp' src/llvm_pass/brighten_070_global_data_recovery/CMakeLists.txt
+          ! grep -q 'NativePointerProvenance.cpp' src/llvm_pass/brighten_080_type_reconstruction/CMakeLists.txt
+          ! grep -q 'NativeCleanup.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
+          ! grep -q 'NativeStateSSA.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
+          ! grep -q 'Chernobog.*Rules.cpp' src/llvm_pass/deobfuscate_095_deobfus_ollvm/CMakeLists.txt
+          ! grep -q 'libmcsema_rt' src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh
+      - name: Validate semantic pipeline order
+        shell: bash
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from llvm_pass.britening_ir import DEFAULT_PASS_PIPELINE
+
+          def top_level(text):
+              out, current, depth = [], [], 0
+              for ch in text:
+                  if ch == '(':
+                      depth += 1
+                  elif ch == ')':
+                      depth -= 1
+                  if ch == ',' and depth == 0:
+                      out.append(''.join(current))
+                      current = []
+                  else:
+                      current.append(ch)
+              if current:
+                  out.append(''.join(current))
+              assert depth == 0
+              return out
+
+          parts = top_level(DEFAULT_PASS_PIPELINE)
+          first_wave = [
+              'brighten-repair-pass',
+              'brighten-remill-runtime-pass',
+              'brighten-devirt-pass',
+              'brighten-state-ssa-pass',
+              'brighten-stack-frame-pass',
+              'brighten-abi-recovery-pass',
+              'brighten-extern-call-bridge',
+              'brighten-global-data-recovery-pass',
+              'brighten-type-reconstruct',
+              '095',
+          ]
+          positions = [parts.index(x) for x in first_wave]
+          assert positions == sorted(positions), (first_wave, positions)
+          assert parts.count('095') == 1
+          assert parts.index('brighten-region-ssa-unflatten-pass') > parts.index('095')
+          assert parts.index('brighten-native-cleanup-pass') > parts.index('brighten-region-ssa-unflatten-pass')
+          assert parts[-1] == 'verify'
+          assert 'brighten-native-cleanup-final-pass' not in parts
+          PY

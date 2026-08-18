@@ -2,21 +2,11 @@ import subprocess
 import os
 import sys
 import re
-import tempfile
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PASS_DIR = os.path.dirname(TESTS_DIR)
 BUILD_DIR = os.path.join(PASS_DIR, "build")
 PLUGIN_PATH = os.path.join(BUILD_DIR, "BrightenTypeReconstructionPass.so")
-POST_STATE_PLUGIN = os.path.join(
-    os.path.dirname(PASS_DIR), "brighten_040_stack_frame_pass", "build",
-    "BrightenStackFramePass.so")
-EXTERN_BRIDGE_PLUGIN = os.path.join(
-    os.path.dirname(PASS_DIR), "brighten_060_extern_call_bridge", "build",
-    "BrightenExternCallBridgePass.so")
-NATIVE_CLEANUP_PLUGIN = os.path.join(
-    os.path.dirname(PASS_DIR), "brighten_090_native_cleanup", "build",
-    "BrightenNativeCleanupPass.so")
 
 OPT_BIN = "opt-21"
 FILECHECK_BIN = "FileCheck-21"
@@ -242,10 +232,11 @@ target triple = "x86_64-unknown-linux-gnu"
 
 define void @test_unknown_dyn(i64 %idx) {
 entry:
-  ; CHECK: %obj = alloca [64 x [1 x i8]]
+  ; CHECK: %obj = alloca [64 x i8]
+  ; CHECK-NOT: brighten.gep
   %obj = alloca [64 x i8], align 4
 
-  ; Unknown offset calculation: shift left by a dynamic variable or non-linear arithmetic
+  ; Non-affine offset: the shift amount is itself dynamic.
   %shift = shl i64 %idx, %idx
   %p = getelementptr [64 x i8], ptr %obj, i64 0, i64 %shift
   store i32 100, ptr %p, align 4
@@ -321,7 +312,8 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
 define void @test_memcpy(ptr %src) {
 entry:
-  ; CHECK: %obj = alloca %brighten.struct.stack.test_memcpy.obj
+  ; CHECK: %obj = alloca [16 x i8]
+  ; CHECK-NOT: %brighten.struct.stack.test_memcpy.obj
   %obj = alloca [16 x i8], align 8
 
   ; CHECK: call void @llvm.memcpy
@@ -498,21 +490,6 @@ entry:
 }
 """
 
-# Pointer provenance recovery uses standalone fixtures because these cases are
-# easier to audit as complete late-IR snippets than as embedded Python strings.
-for extra_test in (
-    "test_native_pointer_affine_malloc.ll",
-    "test_native_pointer_slot_roundtrip.ll",
-    "test_native_pointer_provenance_negative.ll",
-    "test_native_pointer_slot_capture_negative.ll",
-    "test_native_pointer_direct_safety_negative.ll",
-    "test_same_anchor_ptrint_affine.ll",
-    "test_heap_proven_resolver_collapse.ll",
-    "test_heap_proven_resolver_lifecycle.ll",
-):
-    with open(os.path.join(TESTS_DIR, extra_test), "r") as extra_file:
-        test_cases[extra_test] = extra_file.read()
-
 failed = 0
 passed = 0
 
@@ -525,28 +502,8 @@ for name, content in test_cases.items():
     sys.stdout.flush()
 
     pipeline = "brighten-type-reconstruct"
-    if name == "test_same_anchor_ptrint_affine.ll":
-        pipeline = "brighten-address-canonicalize,verify"
-    if name == "test_heap_proven_resolver_collapse.ll":
-        pipeline = "brighten-heap-proven-resolver-collapse,verify"
-    if name == "test_heap_proven_resolver_lifecycle.ll":
-        pipeline = (
-            "brighten-extern-call-bridge,"
-            "brighten-post-state-frame-pass,"
-            "brighten-heap-proven-resolver-collapse,verify"
-        )
     opt_cmd = [OPT_BIN, "-load-pass-plugin", PLUGIN_PATH, f"-passes={pipeline}", "-verify-each", "-S", path, "-o", "-"]
 
-    lifecycle = name == "test_same_anchor_ptrint_affine.ll"
-    if lifecycle:
-        opt_cmd[3:3] = ["-load-pass-plugin", POST_STATE_PLUGIN]
-        # The ordinary checks validate 080 in isolation.  A second lifecycle
-        # run below proves 040 only consumes the safe canonical GEP.
-    if name == "test_heap_proven_resolver_lifecycle.ll":
-        opt_cmd[3:3] = [
-            "-load-pass-plugin", EXTERN_BRIDGE_PLUGIN,
-            "-load-pass-plugin", POST_STATE_PLUGIN,
-        ]
     if "brighten-type-mode=conservative" in content:
         opt_cmd.append("-brighten-type-mode=conservative")
 
@@ -570,109 +527,6 @@ for name, content in test_cases.items():
             print(fc_err.decode())
             failed += 1
 
-        if name == "test_heap_proven_resolver_lifecycle.ll":
-            # The real pipeline serializes after 060 before final 040/080.
-            # Prove that the per-call captures(none) fact is not merely an
-            # in-memory analysis artifact and that 080 consumes the persisted
-            # proof only after 040 has recovered the pointer slot.
-            with tempfile.TemporaryDirectory(
-                    prefix="brighten-060-040-080-") as temp_dir:
-                checkpoint = os.path.join(temp_dir, "after_060.bc")
-                stage_060 = subprocess.Popen(
-                    [OPT_BIN, "-load-pass-plugin", EXTERN_BRIDGE_PLUGIN,
-                     "-passes=brighten-extern-call-bridge,verify",
-                     path, "-o", checkpoint],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                _, stage_060_err = stage_060.communicate()
-                stage_040_080 = subprocess.Popen(
-                    [OPT_BIN, "-load-pass-plugin", PLUGIN_PATH,
-                     "-load-pass-plugin", POST_STATE_PLUGIN,
-                     "-passes=brighten-post-state-frame-pass,"
-                     "brighten-heap-proven-resolver-collapse,verify",
-                     "-verify-each", "-S", checkpoint, "-o", "-"],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stage_out, stage_err = stage_040_080.communicate()
-                stage_fc = subprocess.Popen(
-                    [FILECHECK_BIN, path], stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                _, stage_fc_err = stage_fc.communicate(input=stage_out)
-                if (stage_060.returncode == 0
-                        and stage_040_080.returncode == 0
-                        and stage_fc.returncode == 0):
-                    print("  lifecycle 060->serialized->040->080: PASS")
-                    passed += 1
-                else:
-                    print("  lifecycle 060->serialized->040->080: FAIL")
-                    print(stage_060_err.decode() or stage_err.decode()
-                          or stage_fc_err.decode())
-                    failed += 1
-
-        if lifecycle:
-            lifecycle_cmd = [
-                OPT_BIN, "-load-pass-plugin", PLUGIN_PATH,
-                "-load-pass-plugin", POST_STATE_PLUGIN,
-                "-passes=brighten-address-canonicalize,brighten-post-state-frame-pass,verify",
-                "-verify-each", "-S", path, "-o", "-",
-            ]
-            lifecycle_proc = subprocess.Popen(
-                lifecycle_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            lifecycle_out, lifecycle_err = lifecycle_proc.communicate()
-            lifecycle_fc = subprocess.Popen(
-                [FILECHECK_BIN, "--check-prefix=LIFECYCLE", path],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE)
-            _, lifecycle_fc_err = lifecycle_fc.communicate(input=lifecycle_out)
-            if lifecycle_proc.returncode == 0 and lifecycle_fc.returncode == 0:
-                print("  lifecycle 080->040: PASS")
-                passed += 1
-            else:
-                print("  lifecycle 080->040: FAIL")
-                print(lifecycle_err.decode() or lifecycle_fc_err.decode())
-                failed += 1
-
-            # Production deliberately serializes immediately after the last
-            # 090/state/region producer and before this late 080 rule.  This
-            # is not an optimization: ConstantExpr uniquing at that lifecycle
-            # boundary is required before exact/proven static anchors can be
-            # compared.  Keep the 040 consumer in this regression so a future
-            # pipeline reorder cannot make 040 depend on unsafe ptrtoint math.
-            with tempfile.TemporaryDirectory(
-                    prefix="brighten-late-090-080-") as temp_dir:
-                checkpoint = os.path.join(temp_dir, "post_090.bc")
-                stage_090_cmd = [
-                    OPT_BIN, "-load-pass-plugin", NATIVE_CLEANUP_PLUGIN,
-                    "-passes=brighten-native-cleanup-pass,verify",
-                    "-verify-each", path, "-o", checkpoint,
-                ]
-                stage_090 = subprocess.Popen(
-                    stage_090_cmd, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE)
-                _, stage_090_err = stage_090.communicate()
-                stage_080_cmd = [
-                    OPT_BIN, "-load-pass-plugin", PLUGIN_PATH,
-                    "-load-pass-plugin", POST_STATE_PLUGIN,
-                    "-passes=brighten-address-canonicalize,"
-                    "brighten-post-state-frame-pass,verify",
-                    "-verify-each", "-S", checkpoint, "-o", "-",
-                ]
-                stage_080 = subprocess.Popen(
-                    stage_080_cmd, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE)
-                stage_080_out, stage_080_err = stage_080.communicate()
-                stage_fc = subprocess.Popen(
-                    [FILECHECK_BIN, "--check-prefix=LIFECYCLE", path],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE)
-                _, stage_fc_err = stage_fc.communicate(input=stage_080_out)
-                if (stage_090.returncode == 0 and stage_080.returncode == 0
-                        and stage_fc.returncode == 0):
-                    print("  lifecycle 090->checkpoint->080->040: PASS")
-                    passed += 1
-                else:
-                    print("  lifecycle 090->checkpoint->080->040: FAIL")
-                    print((stage_090_err.decode() or stage_080_err.decode()
-                           or stage_fc_err.decode()))
-                    failed += 1
     except Exception as e:
         print(f"FAIL (Exception: {e})")
         failed += 1

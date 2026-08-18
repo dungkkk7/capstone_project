@@ -1,95 +1,71 @@
-# LLVM deobfuscation pass 095
+# Deobfuscate 095 — rule-first LLVM engine
 
-`lib095.so` is one LLVM 21 New Pass Manager module pass. It is intentionally
-separate from `britening_ir.py`: development and validation use already
-brightened IR under `result/pass 40`, and this directory does not modify the
-brightening pipeline.
+`095` is the expression and predicate deobfuscation stage used by the clean-IR
+pipeline. Its hot path is deterministic and does not invoke SMT.
 
-## Build and run
+## Architecture
+
+1. Match the independently implemented Chernobog identity catalog.
+2. Rewrite 108 MBA identities to a simpler LLVM expression.
+3. Apply direct predicate and conditional-jump rules.
+4. Repeat to a bounded fixpoint.
+5. Optionally run a small Z3 fallback on unmatched expressions only.
+
+The public rule names and mathematical identities are tracked against
+`19h/chernobog` revision
+`d272b5dffbfbcaea479fb64e469577c2d8011c4c`. This directory does not reuse the
+former capstone `Chernobog*Rules.{cpp,h}` implementation. The matcher,
+catalog, LLVM materializer, reports, and tests are a fresh LLVM-IR
+implementation.
+
+## Catalog contract
+
+- 108 MBA rules.
+- 22 direct predicate rules.
+- 9 direct jump rules.
+- Lazy commutative matching for add, multiply, and/or/xor.
+- Exact-width constants and repeated-variable bindings.
+- `not` is recognized as `xor -1`; `neg` as `sub 0`; `mul 2` also matches the
+  common LLVM `shl 1` spelling.
+- Rules carrying `nsw`, `nuw`, or `exact` assumptions are not matched by the
+  bit-vector catalog.
+
+Run exact catalog certification with:
 
 ```bash
-cmake -S . -B build -G Ninja \
-  -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build -j"$(nproc)"
-
-opt-21 -load-pass-plugin ./build/lib095.so \
-  -095-report=output.095.json \
-  -passes='095' input.ll -S -o output.ll
+opt-21 -load-pass-plugin build/lib095.so \
+  -095-verify-rule-catalog \
+  -095-report=/tmp/095.json \
+  -passes=095 input.ll -disable-output
 ```
 
-Z3 is required through `pkg-config`. `-095-z3-timeout-ms=N` sets the per-query
-timeout (default 100 ms), and `-095-max-z3-candidates=N` bounds work per
-function. `sat` disproves a candidate; `unknown`, including timeout, is always
-treated as no evidence and never authorizes a rewrite.
+Every MBA identity is proved by Z3 at i1, i8, i16, i32, and i64 during that
+certification command. CI requires all 108 rules to pass.
 
-Run the regression and compile-and-execute differential test with:
+## Runtime options
 
-```bash
-bash tests/run_tests.sh
+The default production path performs zero Z3 queries.
+
+```text
+-095-max-rounds=N
+-095-enable-z3-fallback
+-095-max-predicate-z3-candidates=N
+-095-max-mba-candidates=N
+-095-max-mba-recipes-per-expression=N
+-095-z3-timeout-ms=N
+-095-verify-rule-catalog
+-095-rule-catalog-timeout-ms=N
+-095-report=PATH
 ```
 
-## Chernobog to LLVM mapping
+Candidate limits alone do not enable SMT. `-095-enable-z3-fallback` is required,
+which prevents an old command line from accidentally restoring the slow
+scan-every-expression behavior.
 
-The implementation transfers the applicable ideas from Chernobog's
-`src/deobf/handlers` without using IDA or Hex-Rays APIs:
+## Scope of “100%”
 
-| Chernobog family | LLVM implementation and proof boundary |
-|---|---|
-| `deflatten`, recurrent switch, `hikari_cfg` | Discover a switch controlled by a header PHI and a latch state PHI. Constant/select state updates are mapped to switch successors. Each rewritten edge gets a bridge containing a `ValueToValueMapTy` clone of the executed dispatcher payload; `SSAUpdater` rebuilds all loop-carried values and target PHIs are repaired only when dominance proves every incoming. Unmapped recurrent states remain fail-closed. A function containing direct `undef`/`poison` PHI carriers is retained because CFG rewiring changes LLVM's per-use nondeterministic choices even when the result remains verifier-clean. |
-| `bogus_cf`, `native_opaque` | Translate poison-safe integer/`icmp` DAGs to Z3 bit-vectors. Replace a conditional edge only when the negation is `unsat`. Dead successor PHIs are updated before replacement. |
-| `mba_simplify`, `vm_mba`, peephole rules | Run bounded candidate synthesis for constants, leaves, arithmetic and Boolean operators; install only a strictly smaller Z3-proved equivalent. LLVM InstCombine/EarlyCSE handle canonical identities first. |
-| `select_chain` | Collapse same-condition nested selects and equal arms; flattened state selects become exact conditional CFG edges during deflattening. |
-| `indirect_branch`, `indirect_call`, `savedregs` | Follow LLVM aliases, immutable function-pointer globals, casts and equal-target selects. An `indirectbr` becomes direct only for a unique listed `blockaddress`. |
-| `global_const`, `const_decrypt`, `ptr_resolve` | Use LLVM constant folding, `DataLayout`, underlying objects and immutable initializers; unresolved dynamic objects remain unchanged. |
-| stack/fake-stack handlers | SROA and mem2reg recover provable local objects. Large or escaping frames remain and are reported. |
-| register-state cleanup | DominatorTree, LoopInfo and MemorySSA are materialized and verified; DSE, mem2reg, ADCE and InstCombine remove only proven dead/local state. |
-
-The internal order is fixed:
-
-`normalize → resolve objects/pointers → MBA → BCF → deflatten → CFG cleanup → fake stack → register state`
-
-This is an explicit cleanup sequence, not an opaque `-O3` pipeline.
-The post-delift presentation bundle invokes `095` once more only for bounded
-deterministic MBA cleanup and passes `-095-disable-deflatten`; partially
-rewritten dispatcher CFGs are not deflattened a second time.
-
-## Safety and reporting
-
-`verifyModule` runs after BCF, deflatten, CFG cleanup and final register-state
-cleanup. A verifier failure aborts without producing output. CFG rewrites repair
-PHIs before replacing terminators. Every report contains stage change counts,
-unresolved counts/reasons, per-function before/after size, observed loop and
-MemorySSA counts, and Z3 query outcomes.
-`-095-deflatten-debug` additionally groups recurrent-edge refusals by exact
-proof stage (undefined state, missing target, payload-path mismatch, value-map,
-PHI, dominance, or budget) and prints source-edge context for the control-flow
-categories that otherwise look identical in the aggregate report.
-
-The pass deliberately retains dispatcher transitions with undecodable state
-values, computed indirect targets and escaping fake stacks. A `freeze` around
-a PHI dispatcher is inspected per incoming edge. Defined state choices bypass
-it exactly. For `freeze(select Cond, T, F)` with a possibly poison condition,
-the replacement branches on `freeze(Cond)`: defined behavior is preserved and
-the poison case is safely refined to one of the two states already permitted
-by the original frozen value, without introducing `br poison` undefined
-behavior.
-
-For a split dispatcher, each select arm may have its own complete
-root-to-owner path. Each path is limited to eight child switches and 64
-cloneable PHIs/instructions and must provide an exact incoming value for every
-path PHI. Separate arm bridges execute only their own path payload in original
-order. A constant child-switch state which re-enters the latch is composed
-through its exact latch/header iteration first, including carrier and child
-payload clones; later rounds can then remove the ordinary application
-transition. Payload-bearing rewrites remain atomic for real SSA, PHI,
-dominance, or decoding failures, while dispatcher-internal latch edges are
-resolved in preceding rounds rather than blocking an otherwise complete
-frontier. `SSAUpdater` gives payload values used by later cases the reaching
-clone from the actual transition, while one-predecessor bridge PHIs keep values
-from the previous dispatcher visit distinct from the new clone. EH pads,
-`invoke`, `callbr`, `alloca`, token or metadata values, and convergent or
-`noduplicate` calls keep the path fail-closed. Multi-carrier dispatchers are
-rewritten only where every carrier can be reconstructed on a bridge edge. That
-is the production fail-closed contract: an incomplete cleanup is acceptable;
-an unproved semantic change is not.
+The testable guarantee is that 100% of the 108 registered MBA identities are
+present and pass exact bit-vector equivalence checks at the certified widths.
+This is not a claim that every possible future obfuscation is one of those
+identities. Unmatched expressions remain unchanged unless the explicit Z3
+fallback proves a replacement.

@@ -5,7 +5,7 @@
 
 extern "C" LLVM_ATTRIBUTE_WEAK llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "Deobfuscate095", "1.0.0",
+  return {LLVM_PLUGIN_API_VERSION, "Deobfuscate095", "3.0.0",
           [](llvm::PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](llvm::StringRef Name, llvm::ModulePassManager &MPM,
@@ -17,4 +17,3 @@ llvmGetPassPluginInfo() {
                 });
           }};
 }
-

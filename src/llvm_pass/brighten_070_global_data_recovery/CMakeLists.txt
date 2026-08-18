@@ -4,30 +4,17 @@ project(BrightenGlobalDataRecoveryPass LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
 find_package(LLVM REQUIRED CONFIG)
-
 message(STATUS "Using LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "LLVMConfig.cmake: ${LLVM_DIR}")
-
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
-
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
+# 070 v2 replaces the multi-stage candidate/rule catalogue with one byte-range
+# provenance analysis and transactional materializer.
 add_llvm_pass_plugin(BrightenGlobalDataRecoveryPass
   main.cpp
-  RuleDiscoverGuestSegments.cpp
-  RuleFlattenSegmentBytes.cpp
-  RuleBuildGuestAddressMap.cpp
-  GenerateObjectCandidates.cpp
-  ResolveObjectConflicts.cpp
-  MaterializeRecoveredGlobals.cpp
-  RuleRewriteGuestDataReferences.cpp
-  RuleRecoverLateResidualFormatStrings.cpp
-  RuleCanonicalizeGuestPointerResolvers.cpp
-  RecoverJumpTableCFG.cpp
-  RuleCleanupAndVerify.cpp
-  RuleReport.cpp
+  GlobalDataV2.cpp
 )

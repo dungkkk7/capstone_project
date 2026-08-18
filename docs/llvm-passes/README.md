@@ -48,7 +48,7 @@ production là `O3`; experiment phải ghi level vào protocol manifest.
 | 070 | `brighten-global-data-recovery-pass` and late resolver/string passes | [070-global-data.md](070-global-data.md) |
 | 080 | `brighten-type-reconstruct` and pointer canonicalizers | [080-type-reconstruction.md](080-type-reconstruction.md) |
 | 090 | native cleanup/post-frame/final contract passes | [090-native-cleanup.md](090-native-cleanup.md) |
-| 095 | `095` OLLVM/Chernobog deobfuscator | [095-deobfuscation.md](095-deobfuscation.md) |
+| 095 | `095` proof-driven OLLVM deobfuscator | [095-deobfuscation.md](095-deobfuscation.md) |
 | 100 | post-delift executable bundle | [100-delift-bundle.md](100-delift-bundle.md) |
 
 ## Contract dùng xuyên pipeline

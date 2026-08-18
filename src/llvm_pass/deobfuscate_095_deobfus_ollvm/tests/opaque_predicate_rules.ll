@@ -1,4 +1,4 @@
-; Synthetic coverage for every PredicateRule class declared by Chernobog.
+; Synthetic coverage for the supported opaque-predicate proof families.
 ; optnone keeps the source pattern intact until pass 095's own matcher runs.
 
 attributes #0 = { noinline optnone }

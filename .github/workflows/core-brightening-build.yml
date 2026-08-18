@@ -1,0 +1,136 @@
+name: core-brightening-build
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [agent/core-brightening-rebuild]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pass:
+          - brighten_010_repair_pass
+          - brighten_015_runtime_helper_materialization
+          - brighten_020_devirt_pass
+          - brighten_030_state_ssa_pass
+          - brighten_040_stack_frame_pass
+          - brighten_050_abi_recovery
+          - brighten_060_extern_call_bridge
+          - brighten_070_global_data_recovery
+          - brighten_080_type_reconstruction
+          - brighten_090_native_cleanup
+          - deobfuscate_095_deobfus_ollvm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 21 build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates curl gnupg lsb-release cmake ninja-build pkg-config \
+            libz3-dev jq ripgrep
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg
+          codename=$(lsb_release -cs)
+          echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            llvm-21 llvm-21-dev llvm-21-tools clang-21 lld-21
+
+      - name: Configure and build ${{ matrix.pass }} from source
+        shell: bash
+        run: |
+          pass_dir="src/llvm_pass/${{ matrix.pass }}"
+          rm -rf "$pass_dir/build"
+          cmake -S "$pass_dir" -B "$pass_dir/build" -G Ninja \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build "$pass_dir/build" --parallel 2
+
+      - name: Build cross-pass semantic-test dependencies
+        if: >-
+          matrix.pass == 'brighten_040_stack_frame_pass' ||
+          matrix.pass == 'brighten_080_type_reconstruction'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.pass }}" == "brighten_040_stack_frame_pass" ]]; then
+            dependencies=(brighten_090_native_cleanup)
+          else
+            dependencies=(
+              brighten_040_stack_frame_pass
+              brighten_060_extern_call_bridge
+              brighten_090_native_cleanup
+            )
+          fi
+          for dependency in "${dependencies[@]}"; do
+            dependency_dir="src/llvm_pass/$dependency"
+            rm -rf "$dependency_dir/build"
+            cmake -S "$dependency_dir" -B "$dependency_dir/build" -G Ninja \
+              -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            cmake --build "$dependency_dir/build" --parallel 2
+          done
+
+      - name: Run pass-specific proof and semantic regression tests
+        shell: bash
+        env:
+          OPT_BIN: /usr/bin/opt-21
+          OPT: /usr/bin/opt-21
+          FILECHECK_BIN: /usr/bin/FileCheck-21
+          FILECHECK: /usr/bin/FileCheck-21
+          CLANG_BIN: /usr/bin/clang-21
+          CLANG: /usr/bin/clang-21
+        run: |
+          case "${{ matrix.pass }}" in
+            brighten_010_repair_pass)
+              PLUGIN="$GITHUB_WORKSPACE/src/llvm_pass/brighten_010_repair_pass/build/BrightenRepairPass.so" \
+                bash src/llvm_pass/brighten_010_repair_pass/tests/run_tests.sh
+              ;;
+            brighten_015_runtime_helper_materialization)
+              PLUGIN="$GITHUB_WORKSPACE/src/llvm_pass/brighten_015_runtime_helper_materialization/build/BrightenRuntimeHelperPass.so" \
+                bash src/llvm_pass/brighten_015_runtime_helper_materialization/tests/run_tests.sh
+              ;;
+            brighten_020_devirt_pass)
+              PLUGIN="$GITHUB_WORKSPACE/src/llvm_pass/brighten_020_devirt_pass/build/BrightenDevirtPass.so" \
+                bash src/llvm_pass/brighten_020_devirt_pass/tests/run_tests.sh
+              ;;
+            brighten_030_state_ssa_pass)
+              PLUGIN="$GITHUB_WORKSPACE/src/llvm_pass/brighten_030_state_ssa_pass/build/BrightenStateSSAPass.so" \
+                bash src/llvm_pass/brighten_030_state_ssa_pass/tests/run_tests.sh
+              ;;
+            brighten_040_stack_frame_pass)
+              bash src/llvm_pass/brighten_040_stack_frame_pass/tests/run_tests.sh
+              ;;
+            brighten_050_abi_recovery)
+              bash src/llvm_pass/brighten_050_abi_recovery/tests/run_tests.sh
+              ;;
+            brighten_060_extern_call_bridge)
+              bash src/llvm_pass/brighten_060_extern_call_bridge/tests/run_tests.sh
+              ;;
+            brighten_070_global_data_recovery)
+              python3 src/llvm_pass/brighten_070_global_data_recovery/tests/run_tests.py
+              ;;
+            brighten_080_type_reconstruction)
+              python3 src/llvm_pass/brighten_080_type_reconstruction/tests/run_tests.py
+              ;;
+            brighten_090_native_cleanup)
+              bash src/llvm_pass/brighten_090_native_cleanup/tests/run_tests.sh
+              ;;
+            deobfuscate_095_deobfus_ollvm)
+              bash src/llvm_pass/deobfuscate_095_deobfus_ollvm/tests/run_hermetic_tests.sh
+              ;;
+            *)
+              echo "unknown pass: ${{ matrix.pass }}" >&2
+              exit 2
+              ;;
+          esac

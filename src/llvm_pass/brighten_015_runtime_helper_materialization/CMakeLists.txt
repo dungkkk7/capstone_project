@@ -16,12 +16,13 @@ add_definitions(${LLVM_DEFINITIONS})
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 
+# 015 is runtime semantic materialization only. External ABI reconstruction is
+# owned by 060, so this plugin contains no duplicate call-bridge authority.
 add_llvm_pass_plugin(BrightenRuntimeHelperPass
   src/main.cpp
   src/Helpers.cpp
   src/RuleLowerMcSemaAttachThunks.cpp
   src/RulePreserveX86DivideFaults.cpp
-  src/RuleImplementExternCallBridge.cpp
   src/RuleCanonicalizeGuestAddressConstants.cpp
   src/RuleDefineRemillControlFlowRuntime.cpp
   src/RuleLowerRemillMemoryIntrinsics.cpp

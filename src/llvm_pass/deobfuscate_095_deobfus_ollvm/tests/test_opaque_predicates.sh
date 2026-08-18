@@ -49,4 +49,4 @@ clang-21 -O2 "${work_dir}/after.ll" "${driver}" -o "${work_dir}/after"
 "${work_dir}/after" >"${work_dir}/after.stdout"
 cmp "${work_dir}/before.stdout" "${work_dir}/after.stdout"
 
-echo "24/24 declared Chernobog predicate-rule semantics covered"
+echo "opaque predicate semantics covered"

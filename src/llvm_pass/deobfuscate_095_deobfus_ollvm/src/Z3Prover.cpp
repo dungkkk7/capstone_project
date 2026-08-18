@@ -55,8 +55,8 @@ private:
     unsigned Index;
     if (It == T.LeafIndex.end()) {
       Index = T.Leaves.size();
-      // Chernobog's rule registry is not limited to binary MBA trees: a
-      // number of OLLVM/Hackers-Delight identities contain three or more
+      // The rule registry is not limited to binary MBA trees: a number of
+      // OLLVM/Hackers-Delight identities contain three or more
       // independent leaves which cancel algebraically.  Keep those leaves
       // in the proof model even though the compact replacement vocabulary
       // below is intentionally small; Z3 will only accept a replacement if
@@ -118,8 +118,8 @@ private:
       case Instruction::Add: E = *L + *R; break;
       case Instruction::Sub: E = *L - *R; break;
       case Instruction::Mul: E = *L * *R; break;
-      // Chernobog's opaque-predicate and MBA rules explicitly cover modular
-      // arithmetic identities (for example x*(x+1) % 2 == 0).  Keep the
+      // Opaque-predicate and MBA rules cover modular arithmetic identities
+      // (for example x*(x+1) % 2 == 0). Keep the
       // divisor symbolic in the proof model, but reject a zero divisor just
       // as LLVM's defined execution would do for a proven nonzero operand.
       case Instruction::UDiv: E = z3::udiv(*L, *R); break;
@@ -330,8 +330,8 @@ Z3Prover::proveSimplerInteger(Value *V, unsigned MinOps,
       Candidates.push_back({CandidateKind::UnaryNeg, -Vars[1], 1, 1});
     }
     for (unsigned I = 0; I < Vars.size(); ++I) {
-      // Chernobog's special-constant/factor families use 0, 1, 2, -1 and
-      // -2 heavily.  Keep the constants width-masked by bv_val.
+      // Special-constant/factor families use 0, 1, 2, -1 and -2 heavily.
+      // Keep the constants width-masked by bv_val.
       for (uint64_t C : {uint64_t(0), uint64_t(1), uint64_t(2),
                          ~uint64_t(0), ~uint64_t(1)}) {
         z3::expr K = P->Context.bv_val(C, Width);
