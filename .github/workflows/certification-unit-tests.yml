@@ -15,6 +15,7 @@ on:
       - "tests/test_entrypoint_contract.py"
       - "tests/test_bundle_entrypoint_contract.py"
       - "tests/test_certifying_behavior_corpus.py"
+      - "tests/test_publication_hygiene.py"
       - ".github/workflows/certification-unit-tests.yml"
   push:
     branches: [master]
@@ -31,6 +32,7 @@ on:
       - "tests/test_entrypoint_contract.py"
       - "tests/test_bundle_entrypoint_contract.py"
       - "tests/test_certifying_behavior_corpus.py"
+      - "tests/test_publication_hygiene.py"
       - ".github/workflows/certification-unit-tests.yml"
 
 permissions:
@@ -61,4 +63,5 @@ jobs:
             tests/test_certification.py \
             tests/test_entrypoint_contract.py \
             tests/test_bundle_entrypoint_contract.py \
-            tests/test_certifying_behavior_corpus.py
+            tests/test_certifying_behavior_corpus.py \
+            tests/test_publication_hygiene.py

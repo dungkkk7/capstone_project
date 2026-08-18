@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run McSema brightening under a fail-closed certification protocol.
 
-The runner separates candidate generation from authority.  It never claims that
-all lifted programs are recoverable.  It guarantees that an artifact receives
+The runner separates candidate generation from authority. It never claims that
+all lifted programs are recoverable. It guarantees that an artifact receives
 the ``certified`` suffix only when every gate frozen by protocol v1 passes on
 the exact bytes that are published.
 """
@@ -36,18 +36,52 @@ from llvm_pass.certifying_gates import (
 )
 from llvm_pass.certifying_runtime import (
     _brightening_snapshot,
-    _corpus_sha256,
     _environment_snapshot,
     _find_tool,
     _git_snapshot,
     _load_domain_contract,
     _load_protocol,
-    _read_seed_payloads,
     _seed_manifest,
     _tool_version,
     make_brighten_action,
     make_finalize_action,
 )
+
+
+def _publication_targets(output_prefix: Path) -> list[Path]:
+    """Return every fixed-name authority alias controlled by one output prefix."""
+
+    return [
+        Path(f"{output_prefix}.certified.ll"),
+        Path(f"{output_prefix}.certified.bin"),
+        Path(f"{output_prefix}.validated-compat.ll"),
+        Path(f"{output_prefix}.validated-compat.bin"),
+        Path(f"{output_prefix}.evidence.ll"),
+    ]
+
+
+def _clear_stale_publications(output_prefix: Path) -> list[str]:
+    """Remove old authority aliases before a new real run starts.
+
+    Evidence remains available under immutable per-run directories. A directory
+    at an authority path is treated as a configuration error rather than being
+    removed recursively.
+    """
+
+    removed: list[str] = []
+    for target in _publication_targets(output_prefix):
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            continue
+        except IsADirectoryError as exc:
+            raise ValueError(
+                "publication target is a directory and cannot be replaced: "
+                f"{target}"
+            ) from exc
+        removed.append(str(target))
+    return removed
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -120,6 +154,24 @@ def main() -> int:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(f"invalid certification protocol: {exc}")
 
+    # Preflight is complete. Remove fixed-name authority aliases only when a
+    # real run is about to start, so a typo in a required path cannot erase a
+    # previous result. Immutable evidence directories are retained.
+    try:
+        stale_publications_removed = _clear_stale_publications(output_prefix)
+        stale_report_removed = False
+        try:
+            report_path.unlink()
+            stale_report_removed = True
+        except FileNotFoundError:
+            pass
+        except IsADirectoryError as exc:
+            raise ValueError(
+                f"certification report target is a directory: {report_path}"
+            ) from exc
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
     opt = _find_tool(("opt-21", "opt"))
     clang = _find_tool(("clang-21", "clang"))
     llvm_nm = _find_tool(("llvm-nm-21", "llvm-nm"))
@@ -129,6 +181,8 @@ def main() -> int:
         "git": _git_snapshot(PROJECT_ROOT),
         "brightening": _brightening_snapshot(),
         "environment": _environment_snapshot(),
+        "stale_publications_removed": stale_publications_removed,
+        "stale_report_removed": stale_report_removed,
         "protocol": {
             "path": str(protocol_path),
             "sha256": sha256_file(protocol_path),
