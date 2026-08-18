@@ -13,103 +13,63 @@ WORKDIR=$(dirname -- "$PREFIX")
 BASE=$(basename -- "$PREFIX")
 mkdir -p "$WORKDIR"
 
-S1="$WORKDIR/${BASE}.01-verified-input.ll"
-S2="$WORKDIR/${BASE}.02-pointer-opt.ll"
-S3="$WORKDIR/${BASE}.03-storage-delift.ll"
-S4="$WORKDIR/${BASE}.04-storage-o3.ll"
-S5="$WORKDIR/${BASE}.05-unpinned.ll"
+OPT_TOOL="${OPT_BIN:-$(command -v opt-21 || command -v opt)}"
+CLANG_TOOL="${CLANG_BIN:-$(command -v clang-21 || command -v clang)}"
+NM_TOOL="${NM_BIN:-$(command -v llvm-nm-21 || command -v llvm-nm || command -v nm)}"
+DEOBF_PLUGIN="${DEOBF_PLUGIN:-$SCRIPT_DIR/../deobfuscate_095_deobfus_ollvm/build/lib095.so}"
+NATIVE_PLUGIN="${NATIVE_CLEANUP_PLUGIN:-$SCRIPT_DIR/../brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so}"
+
+for tool in "$OPT_TOOL" "$CLANG_TOOL" "$NM_TOOL"; do
+  [[ -x "$tool" ]] || { echo "required tool missing: $tool" >&2; exit 127; }
+done
+[[ -f "$DEOBF_PLUGIN" ]] || { echo "missing 095 plugin: $DEOBF_PLUGIN" >&2; exit 127; }
+[[ -f "$NATIVE_PLUGIN" ]] || { echo "missing 090 plugin: $NATIVE_PLUGIN" >&2; exit 127; }
+
+LEVEL="${DELIFT_OPT_LEVEL:-${BRIGHTEN_OPT_LEVEL:-O2}}"
+[[ "$LEVEL" =~ ^O[123]$ ]] || { echo "DELIFT_OPT_LEVEL must be O1/O2/O3" >&2; exit 2; }
+
+S1="$WORKDIR/${BASE}.01-verified.ll"
+S2="$WORKDIR/${BASE}.02-proof-deobf.ll"
+S3="$WORKDIR/${BASE}.03-scalar-clean.ll"
 FINAL_LL="$WORKDIR/${BASE}.ll"
 FINAL_O="$WORKDIR/${BASE}.o"
 FINAL_BIN="$WORKDIR/${BASE}.bin"
 
-"${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -S -passes=verify "$INPUT" -o "$S1"
-python3 "$SCRIPT_DIR/run_exact_llvm_passes.py" "$S1" "$S2"
-DELIFT_OPT_LEVEL="${DELIFT_OPT_LEVEL:-${BRIGHTEN_OPT_LEVEL:-O3}}"
-if [[ ! "$DELIFT_OPT_LEVEL" =~ ^O[123]$ ]]; then
-  echo "DELIFT_OPT_LEVEL must be O1, O2, or O3; got: $DELIFT_OPT_LEVEL" >&2
-  exit 2
-fi
-DELIFT_OPT_PIPELINE="default<${DELIFT_OPT_LEVEL}>,verify" python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S2" "$S3"
-python3 "$SCRIPT_DIR/delift_storage.py" "$S3" "$S4"
-python3 "$SCRIPT_DIR/strip_brighten_residuals.py" "$S4" "$S5"
-DELIFT_OPT_PIPELINE="default<${DELIFT_OPT_LEVEL}>,verify" \
-  python3 "$SCRIPT_DIR/run_o3_llvm.py" "$S5" "$FINAL_LL"
-python3 "$SCRIPT_DIR/dedup_pointer_selects.py" "$FINAL_LL" "$FINAL_LL.dedup"
-mv "$FINAL_LL.dedup" "$FINAL_LL"
-# Run the deterministic (non-SMT) MBA cleanup once more after resolver
-# centralisation.  The first 095 invocation runs before the mapper exists;
-# this second pass sees the compacted arithmetic and is bounded by zero Z3
-# queries, so it cannot turn the pipeline into an unbounded solver job.
-DEOBF_PLUGIN="${DEOBF_PLUGIN:-$SCRIPT_DIR/../deobfuscate_095_deobfus_ollvm/build/lib095.so}"
-if [[ -f "$DEOBF_PLUGIN" ]]; then
-  OPT_TOOL="${OPT_BIN:-$(command -v opt-21 || command -v opt)}"
-  "$OPT_TOOL" -load-pass-plugin="$DEOBF_PLUGIN" -S \
-    -passes=095 -095-disable-deflatten \
-    -095-max-z3-candidates=0 -095-max-opaque-z3-candidates=0 \
-    "$FINAL_LL" -o "$FINAL_LL.post095"
-  mv "$FINAL_LL.post095" "$FINAL_LL"
-  # 095 exposes source-level comparisons and loop bounds. Run scalar cleanup
-  # only: vectorization at this final presentation boundary makes recovered
-  # pseudocode less readable without adding semantic information. LLVM 21's
-  # one-pass fixpoint diagnostic is not a semantic verifier and can reject
-  # valid newly opened CFGs, so use the same no-verify-fixpoint spelling as the
-  # main brighten pipeline; the module verifier still runs below.
-  "$OPT_TOOL" -S \
-    -passes='function(instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,adce),globaldce,verify' \
-    "$FINAL_LL" -o "$FINAL_LL.post095-o3"
-  mv "$FINAL_LL.post095-o3" "$FINAL_LL"
-  "$OPT_TOOL" -passes=verify -disable-output "$FINAL_LL"
-fi
-# The bundle's O3/095 stages are allowed to expose source-level loop PHIs, but
-# they must not run after the authoritative native contract report. Consume
-# only those late frame products, run bounded scalar cleanup, consume any
-# affine pointer spelling exposed by that cleanup, then report the exact IR
-# that will be compacted and compiled.  Both cleanup calls use the narrow
-# post-frame contract; the second is the final convergence boundary after all
-# standard scalar/ABI cleanup, not broad semantic recovery.  Keeping it last
-# also defines fully overwritten aggregates that late instcombine may respell
-# with a poison seed.
-# This script always links a complete executable whose public entry is `main`.
-# Once the first post-frame pass has created any required source-ABI adapters,
-# LLVM's whole-program internalizer can make non-entry definitions local and
-# global DCE can remove adapters with no in-module users.  The same closed
-# callgraph lets LLVM's interprocedural constant propagation expose constant
-# State-SSA parameters, then dead-argument elimination removes unused
-# parameters and aggregate return fields with its ordinary ABI proof.  This is
-# a linkage proof at the executable boundary; the reusable 090 module pass
-# itself keeps externally visible compatibility wrappers.
-NATIVE_CLEANUP_PLUGIN="${NATIVE_CLEANUP_PLUGIN:-$SCRIPT_DIR/../brighten_090_native_cleanup/build/BrightenNativeCleanupPass.so}"
-if [[ -f "$NATIVE_CLEANUP_PLUGIN" ]]; then
-  OPT_TOOL="${OPT_BIN:-$(command -v opt-21 || command -v opt)}"
-  "$OPT_TOOL" -load-pass-plugin="$NATIVE_CLEANUP_PLUGIN" -S \
-    -passes='brighten-native-cleanup-post-frame-pass,internalize,ipsccp,deadargelim,globalopt,function(instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,adce,simplifycfg,instcombine<no-verify-fixpoint>,simplifycfg,dce,adce),globaldce,function(dce,adce),globaldce,ipsccp,deadargelim,function(instcombine<no-verify-fixpoint>,simplifycfg,dce,adce),globaldce,brighten-native-cleanup-post-frame-pass,brighten-native-cleanup-final-pass,verify' \
-    "$FINAL_LL" -o "$FINAL_LL.native-final"
-  mv "$FINAL_LL.native-final" "$FINAL_LL"
-fi
-python3 "$SCRIPT_DIR/compact_ir_text.py" "$FINAL_LL" "$FINAL_LL.compact"
-mv "$FINAL_LL.compact" "$FINAL_LL"
-"${OPT_BIN:-$(command -v opt-21 || command -v opt)}" -passes=verify -disable-output "$FINAL_LL"
-CLANG_BIN="${CLANG_BIN:-$(command -v clang-21 || command -v clang || true)}"
-if [[ -z "$CLANG_BIN" ]]; then
-  echo "clang-21/clang not found" >&2
-  exit 127
-fi
-"$CLANG_BIN" -O2 -c "$FINAL_LL" -o "$FINAL_O"
-LINK_ARGS=("$FINAL_LL" -lm)
-# Compatibility-class IR may retain McSema's callback trampoline solely
-# through CRT constructor/destructor wrappers.  Link the matching audited
-# McSema runtime only when that symbol is actually unresolved; fully-native IR
-# remains independent of the compatibility runtime.
-MCSEMA_RUNTIME_LIB="${MCSEMA_RUNTIME_LIB:-$SCRIPT_DIR/../../../dependency/mcsema/mcsema/lib/libmcsema_rt64-10.0.a}"
-if "${NM_BIN:-$(command -v nm)}" -u "$FINAL_O" | grep -q '__mcsema_attach_call'; then
-  if [[ ! -f "$MCSEMA_RUNTIME_LIB" ]]; then
-    echo "missing McSema compatibility runtime: $MCSEMA_RUNTIME_LIB" >&2
-    exit 1
-  fi
-  LINK_ARGS+=("$MCSEMA_RUNTIME_LIB")
-fi
-"$CLANG_BIN" -O2 "${LINK_ARGS[@]}" -o "$FINAL_BIN"
+rm -f "$S1" "$S2" "$S3" "$FINAL_LL" "$FINAL_O" "$FINAL_BIN"
 
-printf 'final IR:     %s\n' "$FINAL_LL"
-printf 'final object: %s\n' "$FINAL_O"
-printf 'final binary: %s\n' "$FINAL_BIN"
+# 100 does not invent source semantics. It only consumes facts established by
+# 010-095, performs proof-backed deobfuscation once more after the last scalar
+# exposure, and refuses publication unless 090 proves there is no live lifted
+# runtime/state residue left.
+"$OPT_TOOL" -S -passes=verify "$INPUT" -o "$S1"
+"$OPT_TOOL" -load-pass-plugin="$DEOBF_PLUGIN" -S \
+  -passes='095,verify' "$S1" -o "$S2"
+"$OPT_TOOL" -S \
+  -passes="default<${LEVEL}>,function(instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,adce),globaldce,verify" \
+  "$S2" -o "$S3"
+
+# Whole-program publication boundary. Keep only the process entry externally
+# visible; everything else may be internalized and DCE'd before the strict
+# native contract runs on the exact bytes that will be compiled.
+"$OPT_TOOL" -load-pass-plugin="$NATIVE_PLUGIN" -S \
+  -internalize-public-api-list=main \
+  -passes='brighten-native-cleanup-post-frame-pass,internalize,ipsccp,deadargelim,globalopt,function(instcombine<no-verify-fixpoint>,simplifycfg,gvn,dce,adce),globaldce,brighten-native-cleanup-post-frame-pass,brighten-native-cleanup-final-pass,verify' \
+  "$S3" -o "$FINAL_LL"
+
+"$CLANG_TOOL" -O2 -c "$FINAL_LL" -o "$FINAL_O"
+if ! "$NM_TOOL" --defined-only "$FINAL_O" | grep -Eq '(^|[[:space:]])main$'; then
+  echo "strict clean publication rejected: public main is missing" >&2
+  exit 1
+fi
+if "$NM_TOOL" -u "$FINAL_O" | grep -Eq '__remill_|__mcsema_|__lifter_|__translate_guest_pointer'; then
+  echo "strict clean publication rejected: unresolved lifted runtime symbol" >&2
+  "$NM_TOOL" -u "$FINAL_O" >&2 || true
+  exit 1
+fi
+
+# No McSema compatibility runtime is allowed at the Clean-IR boundary.
+"$CLANG_TOOL" -O2 "$FINAL_LL" -lm -o "$FINAL_BIN"
+
+printf 'clean IR:     %s\n' "$FINAL_LL"
+printf 'clean object: %s\n' "$FINAL_O"
+printf 'clean binary: %s\n' "$FINAL_BIN"
