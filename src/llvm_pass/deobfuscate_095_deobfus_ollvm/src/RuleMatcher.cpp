@@ -6,6 +6,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Transforms/Utils/Local.h"
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <vector>
@@ -280,6 +281,11 @@ bool applyMBARules(Module &M, RuleEngineStats &Stats) {
         Candidates.push_back(&I);
     }
   }
+
+  // Maximal-munch ordering: match the outer expression before its leaves.
+  // Otherwise a cheap inner identity can destroy the shape of a larger
+  // Chernobog rule and force several extra fixpoint rounds.
+  std::reverse(Candidates.begin(), Candidates.end());
 
   bool Changed = false;
   for (Instruction *I : Candidates) {
