@@ -21,6 +21,12 @@ public:
   static bool AnnotateRemillReturns(llvm::Module &M);
   static bool CleanupCallbackThunks(llvm::Module &M);
   static bool CleanupUnusedRemillDispatchers(llvm::Module &M);
+
+  // Primary v2 CFG recovery.  It evaluates finite selector values per incoming
+  // edge with an abstract interpreter instead of requiring one handwritten
+  // affine pattern.  The legacy matcher remains available only for diagnostic
+  // comparison and late region-SSA recovery.
+  static bool RecoverFiniteStateSwitches(llvm::Module &M);
   static bool LowerProvenConstantStateSwitches(llvm::Module &M);
   static bool LowerRegionSSAStateSwitches(llvm::Module &M);
   static bool VerifyDevirtualization(llvm::Module &M);

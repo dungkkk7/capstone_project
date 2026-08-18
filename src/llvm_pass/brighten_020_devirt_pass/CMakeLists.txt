@@ -26,6 +26,7 @@ add_llvm_pass_plugin(BrightenDevirtPass
   src/RuleAnnotateRemillReturns.cpp
   src/RuleCleanupCallbackThunks.cpp
   src/RuleCleanupUnusedRemillDispatchers.cpp
+  src/RuleRecoverFiniteStateSwitches.cpp
   src/RuleLowerProvenConstantStateSwitches.cpp
   src/RuleVerifyDevirtualization.cpp
 )
