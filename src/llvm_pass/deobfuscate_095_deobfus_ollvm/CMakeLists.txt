@@ -44,6 +44,10 @@ add_llvm_pass_plugin(Deobfuscate095
   src/Z3Prover.cpp
 )
 
+# LLVM's plugin helper defaults to -fno-exceptions. The deterministic runtime
+# matcher does not throw, but Z3's C++ wrapper uses exceptions at the optional
+# fallback/catalog-certification boundary. Enable them only for this plugin.
+target_compile_options(Deobfuscate095 PRIVATE -fexceptions)
 target_link_libraries(Deobfuscate095 PRIVATE PkgConfig::Z3)
 set_target_properties(Deobfuscate095 PROPERTIES
   OUTPUT_NAME "095"
