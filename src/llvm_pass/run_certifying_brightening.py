@@ -21,11 +21,8 @@ PROJECT_ROOT = SRC_ROOT.parent
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from llvm_pass.certification import (
-    OutputClass,
-    TransactionalPipeline,
-    sha256_file,
-)
+from llvm_pass.certification import OutputClass, sha256_file
+from llvm_pass.certifying_transaction import TransactionalPipeline
 from llvm_pass.certifying_gates import (
     make_behavior_gate,
     make_bundle_link_gate,
@@ -219,12 +216,15 @@ def main() -> int:
         policy=policy,
         metadata=metadata,
     )
+    reference_snapshot = pipeline.reference_snapshot
+    if reference_snapshot is None:
+        raise RuntimeError("reference snapshot was not created")
 
     brightened = pipeline.workdir / "01-brightened.ll"
     stage1 = pipeline.run_stage(
         stage_id="01-brighten",
         candidate_artifact=brightened,
-        action=make_brighten_action(reference),
+        action=make_brighten_action(reference_snapshot),
         gates=[make_llvm_verify_gate(args.gate_timeout)],
     )
     if not stage1.accepted:
@@ -244,7 +244,7 @@ def main() -> int:
             make_bundle_link_gate(bundle_binary),
             make_behavior_gate(
                 bundle_binary=bundle_binary,
-                reference=reference,
+                reference=reference_snapshot,
                 iterations=args.iterations,
                 execution_timeout=args.execution_timeout,
                 jobs=args.jobs,
