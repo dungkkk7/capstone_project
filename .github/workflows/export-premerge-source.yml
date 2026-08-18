@@ -18,7 +18,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: agent/tmp-premerge-source-export
-      - run: tar --exclude=.git --exclude=dependency --exclude=result --exclude=reports -czf premerge-source.tar.gz src tests tools configs docs README.md
+      - name: Build source archive from paths present in the historical tree
+        shell: bash
+        run: |
+          paths=()
+          for path in src tests tools configs docs README.md; do
+            [[ -e "$path" ]] && paths+=("$path")
+          done
+          if [[ ${#paths[@]} -eq 0 ]]; then
+            echo "no source paths found" >&2
+            exit 1
+          fi
+          tar --exclude=.git --exclude=dependency --exclude=result --exclude=reports \
+            -czf premerge-source.tar.gz "${paths[@]}"
       - uses: actions/upload-artifact@v4
         with:
           name: premerge-source
