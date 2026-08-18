@@ -1,68 +1,115 @@
+from __future__ import annotations
+
 import os
-import sys
 import subprocess
-import glob
+import tempfile
+from pathlib import Path
 
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-PASS_DIR = os.path.dirname(TESTS_DIR)
-BUILD_DIR = os.path.join(PASS_DIR, "build")
-PLUGIN_PATH = os.path.join(BUILD_DIR, "BrightenGlobalDataRecoveryPass.so")
+ROOT = Path(__file__).resolve().parents[1]
+PLUGIN = ROOT / "build/BrightenGlobalDataRecoveryPass.so"
+OPT = os.environ.get("OPT_BIN", "/usr/bin/opt-21")
 
-OPT_BIN = "opt-21"
-FILECHECK_BIN = "FileCheck-21"
 
-failed = 0
-passed = 0
+def run_ir(text: str) -> str:
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "in.ll"
+        out = Path(td) / "out.ll"
+        src.write_text(text)
+        proc = subprocess.run(
+            [
+                OPT,
+                f"-load-pass-plugin={PLUGIN}",
+                "-passes=brighten-global-data-recovery-pass,verify",
+                "-S",
+                str(src),
+                "-o",
+                str(out),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode:
+            raise AssertionError(proc.stderr)
+        return out.read_text()
 
-test_files = glob.glob(os.path.join(TESTS_DIR, "test_*.ll"))
-test_files.sort()
 
-for test_path in test_files:
-    name = os.path.basename(test_path)
-    print(f"Running test: {name} ...", end=" ")
-    sys.stdout.flush()
+DL = 'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-n8:16:32:64-S128"\n'
 
-    # Read the RUN lines from the test file
-    run_lines = []
-    with open(test_path, "r") as f:
-        for line in f:
-            if line.startswith("; RUN:"):
-                run_lines.append(line[len("; RUN:"):].strip())
+# Exact typed range: every observed reference has identical provenance/type,
+# so the segment byte range may become one native i32 global.
+scalar = run_ir(
+    DL
+    + r'''
+@seg_404000__data = internal global [8 x i8] c"\2A\00\00\00\00\00\00\00"
+define i32 @f(i32 %x) {
+entry:
+  %p = getelementptr [8 x i8], ptr @seg_404000__data, i64 0, i64 0
+  %a = load i32, ptr %p
+  store i32 %x, ptr %p
+  %b = load i32, ptr %p
+  %r = add i32 %a, %b
+  ret i32 %r
+}
+'''
+)
+assert "g_recovered_" in scalar
+assert "load i32, ptr @g_recovered_" in scalar
+assert "store i32 %x, ptr @g_recovered_" in scalar
 
-    if not run_lines:
-        print("SKIP (No RUN lines found)")
-        continue
+# Immutable C-string consumer: bytes are copied exactly through the NUL and
+# the call no longer points at the lifted segment.
+string = run_ir(
+    DL
+    + r'''
+@seg_402000__rodata = internal global [7 x i8] c"hello\0A\00"
+declare i32 @puts(ptr)
+define i32 @f() {
+entry:
+  %p = getelementptr [7 x i8], ptr @seg_402000__rodata, i64 0, i64 0
+  %r = call i32 @puts(ptr %p)
+  ret i32 %r
+}
+'''
+)
+assert ".str.recovered." in string
+assert "call i32 @puts(ptr @.str.recovered." in string
 
-    # Join lines and replace %builddir/ or %s or < %s
-    full_cmd_str = " ".join(run_lines)
-    full_cmd_str = full_cmd_str.replace("\\", " ")
-    full_cmd_str = full_cmd_str.replace("%builddir", BUILD_DIR)
-    full_cmd_str = full_cmd_str.replace("opt", OPT_BIN)
-    full_cmd_str = full_cmd_str.replace("FileCheck", FILECHECK_BIN)
-    
-    # We will execute the command using a shell pipeline
-    # To run it safely, we can replace %s with the actual test path
-    # and < %s with < test_path
-    full_cmd_str = full_cmd_str.replace("< %s", f"< {test_path}")
-    full_cmd_str = full_cmd_str.replace("%s", test_path)
+# Overlapping incompatible typed views are one guest byte range with two LLVM
+# interpretations. Splitting them would destroy aliasing, so the segment must
+# remain authoritative.
+overlap = run_ir(
+    DL
+    + r'''
+@seg_500000__data = internal global [8 x i8] zeroinitializer
+define i64 @f() {
+entry:
+  %p0 = getelementptr [8 x i8], ptr @seg_500000__data, i64 0, i64 0
+  %p2 = getelementptr [8 x i8], ptr @seg_500000__data, i64 0, i64 2
+  store i32 1, ptr %p0
+  %x = load i32, ptr %p2
+  %r = zext i32 %x to i64
+  ret i64 %r
+}
+'''
+)
+assert "@seg_500000__data" in overlap
+assert "g_recovered_" not in overlap
 
-    try:
-        proc = subprocess.run(full_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if proc.returncode == 0:
-            print("PASS")
-            passed += 1
-        else:
-            print("FAIL")
-            print("Command:", full_cmd_str)
-            print("Stdout:", proc.stdout.decode())
-            print("Stderr:", proc.stderr.decode())
-            failed += 1
-    except Exception as e:
-        print(f"FAIL (Exception: {e})")
-        failed += 1
+# A dynamic carrier is deliberately not converted into an independent native
+# object; no range/alias proof exists yet.
+dynamic = run_ir(
+    DL
+    + r'''
+@seg_600000__data = internal global [32 x i8] zeroinitializer
+define i8 @f(i64 %i) {
+entry:
+  %p = getelementptr [32 x i8], ptr @seg_600000__data, i64 0, i64 %i
+  %v = load i8, ptr %p
+  ret i8 %v
+}
+'''
+)
+assert "@seg_600000__data" in dynamic
+assert "g_recovered_" not in dynamic
 
-print(f"\nTest Summary: {passed} passed, {failed} failed")
-if failed > 0:
-    sys.exit(1)
-else:
-    sys.exit(0)
+print("070 byte-range provenance tests: PASS")
