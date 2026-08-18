@@ -135,7 +135,7 @@ bool runPredicateFallback(Module &M, Z3Prover &Prover,
     return false;
 
   SmallVector<Value *, 64> Conditions;
-  SmallPtrSet<Value *, 64> Seen;
+  SmallPtrSet<Value *, 32> Seen;
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
