@@ -1287,7 +1287,13 @@ bool BrightenPostStateFramePass::CompactProvenPostStateFrameBackings(Module &M) 
         uint64_t(Min) % Alignment.value() != 0)
       continue;
 
-    int64_t FrameSize = std::max<int64_t>(Max - Min + 16384, 65536);
+    // The complete-use proof above establishes that every observable
+    // byte lies in [Min, Max).  Retaining a 64 KiB guest-stack cushion
+    // after that proof only preserves lifted representation noise and
+    // prevents downstream SROA/type recovery.  Materialize exactly the
+    // proven native object span; unsupported/escaping accesses were
+    // already refused before this transaction.
+    int64_t FrameSize = Max - Min;
     auto *FrameTy = ArrayType::get(Type::getInt8Ty(M.getContext()), FrameSize);
     IRBuilder<> Entry(&*Owner->getEntryBlock().getFirstInsertionPt());
     AllocaInst *Frame = Entry.CreateAlloca(FrameTy, nullptr, "native_frame");
