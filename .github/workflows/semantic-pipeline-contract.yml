@@ -1,0 +1,57 @@
+name: semantic-pipeline-contract
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [agent/core-brightening-rebuild]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile production runner
+        run: python -m py_compile src/llvm_pass/britening_ir.py
+      - name: Check strict publication shell
+        run: bash -n src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh
+      - name: Enforce pass ownership boundaries
+        shell: bash
+        run: |
+          ! grep -q 'RuleImplementExternCallBridge.cpp' src/llvm_pass/brighten_015_runtime_helper_materialization/CMakeLists.txt
+          ! grep -q 'NativeCleanup.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
+          ! grep -q 'NativeStateSSA.cpp' src/llvm_pass/brighten_090_native_cleanup/CMakeLists.txt
+          ! grep -q 'Chernobog.*Rules.cpp' src/llvm_pass/deobfuscate_095_deobfus_ollvm/CMakeLists.txt
+          ! grep -q 'libmcsema_rt' src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh
+      - name: Validate semantic pipeline order
+        shell: bash
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from llvm_pass.britening_ir import DEFAULT_PASS_PIPELINE
+          p = DEFAULT_PASS_PIPELINE
+          required = [
+              'brighten-repair-pass',
+              'brighten-remill-runtime-pass',
+              'brighten-devirt-pass',
+              'brighten-state-ssa-pass',
+              'brighten-stack-frame-pass',
+              'brighten-abi-recovery-pass',
+              'brighten-extern-call-bridge',
+              'brighten-global-data-recovery-pass',
+              'brighten-type-reconstruct',
+              '095',
+              'brighten-region-ssa-unflatten-pass',
+              'brighten-native-cleanup-pass',
+              'verify',
+          ]
+          positions = [p.index(x) for x in required]
+          assert positions == sorted(positions), (required, positions)
+          assert p.count('095') == 1
+          assert 'brighten-native-cleanup-final-pass' not in p
+          PY
