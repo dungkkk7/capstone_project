@@ -1,0 +1,25 @@
+name: export-core-source
+
+on:
+  push:
+    branches:
+      - agent/core-brightening-rebuild
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build source archive
+        run: |
+          tar --exclude=.git --exclude=dependency --exclude=result --exclude=reports -czf core-source.tar.gz \
+            README.md configs docs src tests tools .github
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-source
+          path: core-source.tar.gz
+          retention-days: 1
