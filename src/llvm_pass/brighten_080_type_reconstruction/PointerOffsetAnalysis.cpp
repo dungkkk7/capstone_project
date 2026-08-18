@@ -241,8 +241,8 @@ static void tracePointerUses(Value *Val, int64_t Offset, Value *IndexExpr,
   if (!Visited.insert({Val, Offset, IndexExpr, Stride}).second)
     return;
 
-  for (Use &Use : Val->uses()) {
-    User *U = Use.getUser();
+  for (Use &PointerUse : Val->uses()) {
+    User *U = PointerUse.getUser();
     Instruction *Inst = dyn_cast<Instruction>(U);
 
     if (auto *LI = dyn_cast<LoadInst>(U)) {
