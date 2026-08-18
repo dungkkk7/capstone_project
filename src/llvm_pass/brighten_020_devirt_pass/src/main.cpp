@@ -16,7 +16,11 @@ PreservedAnalyses BrightenDevirtPass::run(Module &M, ModuleAnalysisManager &) {
   Changed |= AnnotateRemillReturns(M);
   Changed |= CleanupCallbackThunks(M);
   Changed |= CleanupUnusedRemillDispatchers(M);
-  Changed |= LowerProvenConstantStateSwitches(M);
+
+  // v2: finite-state recovery is driven by an abstract interpreter over the
+  // selector DAG.  The previous affine matcher accepted only a PHI followed by
+  // add/sub/mul/xor constants and missed ordinary or/and/shift/cast forms.
+  Changed |= RecoverFiniteStateSwitches(M);
 
   VerifyDevirtualization(M);
 
@@ -35,7 +39,7 @@ PreservedAnalyses BrightenRegionSSAUnflattenPass::run(
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION,
           "BrightenDevirtPass",
-          "0.1.0",
+          "0.2.0",
           [](::llvm::PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](::llvm::StringRef Name, ::llvm::ModulePassManager &MPM,

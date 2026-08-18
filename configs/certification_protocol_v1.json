@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "protocol_version": "certifying-brightening-v1",
+  "certification_gates": [
+    "llvm_verify",
+    "entrypoint",
+    "bundle_link",
+    "behavior",
+    "native_contract",
+    "native_compile"
+  ],
+  "structural_gates": [
+    "llvm_verify",
+    "entrypoint",
+    "bundle_link"
+  ],
+  "behavior_gate": "behavior",
+  "native_gate": "native_contract",
+  "pass_predicates": {
+    "llvm_verify": "opt -passes=verify returns 0 on the final candidate",
+    "entrypoint": "llvm-nm reports the configured public entrypoint as externally visible and defined",
+    "bundle_link": "the finalization bundle creates a non-empty executable and records its SHA-256",
+    "behavior": "all registered valid-domain executions match the reference observation tuple with zero mismatch, zero inconclusive and no early stop",
+    "native_contract": "the strict final native-contract reporter returns zero violations",
+    "native_compile": "the final IR links as an executable without the McSema compatibility runtime"
+  },
+  "authority_classes": {
+    "certified": "every certification gate passes",
+    "validated_compat": "all structural gates and the behavioral gate pass, but one or more native gates do not pass",
+    "evidence_only": "the candidate passes LLVM verification but lacks complete behavioral or structural authority",
+    "rejected": "no trustworthy candidate is publishable"
+  }
+}
