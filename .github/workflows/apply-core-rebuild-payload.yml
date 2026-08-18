@@ -28,6 +28,9 @@ jobs:
           cat .github/core-payload/part* | base64 -d > /tmp/core-rebuild-update.tar.gz
           echo "6f976c6ad113758f0dde9bf2997c37b3e26d035a5b9a03cc045e5deee9e0da7a  /tmp/core-rebuild-update.tar.gz" | sha256sum -c -
           tar -xzf /tmp/core-rebuild-update.tar.gz
+          # GITHUB_TOKEN cannot alter workflow files. Keep the source update
+          # separate; the connector updates CI in a following commit.
+          git checkout -- .github/workflows/core-brightening-build.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
