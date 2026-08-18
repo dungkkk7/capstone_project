@@ -1,19 +1,12 @@
 name: apply-core-rebuild-payload
 
 on:
-  push:
-    branches:
-      - agent/core-brightening-rebuild
   pull_request:
     branches:
       - master
 
 permissions:
   contents: write
-
-concurrency:
-  group: apply-core-rebuild-payload
-  cancel-in-progress: true
 
 jobs:
   apply:
