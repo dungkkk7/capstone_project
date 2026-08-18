@@ -1,6 +1,7 @@
 #include "BrightenTypeReconstructionPass.h"
 #include "TypeReconstructionContext.h"
 
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -153,8 +154,8 @@ bool VerifyReconstruction(TypeReconstructionContext &Ctx) {
   if (verifyModule(Ctx.M, &OS)) {
     Ctx.Report.VerificationFailures++;
     OS.flush();
-    report_fatal_error("brighten type reconstruction produced invalid IR: " +
-                       Error);
+    report_fatal_error(
+        Twine("brighten type reconstruction produced invalid IR: ") + Error);
   }
   return true;
 }
