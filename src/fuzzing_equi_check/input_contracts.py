@@ -203,8 +203,11 @@ def _custom_manifest_paths(project_root: str) -> List[Path]:
     separately so their denominators and contamination claims cannot be mixed.
     """
 
-    root = Path(project_root) / "data" / "input_contracts"
-    return [root / "custom_dataset.json", root / "own_dataset.json"]
+    project = Path(project_root)
+    return [
+        project / "data" / "input_contracts" / "custom_dataset.json",
+        project / "custom_dataset" / "input_contracts" / "dataset.json",
+    ]
 
 
 def _load_manifest(path: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:

@@ -25,9 +25,9 @@ class VertexEndpointTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = RecoveryConfig()
 
-        self.assertEqual(config.model, "gemini-3.5-flash")
+        self.assertEqual(config.model, "ag/gemini-3-flash-agent")
         self.assertEqual(config.location, "global")
-        self.assertEqual(config.thinking_level, "LOW")
+        self.assertIsNone(config.thinking_level)
         self.assertEqual(
             _vertex_api_base_url(config.location),
             "https://aiplatform.googleapis.com",
@@ -37,7 +37,7 @@ class VertexEndpointTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             generation_config = _vertex_generation_config(RecoveryConfig())
 
-        self.assertEqual(generation_config["thinkingConfig"], {"thinkingLevel": "LOW"})
+        self.assertNotIn("thinkingConfig", generation_config)
         self.assertEqual(generation_config["maxOutputTokens"], 65535)
 
     def test_invalid_thinking_level_is_rejected(self):
@@ -89,7 +89,7 @@ class VertexEndpointTests(unittest.TestCase):
 
         requests_module = types.SimpleNamespace(post=post)
         client = VertexGemini(
-            RecoveryConfig(project="test-project", use_file_api=False)
+            RecoveryConfig(project="test-project", use_file_api=False, api_key=None)
         )
         with patch.dict(sys.modules, {"requests": requests_module}), patch(
             "llm_recovery.llm_recovery._load_adc_credentials",

@@ -1,4 +1,4 @@
-"""Deterministic program-level assembly export for B2/B3.
+"""Deterministic program-level assembly export for B2.
 
 LLM4Decompile-End disassembles binaries with ``objdump -d``, removes the raw
 machine-code byte column and comments, and wraps the remaining AT&T assembly
@@ -93,7 +93,7 @@ def export_program_assembly(
     forbidden = ("_brightened", "_final", "_ref.bin", "recovered")
     if any(token in target.name.lower() for token in forbidden):
         raise AssemblyBaselineError(
-            f"B2/B3 must disassemble the original obfuscated ELF: {target.name}"
+            f"B2 must disassemble the original obfuscated ELF: {target.name}"
         )
 
     executable = Path(objdump).resolve()
@@ -127,8 +127,15 @@ def export_program_assembly(
             f"objdump failed with exit={process.returncode}; see {stderr_path}"
         )
     assembly = clean_objdump_program(process.stdout or "")
-    if "<main>:" not in assembly:
-        raise AssemblyBaselineError("Program assembly contains no <main> function")
+    # The evaluation corpus contains stripped ELF files.  Their entry code is
+    # emitted as `<.text>` rather than `<main>`, so requiring a symbol named
+    # main rejects valid program-level assembly before the model sees it.
+    has_function_block = any(
+        line.startswith("<") and line.endswith(":")
+        for line in assembly.splitlines()
+    )
+    if not has_function_block:
+        raise AssemblyBaselineError("Program assembly contains no disassembled text block")
     assembly_path.write_text(assembly, encoding="utf-8")
 
     manifest = {

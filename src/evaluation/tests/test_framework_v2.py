@@ -110,22 +110,15 @@ def test_canonical_metric_formulas_and_na_behavior():
     assert reduction(0, 0) is None
 
 
-def test_full_first_flow_layout_and_legacy_contract_detection(tmp_path: Path):
+def test_five_flow_layout_and_legacy_contract_detection(tmp_path: Path):
     expected = {
-        "F1": ("FULL", False, True, True, True),
-        "F2": ("NO_ERROR_CONTEXT", False, True, True, False),
-        "F3": ("NO_PSEUDOCODE", False, True, False, True),
-        "F4": ("NO_DIRECT_CLEAN_IR", False, False, True, True),
-        "F5": ("RAW_IR_BASELINE", True, False, False, True),
-        "F6": (
-            "RAW_IR_NO_ERROR_CONTEXT_DERIVED",
-            True,
-            False,
-            False,
-            False,
-        ),
+        "B1": ("GHIDRA_PSEUDOCODE_ONESHOT", False, False, True, False),
+        "B2": ("OBJDUMP_ASSEMBLY_ONESHOT", False, False, False, False),
+        "F1": ("CLEAN_IR_ITERATIVE", False, True, False, True),
+        "F2": ("RAW_IR_ITERATIVE", True, False, False, True),
+        "F3": ("CLEAN_IR_ONESHOT", False, True, False, False),
     }
-    assert tuple(FLOW_SPECS) == ("B1", "B2", "B3", *FLOW_ORDER)
+    assert tuple(FLOW_SPECS) == FLOW_ORDER == ("B1", "B2", "F1", "F2", "F3")
     assert LEGACY_TO_CURRENT_FLOW_ID == {
         "F2": "F1",
         "F5": "F2",
@@ -142,14 +135,11 @@ def test_full_first_flow_layout_and_legacy_contract_detection(tmp_path: Path):
             spec.iterative,
         )
         for flow_id, spec in FLOW_SPECS.items()
-        if flow_id.startswith("F")
     } == expected
     assert FLOW_SPECS["B1"].requires_pseudocode
-    assert FLOW_SPECS["B1"].iterative
+    assert not FLOW_SPECS["B1"].iterative
     assert FLOW_SPECS["B2"].requires_assembly
     assert not FLOW_SPECS["B2"].iterative
-    assert FLOW_SPECS["B3"].requires_assembly
-    assert FLOW_SPECS["B3"].iterative
 
     legacy_dir = tmp_path / "legacy" / "F5"
     legacy_dir.mkdir(parents=True)
@@ -162,6 +152,14 @@ def test_full_first_flow_layout_and_legacy_contract_detection(tmp_path: Path):
         encoding="utf-8",
     )
     assert _artifact_flow_spec(current_dir, "F2") == FLOW_SPECS["F2"]
+
+    b2_dir = tmp_path / "current" / "B2"
+    b2_dir.mkdir(parents=True)
+    (b2_dir / "flow_contract.json").write_text(
+        json.dumps(flow_contract(FLOW_SPECS["B2"])),
+        encoding="utf-8",
+    )
+    assert _artifact_flow_spec(b2_dir, "B2") == FLOW_SPECS["B2"]
 
 
 def make_run(sample: str, flow: str, **overrides):
@@ -253,16 +251,16 @@ def make_run(sample: str, flow: str, **overrides):
 
 
 def test_one_shot_f2_na_and_validation_behavior():
-    valid = make_run("p1", "F2")
+    valid = make_run("p1", "B1")
     assert not [item for item in validate_run(valid) if item["severity"] == "ERROR"]
-    invalid = make_run("p2", "F2", llm_calls=2)
+    invalid = make_run("p2", "B1", llm_calls=2)
     errors = validate_run(invalid)
     assert any(
         item["violated_rule"] == "RULE_1_ONESHOT_CONTRACT"
         for item in errors
     )
     rows = aggregate_flows([valid, invalid], errors, [])
-    f2 = next(row for row in rows if row["flow_id"] == "F2")
+    f2 = next(row for row in rows if row["flow_id"] == "B1")
     assert f2["eligible_sample_count"] == 1
     assert f2["compilation_repair_gain_pp"] is None
     assert f2["semantic_repair_success_rate_percent"] is None
@@ -274,14 +272,14 @@ def test_paired_alignment_and_exclusion_reason():
         make_run("p1", "F1"),
         make_run("p1", "F2"),
         make_run("p2", "F1"),
-        make_run("p2", "F2", llm_calls=2),
+        make_run("p2", "F2", final_counterexample_found=True),
     ]
     errors = validate_runs(runs)
     comparisons, tests = paired_analysis(runs, errors)
     row = next(
         item
         for item in comparisons
-        if item["contrast_id"] == "F1_VS_F2_ERROR_CONTEXT"
+        if item["contrast_id"] == "F1_VS_F2_CLEAN_IR_VS_RAW_IR"
         and item["metric_name"] == "Canonical E2E Rate"
     )
     assert row["paired_sample_count"] == 1
@@ -293,7 +291,7 @@ def test_paired_alignment_and_exclusion_reason():
 def test_middle_candidate_compile_success_is_monotonic():
     run = make_run(
         "p1",
-        "F3",
+        "F1",
         compile_success_first=False,
         any_compile_success_within_budget=True,
         last_candidate_compile_success=False,
@@ -302,24 +300,24 @@ def test_middle_candidate_compile_success_is_monotonic():
         compile_repair_success=True,
     )
     rows = aggregate_flows([run], [], [])
-    f3 = next(row for row in rows if row["flow_id"] == "F3")
-    assert f3["first_pass_rsr_percent"] == 0.0
-    assert f3["final_rsr_percent"] == 100.0
-    assert f3["compilation_repair_gain_pp"] == 100.0
-    assert f3["compilation_repair_success_rate_percent"] == 100.0
+    f1 = next(row for row in rows if row["flow_id"] == "F1")
+    assert f1["first_pass_rsr_percent"] == 0.0
+    assert f1["final_rsr_percent"] == 100.0
+    assert f1["compilation_repair_gain_pp"] == 100.0
+    assert f1["compilation_repair_success_rate_percent"] == 100.0
 
 
 def test_reexecutability_does_not_require_semantic_pass():
     run = make_run(
         "p1",
-        "F4",
+        "F3",
         status="FAIL_BEHAVIORAL",
         canonical_e2e_success=False,
         re_executability_success=True,
         final_behavioral_pass=False,
         fuzz_mismatches=1,
     )
-    row = next(item for item in aggregate_flows([run], [], []) if item["flow_id"] == "F4")
+    row = next(item for item in aggregate_flows([run], [], []) if item["flow_id"] == "F3")
     assert row["re_executability_success_count"] == 1
     assert row["re_executability_rate_percent"] == 100.0
     assert row["canonical_e2e_success_count"] == 0

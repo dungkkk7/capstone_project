@@ -1,5 +1,9 @@
 # Kết quả cuối của năm flow và đúc kết từ toàn bộ quá trình
 
+> **Historical snapshot, not the active taxonomy.** The `F3-O1/O2/O3` labels
+> below belong to an older optimizer ablation. The active five-flow protocol is
+> `B1/B2/F1/F2/F3` as defined in [`research-evaluation-protocol.md`](research-evaluation-protocol.md).
+
 > **Superseded:** đây là snapshot trước khi thêm raw-assembly B2/B3. Kết quả
 > authoritative hiện tại là `docs/seven-treatment-analysis.md`; chi tiết
 > O1/O2/O3 trên IR là `docs/optimization-ir-boundary-analysis.md`.

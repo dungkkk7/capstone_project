@@ -1,0 +1,112 @@
+{
+  "assembly_prompt": {
+    "after": "\n# What is the source code?\n",
+    "before": "# This is the assembly code:\n",
+    "official_repository": "https://github.com/albertan017/LLM4Decompile",
+    "source": "https://arxiv.org/abs/2403.05286v3",
+    "source_section": "4.1.1",
+    "system_instruction": null
+  },
+  "campaign_id": "fiveflow_20260821_111438",
+  "dataset": "/home/dungbv/clau/data/custom_dataset.csv",
+  "dataset_sha256": "5ae4f079df131e251a7f0c27ecd5bf82ac868a776a9085551e940ec441d0a691",
+  "executed_flows": [
+    "B1",
+    "B2",
+    "FL1",
+    "FL2",
+    "FL3"
+  ],
+  "flow_order": [
+    "B1",
+    "B2",
+    "FL1",
+    "FL2",
+    "FL3"
+  ],
+  "flows": {
+    "B1": {
+      "behavioral_feedback": false,
+      "compiler_feedback": false,
+      "contribution_role": "Ghidra one-shot baseline",
+      "flow_id": "B1",
+      "model_input": "program-level Ghidra pseudocode from the original obfuscated ELF",
+      "name": "GHIDRA_PSEUDOCODE_ONESHOT",
+      "provider_call_budget": 1
+    },
+    "B2": {
+      "behavioral_feedback": false,
+      "compiler_feedback": false,
+      "contribution_role": "assembly one-shot baseline",
+      "flow_id": "B2",
+      "model_input": "program-level cleaned objdump assembly from the original obfuscated ELF",
+      "name": "OBJDUMP_ASSEMBLY_ONESHOT",
+      "provider_call_budget": 1
+    },
+    "FL1": {
+      "behavioral_feedback": true,
+      "compiler_feedback": true,
+      "contribution_role": "Clean IR with iterative LLM recovery",
+      "flow_id": "FL1",
+      "model_input": "Clean IR produced by the custom lifting and deobfuscation pipeline",
+      "name": "CLEAN_IR_ITERATIVE_LLM",
+      "provider_call_budget": 5
+    },
+    "FL2": {
+      "behavioral_feedback": true,
+      "compiler_feedback": true,
+      "contribution_role": "Raw IR with iterative LLM recovery",
+      "flow_id": "FL2",
+      "model_input": "Raw lifted LLVM IR before custom deobfuscation",
+      "name": "RAW_IR_ITERATIVE_LLM",
+      "provider_call_budget": 5
+    },
+    "FL3": {
+      "behavioral_feedback": false,
+      "compiler_feedback": false,
+      "contribution_role": "Clean IR pipeline without LLM recovery",
+      "flow_id": "FL3",
+      "model_input": "Clean IR and executable produced by the deterministic custom pipeline",
+      "name": "CLEAN_IR_NO_LLM",
+      "provider_call_budget": 0
+    }
+  },
+  "fuzz_iterations": 1000,
+  "generation_config": {
+    "candidate_count": 1,
+    "max_output_tokens": 8192,
+    "temperature": 0.05,
+    "top_p": 0.9
+  },
+  "ghidra_headless": "/opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless",
+  "ghidra_prompt": {
+    "instruction": "Generate linux compilable C/C++ code of the main and other functions in the supplied snippet without using goto, fix any missing headers. Do not explain anything.",
+    "instruction_sha256": "236005f155c0542448ccb0d1d79376423ec004be9bd9a2b8a0dfeeec022fe65a",
+    "serialization": "instruction + two LF bytes + raw Ghidra export",
+    "source": "https://arxiv.org/abs/2403.05286v3",
+    "source_section": "4.2.1",
+    "system_instruction": null
+  },
+  "git": {
+    "commit": "1c43bfe9d5d7f6c59503ca46cc29848a000851d7",
+    "worktree_dirty": true
+  },
+  "implementation_sha256": {
+    "configs/prompts_config.py": "3ff94cb31103842efa6a26ea98cd18843424d1c8c96e96c12a79cbe472924df9",
+    "src/evaluation/assembly_baseline.py": "1d1bde39c69542feda6e69b9ccea30962351e6f6fdda9122150cb3cf68534b43",
+    "src/evaluation/five_flow_protocol.py": "7ec64e263e60cf9a0496d8ac256d4b797f06d8fded6471381db5ab4500b296f2",
+    "src/evaluation/ghidra/ExportProgramDecomp.java": "68ffddf430da23a0f37297d18efc4d6324d63bcf65c9d02d6e9ebc076e1dc013",
+    "src/evaluation/ghidra_baseline.py": "4340ad78f1894598b20fc08e40679dfd3cdf61ed4a0a754ceb42c986d16280fb",
+    "src/evaluation/run_experiment.py": "fd89946d5672862e9780cade301da3ace584607829990f43107f16623226d225",
+    "src/evaluation/run_five_flow_experiment.py": "471cfce791455d98d55370c69fe4d1953b3a27b4f454bb672ac8b83fdc038a43",
+    "src/evaluation/schema.py": "38291ab232534a33dd165ad920ed86708293a5e720bb13bbc49f4f5d975efff6",
+    "src/llm_recovery/llm_recovery.py": "dcacee32f23d867e3ca6efa5f511bc68c02001d592f58a831fa0780864eafdec",
+    "src/llvm_pass/brighten_100_delift_bundle/run_brighten_delift_pipeline.sh": "3b9a6a9a1e60d197832ace66209afd54e34f6d9b3bc8c257d80877e3eb049353",
+    "src/llvm_pass/britening_ir.py": "bd3a4797009620519c141d3988f23be2836f017653c04056e5680b80f9d96af6"
+  },
+  "location": "us-central1",
+  "model": "ag/gemini-3-flash-agent",
+  "objdump": "/usr/bin/x86_64-linux-gnu-objdump",
+  "pipeline_llvm_optimization_level": "O3",
+  "protocol_version": "five-flow-b1-b2-fl1-fl2-fl3-v1"
+}

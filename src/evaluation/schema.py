@@ -13,10 +13,10 @@ from typing import Any, Optional
 
 
 SCHEMA_VERSION = "2.0"
-FLOW_LAYOUT_VERSION = "full-first-v1"
+FLOW_LAYOUT_VERSION = "five-flow-b1-b2-f1-f2-f3-v3"
 LEGACY_FLOW_LAYOUT_VERSION = "legacy-full-at-f2-v1"
-ARTIFACT_FLOW_ORDER = ("F1", "F2", "F3", "F4", "F5")
-FLOW_ORDER = (*ARTIFACT_FLOW_ORDER, "F6")
+FLOW_ORDER = ("B1", "B2", "F1", "F2", "F3")
+ARTIFACT_FLOW_ORDER = FLOW_ORDER
 FINAL_STATUSES = (
     "PASS",
     "FAIL_PREPROCESSING",
@@ -37,16 +37,18 @@ class FlowSpec:
     requires_pseudocode: bool
     iterative: bool
     requires_assembly: bool = False
+    optimization_level: Optional[str] = None
+    llm_enabled: bool = True
 
 
 FLOW_SPECS = {
     "B1": FlowSpec(
         "B1",
-        "GHIDRA_PSEUDOCODE_ITERATIVE",
+        "GHIDRA_PSEUDOCODE_ONESHOT",
         False,
         False,
         True,
-        True,
+        False,
     ),
     "B2": FlowSpec(
         "B2",
@@ -57,53 +59,27 @@ FLOW_SPECS = {
         False,
         requires_assembly=True,
     ),
-    "B3": FlowSpec(
-        "B3",
-        "OBJDUMP_ASSEMBLY_ITERATIVE",
-        False,
-        False,
-        False,
-        True,
-        requires_assembly=True,
-    ),
     "F1": FlowSpec(
         "F1",
-        "FULL",
+        "CLEAN_IR_ITERATIVE",
         False,
         True,
-        True,
+        False,
         True,
     ),
     "F2": FlowSpec(
         "F2",
-        "NO_ERROR_CONTEXT",
-        False,
-        True,
-        True,
-        False,
-    ),
-    "F3": FlowSpec("F3", "NO_PSEUDOCODE", False, True, False, True),
-    "F4": FlowSpec(
-        "F4",
-        "NO_DIRECT_CLEAN_IR",
-        False,
-        False,
-        True,
-        True,
-    ),
-    "F5": FlowSpec(
-        "F5",
-        "RAW_IR_BASELINE",
+        "RAW_IR_ITERATIVE",
         True,
         False,
         False,
         True,
     ),
-    "F6": FlowSpec(
-        "F6",
-        "RAW_IR_NO_ERROR_CONTEXT_DERIVED",
-        True,
+    "F3": FlowSpec(
+        "F3",
+        "CLEAN_IR_ONESHOT",
         False,
+        True,
         False,
         False,
     ),
@@ -151,6 +127,8 @@ def flow_contract(spec: FlowSpec) -> dict[str, Any]:
         "requires_clean_ir": spec.requires_clean_ir,
         "requires_pseudocode": spec.requires_pseudocode,
         "requires_assembly": spec.requires_assembly,
+        "optimization_level": spec.optimization_level,
+        "llm_enabled": spec.llm_enabled,
         "error_context_enabled": spec.iterative,
         "iterative": spec.iterative,
     }

@@ -15,9 +15,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASET = ROOT / "data" / "own_dataset"
-CSV_PATH = ROOT / "data" / "own_dataset.csv"
-MANIFEST_PATH = DATASET / "manifest.json"
+DATA_ROOT = ROOT / "custom_dataset"
+CSV_PATH = DATA_ROOT / "dataset.csv"
+MANIFEST_PATH = DATA_ROOT / "manifest.json"
+BUILD_MANIFEST_PATH = DATA_ROOT / "build_manifest.json"
 PLUGIN_ROOT = ROOT / "tools" / "own_obfuscator"
 DEFAULT_PLUGIN = PLUGIN_ROOT / "build" / "libOwnObfuscator.so"
 PASS_PIPELINE = "function(reg2mem,own-instsub,own-fla,own-bcf),verify"
@@ -77,14 +78,16 @@ def category_for(case_id: str) -> str:
 
 
 def discover_cases() -> list[dict[str, str]]:
-    sources = sorted((DATASET / "src").glob("h[0-9][0-9][0-9][0-9][0-9]/*.c"))
+    sources = sorted(
+        (DATA_ROOT / "clean_src").glob("h[0-9][0-9][0-9][0-9][0-9]/*.c")
+    )
     if len(sources) != 40:
         raise SystemExit(f"own_dataset must contain exactly 40 C sources, found {len(sources)}")
     discovered = []
     for source in sources:
         case_id = source.parent.name
         submission_id = source.stem
-        seed = DATASET / "seeds" / case_id / f"{case_id}_seed.txt"
+        seed = DATA_ROOT / "seeds" / case_id / f"{case_id}_seed.txt"
         if not seed.is_file():
             raise SystemExit(f"missing seed: {seed}")
         discovered.append(
@@ -92,8 +95,8 @@ def discover_cases() -> list[dict[str, str]]:
                 "case_id": case_id,
                 "submission_id": submission_id,
                 "category": category_for(case_id),
-                "source": str(source.relative_to(DATASET)),
-                "seed": str(seed.relative_to(DATASET)),
+                "source": str(source.relative_to(DATA_ROOT)),
+                "seed": str(seed.relative_to(DATA_ROOT)),
             }
         )
     if len({case["submission_id"] for case in discovered}) != 40:
@@ -102,7 +105,7 @@ def discover_cases() -> list[dict[str, str]]:
 
 
 def compile_plain(case: dict[str, str], compiler: str, output: Path) -> list[str]:
-    source = DATASET / case["source"]
+    source = DATA_ROOT / case["source"]
     command = [
         compiler,
         "-std=c11",
@@ -129,8 +132,8 @@ def refresh_manifest(compiler: str) -> dict:
     with tempfile.TemporaryDirectory(prefix="own-dataset-freeze-") as temporary:
         temporary_root = Path(temporary)
         for case in cases:
-            source = DATASET / case["source"]
-            seed = DATASET / case["seed"]
+            source = DATA_ROOT / case["source"]
+            seed = DATA_ROOT / case["seed"]
             plain = temporary_root / case["case_id"]
             compile_plain(case, compiler, plain)
             oracle = execute_oracle(plain, seed)
@@ -178,7 +181,7 @@ def refresh_manifest(compiler: str) -> dict:
     os.replace(temporary, MANIFEST_PATH)
 
     with CSV_PATH.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(
             [
                 "submission_id",
@@ -195,8 +198,8 @@ def refresh_manifest(compiler: str) -> dict:
                     case["submission_id"],
                     "",
                     "",
-                    f"data/own_dataset/{case['source']}",
-                    "data/own_dataset/obfuscated/"
+                    f"custom_dataset/{case['source']}",
+                    "custom_dataset/obfuscated/"
                     f"{case['case_id']}/{case['submission_id']}_fla_bcf_instsub.elf",
                     "own_v1",
                 ]
@@ -241,7 +244,7 @@ def build_obfuscated(
     plugin: Path,
     temporary_root: Path,
 ) -> tuple[Path, dict[str, object]]:
-    source = DATASET / case["source"]
+    source = DATA_ROOT / case["source"]
     raw_bc = temporary_root / f"{case['case_id']}.raw.bc"
     obfuscated_bc = temporary_root / f"{case['case_id']}.obf.bc"
     obfuscated_ll = temporary_root / f"{case['case_id']}.obf.ll"
@@ -326,8 +329,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="own-dataset-build-") as temporary:
         temporary_root = Path(temporary)
         for case in cases:
-            source = DATASET / case["source"]
-            seed = DATASET / case["seed"]
+            source = DATA_ROOT / case["source"]
+            seed = DATA_ROOT / case["seed"]
             if digest(source) != case["source_sha256"]:
                 raise SystemExit(f"source hash drift: {case['case_id']}")
             if digest(seed) != case["seed_sha256"]:
@@ -367,7 +370,7 @@ def main() -> int:
                     raise SystemExit(f"obfuscated semantic mismatch: {case['case_id']}")
                 if digest(linked) == digest(plain):
                     raise SystemExit(f"obfuscated binary equals plain binary: {case['case_id']}")
-                output = DATASET / "obfuscated" / case["case_id"] / (
+                output = DATA_ROOT / "obfuscated" / case["case_id"] / (
                     case["submission_id"] + "_fla_bcf_instsub.elf"
                 )
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -390,7 +393,7 @@ def main() -> int:
         "dataset_manifest_sha256": digest(MANIFEST_PATH),
         "dataset_csv_sha256": digest(CSV_PATH),
         "input_contract_sha256": digest(
-            ROOT / "data" / "input_contracts" / "own_dataset.json"
+            DATA_ROOT / "input_contracts" / "dataset.json"
         ),
         "builder_sha256": digest(Path(__file__).resolve()),
         "compiler": args.compiler,
@@ -406,7 +409,7 @@ def main() -> int:
         "cases": build_records,
     }
     if not args.plain_only:
-        output = DATASET / "build_manifest.json"
+        output = BUILD_MANIFEST_PATH
         pending = output.with_suffix(".json.tmp")
         pending.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         os.replace(pending, output)

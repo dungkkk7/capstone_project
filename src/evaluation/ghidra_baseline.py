@@ -1,4 +1,4 @@
-"""Build and validate B0's Ghidra-only representation."""
+"""Build and validate B1's Ghidra-only representation."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 DEFAULT_GHIDRA_HEADLESS = "/opt/ghidra_12.0.4_PUBLIC/support/analyzeHeadless"
-BUILDER_VERSION = "b0-ghidra-original-program-v1"
+BUILDER_VERSION = "b1-ghidra-original-program-v1"
 
 
 class GhidraBaselineError(RuntimeError):
@@ -47,17 +47,17 @@ def export_program_pseudocode(
     ghidra_headless: str | os.PathLike[str] = DEFAULT_GHIDRA_HEADLESS,
     timeout_seconds: float = 600,
 ) -> Path:
-    """Decompile the original ELF and persist an auditable B0 manifest."""
+    """Decompile the original ELF and persist an auditable B1 manifest."""
 
     target = Path(original_obfuscated_elf).resolve()
     if not target.is_file():
-        raise GhidraBaselineError(f"B0 input ELF does not exist: {target}")
+        raise GhidraBaselineError(f"B1 input ELF does not exist: {target}")
     if target.read_bytes()[:4] != b"\x7fELF":
-        raise GhidraBaselineError(f"B0 input is not an ELF binary: {target}")
+        raise GhidraBaselineError(f"B1 input is not an ELF binary: {target}")
     forbidden = ("_brightened", "_final", "_ref.bin", "recovered")
     if any(token in target.name.lower() for token in forbidden):
         raise GhidraBaselineError(
-            f"B0 must decompile the original obfuscated ELF, got: {target.name}"
+            f"B1 must decompile the original obfuscated ELF, got: {target.name}"
         )
 
     ghidra = Path(ghidra_headless).resolve()
@@ -76,7 +76,7 @@ def export_program_pseudocode(
         command = [
             str(ghidra),
             project,
-            "b0_project",
+            "b1_project",
             "-import",
             str(target),
             "-overwrite",

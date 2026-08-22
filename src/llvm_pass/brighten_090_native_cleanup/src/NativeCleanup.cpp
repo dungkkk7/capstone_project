@@ -2511,6 +2511,7 @@ static bool containsProvenNativePointerInteger(
 static unsigned forwardProvenNativeFramePointerIntegerLoads(Module &M,
                                                             bool &Changed) {
   SmallVector<std::pair<LoadInst *, Value *>, 32> Work;
+  SmallPtrSet<LoadInst *, 32> CandidateLoads;
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -2520,8 +2521,10 @@ static unsigned forwardProvenNativeFramePointerIntegerLoads(Module &M,
           SmallPtrSet<Value *, 32> Seen;
           Value *Stored = nullptr;
           if (isProvenNativeFramePointerIntegerLoad(Load, Seen, &Stored) &&
-              Stored && Stored->getType() == Load->getType())
+              Stored && Stored->getType() == Load->getType()) {
             Work.push_back({Load, Stored});
+            CandidateLoads.insert(Load);
+          }
         }
   }
 
@@ -2532,6 +2535,13 @@ static unsigned forwardProvenNativeFramePointerIntegerLoads(Module &M,
   // load's remaining users before that producer is erased.
   for (auto [Load, Stored] : reverse(Work)) {
     if (!Load->getParent())
+      continue;
+    // A cyclic/reload chain can make the proven source another candidate in
+    // this same batch.  Do not erase either side while the other still owns
+    // the source graph; leaving this optional forwarding undone is safe, and
+    // avoids dangling load operands in later provenance checks.
+    if (auto *StoredLoad = dyn_cast<LoadInst>(Stored);
+        StoredLoad && CandidateLoads.contains(StoredLoad))
       continue;
     Load->replaceAllUsesWith(Stored);
     Load->eraseFromParent();
@@ -2578,8 +2588,15 @@ static PtrToIntInst *findExactAffinePointerAnchor(Value *V,
 }
 
 static bool containsAnyPtrToInt(Value *V, SmallPtrSetImpl<Value *> &Seen,
-                                unsigned Depth = 0) {
-  if (!V || Depth > 12 || !Seen.insert(V).second)
+                                unsigned Depth = 0,
+                                const SmallPtrSetImpl<Value *> *LiveValues =
+                                    nullptr) {
+  // Some callers run while rewriting a worklist of instructions.  A raw
+  // Value* can outlive its instruction when an earlier rewrite erases it;
+  // checking the live module set must therefore happen before any isa<> or
+  // operand access on V.
+  if (!V || Depth > 12 ||
+      (LiveValues && !LiveValues->count(V)) || !Seen.insert(V).second)
     return false;
   if (isa<PtrToIntInst>(V))
     return true;
@@ -2590,14 +2607,15 @@ static bool containsAnyPtrToInt(Value *V, SmallPtrSetImpl<Value *> &Seen,
   if (!U)
     return false;
   for (Value *Operand : U->operands())
-    if (containsAnyPtrToInt(Operand, Seen, Depth + 1))
+    if (containsAnyPtrToInt(Operand, Seen, Depth + 1, LiveValues))
       return true;
   return false;
 }
 
 static std::optional<NativeAffinePointer> materializeNativeAffinePointer(
     Value *V, IRBuilder<> &B, const DataLayout &DL,
-    DenseMap<Value *, Value *> &PointerPhiCache, unsigned Depth = 0) {
+    DenseMap<Value *, Value *> &PointerPhiCache, unsigned Depth = 0,
+    const SmallPtrSetImpl<Value *> *LiveValues = nullptr) {
   if (!V || Depth > 12 || !V->getType()->isIntegerTy())
     return std::nullopt;
   unsigned Width = V->getType()->getIntegerBitWidth();
@@ -2718,10 +2736,11 @@ static std::optional<NativeAffinePointer> materializeNativeAffinePointer(
       continue;
     Value *Other = BO->getOperand(1 - CarrierSide);
     SmallPtrSet<Value *, 16> OtherSeen;
-    if (containsAnyPtrToInt(Other, OtherSeen))
+    if (containsAnyPtrToInt(Other, OtherSeen, 0, LiveValues))
       continue;
     auto Affine = materializeNativeAffinePointer(
-        BO->getOperand(CarrierSide), B, DL, PointerPhiCache, Depth + 1);
+        BO->getOperand(CarrierSide), B, DL, PointerPhiCache, Depth + 1,
+        LiveValues);
     if (!Affine)
       continue;
     bool Subtract = BO->getOpcode() == Instruction::Sub;
@@ -2763,8 +2782,27 @@ static unsigned lowerNativeAffinePointerRoundTrips(Module &M,
           if (auto *ITP = dyn_cast<IntToPtrInst>(&I))
             Work.push_back(ITP);
 
+  // This is an opportunistic peephole, not a prerequisite for native
+  // cleanup.  Large lifted dispatcher graphs have too many interacting
+  // pointer carriers for a bounded local rewrite; refusing them preserves
+  // the original IR and avoids perturbing later post-frame passes.
+  if (Work.size() > 128)
+    return 0;
+
   DenseMap<Value *, Value *> PointerPhiCache;
   unsigned Lowered = 0;
+  SmallVector<IntToPtrInst *, 64> EraseAfterSweep;
+  SmallPtrSet<Value *, 32> LiveValues;
+  for (GlobalVariable &GV : M.globals())
+    LiveValues.insert(&GV);
+  for (Function &F : M) {
+    LiveValues.insert(&F);
+    for (Argument &A : F.args())
+      LiveValues.insert(&A);
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        LiveValues.insert(&I);
+  }
   const DataLayout &DL = M.getDataLayout();
   // Process later consumers first: cleanup commonly has a direct inttoptr of
   // a nullable pointer-integer PHI at function exit and affine uses of that
@@ -2775,7 +2813,7 @@ static unsigned lowerNativeAffinePointerRoundTrips(Module &M,
       continue;
     IRBuilder<> B(ITP);
     auto Affine = materializeNativeAffinePointer(
-        ITP->getOperand(0), B, DL, PointerPhiCache);
+        ITP->getOperand(0), B, DL, PointerPhiCache, 0, &LiveValues);
     if (!Affine || Affine->Base->getType() != ITP->getType()) {
       if (NativeAffineDebug && ITP->hasName() &&
           ITP->getName().starts_with("native.address.fallback")) {
@@ -2793,10 +2831,17 @@ static unsigned lowerNativeAffinePointerRoundTrips(Module &M,
           Affine->NoUnsignedWrap ? GEPNoWrapFlags::noUnsignedWrap()
                                  : GEPNoWrapFlags::none());
     ITP->replaceAllUsesWith(Pointer);
-    ITP->eraseFromParent();
+    // Keep transformed instructions alive until the analysis sweep finishes.
+    // The affine matcher/cache can still reach an older work-list value while
+    // processing a later inttoptr. Erasing here leaves a dangling Value* and
+    // makes isa<> in containsAnyPtrToInt() crash on valid affine chains.
+    EraseAfterSweep.push_back(ITP);
     ++Lowered;
     Changed = true;
   }
+  for (IntToPtrInst *ITP : EraseAfterSweep)
+    if (ITP->getParent() && ITP->use_empty())
+      ITP->eraseFromParent();
   return Lowered;
 }
 
@@ -4071,7 +4116,7 @@ findGuestAddressExpression(Module &M, Value *V, IRBuilder<> &B,
   if (auto *Cast = dyn_cast<CastInst>(V))
     return findGuestAddressExpression(M, Cast->getOperand(0), B, Depth + 1);
 
-  auto *BO = dyn_cast<BinaryOperator>(V);
+    auto *BO = dyn_cast<BinaryOperator>(V);
   if (!BO || BO->getOpcode() != Instruction::Add ||
       !BO->getType()->isIntegerTy())
     return std::nullopt;
@@ -16063,6 +16108,21 @@ bool NativeCleanupPass::finalizeCompactedFrames(Module &M) {
           M.getNamedMetadata("brighten.final.frame.compacted")) {
     Marker->eraseFromParent();
     Changed = true;
+  }
+
+  unsigned IntToPtrCount = 0;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          IntToPtrCount += isa<IntToPtrInst>(&I);
+  if (IntToPtrCount > 64) {
+    // Final frame recovery is optional.  On very large lifted dispatcher
+    // graphs the interacting spill/provenance rewrites are not bounded; keep
+    // the already-valid pre-frame module and let the final cleanup/reporting
+    // passes handle it without risking a mid-pass LLVM crash.
+    errs() << "  post-frame affine recovery refused for large dispatcher graph\n";
+    return Changed;
   }
 
   unsigned NativeStackPointerABIs =

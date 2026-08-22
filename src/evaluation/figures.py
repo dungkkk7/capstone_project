@@ -235,7 +235,7 @@ def generate_figures(
             ),
         },
     )
-    manifest.append({"figure_id": "overall_performance", "caption": "Primary recovery outcomes with executable availability over all eligible samples; F6 is derived from F5's first provider call."})
+    manifest.append({"figure_id": "overall_performance", "caption": "Primary recovery outcomes with executable availability over all eligible samples."})
 
     fig, axes = plt.subplots(1, 3, figsize=(11.5, 4.2))
     x = np.arange(len(FLOW_ORDER))
@@ -360,9 +360,14 @@ def generate_figures(
     # Direct matched-evidence view for the iterative-feedback ablation. This
     # uses the common all-eligible re-executability denominator instead of mixing
     # behavioral-campaign counts or conditional pass rates.
-    feedback_pairs = (
-        ("Clean IR + LLVM2C", "F2", "F1"),
-        ("Raw IR", "F6", "F5"),
+    feedback_pair_candidates = (
+        ("Clean IR", "F3", "F1"),
+    )
+    # The active protocol contains a Clean-IR one-shot/iterative pair. There is
+    # no raw-IR one-shot arm, so do not synthesize one from historical IDs.
+    feedback_pairs = tuple(
+        pair for pair in feedback_pair_candidates
+        if pair[1] in lookup and pair[2] in lookup
     )
     fig, ax = plt.subplots(figsize=(7.2, 4.2))
     y_positions = np.arange(len(feedback_pairs))[::-1]

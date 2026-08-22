@@ -2215,9 +2215,17 @@ def _vertex_generation_config(config: RecoveryConfig) -> Dict[str, Any]:
         generation_config["responseMimeType"] = "application/json"
         generation_config["responseSchema"] = _recovery_response_schema()
     thinking_level = _text(config.thinking_level).upper()
-    if thinking_level and ("pro" in _text(config.model).lower() or os.environ.get("LLM_RECOVERY_THINKING_LEVEL")):
+    if thinking_level:
         allowed = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
-        if thinking_level in allowed:
+        if thinking_level not in allowed:
+            raise RecoveryError(
+                "Invalid LLM_RECOVERY_THINKING_LEVEL: "
+                f"{config.thinking_level!r}; expected one of "
+                "MINIMAL, LOW, MEDIUM, HIGH"
+            )
+        if "pro" in _text(config.model).lower() or os.environ.get(
+            "LLM_RECOVERY_THINKING_LEVEL"
+        ):
             generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
     return generation_config
 

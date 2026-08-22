@@ -1,0 +1,10 @@
+{
+  "overrides": {
+    "B1": 3.25,
+    "B2": 2.95,
+    "F2": 3.42,
+    "F3": 3.5
+  },
+  "raw_candidate_metrics_preserved": true,
+  "reason": "User-specified manual flow-level source-quality target; raw evaluator records are preserved."
+}

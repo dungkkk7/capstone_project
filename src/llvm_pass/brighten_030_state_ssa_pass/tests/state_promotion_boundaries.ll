@@ -50,10 +50,12 @@ entry:
   ret ptr %memory
 }
 
-; CHECK: %state_2216 = alloca i64{{.*}}!brighten.state.offset
-; CHECK: %state_16 = alloca i64{{.*}}!brighten.state.offset
-; CHECK: %state_2312 = alloca i64{{.*}}!brighten.state.offset
-; CHECK: %state_2328 = alloca i64{{.*}}!brighten.state.offset
+; CHECK-DAG: %state_2216 = alloca i64{{.*}}!brighten.state.offset
+; XMM aliases share a 128-bit architectural cell even when this fixture
+; touches only its low 64 bits.
+; CHECK-DAG: %state_16 = alloca i128{{.*}}!brighten.state.offset
+; CHECK-DAG: %state_2312 = alloca i64{{.*}}!brighten.state.offset
+; CHECK-DAG: %state_2328 = alloca i64{{.*}}!brighten.state.offset
 ; CHECK-NOT: %state_2200 = alloca
 ; CHECK-NOT: %state_2204 = alloca
 ; CHECK: call void @native_helper(ptr %buffer)

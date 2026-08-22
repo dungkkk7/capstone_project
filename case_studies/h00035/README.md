@@ -1,5 +1,11 @@
 # Case study h00035 — hồ sơ trình bày trước hội đồng
 
+> **Historical snapshot:** the measurements below were produced by the older
+> F3-O1/O2/O3 experiment. They are retained for audit only. The active
+> taxonomy is `B1` Ghidra pseudocode one-shot, `B2` assembly one-shot, `F1`
+> Clean IR with loop, `F2` Raw IR with loop, and `F3` Clean IR one-shot; see
+> [`docs/research-evaluation-protocol.md`](../../docs/research-evaluation-protocol.md).
+
 ## 0. Một câu để mở đầu
 
 `h00035` nhận tối đa 64 đoạn số nguyên, sắp xếp rồi hợp nhất các đoạn kề nhau,
@@ -19,9 +25,9 @@ Thông điệp cần nói rõ:
 | Thành phần | Giá trị |
 |---|---|
 | Case | `h00035`, category `data_structures` |
-| Source | `data/own_dataset/src/h00035/n26081535.c` |
+| Source | `custom_dataset/clean_src/h00035/n26081535.c` |
 | Source SHA-256 | `45c311707c49c82a0d8b0b850c6c501b9b5990f3fac1af54b717e3ccfe901797` |
-| Obfuscated ELF | `data/own_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf` |
+| Obfuscated ELF | `custom_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf` |
 | ELF SHA-256 | `0389fac14b9b17a15cd5b89747764dfec59fbcc1827e781d0b9351b1cf8c92bd` |
 | Seed | `case_studies/h00035/seed.txt` |
 | Expected | `groups=5 covered=27 tail=40:41` |
@@ -408,8 +414,8 @@ research limitation riêng, không bị che bằng recovered-C behavioral score.
 
 ## 16. File nên mở khi demo
 
-1. `data/own_dataset/src/h00035/n26081535.c`
-2. `data/own_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf`
+1. `custom_dataset/clean_src/h00035/n26081535.c`
+2. `custom_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf`
 3. `result/twoflow_20260815_213257/h00035/B0/representation/ghidra_original_program.c`
 4. `result/b23_final_20260816/h00035/B2/representation/objdump_original_program.s`
 5. `result/f3_o1_final_20260815/h00035/h00035.ll`

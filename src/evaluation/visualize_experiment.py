@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
 
-from evaluation.schema import FLOW_SPECS
+from evaluation.schema import FLOW_ORDER, FLOW_SPECS
 
 # Try importing scipy.stats for McNemar / Wilcoxon tests
 try:
@@ -42,27 +42,27 @@ def set_academic_style():
     })
 
 FLOW_COLORS = {
+    'B1': '#1b9e77',
+    'B2': '#e7298a',
     'F1': '#2b5c8f',  # Slate Blue
     'F2': '#d95f02',  # Burnt Orange
     'F3': '#7570b3',  # Muted Purple
-    'F4': '#1b9e77',  # Emerald Teal
-    'F5': '#e7298a',  # Magenta Accent
 }
 
 FLOW_HATCHES = {
+    'B1': '..',
+    'B2': '||',
     'F1': '//',
     'F2': '\\\\',
     'F3': 'xx',
-    'F4': '..',
-    'F5': '||'
 }
 
 FLOW_LABELS = {
-    'F1': 'F1: Full',
-    'F2': 'F2: No Error Context',
-    'F3': 'F3: No Pseudocode',
-    'F4': 'F4: No Direct Clean IR',
-    'F5': 'F5: Raw IR Baseline',
+    'B1': 'B1: Ghidra pseudocode one-shot',
+    'B2': 'B2: objdump assembly one-shot',
+    'F1': 'F1: Clean IR iterative',
+    'F2': 'F2: Raw IR iterative',
+    'F3': 'F3: Clean IR one-shot',
 }
 
 def compute_bootstrap_ci(data_series: np.ndarray, n_bootstraps: int = 2000, ci: float = 95.0) -> Tuple[float, float, float]:
@@ -191,7 +191,7 @@ def _plot_overall_performance(df: pd.DataFrame, fig_dir: str):
     """1. Overall Performance Figure with Bootstrap 95% CIs, Hatch patterns, n=40."""
     fig, ax = plt.subplots(figsize=(6.5, 3.8))
     
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     metrics_names = ["First-pass RSR", "Final Behavioral Pass", "E2E Recovery Rate"]
     
     # Store means and CIs
@@ -260,10 +260,9 @@ def _plot_ablation_forest_plot(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(6.0, 3.2))
     
     contrasts = [
-        ("F1", "F2", "F1 vs F2: Error Context Effect"),
-        ("F1", "F3", "F1 vs F3: Pseudocode Effect"),
-        ("F1", "F4", "F1 vs F4: Direct Clean IR Effect"),
-        ("F3", "F5", "F3 vs F5: Deobfuscation Effect"),
+        ("B1", "B2", "B1 vs B2: Baseline representation"),
+        ("F1", "F2", "F1 vs F2: Clean IR vs Raw IR"),
+        ("F1", "F3", "F1 vs F3: Iterative vs one-shot"),
     ]
     
     labels = []
@@ -316,7 +315,7 @@ def _plot_cost_quality_pareto(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(6.0, 3.8))
     
     flow_stats = []
-    for f in ["F1", "F2", "F3", "F4", "F5"]:
+    for f in FLOW_ORDER:
         flow_df = df[df["flow_id"] == f]
         if flow_df.empty: continue
         mean_time = flow_df["total_runtime"].mean()
@@ -335,8 +334,8 @@ def _plot_cost_quality_pareto(df: pd.DataFrame, fig_dir: str):
         'F1': (8, -12),
         'F2': (-35, 8),
         'F3': (8, -8),
-        'F4': (8, 6),
-        'F5': (8, -12)
+        'B1': (8, 6),
+        'B2': (8, -12)
     }
     for _, row in f_df.iterrows():
         f = row["flow"]
@@ -373,7 +372,7 @@ def _plot_behavioral_metrics(df: pd.DataFrame, fig_dir: str):
     """4. Behavioral Metrics Figure with distinct naming and no population confusion."""
     fig, ax = plt.subplots(figsize=(6.5, 3.8))
     
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     f_pass, cx_ever, cx_final = [], [], []
     
     for f in flows:
@@ -481,7 +480,7 @@ def _plot_stage_completion_funnel(df: pd.DataFrame, fig_dir: str):
 def _save_summary_tables(df: pd.DataFrame, output_dir: str):
     """6. Tables with Numerator/Denominator formats, bold best values, and McNemar p-values."""
     summary_rows = []
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     
     for flow in flows:
         flow_df = df[df["flow_id"] == flow]
@@ -510,11 +509,9 @@ def _save_extra_csvs(df: pd.DataFrame, output_dir: str):
     # Paired Ablation Table with p-values
     ablation_data = []
     contrasts = [
-        ("F1", "F2", "Error Context Benefit"),
-        ("F1", "F3", "Pseudocode Benefit"),
-        ("F1", "F4", "Direct Clean IR Benefit"),
-        ("F3", "F5", "Deobfuscation Benefit"),
-        ("F1", "F5", "Full Configuration vs Raw"),
+        ("B1", "B2", "Baseline representation"),
+        ("F1", "F2", "Clean IR vs Raw IR"),
+        ("F1", "F3", "Iterative vs one-shot"),
     ]
     all_samples = set(df["sample_id"].unique())
     for fa, fb, desc in contrasts:
@@ -706,7 +703,7 @@ def _generate_report_markdown(df: pd.DataFrame, output_dir: str, experiment_id: 
 | Flow | First-pass RSR | Final RSR | Behavioral Pass Rate | Input Match Rate | E2E Recovery Rate |
 |------|----------------|-----------|----------------------|------------------|-------------------|
 """
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
+    for flow in FLOW_ORDER:
         flow_df = df[df["flow_id"] == flow]
         if flow_df.empty: continue
         count = len(flow_df)
@@ -722,7 +719,8 @@ def _generate_report_markdown(df: pd.DataFrame, output_dir: str, experiment_id: 
 ## 🔍 Paired Ablation Win/Tie/Loss Results
 
 See `ablation_comparisons.csv` for raw details. F1 vs F2 isolates the
-contribution of error context; F1 vs F5 is a multi-factor comparison.
+Clean-IR versus Raw-IR representation effect; F1 vs F3 isolates iterative
+feedback from the Clean-IR one-shot treatment.
 """
     with open(os.path.join(output_dir, "report.md"), "w") as f:
         f.write(report_content)
@@ -730,7 +728,7 @@ contribution of error context; F1 vs F5 is a multi-factor comparison.
 def _plot_main_success_rates(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     flow_grouped = df.groupby("flow_id").mean(numeric_only=True) * 100
     for flow in flows:
         flow_df = df[df["flow_id"] == flow]
@@ -764,7 +762,7 @@ def _plot_main_success_rates(df: pd.DataFrame, fig_dir: str):
 def _plot_compilation_metrics(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(6.0, 3.8))
     
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     flow_grouped = df.groupby("flow_id").mean(numeric_only=True) * 100
     plot_df = flow_grouped.reindex(flows)[["compile_success_first", "compile_success_final"]].copy()
     plot_df.columns = ["First-pass RSR", "Final RSR"]
@@ -790,7 +788,7 @@ def _plot_compilation_metrics(df: pd.DataFrame, fig_dir: str):
 
     # Compilation Repair Gain Bar Chart
     fig, ax = plt.subplots(figsize=(5.5, 3.5))
-    flows_gain = ["F1", "F2", "F3", "F4"]
+    flows_gain = list(FLOW_ORDER)
     gains = []
     for flow in flows_gain:
         flow_df = df[df["flow_id"] == flow]
@@ -822,7 +820,7 @@ def _plot_compilation_metrics(df: pd.DataFrame, fig_dir: str):
 def _plot_behavioral_metrics(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     correctness, matches, cxs_found = [], [], []
     
     for f in flows:
@@ -857,7 +855,7 @@ def _plot_behavioral_metrics(df: pd.DataFrame, fig_dir: str):
 def _plot_behavioral_repair_gain(df: pd.DataFrame, fig_dir: str):
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
     
-    flows = ["F1", "F2", "F3", "F4"]
+    flows = list(FLOW_ORDER)
     before, after = [], []
     
     for f in flows:
@@ -895,7 +893,7 @@ def _plot_cumulative_success(df: pd.DataFrame, fig_dir: str):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.8))
     rounds = np.arange(6)
     
-    for flow in ["F1", "F2", "F3", "F4"]:
+    for flow in FLOW_ORDER:
         flow_df = df[df["flow_id"] == flow]
         if flow_df.empty: continue
         first_r = flow_df["compile_success_first"].mean() * 100
@@ -909,7 +907,7 @@ def _plot_cumulative_success(df: pd.DataFrame, fig_dir: str):
     ax1.set_ylim(0, 108)
     ax1.legend(frameon=True, facecolor='white', edgecolor='#cccccc', fontsize=8)
     
-    for flow in ["F1", "F2", "F3", "F4"]:
+    for flow in FLOW_ORDER:
         flow_df = df[df["flow_id"] == flow]
         if flow_df.empty: continue
         init_pass = sum(1 for _, r in flow_df.iterrows() if r["compile_success_first"] == 1 and r.get("counterexample_ever_found", 0) == 0) / max(1, len(flow_df)) * 100.0
@@ -935,7 +933,7 @@ def _plot_cumulative_success(df: pd.DataFrame, fig_dir: str):
 def _plot_failure_breakdowns(df: pd.DataFrame, fig_dir: str):
     # final_status_breakdown
     fig, ax = plt.subplots(figsize=(8, 5))
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     
     status_counts = {flow: {"PASS": 0, "FAIL_COMPILE": 0, "FAIL_BEHAVIORAL": 0, "INCONCLUSIVE": 0} for flow in flows}
     for _, r in df.iterrows():
@@ -1009,7 +1007,7 @@ def _plot_ablation_visualizations(df: pd.DataFrame, fig_dir: str):
 def _plot_cost_quality_tradeoffs(df: pd.DataFrame, fig_dir: str):
     # Scatter plot
     fig, ax = plt.subplots(figsize=(7, 5))
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
+    for flow in FLOW_ORDER:
         flow_df = df[df["flow_id"] == flow]
         if flow_df.empty: continue
         x_val = flow_df["total_tokens"].mean()
@@ -1027,7 +1025,7 @@ def _plot_cost_quality_tradeoffs(df: pd.DataFrame, fig_dir: str):
 
     # runtime vs behavioral pass
     fig, ax = plt.subplots(figsize=(7, 5))
-    for flow in ["F1", "F2", "F3", "F4", "F5"]:
+    for flow in FLOW_ORDER:
         flow_df = df[df["flow_id"] == flow]
         if flow_df.empty: continue
         x_val = flow_df["total_runtime"].mean()
@@ -1154,14 +1152,14 @@ def _generate_figures_manifest(df: pd.DataFrame, output_dir: str):
             "metric": "RSR & E2E Pass Rate",
             "output_png": "figures/main_success_rates.png",
             "output_svg": "figures/main_success_rates.svg",
-            "flows": ["F1", "F2", "F3", "F4", "F5"]
+            "flows": list(FLOW_ORDER)
         },
         {
             "figure_id": "behavioral_metrics",
             "title": "Behavioral Correctness & Fuzzing Divergence Metrics",
             "metric": "Match & Pass Rates",
             "output_png": "figures/behavioral_metrics.png",
-            "flows": ["F1", "F2", "F3", "F4", "F5"]
+            "flows": list(FLOW_ORDER)
         }
     ]
     with open(os.path.join(output_dir, "figures_manifest.json"), "w") as f:

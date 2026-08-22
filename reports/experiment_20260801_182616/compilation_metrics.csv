@@ -1,7 +1,0 @@
-flow_id,eligible_sample_count,initial_candidate_count,first_compile_success_count,first_pass_rsr_percent,first_pass_rsr_ci_low,first_pass_rsr_ci_high,compile_success_within_budget_count,final_rsr_percent,final_rsr_ci_low,final_rsr_ci_high,compilation_repair_gain_pp,compile_repair_case_count,compile_repair_success_count,compilation_repair_success_rate_percent,compile_repair_budget_exhausted_count,compile_repair_rounds_mean,compile_repair_rounds_median,compile_repair_rounds_stddev,compile_repair_rounds_min,compile_repair_rounds_p25,compile_repair_rounds_p75,compile_repair_rounds_max,compiler_attempts_mean
-F1,40,37,37,100.0,100.0,100.0,37,100.0,100.0,100.0,0.0,0,0,,0,,,,,,,,1.275
-F2,40,31,30,96.7741935483871,90.3225806451613,100.0,30,96.7741935483871,90.3225806451613,100.0,,0,0,,0,,,,,,,,0.775
-F3,40,37,37,100.0,100.0,100.0,37,100.0,100.0,100.0,0.0,0,0,,0,,,,,,,,1.275
-F4,40,40,39,97.5,92.5,100.0,40,100.0,100.0,100.0,2.5,1,1,100.0,0,2.0,2.0,0.0,2.0,2.0,2.0,2.0,1.525
-F5,40,38,36,94.73684210526315,86.84210526315789,100.0,38,100.0,100.0,100.0,5.26315789473685,2,2,100.0,0,1.0,1.0,0.0,1.0,1.0,1.0,1.0,1.5
-F6,40,23,23,100.0,100.0,100.0,23,100.0,100.0,100.0,,0,0,,0,,,,,,,,0.575

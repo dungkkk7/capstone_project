@@ -1,0 +1,6 @@
+Flow,N,Eligible N,First-pass RSR,Final RSR@R,Program Behavioral Pass Rate,Initial Behavioral Pass Rate,Final Behavioral Pass Rate,Input Match Macro,Input Match Micro,Counterexample Detection Rate,Re-executability Rate,Compilation Repair Gain,Behavioral Repair Gain,Mean Tokens,Mean Runtime
+B1,1,1,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,0/1 (0.0%),N/A,N/A,16821,43.1s
+B2,1,1,1/1 (100.0%),1/1 (100.0%),N/A,N/A,N/A,N/A,N/A,N/A,1/1 (100.0%),N/A,N/A,16240,45.5s
+F1,1,1,1/1 (100.0%),1/1 (100.0%),N/A,N/A,N/A,N/A,N/A,N/A,1/1 (100.0%),+0.0 pp,N/A,361124,273.0s
+F2,1,1,1/1 (100.0%),1/1 (100.0%),N/A,N/A,N/A,N/A,N/A,N/A,1/1 (100.0%),+0.0 pp,N/A,696052,205.6s
+F3,1,1,1/1 (100.0%),1/1 (100.0%),N/A,N/A,N/A,N/A,N/A,N/A,1/1 (100.0%),N/A,N/A,57804,78.4s

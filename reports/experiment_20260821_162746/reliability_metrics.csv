@@ -1,0 +1,6 @@
+flow_id,fuzz_generated_count,fuzz_executed_on_both_count,fuzz_valid_count,valid_input_rate_percent,executable_pair_execution_rate_percent,counterexample_replay_count,counterexample_replay_success_count,counterexample_reproducibility_rate_percent,inconclusive_count,inconclusive_rate_percent
+B1,4000,4000,4000,100.0,100.0,0,0,,0,0.0
+B2,33043,31007,30310,91.7289592349363,93.83833187059287,338,338,100.0,0,0.0
+F1,39070,38009,37740,96.59585359610955,97.2843614026107,202,202,100.0,0,0.0
+F2,38053,37007,35512,93.32247129004283,97.25120227051744,546,546,100.0,0,0.0
+F3,35084,32008,32004,91.22106943335993,91.23247064188804,124,124,100.0,0,0.0

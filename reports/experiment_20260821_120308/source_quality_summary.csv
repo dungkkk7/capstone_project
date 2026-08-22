@@ -1,0 +1,6 @@
+Flow,Accepted,Evaluated,Coverage,Variables,Loops,Conditions,Logic flow,Structural integrity,Overall
+B1,0,0,0/0 (N/A),N/A,N/A,N/A,N/A,N/A,N/A
+B2,3,3,3/3 (100.0%),3.67,4.67,4.67,4.67,4.67,4.47
+F1,4,4,4/4 (100.0%),4.00,5.00,4.50,5.00,5.00,4.70
+F2,0,0,0/0 (N/A),N/A,N/A,N/A,N/A,N/A,N/A
+F3,3,3,3/3 (100.0%),4.00,5.00,5.00,5.00,4.67,4.73

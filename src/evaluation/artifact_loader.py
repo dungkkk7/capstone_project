@@ -94,6 +94,13 @@ def _artifact_flow_spec(flow_dir: Path, flow_id: str) -> FlowSpec:
                 contract.get("iterative"),
             )
         ),
+        requires_assembly=bool(
+            contract.get("requires_assembly", expected.requires_assembly)
+        ),
+        optimization_level=contract.get(
+            "optimization_level", expected.optimization_level
+        ),
+        llm_enabled=bool(contract.get("llm_enabled", expected.llm_enabled)),
     )
 
 
@@ -150,8 +157,6 @@ def _dataset_rows(project_root: Path) -> dict[str, dict[str, str]]:
                 match = re.search(r"(p\d+)", binary)
                 if match:
                     mapping.setdefault(match.group(1), row)
-        if mapping:
-            break
     return mapping
 
 
@@ -209,6 +214,22 @@ def _usage(meta: dict[str, Any], *keys: str) -> int | None:
     for key in keys:
         if key in usage and usage[key] is not None:
             return int(usage[key])
+    return None
+
+
+def _usage_number(meta: dict[str, Any], *keys: str) -> float | None:
+    """Read provider-supplied numeric metadata without inventing pricing."""
+
+    usage = meta.get("usage_metadata") or {}
+    for container in (meta, usage):
+        for key in keys:
+            value = container.get(key) if isinstance(container, dict) else None
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -278,7 +299,13 @@ def _attempt_records(
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "total_tokens": total_tokens,
-                    "estimated_cost": None,
+                    "estimated_cost": _usage_number(
+                        meta,
+                        "estimated_cost",
+                        "estimated_api_cost",
+                        "cost_usd",
+                        "cost",
+                    ),
                     "latency_seconds": meta.get("latency_seconds"),
                     "prompt_path": (
                         str(flow_dir / f"recovery_iter{iteration}.prompt.txt")
@@ -572,6 +599,61 @@ def _counterexample_records(
     return records
 
 
+def _strip_c_comments(text: str) -> str:
+    """Remove C/C++ comments while preserving literals and line structure."""
+
+    output: list[str] = []
+    state = "normal"
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if state == "normal":
+            if char == "/" and next_char == "*":
+                state = "block_comment"
+                output.extend((" ", " "))
+                index += 2
+                continue
+            if char == "/" and next_char == "/":
+                state = "line_comment"
+                output.extend((" ", " "))
+                index += 2
+                continue
+            output.append(char)
+            if char == '"':
+                state = "string"
+                escaped = False
+            elif char == "'":
+                state = "char"
+                escaped = False
+        elif state == "line_comment":
+            if char == "\n":
+                output.append(char)
+                state = "normal"
+            else:
+                output.append(" ")
+        elif state == "block_comment":
+            if char == "*" and next_char == "/":
+                output.extend((" ", " "))
+                state = "normal"
+                index += 2
+                continue
+            output.append("\n" if char == "\n" else " ")
+        else:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif (state == "string" and char == '"') or (
+                state == "char" and char == "'"
+            ):
+                state = "normal"
+        index += 1
+    return "".join(output)
+
+
 def _source_quality(
     original: Path | None,
     recovered: Path | None,
@@ -602,32 +684,47 @@ def _source_quality(
         "original_sloc": None,
         "recovered_sloc": None,
         "sloc_ratio": None,
+        "sloc_method": None,
     }
 
     def sloc(path: Path) -> int | None:
-        process = subprocess.run(
-            [clang_format, str(path)], capture_output=True, text=True
-        )
-        if process.returncode != 0:
+        if not path.is_file():
             return None
-        text = re.sub(r"/\*.*?\*/", "", process.stdout, flags=re.DOTALL)
-        text = re.sub(r"//.*", "", text)
+        if clang_format:
+            process = subprocess.run(
+                [clang_format, str(path)], capture_output=True, text=True
+            )
+            if process.returncode == 0:
+                text = process.stdout
+            else:
+                text = path.read_text(encoding="utf-8", errors="replace")
+        else:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        # Count non-empty source lines after removing comments.  Use a small
+        # lexical scanner so comment markers inside C strings/chars are not
+        # mistaken for comments (the common regex approach gets this wrong).
+        text = _strip_c_comments(text)
         return sum(bool(line.strip()) for line in text.splitlines())
 
     original_sloc = (
         sloc(original)
-        if clang_format and original and original.is_file()
+        if original and original.is_file()
         else None
     )
     recovered_sloc = (
         sloc(recovered)
-        if clang_format and recovered and recovered.is_file()
+        if recovered and recovered.is_file()
         else None
     )
     base.update(
         {
             "original_sloc": original_sloc,
             "recovered_sloc": recovered_sloc,
+            "sloc_method": (
+                "clang-format-nonempty-lines"
+                if clang_format
+                else "lexical-comment-stripped-nonempty-lines"
+            ),
             "sloc_ratio": (
                 recovered_sloc / original_sloc
                 if original_sloc and recovered_sloc is not None
@@ -1151,7 +1248,17 @@ def load_campaign(
         brightened_ir = sample_dir / f"{sample_id}_brightened.ll"
         sample_pseudocode_ready = any(
             path.is_file() and path.stat().st_size > 0
-            for path in sample_dir.glob("F*/clean_pseudocode.c")
+            for path in (
+                list(sample_dir.glob("*/ghidra_original_program.c"))
+                + list(sample_dir.glob("*/clean_pseudocode.c"))
+            )
+        )
+        sample_assembly_ready = any(
+            path.is_file() and path.stat().st_size > 0
+            for path in (
+                list(sample_dir.glob("*/objdump_original_program.s"))
+                + list(sample_dir.glob("*/objdump_raw.txt"))
+            )
         )
         raw_counts = _ir_counts(raw_ir)
         clean_counts = _ir_counts(clean_ir)
@@ -1338,15 +1445,35 @@ def load_campaign(
                 else None
             )
             pseudo_path = flow_dir / "clean_pseudocode.c"
+            assembly_paths = (
+                flow_dir / "objdump_original_program.s",
+                flow_dir / "objdump_raw.txt",
+            )
             raw_ready = raw_ir.is_file() and raw_ir.stat().st_size > 0
             clean_ready = clean_ir.is_file() and clean_ir.stat().st_size > 0
-            pseudo_ready = pseudo_path.is_file() and pseudo_path.stat().st_size > 0
+            pseudo_ready = (
+                pseudo_path.is_file() and pseudo_path.stat().st_size > 0
+            ) or (
+                flow_dir / "ghidra_original_program.c"
+            ).is_file() and (
+                flow_dir / "ghidra_original_program.c"
+            ).stat().st_size > 0
+            assembly_ready = any(
+                path.is_file() and path.stat().st_size > 0
+                for path in assembly_paths
+            )
             required_ready = (
                 (not required.requires_raw_ir or raw_ready)
                 and (not required.requires_clean_ir or clean_ready)
                 and (not required.requires_pseudocode or pseudo_ready)
+                and (not required.requires_assembly or assembly_ready)
             )
-            canonical_ready = raw_ready and clean_ready and sample_pseudocode_ready
+            canonical_ready = (
+                raw_ready
+                and clean_ready
+                and sample_pseudocode_ready
+                and sample_assembly_ready
+            )
             recovered_path = flow_dir / f"{sample_id}_recovered.c"
             source_row = row.get("clean_source") or row.get("source_c")
             original_path = project_root / source_row if source_row else None
@@ -1362,6 +1489,11 @@ def load_campaign(
             total_output_tokens = sum(
                 int(attempt["output_tokens"] or 0) for attempt in flow_llm
             )
+            estimated_cost_values = [
+                float(attempt["estimated_cost"])
+                for attempt in flow_llm
+                if attempt.get("estimated_cost") is not None
+            ]
             oracle_path = flow_dir / "oracle_contract.json"
             oracle_contract = _read_json(oracle_path) if oracle_path.is_file() else {}
             strict_oracle = (
@@ -1373,9 +1505,21 @@ def load_campaign(
                 and oracle_contract.get("compare_terminating_signal") is True
                 and oracle_contract.get("compare_timeout_status") is True
             )
-            warnings = [
-                "Per-attempt LLM latency and API cost were not persisted.",
-            ]
+            warnings: list[str] = []
+            if any(
+                attempt.get("latency_seconds") is None for attempt in flow_llm
+            ):
+                warnings.append(
+                    "At least one LLM attempt is missing provider latency metadata."
+                )
+            if not estimated_cost_values:
+                warnings.append(
+                    "Provider did not return API cost metadata; estimated API cost is unavailable."
+                )
+            elif len(estimated_cost_values) != len(flow_llm):
+                warnings.append(
+                    "API cost metadata is incomplete for at least one LLM attempt."
+                )
             if any(attempt["prompt_path"] is None for attempt in flow_llm):
                 warnings.append(
                     "Historical prompts were not persisted; prompt_path is null."
@@ -1402,7 +1546,11 @@ def load_campaign(
             if any(attempt["provenance"] == "aggregate_only_missing_artifact" for attempt in flow_llm):
                 warnings.append("At least one LLM call has no response/metadata artifact.")
             if quality["sloc_ratio"] is None:
-                warnings.append("clang-format or source prerequisite unavailable; SLOC metrics are null.")
+                warnings.append("Source prerequisite unavailable; SLOC metrics are null.")
+            elif quality["sloc_method"] != "clang-format-nonempty-lines":
+                warnings.append(
+                    "SLOC measured with lexical comment-stripped fallback because clang-format is unavailable."
+                )
             if status == "PASS" and quality["readability_overall"] is None:
                 warnings.append(
                     "Accepted candidate has no valid readability evaluator record."
@@ -1480,7 +1628,11 @@ def load_campaign(
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,
                 "total_tokens": total_input_tokens + total_output_tokens,
-                "estimated_api_cost": None,
+                "estimated_api_cost": (
+                    sum(estimated_cost_values)
+                    if estimated_cost_values
+                    else None
+                ),
                 "llm_latency": tracker.get("llm_latency"),
                 "preprocessing_time": None,
                 "compile_time": tracker.get("compile_time"),

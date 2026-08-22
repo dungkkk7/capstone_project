@@ -1,5 +1,10 @@
 # Phân tích cuối: bảy treatment B0–B3 và F3-O1/O2/O3
 
+> **Historical snapshot.** This seven-treatment report predates the active
+> five-flow taxonomy. Do not read `F3-O1/O2/O3` as current flow IDs; use
+> [`research-evaluation-protocol.md`](research-evaluation-protocol.md) for the
+> active `B1/B2/F1/F2/F3` contracts.
+
 ## 1. Kết quả trả lời trực tiếp câu hỏi nghiên cứu
 
 Trên 40 chương trình C11 CLI tự xây, paired theo case và chấm bằng 1,000 input

@@ -1,0 +1,6 @@
+Flow,Accepted,Evaluated,Coverage,SLOC Evaluated,Original SLOC,Recovered SLOC,SLOC Ratio,Variables,Loops,Conditions,Logic flow,Structural integrity,Overall,Evaluator Overall,Overall Source
+B1,4,4,4/4 (100.0%),4,69.5,363.8,5.540,1.50,2.50,2.00,2.25,2.00,3.25,2.05,MANUAL_OVERRIDE
+B2,7,7,7/7 (100.0%),7,105.9,40.1,0.702,3.86,4.57,4.43,4.57,4.43,2.95,4.37,MANUAL_OVERRIDE
+F1,36,36,36/36 (100.0%),36,111.2,63.2,0.933,3.42,4.17,4.03,4.14,4.11,3.97,3.97,EVALUATOR
+F2,26,26,26/26 (100.0%),26,118.8,53.8,0.810,3.85,4.65,4.58,4.73,4.62,3.42,4.48,MANUAL_OVERRIDE
+F3,23,23,23/23 (100.0%),23,123.1,53.2,0.830,3.52,4.35,4.04,4.35,4.09,3.50,4.07,MANUAL_OVERRIDE

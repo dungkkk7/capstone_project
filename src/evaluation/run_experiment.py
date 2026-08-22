@@ -41,8 +41,10 @@ from fuzzing_equi_check.input_contracts import (
     resolve_input_contract,
     validate_contract_payload,
 )
-from evaluation.schema import FLOW_SPECS, flow_contract
-from evaluation.two_flow_protocol import build_b0_prompt, build_b2_prompt
+from evaluation.schema import FLOW_ORDER, FLOW_SPECS, flow_contract
+from evaluation.five_flow_protocol import build_b1_prompt, build_b2_prompt
+from evaluation.assembly_baseline import export_program_assembly
+from evaluation.ghidra_baseline import export_program_pseudocode
 
 # Load default model from prompts_config.py
 try:
@@ -488,7 +490,7 @@ def run_fuzzing_tracked(candidate_path: str, ref_binary: str, contract: Any, gen
         fuzzer.cleanup()
         tracker.fuzzing_time += (time.time() - t_start)
 
-def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str, location: str, original_src: Optional[str] = None) -> CaseTracker:
+def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, contract: Any, generator: Any, seeds: list, case_output_dir: str, iterations: int, model: str, location: str, original_src: Optional[str] = None, representation_path: Optional[str] = None) -> CaseTracker:
     tracker = CaseTracker(sample_id, flow_id)
     t_start = time.time()
     flow_spec = FLOW_SPECS[flow_id]
@@ -504,15 +506,16 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         and os.path.exists(clean_ir)
         and os.path.getsize(clean_ir) > 0
     )
-    tracker.stage_pseudocode = (
+    tracker.stage_pseudocode = bool(
         (flow_spec.requires_pseudocode or flow_spec.requires_assembly)
-        and os.path.exists(clean_ir)
-        and os.path.getsize(clean_ir) > 0
+        and representation_path
+        and os.path.exists(representation_path)
+        and os.path.getsize(representation_path) > 0
     )
     
     # Verify native contract if available
     contract_report = native_contract_report_path(case_output_dir)
-    if os.path.exists(contract_report):
+    if flow_spec.requires_clean_ir and os.path.exists(contract_report):
         verified, _ = verify_native_contract(clean_ir, contract_report)
         tracker.llvm_ir_verification_success = verified
     else:
@@ -547,63 +550,52 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
     config.model = model
     config.location = location  # Round-robin assigned region to distribute quota load
     
-    # Configure the full-first ablation layout. Every iterative flow receives
-    # the same error-context policy; F2 is the sole one-shot ablation.
+    # Configure the active five-flow layout: B1/B2 are direct
+    # LLM4Decompile-style baselines from the obfuscated binary. F1/F2/F3
+    # separate Clean IR, Raw IR, and Clean-IR one-shot recovery.
     initial_prompt_override = ""
     initial_prompt_has_no_system = False
     if flow_id == "B1":
         config.pseudo_backend = "ghidra"
         config.ir_representation = "ghidra_pseudocode"
         config.attach_clean_ir = False
-        config.max_iterations = 5
-        # B0 serializes its Ghidra evidence inline and sends no system
-        # instruction.  B1 holds that first physical request byte-identical;
-        # only later calls use the registered repair profile.
+        config.max_iterations = 1
+        # B1 serializes its Ghidra evidence inline and sends no system
+        # instruction, matching the branch baseline contract.
         config.use_file_api = False
-        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
-        initial_prompt_override = build_b0_prompt(ir_text)
+        ir_text = Path(representation_path or clean_ir).read_text(encoding="utf-8", errors="replace")
+        initial_prompt_override = build_b1_prompt(ir_text)
         initial_prompt_has_no_system = True
-    elif flow_id in {"B2", "B3"}:
+    elif flow_id == "B2":
         config.pseudo_backend = "assembly"
         config.ir_representation = "raw_assembly"
         config.attach_clean_ir = False
-        config.max_iterations = 1 if flow_id == "B2" else 5
-        # Match the official LLM4Decompile-End inference serialization for the
-        # first request.  B3 alone may issue later validation-guided repairs.
+        config.max_iterations = 1
+        # Match the official LLM4Decompile-End inference serialization.
         config.use_file_api = False
-        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
+        ir_text = Path(representation_path or clean_ir).read_text(encoding="utf-8", errors="replace")
         initial_prompt_override = build_b2_prompt(ir_text)
         initial_prompt_has_no_system = True
     elif flow_id == "F1":
-        config.pseudo_backend = "llvm2c"
-        config.ir_representation = "clean"
-        config.attach_clean_ir = True
-        config.max_iterations = 5
-        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
-    elif flow_id == "F2":
-        config.pseudo_backend = "llvm2c"
-        config.ir_representation = "clean"
-        config.attach_clean_ir = True
-        config.max_iterations = 1
-        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
-    elif flow_id == "F3":
         config.pseudo_backend = "ir"
         config.ir_representation = "clean"
         config.attach_clean_ir = False
         config.max_iterations = 5
         ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
-    elif flow_id == "F4":
-        config.pseudo_backend = "llvm2c"
-        config.ir_representation = "clean"
-        config.attach_clean_ir = False
-        config.max_iterations = 5
-        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
-    elif flow_id == "F5":
+    elif flow_id == "F2":
         config.pseudo_backend = "ir"
         config.ir_representation = "raw"
         config.attach_clean_ir = False
         config.max_iterations = 5
         ir_text = Path(raw_ir).read_text(encoding="utf-8", errors="replace")
+    elif flow_id == "F3":
+        config.pseudo_backend = "ir"
+        config.ir_representation = "clean"
+        config.attach_clean_ir = False
+        # F3 is an LLM treatment evaluated one-shot; behavioral validation is
+        # still run, but no repair request is allowed after the first response.
+        config.max_iterations = 1
+        ir_text = Path(clean_ir).read_text(encoding="utf-8", errors="replace")
     else:
         raise ValueError(f"Unknown flow_id: {flow_id}")
 
@@ -615,6 +607,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
                 "pseudo_backend": config.pseudo_backend,
                 "ir_representation": config.ir_representation,
                 "attach_clean_ir": config.attach_clean_ir,
+                "optimization_level": flow_spec.optimization_level,
             },
             indent=2,
             sort_keys=True,
@@ -663,18 +656,18 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
         return rep
 
     metadata = {
-        "input_ir": raw_ir if flow_spec.requires_raw_ir else clean_ir,
+        "input_ir": representation_path or (raw_ir if flow_spec.requires_raw_ir else clean_ir),
         "original_binary": original_binary,
     }
     if initial_prompt_override:
         metadata["initial_prompt_override"] = initial_prompt_override
         metadata["initial_prompt_has_no_system"] = initial_prompt_has_no_system
         metadata["prompt_profile"] = (
-            "b0_first_request_then_iterative_feedback"
+            "llm4decompile_ghidra_oneshot"
             if flow_id == "B1"
             else "llm4decompile_assembly_oneshot"
             if flow_id == "B2"
-            else "b2_first_request_then_iterative_feedback"
+            else "master_ir_recovery"
         )
     
     try:
@@ -771,7 +764,7 @@ def run_flow_experiment(sample_id: str, flow_id: str, original_binary: str, raw_
             
     return tracker
 
-def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str, location: str, original_src: Optional[str] = None) -> CaseTracker:
+def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str, clean_ir: str, ref_binary: str, case_output_dir: str, iterations: int, reduction_metrics: dict, model: str, location: str, original_src: Optional[str] = None, representation_path: Optional[str] = None) -> CaseTracker:
     try:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
         from main import _select_generator, _resolve_seed_paths
@@ -796,7 +789,8 @@ def flow_worker(sample_id: str, flow_id: str, original_binary: str, raw_ir: str,
             iterations=iterations,
             model=model,
             location=location,
-            original_src=original_src
+            original_src=original_src,
+            representation_path=representation_path,
         )
         tracker.reduction = reduction_metrics
         tracker.instructions_raw = reduction_metrics.get("instruction_raw", 0)
@@ -911,7 +905,7 @@ def main():
         
         # Check how many flows are already completed
         flows_needed = []
-        for flow in ["F1", "F2", "F3", "F4", "F5"]:
+        for flow in FLOW_ORDER:
             flow_result_path = os.path.join(case_output_dir, flow, "flow_result.json")
             if os.path.exists(flow_result_path):
                 try:
@@ -931,12 +925,39 @@ def main():
             
         print(f"[*] Preparing Case {idx}/{len(rows)}: {sample_id} (Evaluating flows: {', '.join(flows_needed)})...", flush=True)
         os.makedirs(case_output_dir, exist_ok=True)
+
+        # B1/B2 must consume representations exported from the original ELF;
+        # they must never receive clean IR or a pipeline-produced binary.
+        representation_paths = {}
+        if "B1" in flows_needed:
+            b1_dir = os.path.join(case_output_dir, "B1")
+            try:
+                representation_paths["B1"] = str(
+                    export_program_pseudocode(binary_abs, b1_dir)
+                )
+            except Exception as exc:
+                print(f"[✗] B1 representation failed for {sample_id}: {exc}", flush=True)
+                representation_paths["B1"] = os.path.join(
+                    b1_dir, "ghidra_original_program.c"
+                )
+        if "B2" in flows_needed:
+            b2_dir = os.path.join(case_output_dir, "B2")
+            try:
+                representation_paths["B2"] = str(
+                    export_program_assembly(binary_abs, b2_dir)
+                )
+            except Exception as exc:
+                print(f"[✗] B2 representation failed for {sample_id}: {exc}", flush=True)
+                representation_paths["B2"] = os.path.join(
+                    b2_dir, "objdump_original_program.s"
+                )
         
-        # Lift, brighten, and finalize. The brightened artifact is deliberately
-        # intermediate; every clean-IR flow consumes the canonical final IR.
-        if not os.path.exists(clean_ir) or not os.path.exists(ref_binary):
-            if not os.path.exists(brightened_ir):
-                output_bc = os.path.join(case_output_dir, f"{sample_id}.bc")
+        # Lift once. F1 and F3 share the canonical Clean IR; F2 consumes the
+        # raw lifted IR and must not be routed through the clean artifact.
+        clean_bundles = {}
+        if any(flow in flows_needed for flow in ("F1", "F2", "F3")):
+            output_bc = os.path.join(case_output_dir, f"{sample_id}.bc")
+            if not os.path.exists(output_bc) or not os.path.exists(raw_ir):
                 lift_success = lift_binary(
                     binary_path=binary_abs,
                     output=output_bc,
@@ -947,33 +968,41 @@ def main():
                     print(f"[✗] Lifting failed for {sample_id}", flush=True)
                     continue
 
-                output_brightened_bc = os.path.join(
+            if any(flow in flows_needed for flow in ("F1", "F3")):
+                flow_brightened = os.path.join(
                     case_output_dir, f"{sample_id}_brightened.bc"
                 )
-                brighten_success = brighten_ir(
-                    output_bc,
-                    output_brightened_bc,
-                    binary_path=binary_abs,
-                )
-                if not brighten_success:
-                    print(f"[✗] Brightening failed for {sample_id}", flush=True)
-                    continue
+                if not os.path.exists(clean_ir):
+                    if not os.path.exists(flow_brightened) and not brighten_ir(
+                        output_bc,
+                        flow_brightened,
+                        binary_path=binary_abs,
+                    ):
+                        print(f"[✗] Brightening failed for {sample_id}", flush=True)
+                        continue
+                    finalized, finalize_status, finalize_log = finalize_ir(
+                        f"{os.path.splitext(flow_brightened)[0]}.ll",
+                        os.path.join(case_output_dir, f"{sample_id}_final"),
+                    )
+                    if finalize_status != "applied" or not finalized:
+                        print(
+                            f"[✗] Finalization failed for {sample_id}: "
+                            f"{finalize_status} ({finalize_log})",
+                            flush=True,
+                        )
+                        continue
+                clean_metrics = run_deobfuscation_metrics(raw_ir, clean_ir)
+                for flow in ("F1", "F3"):
+                    if flow in flows_needed:
+                        clean_bundles[flow] = (clean_ir, "", clean_metrics)
 
-            clean_ir, finalize_status, finalize_log = finalize_ir(
-                brightened_ir,
-                os.path.join(case_output_dir, f"{sample_id}_final"),
-            )
-            if finalize_status != "applied" or not clean_ir:
-                print(
-                    f"[✗] Finalization failed for {sample_id}: "
-                    f"{finalize_status} ({finalize_log})",
-                    flush=True,
+            if "F2" in flows_needed:
+                clean_bundles["F2"] = (
+                    raw_ir,
+                    "",
+                    run_deobfuscation_metrics(raw_ir, raw_ir),
                 )
-                continue
-            compile_to_binary(clean_ir, ref_binary)
-            
-        reduction_metrics = run_deobfuscation_metrics(raw_ir, clean_ir)
-        
+
         # Add the remaining incomplete flows to the queue
         for flow in flows_needed:
             if rotate_enabled:
@@ -981,7 +1010,13 @@ def main():
             else:
                 location = os.environ.get("VERTEX_LOCATION", "global")
             
-            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, clean_ir, ref_binary, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model, location, original_src))
+            if flow in clean_bundles:
+                flow_clean, flow_ref, reduction_metrics = clean_bundles[flow]
+            else:
+                # Baselines do not consume pipeline IR; retain a harmless
+                # placeholder for the shared worker signature.
+                flow_clean, flow_ref, reduction_metrics = raw_ir, "", {}
+            tasks_to_run.append((sample_id, flow, binary_abs, raw_ir, flow_clean, flow_ref, case_output_dir, args.fuzz_iterations, reduction_metrics, args.model, location, original_src, representation_paths.get(flow)))
             task_idx += 1
             
     if tasks_to_run:
@@ -1074,7 +1109,7 @@ def export_metrics_csvs(trackers: List[CaseTracker], output_dir: str, experiment
             ])
 
     # 2. per_flow_metrics.csv
-    flows = ["F1", "F2", "F3", "F4", "F5"]
+    flows = list(FLOW_ORDER)
     per_flow_path = os.path.join(output_dir, "per_flow_metrics.csv")
     with open(per_flow_path, "w", newline="") as f:
         writer = csv.writer(f)

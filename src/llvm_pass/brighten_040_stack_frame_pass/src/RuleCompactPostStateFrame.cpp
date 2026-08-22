@@ -1287,7 +1287,11 @@ bool BrightenPostStateFramePass::CompactProvenPostStateFrameBackings(Module &M) 
         uint64_t(Min) % Alignment.value() != 0)
       continue;
 
-    int64_t FrameSize = std::max<int64_t>(Max - Min + 16384, 65536);
+    // The proof above establishes the complete live byte interval.  Allocate
+    // exactly that interval: the old fixed 64 KiB floor made a 4-byte proven
+    // frame appear as a 65536-byte object and broke the post-state lifecycle
+    // contract without adding any reachable storage.
+    int64_t FrameSize = Max - Min;
     auto *FrameTy = ArrayType::get(Type::getInt8Ty(M.getContext()), FrameSize);
     IRBuilder<> Entry(&*Owner->getEntryBlock().getFirstInsertionPt());
     AllocaInst *Frame = Entry.CreateAlloca(FrameTy, nullptr, "native_frame");

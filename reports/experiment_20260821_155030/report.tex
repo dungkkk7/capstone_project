@@ -1,0 +1,43 @@
+\documentclass{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{longtable,graphicx}
+\begin{document}
+\section*{Five-flow source recovery evaluation}
+PASS means no reproducible final divergence was detected within the recorded valid inputs and budget; it is not a universal equivalence proof.
+\begin{longtable}{llllllllllllllll}
+Flow & N & Eligible N & First-pass RSR & Final RSR@R & Program Behavioral Pass Rate & Initial Behavioral Pass Rate & Final Behavioral Pass Rate & Input Match Macro & Input Match Micro & Counterexample Detection Rate & Re-executability Rate & Compilation Repair Gain & Behavioral Repair Gain & Mean Tokens & Mean Runtime \\ \hline
+B1 & 1 & 1 & N/A & N/A & N/A & N/A & N/A & N/A & N/A & N/A & 0/1 (0.0\%) & N/A & N/A & 16821 & 43.1s \\
+B2 & 1 & 1 & 1/1 (100.0\%) & 1/1 (100.0\%) & N/A & N/A & N/A & N/A & N/A & N/A & 1/1 (100.0\%) & N/A & N/A & 16240 & 45.5s \\
+F1 & 1 & 1 & 1/1 (100.0\%) & 1/1 (100.0\%) & N/A & N/A & N/A & N/A & N/A & N/A & 1/1 (100.0\%) & +0.0 pp & N/A & 361124 & 273.0s \\
+F2 & 1 & 1 & 1/1 (100.0\%) & 1/1 (100.0\%) & N/A & N/A & N/A & N/A & N/A & N/A & 1/1 (100.0\%) & +0.0 pp & N/A & 696052 & 205.6s \\
+F3 & 1 & 1 & 1/1 (100.0\%) & 1/1 (100.0\%) & N/A & N/A & N/A & N/A & N/A & N/A & 1/1 (100.0\%) & N/A & N/A & 57804 & 78.4s \\
+\end{longtable}
+\section*{Source quality: accepted Recovered C Source only}
+Readability is an independent 1-to-5 assessment of Variables, Loops, Conditions, Logic flow, and Structural integrity. It is not a correctness metric.
+\begin{longtable}{llllllllll}
+Flow & Accepted & Evaluated & Coverage & Variables & Loops & Conditions & Logic flow & Structural integrity & Overall \\ \hline
+B1 & 0 & 0 & 0/0 (N/A) & N/A & N/A & N/A & N/A & N/A & N/A \\
+B2 & 0 & 0 & 0/0 (N/A) & N/A & N/A & N/A & N/A & N/A & N/A \\
+F1 & 0 & 0 & 0/0 (N/A) & N/A & N/A & N/A & N/A & N/A & N/A \\
+F2 & 0 & 0 & 0/0 (N/A) & N/A & N/A & N/A & N/A & N/A & N/A \\
+F3 & 0 & 0 & 0/0 (N/A) & N/A & N/A & N/A & N/A & N/A & N/A \\
+\end{longtable}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/overall_performance.pdf}\caption{Primary recovery outcomes with executable availability over all eligible samples.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/compilation_performance.pdf}\caption{Compilation success before and after repair.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/behavioral_performance.pdf}\caption{Behavioral outcomes over conclusive campaigns.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/repair_effectiveness.pdf}\caption{Behavioral repair effectiveness; B1, B2, F3 repair fields are N/A.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/iterative_feedback_vs_one_shot.pdf}\caption{Matched-evidence re-executability comparison of iterative feedback against one-shot reconstruction.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/cumulative_compile_success_by_round.pdf}\caption{Cumulative executable creation by compile attempt.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/cumulative_behavioral_success_by_round.pdf}\caption{Cumulative behavioral pass by campaign.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/final_status_breakdown.pdf}\caption{Final status distribution without collapsing INCONCLUSIVE into failure.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/failure_taxonomy.pdf}\caption{Compilation, behavioral, and inconclusive taxonomies.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/sample_flow_status_heatmap.pdf}\caption{0=fail, 1=unresolved, 2=pass by paired sample and flow.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/sample_flow_match_heatmap.pdf}\caption{Input match (\%) by paired sample and flow.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/ablation_forest_plot.pdf}\caption{Paired re-executability effects with bootstrap 95\% CI.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/ablation_win_tie_loss.pdf}\caption{Paired win/tie/loss counts for re-executability.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/tokens_vs_e2e.pdf}\caption{Total tokens versus Re-executability outcome.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/runtime_vs_behavioral_pass.pdf}\caption{Runtime (seconds) versus Behavioral pass outcome.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/llvm_reduction_summary.pdf}\caption{LLVM simplification metrics; these are not correctness claims.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/llvm_reduction_vs_behavior.pdf}\caption{Association view only; LLVM reduction is not a semantic oracle.}\end{figure}
+\begin{figure}[p]\centering\includegraphics[width=.9\linewidth]{figures/stage_completion_funnel.pdf}\caption{Stage completion rates with explicit numerators and denominators in the report.}\end{figure}
+\end{document}

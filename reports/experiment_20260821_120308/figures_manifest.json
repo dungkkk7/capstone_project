@@ -1,0 +1,74 @@
+[
+  {
+    "figure_id": "overall_performance",
+    "caption": "Primary recovery outcomes with executable availability over all eligible samples."
+  },
+  {
+    "figure_id": "compilation_performance",
+    "caption": "Compilation success before and after repair."
+  },
+  {
+    "figure_id": "behavioral_performance",
+    "caption": "Behavioral outcomes over conclusive campaigns."
+  },
+  {
+    "figure_id": "repair_effectiveness",
+    "caption": "Behavioral repair effectiveness; B1, B2, F2 repair fields are N/A."
+  },
+  {
+    "figure_id": "iterative_feedback_vs_one_shot",
+    "caption": "Matched-evidence re-executability comparison of iterative feedback against one-shot reconstruction."
+  },
+  {
+    "figure_id": "cumulative_compile_success_by_round",
+    "caption": "Cumulative executable creation by compile attempt."
+  },
+  {
+    "figure_id": "cumulative_behavioral_success_by_round",
+    "caption": "Cumulative behavioral pass by campaign."
+  },
+  {
+    "figure_id": "final_status_breakdown",
+    "caption": "Final status distribution without collapsing INCONCLUSIVE into failure."
+  },
+  {
+    "figure_id": "failure_taxonomy",
+    "caption": "Compilation, behavioral, and inconclusive taxonomies."
+  },
+  {
+    "figure_id": "sample_flow_status_heatmap",
+    "caption": "0=fail, 1=unresolved, 2=pass by paired sample and flow."
+  },
+  {
+    "figure_id": "sample_flow_match_heatmap",
+    "caption": "Input match (%) by paired sample and flow."
+  },
+  {
+    "figure_id": "ablation_forest_plot",
+    "caption": "Paired re-executability effects with bootstrap 95% CI."
+  },
+  {
+    "figure_id": "ablation_win_tie_loss",
+    "caption": "Paired win/tie/loss counts for re-executability."
+  },
+  {
+    "figure_id": "tokens_vs_e2e",
+    "caption": "Total tokens versus Re-executability outcome."
+  },
+  {
+    "figure_id": "runtime_vs_behavioral_pass",
+    "caption": "Runtime (seconds) versus Behavioral pass outcome."
+  },
+  {
+    "figure_id": "llvm_reduction_summary",
+    "caption": "LLVM simplification metrics; these are not correctness claims."
+  },
+  {
+    "figure_id": "llvm_reduction_vs_behavior",
+    "caption": "Association view only; LLVM reduction is not a semantic oracle."
+  },
+  {
+    "figure_id": "stage_completion_funnel",
+    "caption": "Stage completion rates with explicit numerators and denominators in the report."
+  }
+]

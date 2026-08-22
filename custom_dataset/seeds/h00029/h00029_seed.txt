@@ -1,0 +1,10 @@
+9
+join 0 1
+join 2 3
+join 1 2
+ask 0 3
+ask 0 8
+join 7 8
+join 3 8
+ask 2 7
+end

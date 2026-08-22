@@ -1,0 +1,44 @@
+{
+  "flows": [
+    {
+      "canonical_e2e_rate": 0.0,
+      "flow_id": "B1",
+      "mean_logical_llm_calls": 1.0,
+      "n": 4,
+      "pass_count": 0,
+      "role": "Ghidra one-shot baseline"
+    },
+    {
+      "canonical_e2e_rate": 0.25,
+      "flow_id": "B2",
+      "mean_logical_llm_calls": 1.0,
+      "n": 4,
+      "pass_count": 1,
+      "role": "assembly one-shot baseline"
+    },
+    {
+      "canonical_e2e_rate": 0.0,
+      "flow_id": "FL1",
+      "mean_logical_llm_calls": 0.0,
+      "n": 4,
+      "pass_count": 0,
+      "role": "Clean IR with iterative LLM recovery"
+    },
+    {
+      "canonical_e2e_rate": 0.0,
+      "flow_id": "FL2",
+      "mean_logical_llm_calls": 0.0,
+      "n": 4,
+      "pass_count": 0,
+      "role": "Raw IR with iterative LLM recovery"
+    },
+    {
+      "canonical_e2e_rate": 0.0,
+      "flow_id": "FL3",
+      "mean_logical_llm_calls": 0.0,
+      "n": 4,
+      "pass_count": 0,
+      "role": "Clean IR pipeline without LLM recovery"
+    }
+  ]
+}

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import evaluation.artifact_loader as artifact_loader
 from evaluation.artifact_loader import _source_quality
 from evaluation.readability import (
     EvaluationTask,
@@ -119,3 +120,27 @@ def test_loader_rejects_readability_that_claims_correctness(tmp_path: Path):
 
     loaded = _source_quality(None, source, cache, accepted=True)
     assert loaded["readability_overall"] is None
+
+
+def test_sloc_fallback_preserves_comment_markers_inside_literals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(artifact_loader.shutil, "which", lambda _: None)
+    original = tmp_path / "original.c"
+    recovered = tmp_path / "recovered.c"
+    original.write_text(
+        '#include <stdio.h>\n'
+        'int main(void) {\n'
+        '  puts("http://host/* literal */"); // trailing comment\n'
+        '  return 0;\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    recovered.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+    quality = _source_quality(original, recovered, accepted=False)
+
+    assert quality["original_sloc"] == 5
+    assert quality["recovered_sloc"] == 1
+    assert quality["sloc_ratio"] == 0.2
+    assert quality["sloc_method"] == "lexical-comment-stripped-nonempty-lines"

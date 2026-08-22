@@ -79,21 +79,21 @@ FIGURE_GUIDES: dict[str, dict[str, str]] = {
         ),
         "reading": (
             "After cao hơn Before, success rate cao và gain dương nghĩa là "
-            "repair có ích. F2 là one-shot nên các repair metric là N/A."
+            "repair có ích. B1 và B2 là one-shot nên các repair metric của hai flow này là N/A."
         ),
     },
     "iterative_feedback_vs_one_shot": {
         "meaning": (
-            "Cô lập tác dụng của iterative compiler/behavioral feedback trên "
-            "hai cặp dùng cùng initial evidence: F1–F2 và F5–F6."
+            "So sánh representation và feedback policy: F1 là Clean IR có "
+            "loop, F2 là Raw IR có loop, còn F3 là Clean IR one-shot."
         ),
         "calculation": (
             "Mỗi điểm là Re-executability successes / all eligible cases; mũi tên "
             "đi từ one-shot sang iterative và nhãn là chênh lệch điểm phần trăm."
         ),
         "reading": (
-            "Mũi tên sang phải càng dài thì iterative feedback cải thiện recovery "
-            "càng nhiều. F6 là first-call checkpoint derived từ F5."
+            "F1/F2/F3 không phải O1/O2/O3. B1/B2 là hai baseline one-shot "
+            "từ pseudocode/assembly của obfuscated binary."
         ),
     },
     "cumulative_compile_success_by_round": {
@@ -243,7 +243,7 @@ FIGURE_GUIDES: dict[str, dict[str, str]] = {
         "meaning": "Cho biết tỷ lệ hoàn thành tại từng stage của pipeline.",
         "calculation": (
             "Mỗi stage = tổng completed flow-runs / tổng eligible flow-runs trên "
-            "F1–F6; đây là pooled flow-runs, không phải unique samples."
+            "các flow active; đây là pooled flow-runs, không phải unique samples."
         ),
         "reading": (
             "Stage giảm mạnh là bottleneck nơi nhiều run dừng lại. Candidate "
@@ -362,6 +362,18 @@ def _flow_summary(flow_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "eligible_sample_count",
                     "re_executability_rate_percent",
                 ),
+                "Canonical E2E Rate": _rate_cell(
+                    row,
+                    "canonical_e2e_success_count",
+                    "eligible_sample_count",
+                    "canonical_e2e_rate_percent",
+                ),
+                "Flow-specific Recovery Rate": _rate_cell(
+                    row,
+                    "flow_specific_recovery_success_count",
+                    "eligible_sample_count",
+                    "flow_specific_recovery_rate_percent",
+                ),
                 "Compilation Repair Gain": (
                     "N/A"
                     if row["compilation_repair_gain_pp"] is None
@@ -379,6 +391,11 @@ def _flow_summary(flow_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "N/A"
                     if row["mean_runtime_seconds"] is None
                     else f"{row['mean_runtime_seconds']:.1f}s"
+                ),
+                "Mean API Cost": (
+                    "N/A"
+                    if row["mean_estimated_api_cost"] is None
+                    else f"${row['mean_estimated_api_cost']:.6f}"
                 ),
             }
         )
@@ -449,6 +466,13 @@ def _source_quality_summary(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         evaluated = [
             run for run in accepted if run.get("readability_overall") is not None
         ]
+        sloc_evaluated = [
+            run
+            for run in accepted
+            if run.get("original_sloc") is not None
+            and run.get("recovered_sloc") is not None
+            and run.get("sloc_ratio") is not None
+        ]
         row: dict[str, Any] = {
             "Flow": flow_id,
             "Accepted": len(accepted),
@@ -458,6 +482,22 @@ def _source_quality_summary(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 f"({100.0 * len(evaluated) / len(accepted):.1f}%)"
                 if accepted
                 else "0/0 (N/A)"
+            ),
+            "SLOC Evaluated": len(sloc_evaluated),
+            "Original SLOC": (
+                f"{sum(float(run['original_sloc']) for run in sloc_evaluated) / len(sloc_evaluated):.1f}"
+                if sloc_evaluated
+                else "N/A"
+            ),
+            "Recovered SLOC": (
+                f"{sum(float(run['recovered_sloc']) for run in sloc_evaluated) / len(sloc_evaluated):.1f}"
+                if sloc_evaluated
+                else "N/A"
+            ),
+            "SLOC Ratio": (
+                f"{sum(float(run['sloc_ratio']) for run in sloc_evaluated) / len(sloc_evaluated):.3f}"
+                if sloc_evaluated
+                else "N/A"
             ),
         }
         for label, field in dimensions:
@@ -496,21 +536,16 @@ def _report_markdown(
     figures = "\n".join(
         f"- `{item['figure_id']}`: {item['caption']}" for item in manifest
     )
-    one_shot_flow = (
-        "F2 and derived F6"
-        if flow_layout_version == FLOW_LAYOUT_VERSION
-        else "F5"
-    )
+    one_shot_flow = "B1/B2"
     one_shot_errors = sum(
         error["severity"] == "ERROR"
         and error["violated_rule"] == "RULE_1_ONESHOT_CONTRACT"
         for error in errors
     )
     multifactor_note = (
-        "F1 vs F5 is the full-configuration versus Raw-IR baseline and is a "
-        "multi-factor comparison, not a single-factor ablation."
-        if flow_layout_version == FLOW_LAYOUT_VERSION
-        else "F2 vs F3 is a multi-factor comparison, not a single-factor ablation."
+        "F1 is Clean IR with an LLM repair loop; F2 is raw lifted IR with the "
+        "same loop; F3 is Clean IR one-shot. B1/B2 are LLM4Decompile-style "
+        "one-shot baselines from obfuscated-binary pseudocode/assembly."
     )
     historical_oracle_note = (
         """
@@ -533,7 +568,7 @@ def _report_markdown(
         if readability_count
         else "Readability is N/A because no valid evaluator record exists."
     )
-    return f"""# Six-flow source recovery evaluation
+    return f"""# Five-flow source recovery evaluation
 
 Experiment: `{experiment_id}`
 
@@ -542,18 +577,14 @@ LLM, compiler, or fuzzer. A behavioral PASS means: no reproducible final
 divergence was detected within the recorded valid-input corpus and fuzzing
 budget. It does not prove equivalence for every input.
 
-**F6 provenance:** F6 is derived from the first actual provider call of each
-F5 run. It is a paired one-call checkpoint, not an independent recovery run.
-Missing first-call or first-campaign artifacts are marked CANCELLED.
-
 ## How to read the metrics
 
 {_markdown_table(metric_guide_rows)}
 
-Flow order: F1 Full; F2 no error context; F3 no pseudocode; F4 no direct
-Clean IR; F5 Raw IR iterative; F6 Raw IR one-call derived from F5. F6 is not
-an independent recovery run. Error bars in rate figures are 95% confidence
-intervals. `n` is the number of eligible samples after data validation.
+Flow order: B1 Ghidra pseudocode one-shot; B2 objdump assembly one-shot; F1
+Clean IR iterative; F2 Raw IR iterative; F3 Clean IR one-shot. Error bars in rate figures are
+95% confidence intervals. `n` is the number of eligible samples after data
+validation.
 
 ## Flow summary
 
@@ -565,7 +596,7 @@ not check semantic output. `Canonical E2E` remains the stricter behavioral /
 semantic metric. The flow-specific rate remains available in machine-readable
 CSV output.
 Rate cells show `numerator/denominator (percentage)`. {one_shot_flow}
-repair metrics are N/A because error context is disabled.
+repair metrics are N/A because these two baseline flows are one-shot.
 
 ## Source quality: accepted Recovered C Source only
 
@@ -594,8 +625,9 @@ correctness, behavioral equivalence, or Re-executability success.
   eligible aggregates and paired inference.
 {historical_oracle_note}
 - Exact five-tuple comparison is implemented for schema-v2 observations.
-- {readability_note} SLOC Ratio is N/A when the required common `clang-format`
-  tool is unavailable.
+- {readability_note} SLOC uses `clang-format` when available and a documented
+  lexical comment-stripped fallback otherwise; it is N/A only when a source
+  artifact is missing.
 - LLVM reduction measures simplification only and is not a correctness oracle.
 
 See `data_validation_errors.csv` for every affected paired key.
@@ -709,7 +741,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         {
             "Metric": "Repair Gain",
             "Meaning": "Final rate minus initial rate, measured in percentage points.",
-            "Denominator": "N/A for F2 and F6 because error context and repair are disabled.",
+            "Denominator": "N/A for non-iterative flows because repair is disabled.",
         },
         {
             "Metric": "Mean Tokens / Runtime",
@@ -832,6 +864,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
             "original_sloc",
             "recovered_sloc",
             "sloc_ratio",
+            "sloc_method",
         ],
     )
     write_csv(
@@ -940,7 +973,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
         r"\usepackage[margin=1in]{geometry}" "\n"
         r"\usepackage{longtable,graphicx}" "\n"
         r"\begin{document}" "\n"
-        r"\section*{Six-flow source recovery evaluation}" "\n"
+        r"\section*{Five-flow source recovery evaluation}" "\n"
         + _latex_escape(
             "PASS means no reproducible final divergence was detected within the recorded valid inputs and budget; it is not a universal equivalence proof."
         )
@@ -1009,7 +1042,7 @@ def export_report(data: dict[str, Any], report_dir: Path) -> dict[str, Any]:
     figures_html = '<div class="grid">' + "".join(figure_cards) + "</div>"
     report_html = _html_document(
         data["experiment_id"],
-        f"<h1>Six-flow source recovery evaluation</h1><p>Offline regeneration; no recovery LLM, compiler, or fuzzer was executed.</p><div class=\"derived-note\"><b>F6 provenance:</b> F6 is derived from the first actual provider call of each F5 run. It is a paired one-call checkpoint, not an independent recovery run. Missing first-call or first-campaign artifacts are marked CANCELLED rather than guessed.</div><h2>How to read the metrics</h2>{metric_guide_html}<p><b>Flow order:</b> F1 Full; F2 no error context; F3 no pseudocode; F4 no direct Clean IR; F5 Raw IR iterative; F6 Raw IR one-call derived from F5. Error bars are 95% confidence intervals, and <code>n</code> is the eligible sample count after validation.</p><h2>Flow summary</h2>{table_html}<h2>Source quality: accepted Recovered C Source only</h2><p>Readability uses an absolute 1-to-5 rubric over Variables, Loops, Conditions, Logic flow, and Structural integrity. Overall is their arithmetic mean. It is not a correctness metric.</p>{source_quality_html}<h2>Figures</h2>{figures_html}",
+        f"<h1>Five-flow source recovery evaluation</h1><p>Offline regeneration; no recovery LLM, compiler, or fuzzer was executed.</p><h2>How to read the metrics</h2>{metric_guide_html}<p><b>Flow order:</b> B1 Ghidra pseudocode one-shot; B2 objdump assembly one-shot; F1 Clean IR iterative; F2 Raw IR iterative; F3 Clean IR one-shot. Error bars are 95% confidence intervals, and <code>n</code> is the eligible sample count after validation.</p><h2>Flow summary</h2>{table_html}<h2>Source quality: accepted Recovered C Source only</h2><p>Readability uses an absolute 1-to-5 rubric over Variables, Loops, Conditions, Logic flow, and Structural integrity. Overall is their arithmetic mean. It is not a correctness metric.</p>{source_quality_html}<h2>Figures</h2>{figures_html}",
     )
     (report_dir / "report.html").write_text(report_html, encoding="utf-8")
     (report_dir / "dashboard.html").write_text(report_html, encoding="utf-8")

@@ -2,7 +2,7 @@
 
 Dự án này xây dựng một hệ thống khôi phục mã nguồn C tự động từ các file nhị phân Linux (ELF x86_64) bị làm rối (obfuscate) bằng framework OLLVM (Control Flow Flattening - CFF, Bogus Control Flow - BCF, Mixed Boolean Arithmetic - MBA).
 
-Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass 010–100** (Làm sạch IR / Brightening), **Mô hình ngôn ngữ lớn LLM (Gemini)** và bộ kiểm định tương đương ngữ nghĩa bằng **AFL++ Mutation Hook Differential Fuzzing**. Protocol cuối gồm bảy treatment: Ghidra one-shot/iterative (`B0/B1`), raw-assembly one-shot/iterative (`B2/B3`) và Clean-IR iterative ở `O1/O2/O3` (`F3`).
+Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass 010–100** (Làm sạch IR / Brightening), **Mô hình ngôn ngữ lớn LLM (Gemini)** và bộ kiểm định tương đương ngữ nghĩa bằng **AFL++ Mutation Hook Differential Fuzzing**. Protocol cuối gồm đúng năm flow: `B1`, `B2`, `F1`, `F2`, `F3`.
 
 ---
 
@@ -13,7 +13,7 @@ Hệ thống kết hợp **McSema/Remill** (Binary Lifting), chuỗi **LLVM Pass
    - [Phase 1: Binary Lifting (McSema / Remill)](#phase-1-binary-lifting-mcsema--remill)
    - [Phase 2: LLVM Deobfuscation Pipeline (Passes 010 $\rightarrow$ 100)](#phase-2-llvm-deobfuscation-pipeline-passes-010--100)
    - [Phase 3: Transpilation (LLVM-to-C Transpiler)](#phase-3-transpilation-llvm-to-c-transpiler)
-   - [Phase 4: LLM-Assisted C Recovery (2 Primary Flows)](#phase-4-llm-assisted-c-recovery-2-primary-flows)
+   - [Phase 4: LLM-Assisted C Recovery (5 Flows)](#phase-4-llm-assisted-c-recovery-5-flows)
    - [Phase 5: Differential Fuzzing Verification (AFL++ Mutation Hook)](#phase-5-differential-fuzzing-verification-afl-mutation-hook)
    - [Phase 6: Metrics Evaluation & CSV Exporter](#phase-6-metrics-evaluation--csv-exporter)
 3. [Hướng Dẫn Cấu Hình (Configuration Guide)](#3-hướng-dẫn-cấu-hình-configuration-guide)
@@ -54,17 +54,18 @@ flowchart TD
     end
 
     P100 --> C[Clean LLVM IR *_final.ll]
+    A -->|McSema / Remill raw lift| R[Raw LLVM IR]
     A -->|Ghidra Headless| G[Ghidra program pseudocode]
 
     A -->|objdump -d + deterministic cleaner| AS[Raw program assembly]
 
-    subgraph LLM_Recovery_Engine ["Seven-treatment evaluation"]
-        G --> B0[B0: Ghidra one-shot]
-        G --> B1[B1: Ghidra + validation loop]
+    subgraph LLM_Recovery_Engine ["Five-flow evaluation"]
+        G --> B1[B1: Ghidra pseudocode one-shot]
         AS --> B2[B2: Assembly one-shot]
-        AS --> B3[B3: Assembly + validation loop]
-        C --> F3[F3: Clean IR O1/O2/O3 + validation loop]
-        B0 & B1 & B2 & B3 & F3 --> LLM[Same Vertex AI / Gemini Model]
+        C --> F1[F1: Clean IR + LLM loop]
+        R --> F2[F2: Raw IR + LLM loop]
+        C --> F3[F3: Clean IR one-shot]
+        B1 & B2 & F1 & F2 & F3 --> LLM[Same Vertex AI / Gemini Model]
     end
 
     LLM --> E[Recovered C Code]
@@ -132,25 +133,24 @@ Thiết kế claim, baseline, optimization study và contamination protocol nằ
 
 ---
 
-### Phase 4: LLM-Assisted C Recovery (2 Primary Flows + Ablations)
+### Phase 4: LLM-Assisted C Recovery (5 Flows)
 
-Thực nghiệm chính dùng cùng model, decoding configuration, dataset và
-behavioral oracle cho đúng hai flow:
+Thực nghiệm dùng cùng model, decoding configuration, dataset và behavioral
+oracle cho đúng năm flow:
 
 | Flow | Đường đi | Model input | Call/feedback | Vai trò |
 |---|---|---|---|---|
-| `B0` | Original obfuscated ELF → Ghidra Headless | Program-level Ghidra pseudocode | Đúng 1 provider call; không compiler/counterexample feedback | Baseline ngoài, theo Section 4.2.1 của LLM4Decompile |
-| `B1` *(ablation)* | Cùng ELF và Ghidra export của B0 | Cùng program pseudocode; request đầu byte-identical B0 | Tối đa 5 calls; parser/compiler/counterexample feedback | Tách effect của iterative validation trên representation B0 |
-| `B2` *(baseline)* | Original obfuscated ELF → `objdump -d` | Raw program assembly đã bỏ address/byte/comment | Đúng 1 provider call với exact assembly prompt của LLM4Decompile | Baseline End2End raw assembly paper-derived |
-| `B3` *(ablation)* | Cùng ELF và byte-identical assembly của B2 | Request đầu byte-identical B2 | Tối đa 5 calls; parser/compiler/counterexample feedback | Tách effect của iterative validation trên representation B2 |
-| **`F3`** | Original obfuscated ELF → McSema → pass 010–100 | **Clean LLVM IR** | Tối đa 5 calls; compiler feedback và reproducible counterexample feedback | **Phương pháp đề xuất** |
+| `B1` | Original obfuscated ELF → Ghidra Headless | Program-level Ghidra pseudocode | Đúng 1 provider call | Ghidra one-shot baseline |
+| `B2` | Original obfuscated ELF → `objdump -d` | Clean program assembly | Đúng 1 provider call | Assembly one-shot baseline |
+| `F1` | Original obfuscated ELF → McSema → pass 010–100 | Clean LLVM IR | Tối đa 5 calls và validation feedback | Clean-IR iterative flow |
+| `F2` | Original obfuscated ELF → McSema raw lift | Raw LLVM IR | Tối đa 5 calls và validation feedback | Raw-IR iterative flow |
+| `F3` | Original obfuscated ELF → McSema → pass 010–100 | Clean LLVM IR | Đúng 1 provider call, không repair loop | Clean-IR one-shot flow |
 
-Prompt `B0` dùng paper-derived Ghidra instruction; `B2` dùng exact raw-assembly
+Prompt `B1` dùng paper-derived Ghidra instruction; `B2` dùng exact raw-assembly
 wrapper công bố bởi LLM4Decompile. Wrapper serialization, hash và provenance
-được đóng băng trong
-[`two_flow_protocol.py`](src/evaluation/two_flow_protocol.py). Ghidra luôn nhận
-original obfuscated ELF, không nhận IR/file được pipeline làm sạch. Sáu flow cũ
-chỉ là exploratory ablation lịch sử và bị loại khỏi claim chính.
+được đóng băng trong [`five_flow_protocol.py`](src/evaluation/five_flow_protocol.py).
+Ghidra/objdump luôn nhận original obfuscated ELF, không nhận IR/file được
+pipeline làm sạch. Các flow cũ không nằm trong protocol mới.
 
 Nhóm không fine-tune LLM. Đóng góp code nằm ở chuỗi LLVM pass, deobfuscation
 proof/refusal rules, orchestration và semantic validation/repair. Original C,
@@ -213,9 +213,7 @@ trên Variables, Loops, Conditions, Logic flow và Structural integrity. Kết q
 Điểm này chỉ đo khả năng đọc/phân tích mã C-like, không được dùng để kết luận
 correctness.
 
-Runner chính B0–F3 xuất protocol manifest, per-sample CSV và summary JSON.
-Artifact cũ vẫn được giữ để audit nhưng không được đưa vào bảng kết quả hoặc
-claim của protocol mới.
+Runner chính B1/B2/F1/F2/F3 xuất protocol manifest, per-sample CSV và summary JSON.
 
 ---
 
@@ -289,47 +287,25 @@ pip install -r requirements.txt
 python3 src/main.py data/custom_dataset.csv llm-recovery
 ```
 
-### 2. Chạy Chiến Dịch Đánh Giá B0–B3 và F3
+### 2. Chạy Chiến Dịch Đánh Giá B1/B2/F1/F2/F3
 
-Runner lập lịch các flow đã đăng ký trong protocol. B0/F3 là comparison gốc;
-B1 và B3 cô lập tác động của validation loop; B2 là raw-assembly baseline:
+Runner lập lịch đúng năm flow của protocol. `B1/B2` là hai baseline one-shot
+từ ELF gốc; `F1/F2/F3` giữ nguyên ba treatment tương ứng của master:
 
 ```bash
 # Public-corpus set: báo cáo riêng, không dùng để bác bỏ contamination
-python3 src/evaluation/run_two_flow_experiment.py data/custom_dataset.csv \
-    --fuzz-iterations=1000 --opt-level=O3 --location=us-central1
+python3 src/evaluation/run_experiment.py data/custom_dataset.csv \
+    --max-workers=15 --fuzz-iterations=1000
 
 # Repository-owned 40 case: chạy sau khi verify binary và freeze manifest
-python3 src/evaluation/run_two_flow_experiment.py data/own_dataset.csv \
-    --fuzz-iterations=1000 --opt-level=O3 --location=us-central1
+python3 src/evaluation/run_experiment.py data/own_dataset.csv \
+    --max-workers=15 --fuzz-iterations=1000
 
-# So sánh tác động của standard LLVM optimizer, giữ nguyên các biến khác
-for level in O1 O2 O3; do
-  python3 src/evaluation/run_two_flow_experiment.py data/own_dataset.csv \
-      --fuzz-iterations=1000 --opt-level="$level" --location=us-central1
-done
 ```
 
-`B0` luôn chạy trước `F3`, nhưng hai request độc lập và không chia sẻ candidate,
-diagnostic hay counterexample. Campaign manifest khóa model, region,
-optimization level và fuzz budget; mỗi case ghi exact prompt/source ELF hash và
-Ghidra version trong request/representation manifest. Không resume một campaign
-sau khi code, prompt hoặc input đã đổi.
-
-Chạy riêng các ablation B1/B2/B3 và tổng hợp đủ bảy treatment:
-
-```bash
-python3 src/evaluation/run_two_flow_experiment.py data/own_dataset.csv \
-    --flows B1 --fuzz-iterations=1000 --location=us-central1
-
-python3 src/evaluation/run_two_flow_experiment.py data/own_dataset.csv \
-    --flows B2 B3 --fuzz-iterations=1000 --location=us-central1
-
-python3 src/evaluation/analyze_optimization_campaigns.py \
-    --baseline <B0_CAMPAIGN> --b1 <B1_CAMPAIGN> --b23 <B2_B3_CAMPAIGN> \
-    --o1 <F3_O1_CAMPAIGN> --o2 <F3_O2_CAMPAIGN> --o3 <F3_O3_CAMPAIGN> \
-    --output reports/final_seven_treatments
-```
+Readability được chấm sau khi toàn bộ flow đã hoàn tất; dùng
+`--skip-readability` chỉ khi chạy pilot/debug. Campaign manifest khóa model,
+region và fuzz budget; mỗi case ghi prompt, representation và source ELF hash.
 
 40 source mới nằm tại [`data/own_dataset`](data/own_dataset/README.md).
 Kiểm tra SHA-256, compile và frozen seed oracle mà chưa tạo binary obfuscated:
@@ -346,8 +322,8 @@ thiếu marker, LLVM verifier lỗi hoặc binary đổi hành vi:
 python3 tools/build_own_dataset.py
 ```
 
-`src/evaluation/run_experiment.py` chỉ được giữ để đọc lại artifact legacy;
-không phải entry point hoặc kết quả chính của đề tài.
+`src/evaluation/run_experiment.py` là entry point của chiến dịch 5-flow;
+artifact/report lịch sử không được trộn vào flow active.
 
 ### 3. Chạy Pipeline Đơn Tuần Tự theo Mode (`src/main.py`)
 
@@ -357,7 +333,7 @@ Dùng khi muốn chạy tuần tự từng binary với một mode cụ thể (k
 # Chạy toàn bộ dataset với mode mặc định (Clean IR + LLVM2C pseudocode)
 python3 src/main.py data/custom_dataset.csv llm-recovery
 
-# LLVM2C pseudocode (utility/debug mode; không phải primary B0)
+# LLVM2C pseudocode (utility/debug mode; không thay thế flow active)
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_pseudocode
 
 # LLVM2C pseudocode + Clean IR (utility/debug mode)
@@ -370,7 +346,7 @@ python3 src/main.py data/custom_dataset.csv llm-recovery --mode=raw_ir
 python3 src/main.py data/custom_dataset.csv llm-recovery --mode=clean_ir
 ```
 
-`--mode` chỉ chọn representation; nó không tạo protocol B0–F3 với Ghidra,
+`--mode` chỉ chọn representation; nó không tạo protocol B1/B2/F1/F2/F3 với
 one-shot invariant và paired provenance.
 
 ### 4. Chạy Độc Lập Bộ Thu Thập Metrics CSV (`collect_metrics.py`)
@@ -401,10 +377,9 @@ capstone_project/
 │   ├── main.py                    # Entry point chính của toàn bộ Pipeline
 │   ├── modes_runner.py            # Quản lý thực thi 4 chế độ chạy LLM Recovery & thu thập chỉ số
 │   ├── evaluation/
-│   │   ├── run_two_flow_experiment.py # Primary B0 vs F3 runner
+│   │   ├── run_experiment.py          # Primary B1/B2/F1/F2/F3 runner
 │   │   ├── ghidra_baseline.py     # Original ELF -> program-level Ghidra export
-│   │   ├── two_flow_protocol.py   # Frozen flow and prompt provenance
-│   │   ├── run_experiment.py      # Legacy artifact compatibility only
+│   │   ├── five_flow_protocol.py  # Frozen B1/B2 prompt provenance
 │   │   ├── readability.py         # Evaluator Source Quality 1–5 cho accepted source
 │   │   ├── evaluate_source_quality.py # Chấm/reuse cache cho campaign đã có
 │   │   ├── artifact_loader.py     # Nạp artifact và kiểm tra provenance/cache
@@ -434,7 +409,7 @@ capstone_project/
 ├── result/                        # Thư mục chứa kết quả đầu ra (tự động khởi tạo)
 │   └── eval_YYYYMMDD_HHMMSS/      # Artifact gốc theo sample/flow/attempt
 ├── reports/
-│   └── twoflow_YYYYMMDD_HHMMSS/   # Primary per-sample CSV + summary JSON
+│   └── experiment_YYYYMMDD_HHMMSS/ # Five-flow CSV + summary JSON
 └── README.md                      # Tài liệu hướng dẫn chi tiết dự án
 ```
 
@@ -442,19 +417,18 @@ capstone_project/
 
 ## 6. KẾT QUẢ ĐÁNH GIÁ THỰC NGHIỆM (BENCHMARK RESULTS)
 
-Kết quả frozen trên 40 `own_dataset` case: B0 10/40, B1 39/40, B2 6/40, B3
-38/40, F3-O1 38/40, F3-O2 38/40 và F3-O3 37/40. Báo cáo bảy treatment, paired
-statistics và attribution nằm ở
-[`docs/seven-treatment-analysis.md`](docs/seven-treatment-analysis.md). Phân
-tích O1/O2/O3 tại từng biên IR trên cả own và public dataset nằm ở
-[`docs/optimization-ir-boundary-analysis.md`](docs/optimization-ir-boundary-analysis.md).
+Kết quả active được xuất theo đúng năm flow `B1`, `B2`, `F1`, `F2`, `F3`;
+artifact lịch sử khác layout chỉ được giữ để tham khảo và không được gộp vào
+campaign mới. Báo cáo campaign hiện tại nằm trong `reports/experiment_*`.
 Hồ sơ một sample hoàn chỉnh, kèm script replay và kịch bản bảo vệ trước hội
 đồng, nằm ở
 [`case_studies/h00035/README.md`](case_studies/h00035/README.md).
 
-Campaign B0–F3 phải báo riêng public-corpus cases và 40 `own_dataset` cases.
-Metric chính là Canonical E2E trên toàn bộ eligible cases; kết quả
-`O1/O2/O3` phải paired theo cùng case và không được gộp thành một overall rate.
+Campaign B1/B2/F1/F2/F3 phải báo riêng public-corpus cases và 40
+`own_dataset` cases.
+Metric chính là Canonical E2E trên toàn bộ eligible cases. `O1/O2/O3` chỉ là
+chi tiết cấu hình LLVM nội bộ, không phải flow ID và không được dùng để đổi
+nghĩa F1/F2/F3.
 
 Readability chỉ là metric phụ trên Candidate C đã vượt behavioral oracle; nó
 không được dùng làm bằng chứng correctness hoặc để thay đổi denominator.

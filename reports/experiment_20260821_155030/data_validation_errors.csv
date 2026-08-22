@@ -1,0 +1,11 @@
+experiment_id,sample_id,flow_id,repeat_id,violated_rule,field_values,severity,message
+experiment_20260821_155030,h00001,B1,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""Per-attempt LLM latency and API cost were not persisted.""}",WARNING,Per-attempt LLM latency and API cost were not persisted.
+experiment_20260821_155030,h00001,B1,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""clang-format or source prerequisite unavailable; SLOC metrics are null.""}",WARNING,clang-format or source prerequisite unavailable; SLOC metrics are null.
+experiment_20260821_155030,h00001,B2,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""Per-attempt LLM latency and API cost were not persisted.""}",WARNING,Per-attempt LLM latency and API cost were not persisted.
+experiment_20260821_155030,h00001,B2,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""clang-format or source prerequisite unavailable; SLOC metrics are null.""}",WARNING,clang-format or source prerequisite unavailable; SLOC metrics are null.
+experiment_20260821_155030,h00001,F1,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""Per-attempt LLM latency and API cost were not persisted.""}",WARNING,Per-attempt LLM latency and API cost were not persisted.
+experiment_20260821_155030,h00001,F1,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""clang-format or source prerequisite unavailable; SLOC metrics are null.""}",WARNING,clang-format or source prerequisite unavailable; SLOC metrics are null.
+experiment_20260821_155030,h00001,F2,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""Per-attempt LLM latency and API cost were not persisted.""}",WARNING,Per-attempt LLM latency and API cost were not persisted.
+experiment_20260821_155030,h00001,F2,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""clang-format or source prerequisite unavailable; SLOC metrics are null.""}",WARNING,clang-format or source prerequisite unavailable; SLOC metrics are null.
+experiment_20260821_155030,h00001,F3,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""Per-attempt LLM latency and API cost were not persisted.""}",WARNING,Per-attempt LLM latency and API cost were not persisted.
+experiment_20260821_155030,h00001,F3,0,RULE_10_SOURCE_DATA_GAP,"{""warning"": ""clang-format or source prerequisite unavailable; SLOC metrics are null.""}",WARNING,clang-format or source prerequisite unavailable; SLOC metrics are null.

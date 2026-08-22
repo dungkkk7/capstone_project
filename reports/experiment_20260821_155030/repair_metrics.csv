@@ -1,0 +1,6 @@
+flow_id,compilation_repair_gain_pp,compile_repair_case_count,compile_repair_success_count,compilation_repair_success_rate_percent,compile_repair_budget_exhausted_count,behavioral_repair_case_count,behavioral_repair_success_count,semantic_repair_success_rate_percent,behavioral_repair_gain_pp,behavioral_repair_budget_exhausted_count,compile_repair_rounds_n,compile_repair_rounds_mean,compile_repair_rounds_median,compile_repair_rounds_stddev,compile_repair_rounds_min,compile_repair_rounds_p25,compile_repair_rounds_p75,compile_repair_rounds_max,compile_repair_rounds_bootstrap_ci_low,compile_repair_rounds_bootstrap_ci_high,behavioral_repair_rounds_n,behavioral_repair_rounds_mean,behavioral_repair_rounds_median,behavioral_repair_rounds_stddev,behavioral_repair_rounds_min,behavioral_repair_rounds_p25,behavioral_repair_rounds_p75,behavioral_repair_rounds_max,behavioral_repair_rounds_bootstrap_ci_low,behavioral_repair_rounds_bootstrap_ci_high
+B1,,0,0,,0,0,0,,,0,0,,,,,,,,,,0,,,,,,,,,
+B2,,0,0,,0,0,0,,,0,0,,,,,,,,,,0,,,,,,,,,
+F1,0.0,0,0,,0,0,0,,,0,0,,,,,,,,,,0,,,,,,,,,
+F2,0.0,0,0,,0,0,0,,,0,0,,,,,,,,,,0,,,,,,,,,
+F3,,0,0,,0,0,0,,,0,0,,,,,,,,,,0,,,,,,,,,

@@ -3,7 +3,7 @@ set -euo pipefail
 
 CASE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd -- "$CASE_DIR/../.." && pwd)
-REFERENCE="$PROJECT_ROOT/data/own_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf"
+REFERENCE="$PROJECT_ROOT/custom_dataset/obfuscated/h00035/n26081535_fla_bcf_instsub.elf"
 RECOVERED="$CASE_DIR/recovered_f3_o1.c"
 SEED="$CASE_DIR/seed.txt"
 EXPECTED="$CASE_DIR/expected.txt"

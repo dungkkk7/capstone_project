@@ -1,0 +1,6 @@
+flow_id,completed_behavioral_validation_count,behavioral_pass_count,program_behavioral_pass_rate_percent,initial_behavioral_validation_count,initial_behavioral_pass_count,initial_behavioral_pass_rate_percent,final_behavioral_pass_rate_percent,input_match_macro_percent,input_match_micro_percent,input_match_median_percent,input_match_percent_bootstrap_ci_low,input_match_percent_bootstrap_ci_high,counterexample_sample_count,counterexample_detection_rate_percent,counterexample_ever_detected_rate_percent,final_counterexample_rate_percent
+B1,0,0,,0,0,,,,,,,,0,,,
+B2,13,3,23.076923076923077,13,3,23.076923076923077,23.076923076923077,27.647031647031646,29.940019993335554,0.0,7.203511203511203,50.723954723954726,10,76.92307692307693,76.92307692307693,76.92307692307693
+F1,4,4,100.0,4,4,100.0,100.0,100.0,100.0,100.0,100.0,100.0,0,0.0,0.0,0.0
+F2,0,0,,0,0,,,,,,,,0,,,
+F3,6,3,50.0,6,3,50.0,50.0,62.57458210422812,76.59661293613547,87.65,29.216666666666665,95.88333333333333,3,50.0,50.0,50.0
